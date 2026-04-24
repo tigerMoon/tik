@@ -1,0 +1,28 @@
+{
+  "kind": "EnvironmentPack",
+  "id": "design-to-code",
+  "name": "Design To Code",
+  "version": "0.1.0",
+  "description": "A frontend-oriented environment for design-system knowledge, UI review, and design-to-code delivery.",
+  "tools": ["figma", "github", "frontend-preview", "mcp"],
+  "skills": ["figma-to-react", "ui-review", "token-consistency-check", "frontend-implementation"],
+  "knowledge": [
+    { "id": "design-system", "kind": "design-system", "label": "Design System" },
+    { "id": "frontend-repo-index", "kind": "repo-index", "label": "Frontend Repo Index" },
+    { "id": "ui-guidelines", "kind": "docs", "label": "UI Guidelines" }
+  ],
+  "policies": ["design-review-before-publish", "token-consistency-required"],
+  "workflowBindings": [
+    {
+      "workflow": "feature-delivery",
+      "phases": {
+        "clarify": ["requirements-clarifier"],
+        "plan": ["solution-proposal", "ui-review"],
+        "implement": ["figma-to-react", "frontend-implementation"],
+        "review": ["ui-review", "token-consistency-check"],
+        "verify": ["frontend-preview"]
+      }
+    }
+  ],
+  "evaluators": ["ux-consistency-evaluator", "token-consistency-check"]
+}

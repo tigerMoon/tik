@@ -1,0 +1,28 @@
+{
+  "kind": "EnvironmentPack",
+  "id": "base-engineering",
+  "name": "Base Engineering",
+  "version": "0.1.0",
+  "description": "A general software delivery environment with code, review, and verification capabilities.",
+  "tools": ["github", "jira", "shell", "mcp"],
+  "skills": ["requirements-clarifier", "solution-proposal", "coder", "pr-review", "test-runner"],
+  "knowledge": [
+    { "id": "repo-index", "kind": "repo-index", "label": "Repository Index" },
+    { "id": "architecture-docs", "kind": "docs", "label": "Architecture Docs" },
+    { "id": "runbooks", "kind": "runbook", "label": "Runbooks" }
+  ],
+  "policies": ["approval-for-high-risk-actions", "no-prod-write-without-review"],
+  "workflowBindings": [
+    {
+      "workflow": "feature-delivery",
+      "phases": {
+        "clarify": ["requirements-clarifier"],
+        "plan": ["solution-proposal"],
+        "implement": ["coder"],
+        "review": ["pr-review"],
+        "verify": ["test-runner"]
+      }
+    }
+  ],
+  "evaluators": ["risk-evaluator", "rollout-safety-check"]
+}

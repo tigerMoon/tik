@@ -1,0 +1,22 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "baseUrl": ".",
+    "paths": {
+      "@tik/shared": ["../shared/dist/index.d.ts"],
+      "@tik/kernel": ["../kernel/dist/index.d.ts"],
+      "@tik/sight": ["../sight/dist/index.d.ts"],
+      "@tik/ace": ["../ace/dist/index.d.ts"]
+    }
+  },
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "tests"
+  ]
+}

@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>KIT Workbench · Skill Manifest</title>
+<style>
+:root{
+  --bg:#08101f; --panel:rgba(12,21,43,.94); --panel2:rgba(11,19,39,.94);
+  --text:#f2f6ff; --muted:#8a97bb; --line:rgba(255,255,255,.08);
+  --blue:#5b8cff; --green:#39d98a; --yellow:#ffb84d; --red:#ff6f7d;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; color:var(--text);
+  font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  background:
+    radial-gradient(circle at 14% 10%, rgba(91,140,255,.18), transparent 24%),
+    radial-gradient(circle at 82% 12%, rgba(129,95,255,.14), transparent 22%),
+    linear-gradient(180deg,#08101f 0%,#07101e 100%);
+}
+.shell{display:grid;grid-template-columns:220px 1fr;gap:20px;padding:24px;min-height:100vh}
+.panel{
+  background:linear-gradient(180deg,rgba(12,21,43,.94),rgba(11,19,39,.92));
+  border:1px solid var(--line); border-radius:28px; box-shadow:0 18px 48px rgba(0,0,0,.35);
+}
+.sidebar{padding:18px 16px;display:flex;flex-direction:column}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:24px}
+.mark{width:34px;height:34px;border-radius:12px;background:linear-gradient(135deg,#6ea4ff,#755cff);display:grid;place-items:center;font-weight:800}
+.brand strong{display:block;font-size:14px}
+.brand span{font-size:11px;color:var(--muted)}
+.nav a{display:block;padding:12px 14px;margin-bottom:8px;border-radius:14px;color:#bec9ea;text-decoration:none}
+.nav a.active{background:rgba(91,140,255,.18);border:1px solid rgba(91,140,255,.24);color:var(--text)}
+.note{margin-top:auto;padding:14px;border-radius:18px;background:rgba(255,255,255,.04);border:1px solid var(--line)}
+.note .t{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.note strong{display:block;margin-top:8px}
+.note p{margin:8px 0 0;color:#a8b5d8;font-size:12px;line-height:1.5}
+
+.main{display:grid;grid-template-rows:auto 1fr auto;gap:18px}
+.topbar{padding:18px 22px;display:flex;justify-content:space-between;align-items:center}
+.top-left{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+h1{margin:0;font-size:24px}
+.chips{display:flex;gap:10px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.06);font-size:12px;color:#d9e4ff}
+.dot{width:8px;height:8px;border-radius:50%}
+.actions{display:flex;gap:10px}
+.btn{padding:10px 14px;border-radius:14px;border:1px solid var(--line);background:rgba(255,255,255,.05);color:var(--text)}
+.btn.primary{background:var(--blue)}
+
+.content{display:grid;grid-template-columns:290px 628px 1fr;gap:18px}
+.card{
+  padding:20px 22px;border-radius:24px;
+  background:linear-gradient(180deg,rgba(12,21,43,.94),rgba(11,19,39,.92));
+  border:1px solid var(--line);
+  box-shadow:0 18px 48px rgba(0,0,0,.28);
+}
+.card-title{font-size:13px;font-weight:700}
+.small{font-size:12px;color:#b9c6e5}
+.menu{display:grid;gap:10px;margin-top:18px}
+.menu-item{padding:11px 14px;border-radius:14px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);font-size:12px;color:#dce6ff}
+.menu-item.active{background:rgba(91,140,255,.14);border-color:rgba(91,140,255,.26)}
+.stack{display:grid;gap:18px}
+.version-list{display:grid;gap:10px;margin-top:16px}
+.vitem{padding:12px 14px;border-radius:14px;background:rgba(255,255,255,.05);border:1px solid var(--line)}
+.vitem strong{display:block;font-size:11px}
+.vitem .small{margin-top:4px}
+
+.tabs{display:flex;gap:8px;margin-top:14px}
+.tab{padding:7px 12px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.06);font-size:12px}
+.tab.active{background:rgba(91,140,255,.18);border-color:rgba(91,140,255,.3)}
+.meta-box{margin-top:18px;padding:14px 16px;border-radius:18px;background:rgba(255,255,255,.05);border:1px solid var(--line)}
+.meta-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.meta-grid .k{font-size:10px;color:var(--muted)}
+.meta-grid .v{margin-top:4px;font-size:12px;font-weight:700}
+.codebox{
+  margin-top:18px;padding:14px 16px;border-radius:18px;background:#070c1a;border:1px solid var(--line);
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.55;color:#d6e1ff;white-space:pre-wrap
+}
+.code-title{margin-bottom:8px;font-family:inherit;color:#b9c7e9;font-weight:700}
+.notes{margin-top:18px;padding:14px 16px;border-radius:18px;background:rgba(255,255,255,.05);border:1px solid var(--line);font-size:12px;color:#d3ddf6;line-height:1.55}
+
+.right-card{display:grid;gap:18px}
+.queue{display:grid;gap:12px;margin-top:16px}
+.qitem{padding:14px;border-radius:16px;background:rgba(255,255,255,.05);border:1px solid var(--line)}
+.qitem strong{display:block;font-size:11px;margin-bottom:8px}
+.metric-list{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+.metric{padding:14px;border-radius:16px;background:rgba(255,255,255,.05);border:1px solid var(--line)}
+.metric .k{font-size:10px;color:var(--muted)}
+.metric .v{margin-top:6px;font-size:13px;font-weight:700}
+.item{padding:10px 12px;border-radius:12px;background:rgba(255,255,255,.05);border:1px solid var(--line);font-size:11px;color:#dce6ff}
+.action-list{display:grid;gap:10px;margin-top:16px}
+.check{display:flex;align-items:center;gap:10px;padding:8px 0;font-size:11px;color:#dce6ff}
+.badge{width:8px;height:8px;border-radius:50%}
+.columns{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+
+.composer{padding:12px 18px;display:grid;grid-template-columns:120px 1fr;gap:14px;align-items:center}
+.inputbox{padding:18px;border-radius:20px;background:#070c1a;border:1px solid var(--line);color:#dde8ff;font-size:14px}
+.helper{margin-top:10px;padding:10px 14px;border-radius:16px;background:rgba(255,255,255,.05);border:1px solid var(--line);font-size:11px;color:#b6c4e6}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="panel sidebar">
+    <div class="brand"><div class="mark">K</div><div><strong>KIT Workbench</strong><span>skill manifest</span></div></div>
+    <nav class="nav">
+      <a href="#">Inbox</a>
+      <a href="#">Tasks</a>
+      <a href="#">Decisions</a>
+      <a href="#">Runs</a>
+      <a href="#">Artifacts</a>
+      <a class="active" href="#">Skills</a>
+      <a href="#">Environments</a>
+    </nav>
+    <div class="note">
+      <div class="t">Manifest mindset</div>
+      <strong>Skill is governed</strong>
+      <p>spec / bindings / tests / versions<br/>not just a prompt</p>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section class="panel topbar">
+      <div class="top-left">
+        <h1>Skill Manifest</h1>
+        <div class="chips">
+          <span class="chip">api-compat-check</span>
+          <span class="chip"><span class="dot" style="background:var(--green)"></span>Environment</span>
+          <span class="chip">v1.1.0</span>
+          <span class="chip"><span class="dot" style="background:var(--yellow)"></span>draft changes unsaved</span>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn">Run test</button>
+        <button class="btn">Save draft</button>
+        <button class="btn primary">Publish</button>
+      </div>
+    </section>
+
+    <section class="content">
+      <section class="card stack">
+        <div>
+          <div class="card-title">Sections</div>
+          <div class="menu">
+            <div class="menu-item active">Overview</div>
+            <div class="menu-item">Contract</div>
+            <div class="menu-item">Dependencies</div>
+            <div class="menu-item">Bindings</div>
+            <div class="menu-item">Success criteria</div>
+            <div class="menu-item">Tests</div>
+            <div class="menu-item">Versions</div>
+          </div>
+        </div>
+
+        <div class="card" style="padding:18px">
+          <div class="card-title">Version history</div>
+          <div class="version-list">
+            <div class="vitem"><strong>v1.1.0</strong><div class="small">Added rollback impact in output schema · 2d ago</div></div>
+            <div class="vitem"><strong>v1.0.3</strong><div class="small">Tightened success criteria · 8d ago</div></div>
+            <div class="vitem"><strong>v1.0.0</strong><div class="small">Initial environment skill · 21d ago</div></div>
+          </div>
+        </div>
+
+        <div class="card" style="padding:18px">
+          <div class="card-title">Promotion path</div>
+          <div class="small" style="margin-top:12px;line-height:1.6">This skill is environment-scoped. You can clone it to global scope after review if it becomes reusable outside commerce-ops.</div>
+          <div class="item" style="margin-top:14px">Clone to global scope · Review portability</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-title">Editable manifest</div>
+        <div class="tabs">
+          <div class="tab active">Overview</div>
+          <div class="tab">Spec</div>
+          <div class="tab">Bindings</div>
+          <div class="tab">Tests</div>
+        </div>
+
+        <div class="meta-box">
+          <div class="meta-grid">
+            <div><div class="k">id</div><div class="v">api-compat-check</div></div>
+            <div><div class="k">scope</div><div class="v">environment</div></div>
+            <div><div class="k">version</div><div class="v">1.1.0</div></div>
+            <div><div class="k">pack</div><div class="v">commerce-ops</div></div>
+          </div>
+        </div>
+
+        <div class="codebox"><div class="code-title">Core spec</div>description: Check backward compatibility for API changes
+goal: produce structured findings and risk level
+entrypoint: skill://api/compat-check
+owner_pack: commerce-ops
+
+input_schema:
+  required: [repo, pr_ref, api_spec_refs]
+output_schema:
+  fields: [summary, findings, risk_level, rollback_impact]</div>
+
+        <div class="columns" style="margin-top:18px">
+          <div class="codebox" style="margin:0"><div class="code-title">Dependencies</div>required_tools:
+  - github-main
+  - spec-diff-parser
+
+required_knowledge:
+  - env/commerce-ops/repo-index
+  - env/commerce-ops/architecture-docs
+
+policy_hooks:
+  - pii-redaction-before-publish</div>
+
+          <div class="codebox" style="margin:0"><div class="code-title">Evaluation</div>success_criteria:
+  - compatibility conclusion required
+  - at least 1 structured finding
+  - rollback impact required
+
+quality_thresholds:
+  confidence: warn_below_0.75
+  missing_rollback: block</div>
+        </div>
+
+        <div class="codebox"><div class="code-title">Bindings</div>workflow_bindings:
+  feature-delivery:
+    phase: implement
+  code-review:
+    phase: review
+  hotfix:
+    phase: verify
+
+allowed_agents: [planner, reviewer, evaluator]</div>
+
+        <div class="notes">This draft adds rollback_impact to the output contract and tightens the evaluation rule: if rollback impact is missing, publishing the result should be blocked.</div>
+      </section>
+
+      <section class="right-card">
+        <div class="card">
+          <div class="card-title">Test harness</div>
+          <div class="small" style="margin-top:12px">Run this skill with sample input before publish</div>
+          <div class="codebox" style="margin-top:14px">repo: service-api
+pr_ref: 412
+api_spec_refs:
+  - openapi/service.yaml</div>
+          <div class="action-list">
+            <div class="item">Run sample</div>
+            <div class="item">Last result · 96% good · 42s avg</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Impact before publish</div>
+          <div class="queue">
+            <div class="qitem"><strong>Workflow impact</strong><div class="small">3 bindings will use new output field</div></div>
+            <div class="qitem"><strong>Agent impact</strong><div class="small">reviewer + evaluator prompts will read rollback_impact</div></div>
+            <div class="qitem"><strong>Policy impact</strong><div class="small">missing rollback_impact becomes block</div></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Review & publish</div>
+          <div class="check"><span class="badge" style="background:var(--green)"></span>Spec is valid</div>
+          <div class="check"><span class="badge" style="background:var(--green)"></span>Bindings updated</div>
+          <div class="check"><span class="badge" style="background:var(--green)"></span>Sample test passed</div>
+          <div class="check"><span class="badge" style="background:var(--yellow)"></span>Promotion review needed</div>
+          <div class="action-list" style="margin-top:14px">
+            <div class="item">Save draft</div>
+            <div class="item">Publish new version</div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <section class="panel composer">
+      <div class="small" style="color:var(--muted)">Universal composer</div>
+      <div>
+        <div class="inputbox">@skill/api-compat-check #edit add rollback_impact to output_schema and update publish rule</div>
+        <div class="helper">Suggested: #run-test · #show-impact · #save-draft · #publish</div>
+      </div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

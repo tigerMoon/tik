@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>KIT Workbench · Inbox v2 · Single Workspace</title>
+<style>
+:root{
+  --bg:#08101f; --panel:rgba(12,21,43,.94); --panel2:rgba(11,19,39,.94);
+  --text:#f2f6ff; --muted:#8a97bb; --line:rgba(255,255,255,.08);
+  --blue:#5b8cff; --green:#39d98a; --yellow:#ffb84d; --red:#ff6f7d;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; color:var(--text);
+  font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  background:
+    radial-gradient(circle at 14% 10%, rgba(91,140,255,.18), transparent 24%),
+    radial-gradient(circle at 82% 12%, rgba(129,95,255,.14), transparent 22%),
+    linear-gradient(180deg,#08101f 0%,#07101e 100%);
+}
+.shell{display:grid;grid-template-columns:220px 1fr;gap:20px;padding:24px;min-height:100vh}
+.panel{
+  background:linear-gradient(180deg,rgba(12,21,43,.94),rgba(11,19,39,.92));
+  border:1px solid var(--line);
+  border-radius:28px;
+  box-shadow:0 18px 48px rgba(0,0,0,.35);
+}
+.sidebar{padding:18px 16px;display:flex;flex-direction:column}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:24px}
+.mark{width:34px;height:34px;border-radius:12px;background:linear-gradient(135deg,#6ea4ff,#755cff);display:grid;place-items:center;font-weight:800}
+.brand strong{display:block;font-size:14px}
+.brand span{font-size:11px;color:var(--muted)}
+.nav a{display:block;padding:12px 14px;margin-bottom:8px;border-radius:14px;color:#bec9ea;text-decoration:none}
+.nav a.active{background:rgba(91,140,255,.18);border:1px solid rgba(91,140,255,.24);color:var(--text)}
+.envbox{margin-top:auto;padding:14px;border-radius:18px;background:rgba(255,255,255,.04);border:1px solid var(--line)}
+.envbox .t{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.envbox strong{display:block;margin-top:8px}
+.envbox p{margin:8px 0 0;color:#a8b5d8;font-size:12px;line-height:1.5}
+
+.main{display:grid;grid-template-rows:auto 1fr auto;gap:18px}
+.topbar{padding:18px 22px;display:flex;justify-content:space-between;align-items:center}
+.top-left{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+h1{margin:0;font-size:24px}
+.chips{display:flex;gap:10px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.06);font-size:12px;color:#d9e4ff}
+.dot{width:8px;height:8px;border-radius:50%}
+.actions{display:flex;gap:10px}
+.btn{padding:10px 14px;border-radius:14px;border:1px solid var(--line);background:rgba(255,255,255,.05);color:var(--text)}
+.btn.primary{background:var(--blue)}
+
+.content{display:grid;grid-template-columns:442px 1fr;gap:18px}
+.card{
+  padding:20px 22px;border-radius:24px;
+  background:linear-gradient(180deg,rgba(12,21,43,.94),rgba(11,19,39,.92));
+  border:1px solid var(--line);
+  box-shadow:0 18px 48px rgba(0,0,0,.28);
+}
+.label{font-size:12px;color:var(--muted);margin-bottom:10px}
+.rowhead{display:flex;align-items:center;gap:10px}
+.rowhead strong{font-size:13px}
+.tasklist{display:grid;gap:14px;margin-top:18px}
+.task{
+  padding:18px 16px;border-radius:20px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.08)
+}
+.task.selected{background:rgba(91,140,255,.14);border-color:rgba(91,140,255,.28)}
+.task-id{font-size:11px;color:var(--muted)}
+.task-title{margin-top:8px;font-size:13px;font-weight:700;line-height:1.45}
+.meta{margin-top:12px;font-size:12px;color:#ced9f2}
+.meta .risk-high{color:var(--red);font-weight:700}
+.meta .risk-med{color:var(--yellow);font-weight:700}
+.openpill{margin-left:auto;padding:6px 10px;border-radius:12px;background:var(--blue);font-size:11px}
+.row{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+
+.focus-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.focus-title{margin:10px 0 0;font-size:18px;font-weight:700}
+p{margin:16px 0 0;color:#cdd8f1;line-height:1.65;font-size:13px}
+.evidence{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:18px}
+.e-card{padding:16px;border-radius:18px;background:rgba(255,255,255,.05);border:1px solid var(--line)}
+.e-card strong{display:block;font-size:12px;margin-bottom:8px}
+.optionrow{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}
+.option{padding:12px 16px;border-radius:18px;background:rgba(255,255,255,.06);border:1px solid var(--line);font-size:12px}
+.option.primary{background:rgba(91,140,255,.88)}
+
+.lower{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.item{padding:12px 14px;border-radius:16px;background:rgba(255,255,255,.05);border:1px solid var(--line);font-size:12px;color:#dce6ff}
+.list{display:grid;gap:10px}
+.small{font-size:12px;color:#b9c6e5}
+
+.composer{padding:12px 18px;display:grid;grid-template-columns:120px 1fr;gap:14px;align-items:center}
+.inputbox{padding:18px;border-radius:20px;background:#070c1a;border:1px solid var(--line);color:#dde8ff;font-size:14px}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="panel sidebar">
+    <div class="brand"><div class="mark">K</div><div><strong>KIT Workbench</strong><span>inbox v2</span></div></div>
+    <nav class="nav">
+      <a class="active" href="#">Inbox</a>
+      <a href="#">Tasks</a>
+      <a href="#">Decisions</a>
+      <a href="#">Runs</a>
+      <a href="#">Artifacts</a>
+      <a href="#">Skills</a>
+      <a href="#">Environments</a>
+    </nav>
+    <div class="envbox">
+      <div class="t">Current environment</div>
+      <strong>commerce-ops</strong>
+      <p>Inbox mode: single-workspace<br/>1 task = 1 workspace</p>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section class="panel topbar">
+      <div class="top-left">
+        <h1>Inbox</h1>
+        <div class="chips">
+          <span class="chip">commerce-ops</span>
+          <span class="chip"><span class="dot" style="background:var(--blue)"></span>4 waiting</span>
+          <span class="chip"><span class="dot" style="background:var(--red)"></span>2 high risk</span>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn">Filter</button>
+        <button class="btn primary">New task</button>
+      </div>
+    </section>
+
+    <section class="content">
+      <section class="card">
+        <div class="rowhead"><strong>Queue · 4</strong><span class="small">sorted by waiting-on-you</span></div>
+        <div class="tasklist">
+          <div class="task selected">
+            <div class="row">
+              <div>
+                <div class="task-id">TASK-231</div>
+                <div class="task-title">核心服务一期方案与兼容改造</div>
+              </div>
+              <div class="openpill">Open</div>
+            </div>
+            <div class="meta">Review • <span class="risk-high">High</span> • commerce-ops</div>
+            <div class="meta">WS service-api-spec · 批准推荐方案 A</div>
+          </div>
+
+          <div class="task">
+            <div class="task-id">TASK-244</div>
+            <div class="task-title">支付超时告警的回滚窗口确认</div>
+            <div class="meta">Approve • <span class="risk-high">High</span> • incident-response</div>
+            <div class="meta">WS checkout-incident · 是否允许降级兜底</div>
+          </div>
+
+          <div class="task">
+            <div class="task-id">TASK-245</div>
+            <div class="task-title">设计稿转 React 页面首版验收</div>
+            <div class="meta">Review • <span class="risk-med">Medium</span> • design-to-code</div>
+            <div class="meta">WS operations-dashboard-ui · 确认组件命名规范</div>
+          </div>
+
+          <div class="task">
+            <div class="task-id">TASK-248</div>
+            <div class="task-title">订单导出慢查询修复方案</div>
+            <div class="meta">Plan • <span class="risk-med">Medium</span> • commerce-ops</div>
+            <div class="meta">WS reporting-query-fix · 确认是否加缓存层</div>
+          </div>
+        </div>
+      </section>
+
+      <div style="display:grid;gap:18px">
+        <section class="card">
+          <div class="focus-head">
+            <strong>Focus</strong>
+            <span class="small">TASK-231</span>
+          </div>
+          <div class="focus-title">批准方案 A，让任务继续在 service-api-spec 内推进</div>
+          <div class="chips" style="margin-top:14px">
+            <span class="chip"><span class="dot" style="background:var(--yellow)"></span>Review</span>
+            <span class="chip"><span class="dot" style="background:var(--red)"></span>High</span>
+            <span class="chip">commerce-ops</span>
+            <span class="chip"><span class="dot" style="background:var(--green)"></span>WS service-api-spec</span>
+          </div>
+          <p>系统已经把 workspace 内部执行压缩成一个决策。你只需要判断是否采用“兼容旧接口 + 渐进切流”的一期方案。</p>
+
+          <div class="evidence">
+            <div class="e-card"><strong>工期</strong><div class="small">方案 A 预计 5 天，方案 B 预计 8 天。</div></div>
+            <div class="e-card"><strong>风险</strong><div class="small">A 的回滚路径更短，上线风险更低。</div></div>
+            <div class="e-card"><strong>代价</strong><div class="small">A 会留下一个二期要清理的兼容层。</div></div>
+          </div>
+
+          <div class="optionrow">
+            <div class="option primary">Approve A</div>
+            <div class="option">Approve w/ condition</div>
+            <div class="option">Send back</div>
+          </div>
+        </section>
+
+        <section class="lower">
+          <section class="card">
+            <div class="label">Primary workspace</div>
+            <div style="font-size:16px;font-weight:700">service-api-spec</div>
+            <div class="small" style="margin-top:10px">Codex · Active</div>
+            <div class="item" style="margin-top:14px">Open workspace · View thread</div>
+          </section>
+
+          <section class="card">
+            <div class="label">Recent artifacts</div>
+            <div class="list">
+              <div class="item">方案对比 memo</div>
+              <div class="item">兼容接口 diff 预览</div>
+              <div class="item">上线与回滚草案</div>
+            </div>
+          </section>
+        </section>
+      </div>
+    </section>
+
+    <section class="panel composer">
+      <div class="label" style="margin:0">Universal composer</div>
+      <div class="inputbox">@TASK-231 #approve 采用方案A，并把兼容层清理列入二期 backlog</div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

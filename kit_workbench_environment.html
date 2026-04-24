@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>KIT Workbench · Environment</title>
+<style>
+:root{
+  --bg:#08101f; --panel:rgba(12,21,43,.94); --panel2:rgba(11,19,39,.94);
+  --text:#f2f6ff; --muted:#8a97bb; --line:rgba(255,255,255,.08);
+  --blue:#5b8cff; --green:#39d98a; --yellow:#ffb84d; --red:#ff6f7d;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; color:var(--text);
+  font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  background:
+    radial-gradient(circle at 14% 10%, rgba(91,140,255,.18), transparent 24%),
+    radial-gradient(circle at 82% 12%, rgba(129,95,255,.14), transparent 22%),
+    linear-gradient(180deg,#08101f 0%,#07101e 100%);
+}
+.shell{display:grid;grid-template-columns:220px 1fr;gap:20px;padding:24px;min-height:100vh}
+.panel{
+  background:linear-gradient(180deg,rgba(12,21,43,.94),rgba(11,19,39,.92));
+  border:1px solid var(--line); border-radius:28px; box-shadow:0 18px 48px rgba(0,0,0,.35);
+}
+.sidebar{padding:18px 16px;display:flex;flex-direction:column}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:24px}
+.mark{width:34px;height:34px;border-radius:12px;background:linear-gradient(135deg,#6ea4ff,#755cff);display:grid;place-items:center;font-weight:800}
+.brand strong{display:block;font-size:14px}
+.brand span{font-size:11px;color:var(--muted)}
+.nav a{display:block;padding:12px 14px;margin-bottom:8px;border-radius:14px;color:#bec9ea;text-decoration:none}
+.nav a.active{background:rgba(91,140,255,.18);border:1px solid rgba(91,140,255,.24);color:var(--text)}
+.note{margin-top:auto;padding:14px;border-radius:18px;background:rgba(255,255,255,.04);border:1px solid var(--line)}
+.note .t{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.note strong{display:block;margin-top:8px}
+.note p{margin:8px 0 0;color:#a8b5d8;font-size:12px;line-height:1.5}
+
+.main{display:grid;grid-template-rows:auto 1fr auto;gap:18px}
+.topbar{padding:18px 22px;display:flex;justify-content:space-between;align-items:center}
+.top-left{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+h1{margin:0;font-size:24px}
+.chips{display:flex;gap:10px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.06);font-size:12px;color:#d9e4ff}
+.dot{width:8px;height:8px;border-radius:50%}
+.actions{display:flex;gap:10px}
+.btn{padding:10px 14px;border-radius:14px;border:1px solid var(--line);background:rgba(255,255,255,.05);color:var(--text)}
+.btn.primary{background:var(--blue)}
+
+.content{display:grid;grid-template-columns:330px 640px 1fr;gap:18px}
+.card{
+  padding:20px 22px;border-radius:24px;
+  background:linear-gradient(180deg,rgba(12,21,43,.94),rgba(11,19,39,.92));
+  border:1px solid var(--line);
+  box-shadow:0 18px 48px rgba(0,0,0,.28);
+}
+.card-title{font-size:13px;font-weight:700}
+.small{font-size:12px;color:#b9c6e5}
+.muted{color:var(--muted)}
+.pack-list{display:grid;gap:14px;margin-top:18px}
+.pack{
+  padding:18px 16px;border-radius:20px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.08)
+}
+.pack.selected{background:rgba(91,140,255,.14);border-color:rgba(91,140,255,.28)}
+.pack-name{font-size:14px;font-weight:700}
+.row{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+.pill{padding:6px 10px;border-radius:12px;background:rgba(255,255,255,.08);font-size:11px}
+.pill.active{background:rgba(57,217,138,.18);border:1px solid rgba(57,217,138,.28)}
+.pill.ready{background:rgba(91,140,255,.18);border:1px solid rgba(91,140,255,.28)}
+.pill.draft{background:rgba(255,184,77,.18);border:1px solid rgba(255,184,77,.28)}
+.desc{margin-top:10px;font-size:12px;color:#c9d5f0;line-height:1.5}
+
+.selected-head .name{font-size:18px;font-weight:700;margin-top:10px}
+p{margin:16px 0 0;color:#cdd8f1;line-height:1.65;font-size:13px}
+.inline-bar{margin-top:18px;padding:8px 14px;border-radius:14px;background:rgba(255,255,255,.05);border:1px solid var(--line);font-size:12px;color:#cdd8f1}
+.module-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px}
+.item-card{padding:18px;border-radius:24px;background:linear-gradient(180deg,rgba(11,19,39,.94),rgba(10,18,37,.92));border:1px solid var(--line)}
+.item-title{font-size:13px;font-weight:700;margin-bottom:16px}
+.item-list{display:grid;gap:8px}
+.item{padding:8px 12px;border-radius:12px;background:rgba(255,255,255,.05);border:1px solid var(--line);font-size:11px;color:#dce6ff}
+
+.stack{display:grid;gap:18px}
+.kv{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.kv .k{font-size:11px;color:var(--muted)}
+.kv .v{margin-top:4px;font-size:13px;font-weight:700}
+.queue{display:grid;gap:12px;margin-top:16px}
+.qitem{padding:14px;border-radius:16px;background:rgba(255,255,255,.05);border:1px solid var(--line)}
+.qitem strong{display:block;font-size:11px;margin-bottom:8px}
+.action-list{display:grid;gap:10px;margin-top:16px}
+
+.composer{padding:12px 18px;display:grid;grid-template-columns:120px 1fr;gap:14px;align-items:center}
+.inputbox{padding:18px;border-radius:20px;background:#070c1a;border:1px solid var(--line);color:#dde8ff;font-size:14px}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="panel sidebar">
+    <div class="brand"><div class="mark">K</div><div><strong>KIT Workbench</strong><span>environment view</span></div></div>
+    <nav class="nav">
+      <a href="#">Inbox</a>
+      <a href="#">Tasks</a>
+      <a href="#">Decisions</a>
+      <a href="#">Runs</a>
+      <a href="#">Artifacts</a>
+      <a href="#">Skills</a>
+      <a class="active" href="#">Environments</a>
+    </nav>
+    <div class="note">
+      <div class="t">Design rule</div>
+      <strong>Environment ≠ Workspace</strong>
+      <p>Environment = capability context<br/>Workspace = execution container</p>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section class="panel topbar">
+      <div class="top-left">
+        <h1>Environments</h1>
+        <div class="chips">
+          <span class="chip"><span class="dot" style="background:var(--blue)"></span>4 packs</span>
+          <span class="chip"><span class="dot" style="background:var(--green)"></span>1 active</span>
+          <span class="chip"><span class="dot" style="background:var(--yellow)"></span>promotion queue 2</span>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn">Open manifest</button>
+        <button class="btn primary">Switch pack</button>
+      </div>
+    </section>
+
+    <section class="content">
+      <section class="card">
+        <div class="card-title">Packs · 4 <span class="small">choose capability context</span></div>
+        <div class="pack-list">
+          <div class="pack selected">
+            <div class="row">
+              <div class="pack-name">commerce-ops</div>
+              <div class="pill active">Active</div>
+            </div>
+            <div class="desc">backend / incident / monorepo</div>
+            <div class="small" style="margin-top:12px">Tools / Skills / Knowledge / Policies</div>
+          </div>
+
+          <div class="pack">
+            <div class="row">
+              <div class="pack-name">design-to-code</div>
+              <div class="pill ready">Ready</div>
+            </div>
+            <div class="desc">figma / ui / tokens</div>
+            <div class="small" style="margin-top:12px">Tools / Skills / Knowledge / Policies</div>
+          </div>
+
+          <div class="pack">
+            <div class="row">
+              <div class="pack-name">incident-response</div>
+              <div class="pill ready">Ready</div>
+            </div>
+            <div class="desc">ops / logs / rollback</div>
+            <div class="small" style="margin-top:12px">Tools / Skills / Knowledge / Policies</div>
+          </div>
+
+          <div class="pack">
+            <div class="row">
+              <div class="pack-name">customer-delivery</div>
+              <div class="pill draft">Draft</div>
+            </div>
+            <div class="desc">docs / status / handoff</div>
+            <div class="small" style="margin-top:12px">Tools / Skills / Knowledge / Policies</div>
+          </div>
+        </div>
+      </section>
+
+      <div style="display:grid;grid-template-rows:auto 1fr;gap:18px">
+        <section class="card selected-head">
+          <div class="card-title">Selected pack</div>
+          <div class="name">commerce-ops</div>
+          <div class="chips" style="margin-top:14px">
+            <span class="chip"><span class="dot" style="background:var(--green)"></span>Active</span>
+            <span class="chip">v0.1.0</span>
+            <span class="chip">risk profile: medium</span>
+            <span class="chip"><span class="dot" style="background:var(--blue)"></span>single-workspace tasks</span>
+          </div>
+          <p>这是通用研发环境的能力上下文。它决定当前任务能访问哪些 tools、会调用哪些 skills、检索哪些知识、遵守哪些 policies，但它本身不是 workspace。</p>
+          <div class="inline-bar">feature-delivery · incident-response · code-review</div>
+        </section>
+
+        <section class="module-grid">
+          <div class="item-card">
+            <div class="item-title">Tools · 4</div>
+            <div class="item-list">
+              <div class="item">github-main</div>
+              <div class="item">jira-core</div>
+              <div class="item">ck-prod</div>
+              <div class="item">k8s-prod</div>
+            </div>
+          </div>
+
+          <div class="item-card">
+            <div class="item-title">Skills · 5</div>
+            <div class="item-list">
+              <div class="item">pr-review</div>
+              <div class="item">api-compat-check</div>
+              <div class="item">sql-slow-query-analysis</div>
+              <div class="item">incident-rca</div>
+            </div>
+          </div>
+
+          <div class="item-card">
+            <div class="item-title">Knowledge · 4</div>
+            <div class="item-list">
+              <div class="item">repo-index</div>
+              <div class="item">architecture docs</div>
+              <div class="item">runbooks</div>
+              <div class="item">incident history</div>
+            </div>
+          </div>
+
+          <div class="item-card">
+            <div class="item-title">Policies · 3</div>
+            <div class="item-list">
+              <div class="item">prod approval required</div>
+              <div class="item">forbid destructive DDL</div>
+              <div class="item">PII redaction</div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="stack">
+        <section class="card">
+          <div class="card-title">Activation</div>
+          <div style="font-size:16px;font-weight:700;margin-top:12px">Mounted and healthy</div>
+          <div class="kv">
+            <div><div class="k">Tasks using this pack</div><div class="v">7 active tasks</div></div>
+            <div><div class="k">Last sync</div><div class="v">2 min ago</div></div>
+          </div>
+          <div class="kv">
+            <div style="grid-column:1 / span 2"><div class="k">Mounted namespaces</div><div class="v">env/commerce-ops/*</div></div>
+          </div>
+          <div class="item" style="margin-top:14px">View health · View namespaces</div>
+        </section>
+
+        <section class="card">
+          <div class="card-title">Promotion queue</div>
+          <div class="small" style="margin-top:12px">2 learned artifacts waiting review</div>
+          <div class="queue">
+            <div class="qitem">
+              <strong>skill proposal</strong>
+              <div class="small">Promote 'compat rollback checklist' to environment skill</div>
+            </div>
+            <div class="qitem">
+              <strong>workflow update</strong>
+              <div class="small">Add 'rollback evidence' before approve phase</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-title">Quick actions</div>
+          <div class="action-list">
+            <div class="item">Switch to design-to-code</div>
+            <div class="item">Open pack manifest</div>
+            <div class="item">Review promotion queue</div>
+            <div class="item">View workflow bindings</div>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section class="panel composer">
+      <div class="small" style="color:var(--muted)">Universal composer</div>
+      <div class="inputbox">@env/commerce-ops #open-manifest 以及列出当前 policies 和 promotion queue</div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

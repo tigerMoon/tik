@@ -1,0 +1,36 @@
+{
+  "kind": "EnvironmentPack",
+  "id": "commerce-ops",
+  "name": "Commerce Ops",
+  "version": "0.1.0",
+  "description": "A commerce-focused environment for API compatibility, incident review, and service delivery.",
+  "tools": ["github", "jira", "clickhouse", "kubernetes", "feishu"],
+  "skills": ["pr-review", "api-compat-check", "incident-rca", "sql-slow-query-analysis"],
+  "knowledge": [
+    { "id": "repo-index", "kind": "repo-index", "label": "Workspace Repo Index" },
+    { "id": "incident-history", "kind": "incident-history", "label": "Incident History" },
+    { "id": "operations-runbooks", "kind": "runbook", "label": "Operations Runbooks" }
+  ],
+  "policies": ["prod-change-requires-approval", "pii-redaction", "forbidden-direct-db-write"],
+  "workflowBindings": [
+    {
+      "workflow": "feature-delivery",
+      "phases": {
+        "clarify": ["requirements-clarifier"],
+        "plan": ["solution-proposal", "api-compat-check"],
+        "implement": ["coder", "api-compat-check"],
+        "review": ["pr-review"],
+        "verify": ["test-runner", "rollout-safety-check"]
+      }
+    },
+    {
+      "workflow": "incident-response",
+      "phases": {
+        "clarify": ["incident-rca"],
+        "plan": ["incident-rca"],
+        "verify": ["incident-rca"]
+      }
+    }
+  ],
+  "evaluators": ["risk-evaluator", "architecture-impact-evaluator", "rollout-safety-check"]
+}
