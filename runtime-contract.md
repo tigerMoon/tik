@@ -39,7 +39,17 @@
 
 ### Terminal States
 
-`converged`, `failed`, `cancelled` — no further transitions allowed.
+- converged
+- completed
+- failed
+- cancelled
+
+Terminal state semantics:
+
+- `converged`: evaluation-threshold success. ACE/convergence metrics reached the configured stop condition.
+- `completed`: evidence-sufficient success. Tik has enough task/workspace evidence to stop successfully even if a numeric convergence threshold was not reached, such as exploration, diagnosis, or document-only workflows.
+- `failed`: runtime or task failure that cannot be safely recovered automatically.
+- `cancelled`: user-initiated cancellation.
 
 ## 2. Event Contract
 

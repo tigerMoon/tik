@@ -1,15 +1,16 @@
 /**
- * Codex CLI Provider
+ * Codex Provider
  *
- * Delegates execution to the local `codex exec` command so Tik can reuse
- * official Codex login/session/tooling instead of maintaining a bridge layer.
+ * Uses Codex App Server as Tik's provider-native execution backend. Tik owns
+ * Task/Event/Session semantics; Codex supplies the native agent brain, tools,
+ * thread/turn runtime, and login state.
  */
 
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { CodexHarnessAdapter } from '@tik/kernel';
+import { CodexHarnessSessionManager } from '@tik/kernel';
 import type {
   ChatMessage,
   ChatResponse,
@@ -399,12 +400,14 @@ export class CodexCliProvider implements ILLMProvider {
   private readonly projectPath: string;
   private readonly model?: string;
   private readonly mode: 'governed' | 'delegate';
+  private readonly harnessSessionManager: CodexHarnessSessionManager;
 
   constructor(projectPath: string, model?: string, mode: 'governed' | 'delegate' = 'governed') {
     this.projectPath = projectPath;
     this.model = process.env.TIK_MODEL || model;
     this.mode = mode;
     this.name = mode === 'delegate' ? 'codex-delegate' : 'codex';
+    this.harnessSessionManager = new CodexHarnessSessionManager(projectPath);
   }
 
   async plan(prompt: string, context: string): Promise<LLMPlanResponse> {
@@ -620,7 +623,11 @@ export class CodexCliProvider implements ILLMProvider {
     }
 
     const beforeFiles = await this.captureChangedFiles();
-    const harness = new CodexHarnessAdapter(this.projectPath);
+    const providerSessionId = options?.providerSessionId;
+    const sessionKey = providerSessionId
+      ? this.buildHarnessSessionKey(providerSessionId, allowWrites)
+      : `transient:${this.promptFingerprint(prompt)}:${allowWrites ? 'write' : 'read'}:${this.model || 'default'}`;
+    const transientSession = !providerSessionId;
     const signal = options?.signal;
     if (signal?.aborted) {
       throw new Error(typeof signal.reason === 'string' ? signal.reason : 'Codex execution aborted by Tik.');
@@ -628,22 +635,26 @@ export class CodexCliProvider implements ILLMProvider {
     let aborted = false;
     const onAbort = () => {
       aborted = true;
-      void harness.stop();
+      void this.harnessSessionManager.closeSession(sessionKey);
     };
     signal?.addEventListener('abort', onAbort, { once: true });
-    let harnessResult: Awaited<ReturnType<CodexHarnessAdapter['runTurn']>>;
+    let harnessResult: Awaited<ReturnType<CodexHarnessSessionManager['runTurn']>>;
     try {
-      harnessResult = await harness.runTurn({
+      harnessResult = await this.harnessSessionManager.runTurn({
+        sessionKey,
         prompt,
         cwd: this.projectPath,
         model: this.model,
         allowWrites,
+        signal,
         onProviderEvent: options?.onProviderEvent,
         onTextDelta: options?.onTextChunk,
       });
     } finally {
       signal?.removeEventListener('abort', onAbort);
-      await harness.stop();
+      if (transientSession) {
+        await this.harnessSessionManager.closeSession(sessionKey);
+      }
     }
     if (aborted) {
       throw new Error(typeof signal?.reason === 'string' ? signal.reason : 'Codex execution aborted by Tik.');
@@ -663,6 +674,25 @@ export class CodexCliProvider implements ILLMProvider {
       stderr: '',
       usage: harnessResult.usage,
     };
+  }
+
+  private buildHarnessSessionKey(providerSessionId: string, allowWrites: boolean): string {
+    return [
+      this.name,
+      providerSessionId,
+      this.model || 'default',
+      allowWrites ? 'write' : 'read',
+      this.projectPath,
+    ].join('|');
+  }
+
+  private promptFingerprint(prompt: string): string {
+    let hash = 2166136261;
+    for (let i = 0; i < prompt.length; i++) {
+      hash ^= prompt.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
   }
 
   private async spawnCodex(

@@ -740,12 +740,14 @@ export class AgentLoop {
     // Build streaming options
     const llmOptions: LLMCallOptions | undefined = this.onStreamChunk
       ? {
+          providerSessionId: `${session.taskId}:${session.sessionId}:${session.currentAgent}`,
           onTextChunk: (text: string) => {
             this.onStreamChunk!(text, { taskId: session.taskId, agent: session.currentAgent });
           },
           onProviderEvent: emitProviderRuntimeEvent,
         }
       : {
+          providerSessionId: `${session.taskId}:${session.sessionId}:${session.currentAgent}`,
           onProviderEvent: emitProviderRuntimeEvent,
         };
 

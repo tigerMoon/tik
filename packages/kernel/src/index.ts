@@ -33,6 +33,7 @@ export { WorkspaceWorktreeManager } from './workspace-worktree-manager.js';
 export { CodexAppServerProcess } from './codex-app-server-process.js';
 export { CodexAppServerClient } from './codex-app-server-client.js';
 export { CodexHarnessAdapter } from './codex-harness-adapter.js';
+export { CodexHarnessSessionManager } from './codex-harness-session-manager.js';
 export { WorkflowSubtaskRuntime } from './subtask-runtime.js';
 export { WorkflowSubtaskSupervisor } from './subtask-supervisor.js';
 export { WorkflowSkillExecutorRegistry } from './workflow-skill-executor.js';
@@ -91,6 +92,13 @@ export type { AgentRole, CoordinatorMode } from './agent-coordinator.js';
 export type { KernelConfig, CreateTaskInputV2 } from './execution-kernel.js';
 export type { ServerConfig } from './server.js';
 export type { CodexAppServerTransport, CodexAppServerProcessOptions } from './codex-app-server-process.js';
+export type { CodexAppServerRequestOptions } from './codex-app-server-client.js';
+export type {
+  CodexHarnessThreadOptions,
+  CodexHarnessTurnOptions,
+  CodexHarnessTurnResult,
+} from './codex-harness-adapter.js';
+export type { CodexHarnessSessionRunOptions } from './codex-harness-session-manager.js';
 export type {
   CodexAppServerInitializeParams,
   CodexAppServerInitializeResponse,
