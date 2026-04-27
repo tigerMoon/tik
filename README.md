@@ -60,7 +60,6 @@ tik/
 │   └── dashboard/   # Web dashboard
 ├── baseline.md      # 当前实现基线
 ├── skill-compatibility.md # ~/.agents/skills 与 Tik 的兼容约束
-├── tik_cli_alignment.md
 └── claw-gap.md
 ```
 
@@ -182,7 +181,7 @@ tik worktree remove [--target service-a] [--lane feature-a] [--force]
 - `policy` 可在 bootstrap 之后查看或更新当前 workspace 的策略档位
 - `workspace clarify` 会生成 `.workspace/clarifications/<project>/clarify-<n>.md`
 - workspace skill 默认从 `~/.agents/skills` 读取；clarify phase 会从 `~/.codex/skills` 读取 superpowers clarifier skill
-- 兼容约束见 [skill-compatibility.md](/Users/huyuehui/ace/tik/skill-compatibility.md)
+- 兼容约束见 [skill-compatibility.md](./skill-compatibility.md)
 - workspace 默认启用 `managed` worktree policy；真实执行路径优先使用 `effectiveProjectPath`
 - 默认 worktree 根目录是 `<workspace-root>/.workspace/worktrees`
 - 每个项目可保留多个受管 lane，但同一时刻只会有一个 active lane 作为真实 execution path
@@ -421,9 +420,8 @@ Tik 已经明显补齐了这些高价值能力：
 - 更成熟的 continuation memory 和 permission-aware runtime
 
 详见：
-- [baseline.md](/Users/huyuehui/ace/tik/baseline.md)
-- [tik_cli_alignment.md](/Users/huyuehui/ace/tik/tik_cli_alignment.md)
-- [claw-gap.md](/Users/huyuehui/ace/tik/claw-gap.md)
+- [baseline.md](./baseline.md)
+- [claw-gap.md](./claw-gap.md)
 
 ## Development
 

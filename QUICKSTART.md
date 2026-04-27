@@ -13,7 +13,7 @@ Tik 是一个 `task-first` 的 agent runtime，默认通过 `tik shell` / `tik r
 在仓库根目录执行：
 
 ```bash
-cd /Users/huyuehui/ace/tik
+cd /path/to/tik
 pnpm install
 pnpm build
 ```
@@ -238,7 +238,7 @@ tik worktree remove --target service-a --lane feature-a --force
 - `workspace policy --non-git source|copy|block` 可切换非 git 项目的 worktree 策略
 - `clarify` 会生成 `.workspace/clarifications/<project>/clarify-<n>.md`，并在需要时生成结构化 decision
 - workspace skill 默认从 `~/.agents/skills` 读取；clarify 例外，会从 `~/.codex/skills` 读取 superpowers clarifier skill
-- 安装版 skill 需要满足 Tik 的兼容约束，见 [skill-compatibility.md](/Users/huyuehui/ace/tik/skill-compatibility.md)
+- 安装版 skill 需要满足 Tik 的兼容约束，见 [skill-compatibility.md](./skill-compatibility.md)
 - `next` 按 `currentPhase` 自动续跑，并自动推进 phase
 - `decisions` 查看待确认的人机决策；`decide` 用结构化选项或自由文本完成确认
 - decision synthesis 会结合 demand、workflow contract、recent events、clarification artifact、spec/plan artifact 和 memory hint，而不只是原始 blocker 文本
@@ -364,8 +364,8 @@ tik workspace run --demand "..." --workflow-profile fast-feedback
 单工作区 workbench 需要本地后端和 dashboard 同时启动：
 
 ```bash
-pnpm --dir /Users/huyuehui/ace/tik --filter @tik/cli exec tik serve --project /Users/huyuehui/ace/tik --provider mock
-pnpm --dir /Users/huyuehui/ace/tik --filter @tik/dashboard dev -- --host 127.0.0.1
+pnpm --filter @tik/cli exec tik serve --project /path/to/tik --provider mock
+pnpm --filter @tik/dashboard dev -- --host 127.0.0.1
 ```
 
 打开 `http://127.0.0.1:5173` 后，你可以：
@@ -378,8 +378,7 @@ pnpm --dir /Users/huyuehui/ace/tik --filter @tik/dashboard dev -- --host 127.0.0
 
 ## 10. 相关文档
 
-- [README.md](/Users/huyuehui/ace/tik/README.md)
-- [baseline.md](/Users/huyuehui/ace/tik/baseline.md)
-- [skill-compatibility.md](/Users/huyuehui/ace/tik/skill-compatibility.md)
-- [workspace_sdd_alignment.md](/Users/huyuehui/ace/tik/workspace_sdd_alignment.md)
-- [workspace_runtime_milestone.md](/Users/huyuehui/ace/tik/workspace_runtime_milestone.md)
+- [README.md](./README.md)
+- [baseline.md](./baseline.md)
+- [skill-compatibility.md](./skill-compatibility.md)
+- [claw-gap.md](./claw-gap.md)
