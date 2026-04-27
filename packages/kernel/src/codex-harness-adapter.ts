@@ -9,9 +9,19 @@ export interface CodexHarnessTurnOptions {
   baseInstructions?: string;
   developerInstructions?: string;
   allowWrites?: boolean;
+  signal?: AbortSignal;
   onProviderEvent?: (event: ProviderRuntimeEvent) => void;
   onTextDelta?: (text: string) => void;
   onTurnVisible?: (source: 'turn.started' | 'item.started' | 'item.completed' | 'message.delta') => void;
+}
+
+export interface CodexHarnessThreadOptions {
+  cwd: string;
+  model?: string;
+  baseInstructions?: string;
+  developerInstructions?: string;
+  allowWrites?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface CodexHarnessTurnResult {
@@ -68,9 +78,8 @@ export class CodexHarnessAdapter {
     await this.client.stop();
   }
 
-  async runTurn(options: CodexHarnessTurnOptions): Promise<CodexHarnessTurnResult> {
+  async startThread(options: CodexHarnessThreadOptions): Promise<string> {
     await this.start();
-
     const threadResponse = await this.client.request<any>('thread/start', {
       cwd: options.cwd,
       model: options.model ?? null,
@@ -80,10 +89,22 @@ export class CodexHarnessAdapter {
       developerInstructions: options.developerInstructions ?? null,
       ephemeral: false,
       experimentalRawEvents: false,
-      persistExtendedHistory: false,
+      persistExtendedHistory: true,
+    }, {
+      timeoutMs: 90_000,
+      signal: options.signal,
     });
 
-    const threadId = threadResponse.thread.id as string;
+    return threadResponse.thread.id as string;
+  }
+
+  async runTurn(options: CodexHarnessTurnOptions): Promise<CodexHarnessTurnResult> {
+    const threadId = await this.startThread(options);
+    return this.runTurnOnThread(threadId, options);
+  }
+
+  async runTurnOnThread(threadId: string, options: CodexHarnessTurnOptions): Promise<CodexHarnessTurnResult> {
+    await this.start();
     let turnId = '';
     let content = '';
     let usage: CodexHarnessTurnResult['usage'];
@@ -213,15 +234,21 @@ export class CodexHarnessAdapter {
             text_elements: [],
           },
         ],
+      }, {
+        timeoutMs: 90_000,
+        signal: options.signal,
       });
 
       turnId = turnResponse.turn.id as string;
+      let turnTimeout: ReturnType<typeof setTimeout> | undefined;
       const status = await Promise.race([
         turnCompleted,
         new Promise<'completed'>((_, reject) => {
-          setTimeout(() => reject(new Error('Codex App Server turn timed out.')), 15 * 60_000).unref();
+          turnTimeout = setTimeout(() => reject(new Error('Codex App Server turn timed out.')), 15 * 60_000);
+          turnTimeout.unref?.();
         }),
       ]);
+      if (turnTimeout) clearTimeout(turnTimeout);
       if (threadSystemError) {
         throw new Error('Codex App Server reported thread systemError.');
       }

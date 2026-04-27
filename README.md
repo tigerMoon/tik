@@ -224,7 +224,7 @@ tik workspace feedback --message "按方案 B 继续" --projects service-a --nex
 
 ### Claude
 
-默认 provider。支持：
+可选 provider。支持：
 - streaming
 - watchdog + timeout fallback
 - out-of-order stream fallback
@@ -248,7 +248,7 @@ tik run "..." --provider openai
 
 ### Codex
 
-支持复用官方 `codex` CLI 的登录态与原生执行能力。
+默认 provider。通过 Codex App Server 复用官方 `codex` 登录态、thread/turn runtime 与原生执行能力。
 
 ```bash
 codex login
@@ -257,7 +257,7 @@ tik run "..." --provider codex
 
 当前形态是：
 - Tik 负责 task、context、memory、event、dashboard
-- Codex CLI 负责原生 agent loop 与代码执行
+- Codex App Server 负责原生 agent loop、thread/turn、工具执行与流式事件
 - 适合没有 API key、但已登录 ChatGPT/Codex 的环境
 - 当前推荐用法：真实业务实现任务优先使用 `--provider codex`
 

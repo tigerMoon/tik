@@ -47,6 +47,16 @@ export interface LLMCallOptions {
   allowWrites?: boolean;
   /** Abort the provider call if the caller decides the run should stop */
   signal?: AbortSignal;
+  /**
+   * Stable runtime session key for provider-native state.
+   *
+   * Tik owns Task/Event/Session as the external contract, but providers such
+   * as Codex App Server can maintain their own thread state. When this value is
+   * present, provider implementations should reuse the same native provider
+   * session/thread across turns. When absent, providers may run an ephemeral
+   * one-shot session.
+   */
+  providerSessionId?: string;
 }
 
 export type ProviderRuntimeEvent =
