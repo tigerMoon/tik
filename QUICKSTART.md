@@ -20,6 +20,18 @@ pnpm build
 
 如果你希望直接用 `tik` 命令，确保本地已经把 CLI 暴露到 PATH，或者从已安装的包环境里运行。
 
+在仓库源码模式（不依赖全局安装）下，建议先验证：
+
+```bash
+pnpm --filter @tik/cli exec node dist/index.js --help
+```
+
+后文所有 `tik ...` 命令都可等价写成：
+
+```bash
+pnpm --filter @tik/cli exec node dist/index.js ...
+```
+
 ## 2. 最短上手路径
 
 ### 进入交互壳

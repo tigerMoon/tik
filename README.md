@@ -70,6 +70,9 @@ tik/
 pnpm install
 pnpm build
 
+# 在仓库源码模式运行 CLI（无需全局安装）
+pnpm --filter @tik/cli exec node dist/index.js --help
+
 # 默认直接进入 shell
 tik
 
@@ -102,6 +105,12 @@ tik worktree use --target service-b --lane feature-a
 # 启动 API Server + Dashboard
 tik serve --port 3001 --project /absolute/path/to/workspace-root
 pnpm --filter @tik/dashboard dev
+```
+
+如果你是直接在本仓库源码里运行（尚未把 `tik` 安装到 PATH），可把上面的 `tik ...` 等价替换为：
+
+```bash
+pnpm --filter @tik/cli exec node dist/index.js ...
 ```
 
 ## CLI Overview
