@@ -49,7 +49,7 @@ export {
 export { WorkspaceSuperpowersClarifier } from './workspace-superpowers-clarifier.js';
 export { WorkspaceEventStore } from './workspace-event-store.js';
 export { buildWorkspaceEventProjection } from './workspace-event-projection.js';
-export { WorkspaceMemoryStore } from './workspace-memory.js';
+export { WorkspaceMemoryStore } from './workspace-memory.js'; export { WorkspaceExplanationBuilder } from './explainability/workspace-explanation-builder.js';
 export { WorkspaceReadModel } from './workspace-public-api.js';
 export { WorkbenchStore } from './workbench/workbench-store.js';
 export { buildWorkbenchTaskList } from './workbench/workbench-projection.js';

@@ -1,4 +1,4 @@
-import type { WorkflowAgentRole, WorkflowExecutablePhase, WorkflowSkillName, WorkflowSubtaskContract } from './subtask.js';
+import type { WorkflowAgentRole, WorkflowExecutablePhase, WorkflowSkillName, WorkflowSubtaskContract } from './subtask.js'; import type { WorkspaceExplanation } from './explanation.js';
 
 /**
  * Workspace Types

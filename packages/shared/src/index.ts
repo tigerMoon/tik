@@ -42,3 +42,5 @@ export * from './types/skill-manifest.js';
 
 // Utilities
 export * from './utils/index.js';
+
+export * from './types/explanation.js';

@@ -1778,7 +1778,35 @@ function workspacePhaseToCommand(phase: 'PARALLEL_CLARIFY' | 'PARALLEL_SPECIFY' 
   return 'ace';
 }
 
-function printWorkspaceReport(snapshot: WorkspaceStatusSnapshot, rootPath: string, projects?: string): void {
+function printWorkspaceExplanation(explanation: import('@tik/shared').WorkspaceExplanation): void {
+  console.log('\n## Explanation');
+  console.log(`- Status: ${explanation.status}`);
+  console.log(`- Confidence: ${explanation.confidence}`);
+  console.log(`- Summary: ${explanation.summary}`);
+  if (explanation.whyThisStatus.length > 0) {
+    console.log('\n### Why this status');
+    for (const reason of explanation.whyThisStatus) console.log(`- ${reason}`);
+  }
+  if (explanation.changedFiles.length > 0) {
+    console.log('\n### Changed Files');
+    for (const file of explanation.changedFiles) {
+      const project = file.projectName ? `${file.projectName}: ` : '';
+      console.log(`- ${project}${file.path} (${file.changeType})`);
+    }
+  }
+  if (explanation.blockers.length > 0) {
+    console.log('\n### Blockers');
+    for (const blocker of explanation.blockers) {
+      const project = blocker.projectName ? `${blocker.projectName}: ` : '';
+      console.log(`- ${project}${blocker.message}`);
+    }
+  }
+  if (explanation.nextActions.length > 0) {
+    console.log('\n### Next Actions');
+    for (const action of explanation.nextActions) console.log(`- ${action}`);
+  }
+}
+ function printWorkspaceReport(snapshot: WorkspaceStatusSnapshot, rootPath: string, projects?: string): void {
   const eventProjection = loadWorkspaceEventProjection(rootPath);
   console.log(chalk.bold('\n# Workspace SDD Summary\n'));
   const visibleItems = selectWorkspaceItems(snapshot, projects);
@@ -1810,7 +1838,7 @@ function printWorkspaceReport(snapshot: WorkspaceStatusSnapshot, rootPath: strin
       console.log(`- Feedback Next Phase: ${snapshot.state.workspaceFeedback.nextPhase}`);
     }
   }
-  console.log('\n## Project Details');
+  const explanation = new TikKernel.WorkspaceExplanationBuilder().build({ workspaceRoot: rootPath, settings: snapshot.settings, state: snapshot.state, splitDemands: snapshot.splitDemands, projectNames: Array.from(selectedProjectNames), }); printWorkspaceExplanation(explanation); console.log('\n## Project Details');
   console.log('| Project | Phase | Status | Exec | Blocker | Contract | Role | Skill | Summary | Next |');
   console.log('|---------|-------|--------|------|---------|----------|------|-------|---------|------|');
   for (const project of visibleProjects) {

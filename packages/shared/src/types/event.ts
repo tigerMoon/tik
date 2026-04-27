@@ -1,4 +1,4 @@
-/**
+import type { WorkspaceExplanation } from './explanation.js'; /**
  * Event System Types
  *
  * All state changes in Tik are expressed through events.
@@ -118,7 +118,7 @@ export interface PlanPayload {
   strategy: string;
 }
 
-export interface HumanInterventionPayload {
+export interface ExplanationCreatedPayload { scope: 'task' | 'workspace'; explanation: WorkspaceExplanation; } export interface HumanInterventionPayload {
   action: 'stop' | 'modify_plan' | 'inject_constraint' | 'change_strategy';
   detail: unknown;
 }
