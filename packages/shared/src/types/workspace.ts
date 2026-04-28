@@ -1,4 +1,10 @@
-import type { WorkflowAgentRole, WorkflowExecutablePhase, WorkflowSkillName, WorkflowSubtaskContract } from './subtask.js'; import type { WorkspaceExplanation } from './explanation.js';
+import type { WorkspaceExplanation } from './explanation.js';
+import type {
+  WorkflowAgentRole,
+  WorkflowExecutablePhase,
+  WorkflowSkillName,
+  WorkflowSubtaskContract,
+} from './subtask.js';
 
 /**
  * Workspace Types
@@ -182,6 +188,7 @@ export interface WorkspaceState {
   workspaceFeedback?: WorkspaceFeedbackState;
   decisions?: WorkspaceDecisionRequest[];
   summary?: WorkspaceExecutionSummary;
+  explanation?: WorkspaceExplanation;
 }
 
 export interface WorkspaceProjectState {

@@ -1783,10 +1783,22 @@ function printWorkspaceExplanation(explanation: import('@tik/shared').WorkspaceE
   console.log(`- Status: ${explanation.status}`);
   console.log(`- Confidence: ${explanation.confidence}`);
   console.log(`- Summary: ${explanation.summary}`);
+
   if (explanation.whyThisStatus.length > 0) {
     console.log('\n### Why this status');
-    for (const reason of explanation.whyThisStatus) console.log(`- ${reason}`);
+    for (const reason of explanation.whyThisStatus) {
+      console.log(`- ${reason}`);
+    }
   }
+
+  if (explanation.phases.length > 0) {
+    console.log('\n### Phase Summary');
+    for (const phase of explanation.phases) {
+      const project = phase.projectName ? `${phase.projectName}:` : '';
+      console.log(`- ${project}${phase.phase} (${phase.status}) ${phase.summary}`);
+    }
+  }
+
   if (explanation.changedFiles.length > 0) {
     console.log('\n### Changed Files');
     for (const file of explanation.changedFiles) {
@@ -1801,12 +1813,23 @@ function printWorkspaceExplanation(explanation: import('@tik/shared').WorkspaceE
       console.log(`- ${project}${blocker.message}`);
     }
   }
+
+  if (explanation.unresolvedItems.length > 0) {
+    console.log('\n### Unresolved Items');
+    for (const item of explanation.unresolvedItems) {
+      console.log(`- ${item}`);
+    }
+  }
+
   if (explanation.nextActions.length > 0) {
     console.log('\n### Next Actions');
-    for (const action of explanation.nextActions) console.log(`- ${action}`);
+    for (const action of explanation.nextActions) {
+      console.log(`- ${action}`);
+    }
   }
 }
- function printWorkspaceReport(snapshot: WorkspaceStatusSnapshot, rootPath: string, projects?: string): void {
+
+function printWorkspaceReport(snapshot: WorkspaceStatusSnapshot, rootPath: string, projects?: string): void {
   const eventProjection = loadWorkspaceEventProjection(rootPath);
   console.log(chalk.bold('\n# Workspace SDD Summary\n'));
   const visibleItems = selectWorkspaceItems(snapshot, projects);
@@ -1838,7 +1861,20 @@ function printWorkspaceExplanation(explanation: import('@tik/shared').WorkspaceE
       console.log(`- Feedback Next Phase: ${snapshot.state.workspaceFeedback.nextPhase}`);
     }
   }
-  const explanation = new TikKernel.WorkspaceExplanationBuilder().build({ workspaceRoot: rootPath, settings: snapshot.settings, state: snapshot.state, splitDemands: snapshot.splitDemands, projectNames: Array.from(selectedProjectNames), }); printWorkspaceExplanation(explanation); console.log('\n## Project Details');
+
+  const explanationBuilder = new TikKernel.WorkspaceExplanationBuilder();
+  const explanation = explanationBuilder.build({
+    workspaceRoot: rootPath,
+    settings: snapshot.settings,
+    state: snapshot.state,
+    splitDemands: snapshot.splitDemands,
+    projectNames: projects
+      ? String(projects).split(',').map((project) => project.trim()).filter(Boolean)
+      : undefined,
+  });
+  printWorkspaceExplanation(explanation);
+
+  console.log('\n## Project Details');
   console.log('| Project | Phase | Status | Exec | Blocker | Contract | Role | Skill | Summary | Next |');
   console.log('|---------|-------|--------|------|---------|----------|------|-------|---------|------|');
   for (const project of visibleProjects) {

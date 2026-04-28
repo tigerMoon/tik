@@ -1,4 +1,6 @@
-import type { WorkspaceExplanation } from './explanation.js'; /**
+import type { WorkspaceExplanation } from './explanation.js';
+
+/**
  * Event System Types
  *
  * All state changes in Tik are expressed through events.
@@ -39,6 +41,9 @@ export enum EventType {
   FITNESS_CALCULATED = 'evaluation.fitness',
   DRIFT_DETECTED = 'evaluation.drift',
   ENTROPY_CALCULATED = 'evaluation.entropy',
+
+  // Explanation
+  EXPLANATION_CREATED = 'explanation.created',
 
   // Convergence
   ITERATION_STARTED = 'iteration.started',
@@ -118,7 +123,12 @@ export interface PlanPayload {
   strategy: string;
 }
 
-export interface ExplanationCreatedPayload { scope: 'task' | 'workspace'; explanation: WorkspaceExplanation; } export interface HumanInterventionPayload {
+export interface ExplanationCreatedPayload {
+  scope: 'task' | 'workspace';
+  explanation: WorkspaceExplanation;
+}
+
+export interface HumanInterventionPayload {
   action: 'stop' | 'modify_plan' | 'inject_constraint' | 'change_strategy';
   detail: unknown;
 }
