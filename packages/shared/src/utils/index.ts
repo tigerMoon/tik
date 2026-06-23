@@ -71,3 +71,23 @@ export async function retry<T>(
   }
   throw lastError;
 }
+
+export { extractModifiedFilesFromEvidenceBody } from './workbench-evidence.js';
+export {
+  getWorkbenchLabelAction,
+  getWorkbenchLabelActionDefinition,
+  getWorkbenchLabelActionTone,
+  getWorkbenchLabelDefinition,
+  getWorkbenchLabelDefinitions,
+  normalizeWorkbenchLabel,
+  WORKBENCH_LABEL_ACTIONS,
+  type WorkbenchLabelEnvironment,
+  type WorkbenchLabelAction,
+  type WorkbenchLabelActionDefinition,
+  type WorkbenchLabelDefinition,
+  type WorkbenchLabelTone,
+} from './workbench-labels.js';
+export {
+  isWorkbenchTaskCodexDispatchable,
+  isWorkbenchTaskMaintenance,
+} from './workbench-dispatch.js';

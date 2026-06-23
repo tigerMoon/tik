@@ -52,6 +52,54 @@ export interface Task {
   environmentPackSelection?: EnvironmentPackSelection;
   /** Workspace / execution context bound at task creation time */
   workspaceBinding?: TaskWorkspaceBinding;
+  /** Recent operator (human) comments surfaced into the agent prompt context. */
+  recentComments?: TaskOperatorComment[];
+  /** Compact task-local history for relaunching/retrying workbench tasks. */
+  taskContextSnapshot?: TaskContextSnapshot;
+}
+
+/** A snapshot of a human comment passed into the agent context. */
+export interface TaskOperatorComment {
+  authorKind: 'human';
+  authorId?: string;
+  body: string;
+  createdAt: string;
+}
+
+/** Compact task-local context carried into a relaunched kernel task. */
+export interface TaskContextSnapshot {
+  taskId: string;
+  identifier?: string;
+  shortIdentifier?: string;
+  status: string;
+  title: string;
+  goal: string;
+  description?: string | null;
+  latestSummary?: string;
+  lastAttempt?: TaskContextAttemptSnapshot;
+  recentComments?: TaskOperatorComment[];
+  timelineSummary?: string[];
+  evidenceSummary?: TaskContextEvidenceSummary;
+}
+
+export interface TaskContextAttemptSnapshot {
+  attemptNumber: number;
+  startedAt: string;
+  finishedAt?: string;
+  outcome?: string;
+  error?: string;
+  kernelTaskId?: string;
+  turnCount?: number;
+}
+
+export interface TaskContextEvidenceSummary {
+  rawEventCount: number;
+  modifiedFileCount: number;
+  previewableArtifactCount: number;
+  latestPreviewableArtifactPath?: string;
+  latestPreviewableArtifactCreatedAt?: string;
+  latestToolName?: string;
+  hasErrorEvidence: boolean;
 }
 
 // ─── Plan ────────────────────────────────────────────────────
@@ -156,6 +204,7 @@ export type ConvergenceStrategy = 'incremental' | 'aggressive' | 'defensive';
 // ─── Task Creation Input ─────────────────────────────────────
 
 export interface CreateTaskInput {
+  id?: string;
   description: string;
   projectPath?: string;
   maxIterations?: number;
@@ -163,6 +212,10 @@ export interface CreateTaskInput {
   environmentPackSnapshot?: EnvironmentPackSnapshot;
   environmentPackSelection?: EnvironmentPackSelection;
   workspaceBinding?: TaskWorkspaceBinding;
+  /** Pre-budgeted operator (human) comments to surface into the agent context. */
+  recentComments?: TaskOperatorComment[];
+  /** Compact task-local history for relaunching/retrying workbench tasks. */
+  taskContextSnapshot?: TaskContextSnapshot;
 }
 
 export interface TaskWorkspaceBinding {

@@ -13,6 +13,7 @@ Tik 是一个 `task-first` 的 agent runtime。
 - continuation-style compact memory
 - path-aware search + repo candidate resolution
 - Dashboard task timeline
+- Linear-like Dashboard workspace / project / task hierarchy
 - Workspace SDD control plane (`workspace run/status/report/board/next/retry`)
 - Workspace-managed worktree isolation (`worktree list/status/path/create/use/remove`)
 
@@ -46,6 +47,7 @@ User → CLI / Dashboard → API Server → ExecutionKernel
 - `Pluggable LLM`: `claude` / `openai` / `codex` / `mock`
 - `Search discipline`: path-aware glob、scoped grep、repo candidate resolution、shell probe suppression
 - `Execution isolation`: workspace 项目默认可切到受管 worktree 执行，源工作区保持干净
+- `Workspace hierarchy`: Dashboard 以 Workspace 为顶层，Project 绑定到 Workspace，Task 可绑定到 Workspace 或 Project
 
 ## Project Structure
 
@@ -103,7 +105,7 @@ tik worktree create --target service-b --lane feature-a
 tik worktree use --target service-b --lane feature-a
 
 # 启动 API Server + Dashboard
-tik serve --port 3001 --project /absolute/path/to/workspace-root
+tik serve --port 3300 --project /absolute/path/to/workspace-root
 pnpm --filter @tik/dashboard dev
 ```
 
@@ -182,6 +184,78 @@ tik worktree create [--target service-a] [--lane feature-a]
 tik worktree use --target service-a --lane feature-a
 tik worktree remove [--target service-a] [--lane feature-a] [--force]
 ```
+
+### Tracker Daemon Commands
+
+`tracker` 是 Tik 在 kernel / workbench / worktree 之上的 Symphony-style 编排层：默认直接读取本地 Workbench Task，把 `todo` / `failed` task 调度给 agent，并把每次执行追加到同一个 task 的 `attempts[]`。JSON 快照仍可用于导入式验证；运行时 source of truth 是本地 Workbench Task。
+
+```text
+tik tracker tick [--file tasks.json] [--workflow WORKFLOW.md]
+tik tracker watch [--workflow WORKFLOW.md]
+```
+
+常用入口：
+
+```bash
+# 本地 first run：用 JSON 快照 + mock LLM provider 验证 daemon 调度链路
+tik tracker tick --file ./tasks.json --provider mock
+
+# 默认使用 Workbench Task 作为 tracker source，持续轮询 tracker
+tik tracker watch --workflow WORKFLOW.md --provider codex
+```
+
+`--provider mock` 只 mock LLM provider，不 mock task importer；不传 `--file` 时，任务来源就是本地 Workbench Task。`--file` 会读取 JSON snapshot。`tracker.kind: linear` 不再作为 daemon 运行时来源，运行 `tik tracker *` 时会直接报错，避免外部 tracker 和本地 task 双写。
+
+`WORKFLOW.md` 示例：
+
+```markdown
+---
+tracker:
+  kind: json
+  task_file: ./tasks.json
+  active_states: [Todo, In Progress]
+  terminal_states: [Done, Closed, Canceled, Cancelled]
+polling:
+  interval_ms: 30000
+agent:
+  max_concurrent_agents: 3
+hooks:
+  after_create: |
+    echo "created $TIK_TRACKER_TASK_IDENTIFIER"
+  before_run: echo "running $TIK_TRACKER_TASK_IDENTIFIER"
+  before_remove: echo "removing $TIK_TRACKER_TASK_IDENTIFIER"
+---
+Implement {{task.shortIdentifier}}: {{task.title}}
+
+{{task.description}}
+```
+
+当前 `WORKFLOW.md` 使用 YAML front matter + Liquid 模板渲染。支持 `{{ task.shortIdentifier }}`、`{{ task.title }}`、`{{ task.description }}`、`{{ task.state }}`、`{{ task.sourceUrl }}`、`{{ task.labels }}`、`{{ attempt }}`，也支持 `{% if %}` / `{% for %}` / `join` 之类常见 Liquid 语义。旧的 `{{issue.identifier}}` / `{{issue.url}}` 等变量仍兼容已有 `WORKFLOW.md`，但新配置应使用 `task.*`。
+
+JSON task 快照可用数组或 `{ "tasks": [...] }`；旧 `{ "issues": [...] }` 仍可读取以便迁移：
+
+```json
+{
+  "tasks": [
+    {
+      "id": "task-1",
+      "shortIdentifier": "TIK-1",
+      "title": "Add cache",
+      "description": "Implement cache for service-b",
+      "state": "Todo",
+      "labels": ["backend"],
+      "blockedBy": [],
+      "repository": { "name": "service-b", "path": "/absolute/path/to/service-b" }
+    }
+  ]
+}
+```
+
+JSON task 的 `state` 字段会推断 active / blocked / terminal；`stateKind` 是内部归一化字段，一般不需要写进 snapshot。
+
+运行状态保存在 `<workspace-root>/.tik/tracker-daemon/state.json`。daemon 会按配置限制并发、对失败 dispatch 做指数退避、重启后 reconcile running task、在 task terminal/blocked 时停止对应 run；如果 `cleanup_terminal` 启用，只会清理 `<workspace-root>/.workspace/worktrees/*` 下的受管执行路径。状态文件会持久化 retry queue、watching 状态和 recent activity；`/api/v1/tracker/state` 会直接返回这些值，dashboard 上能看到最近 dispatch / stop / skip / fail 记录。
+
+安全边界：`WORKFLOW.md` 是 trusted configuration。`hooks.*` 会作为 shell 片段通过 `/bin/sh -lc` 执行，并注入 `TIK_TRACKER_TASK_ID`、`TIK_TRACKER_TASK_IDENTIFIER`、`TIK_TRACKER_WORKSPACE_ROOT`、`TIK_TRACKER_PROJECT_PATH` 等环境变量。旧 `TIK_TRACKER_ISSUE_ID` / `TIK_TRACKER_ISSUE_IDENTIFIER` 仍会注入以兼容已有 hook。不要从不可信 PR、task 内容或用户输入生成 hook 字符串；把修改 `WORKFLOW.md` 视为修改 CI/CD 脚本同等级别的权限。
 
 当前语义：
 - `run` 初始化 `.workspace/*` 并进入 phase 流程
@@ -359,10 +433,13 @@ Workspace 模式下，Tik 当前默认使用受管 worktree 作为项目执行�
 
 Dashboard 当前支持：
 
-- task 列表与事件流
-- execution timeline
-- workspace 决策面板
-- pending decisions 的结构化展示与 resolve
+- Linear-like 左侧导航：`Workspace -> Projects -> Views`
+- workspace/project 作用域切换：Workspace 显示全部 task，Project 只显示绑定到该项目的 task
+- task 列表、事件流、execution timeline、artifact preview
+- task 创建时绑定 execution context：`Workspace · <name>` 或 `Project · <name>`
+- Universal composer：无当前 task 时按当前 workspace/project scope 创建新 task；从已有 task 分支时继承该 task 的环境与 workspace binding
+- environment pack / skill manifest 视图
+- workspace 决策面板、pending decisions 的结构化展示与 resolve
 - workspace worktree lane 面板，可直接 create / use / remove lane
 
 workspace 级 control plane 当前主要在 CLI：
@@ -376,8 +453,43 @@ workspace 级 control plane 当前主要在 CLI：
 - `worktree status`
 
 ```bash
-tik serve --port 3001
+tik serve --port 3300 --project /absolute/path/to/workspace-root
 pnpm --filter @tik/dashboard dev
+```
+
+默认前端地址：
+
+```text
+http://localhost:5173
+```
+
+Dashboard 本地开发默认把 localhost 前端流量指向 `http://localhost:3300/api`。如果 API server 使用其他端口，可显式指定：
+
+```bash
+VITE_API_BASE_URL=http://localhost:3001/api pnpm --filter @tik/dashboard dev
+```
+
+### Dashboard Data Model
+
+Dashboard 复用现有 kernel / workbench / worktree 能力，不引入独立任务后端：
+
+- workspace 元数据来自 `GET /api/workspace/status`
+- task 列表来自 `GET /api/workbench/tasks`
+- task 执行上下文写入 `workspaceBinding`
+- project 列表优先来自 `.code-workspace` settings、workspace memory、worktree entries；单仓库模式下会用 workspace root 生成 fallback project
+- scope key 语义为 `workspace` 或 `project:<name>:<path>`
+
+`workspaceBinding` 关键字段：
+
+```json
+{
+  "workspaceRoot": "/absolute/path/to/workspace",
+  "workspaceName": "tik",
+  "projectName": "dashboard",
+  "sourceProjectPath": "/absolute/path/to/workspace/dashboard",
+  "effectiveProjectPath": "/absolute/path/to/workspace/.workspace/worktrees/dashboard--lane",
+  "worktreeKind": "git-worktree"
+}
 ```
 
 Workspace decision API：
@@ -404,11 +516,69 @@ POST /api/workspace/worktrees/remove
 }
 ```
 
-默认前端地址：
+### Comment Slash Commands
+
+Task comments support a small set of slash commands that auto-fire a status
+transition immediately after the comment is saved. They turn "leave a note,
+then change the status dropdown" into a single action and leave a clean audit
+trail in the timeline.
+
+| Keyword (line-anchored) | Status target  | Typical use                       |
+| ----------------------- | -------------- | --------------------------------- |
+| `/approve`              | `in_progress`  | Unblock a `waiting_for_user` task |
+| `/done`                 | `completed`    | Mark a verified task complete     |
+| `/retry`                | `todo`         | Re-queue a `failed` / `cancelled` task |
+| `/block`                | `blocked`      | Mark blocked, with a note         |
+| `/cancel`               | `cancelled`    | Stop a task without retrying      |
+
+Rules:
+
+- Only `human` comments can trigger transitions; `agent` and `system`
+  comments are ignored even if they include the same keyword.
+- The keyword must be anchored to the start of a line (`/^\s*\/(...)\b/`).
+  Mid-paragraph mentions like `see the /done note` do not trigger.
+- First match wins when multiple commands appear in one comment.
+- If the resulting transition is illegal for the current status (e.g.
+  `/done` from `backlog`), the comment still saves and the status stays put;
+  no error is raised.
+
+Both the comment and the resulting state transition appear in the task
+timeline as separate entries (`Comment added: …`, `Task state changed:
+in_progress -> completed. Reason: Marked done via comment by <author>`).
+
+Example:
 
 ```text
-http://localhost:5173
+**Looking good.** Verified the new dashboard binding.
+
+/done
 ```
+
+After submitting this comment as a human author, the task moves to
+`completed`, the green status banner appears in the right rail, and the
+acceptance block expands automatically.
+
+The Properties rail textarea exposes the supported keywords inline as a
+placeholder. Comments themselves render as Markdown (bold, lists, code
+blocks, fenced code, links — raw HTML is filtered for safety).
+
+### Operator Comments in Agent Context
+
+Recent **human** comments are folded into the supervisor's prompt context
+on every turn under a dedicated `# Operator Guidance` section. The agent
+treats them as authoritative direction without needing a re-prompt.
+
+Budget rules:
+
+- Only `authorKind: 'human'` comments are surfaced. Agent / system comments
+  never enter the prompt.
+- Most recent 5 comments at most.
+- Each body is truncated to 256 chars, total budget 1024 chars; oldest
+  entries are dropped first if the total exceeds the cap.
+
+This means a comment like `/done` is visible to the agent *and* fires the
+status transition. A longer comment such as `Prioritize the failing
+acceptance test before docs` shapes the next turn without changing status.
 
 ## Current Position vs claw-code-main
 

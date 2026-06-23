@@ -5,7 +5,6 @@ import {
   buildSkillBindingsSnippet,
   buildSkillChecklist,
   buildSkillChangeItems,
-  buildSkillCommandSnippet,
   buildSkillDependenciesSnippet,
   buildSkillImpactItems,
   buildSkillManifestRecords,
@@ -143,7 +142,6 @@ export function WorkbenchSkillsView({
   const changeItems = buildSkillChangeItems(selectedSkill, currentNotes);
   const impactItems = buildSkillImpactItems(selectedSkill);
   const versionEntries = buildSkillVersionEntries(selectedSkill);
-  const commandSnippet = buildSkillCommandSnippet(selectedSkill);
   const latestTask = selectedSkill.relatedTasks[0] || null;
   const persistenceStatus = resolveSkillManifestPersistenceStatus(selectedSkill, currentNotes);
   const persistenceChip = resolvePersistenceChip(selectedSkill, persistenceStatus);
@@ -166,7 +164,7 @@ export function WorkbenchSkillsView({
 
   const handleManifestCopy = async () => {
     if (!navigator?.clipboard?.writeText) {
-      setFeedback('Clipboard is unavailable in this browser session. Use the command composer below to inspect the manifest.');
+      setFeedback('Clipboard is unavailable in this browser session.');
       return;
     }
 
@@ -564,14 +562,6 @@ export function WorkbenchSkillsView({
             </div>
           </section>
         </section>
-      </section>
-
-      <section className="panel composer">
-        <div className="small skills-composer-label">Universal composer</div>
-        <div className="skills-composer-main">
-          <div className="inputbox">{commandSnippet}</div>
-          <div className="helper">Suggested: #run-test · #show-impact · #open-task · #copy-manifest</div>
-        </div>
       </section>
 
       {feedback ? (

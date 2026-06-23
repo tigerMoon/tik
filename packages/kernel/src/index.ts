@@ -52,6 +52,24 @@ export { buildWorkspaceEventProjection } from './workspace-event-projection.js';
 export { WorkspaceMemoryStore } from './workspace-memory.js'; export { WorkspaceExplanationBuilder } from './explainability/workspace-explanation-builder.js';
 export { WorkspaceReadModel } from './workspace-public-api.js';
 export { WorkbenchStore } from './workbench/workbench-store.js';
+export { WorkbenchService, WorkbenchTaskError } from './workbench/workbench-service.js';
+export { TrackerDaemon } from './tracker-daemon/tracker-daemon.js';
+export { FileTrackerDaemonStateStore } from './tracker-daemon/file-state-store.js';
+export { JsonTaskImporter } from './tracker-daemon/json-tracker-client.js';
+export { LinearTaskImporter } from './tracker-daemon/linear-tracker-client.js';
+export { WorkbenchTaskImporter } from './tracker-daemon/workbench-tracker-client.js';
+export {
+  defaultTrackerWorkflowContent,
+  loadTrackerWorkflow,
+  readTrackerWorkflowFile,
+  resolveTrackerWorkflowPath,
+  writeTrackerWorkflowFile,
+} from './tracker-daemon/workflow-loader.js';
+export { WorkbenchTrackerLauncher } from './tracker-daemon/workbench-launcher.js';
+export {
+  markWorkbenchRunTaskFailed,
+  runWorkbenchKernelTaskInBackground,
+} from './tracker-daemon/workbench-runner.js';
 export { buildWorkbenchTaskList } from './workbench/workbench-projection.js';
 export { EnvironmentPackRegistry } from './environment-pack-registry.js';
 export { buildEnvironmentPackDashboard } from './environment-pack-dashboard.js';
@@ -127,6 +145,24 @@ export type { WorkspaceMemorySnapshot, WorkspaceProjectMemory, WorkspaceSessionM
 export type { WorkspaceBoardView, WorkspaceManagedWorktreeView, WorkspacePublicSnapshot, WorkspaceReportView, WorkspaceStatusView, WorkspaceWorktreesView } from './workspace-public-api.js';
 export type { WorkbenchTaskBundle } from './workbench/workbench-store.js';
 export type { WorkbenchTaskListItem } from './workbench/workbench-projection.js';
+export type {
+  TrackerDaemonLaunchInput,
+  TrackerDaemonLaunchResult,
+  TrackerDaemonRetryConfig,
+  TrackerDaemonState,
+  TrackerDaemonStateStore,
+  TrackerDaemonTickResult,
+  TrackerDaemonWorkLauncher,
+  TrackerRetryRecord,
+  TrackerRunRecord,
+  TrackerWorkflowConfig,
+  TrackerWorkflowDefinition,
+  TrackedTask,
+  TrackedTaskBlocker,
+  TrackedTaskImporter,
+  TrackedTaskRepositoryRef,
+  TrackedTaskStateKind,
+} from './tracker-daemon/types.js';
 export type {
   EnvironmentPackDashboardResponse,
   EnvironmentPackDashboardSummary,

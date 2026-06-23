@@ -1,4 +1,5 @@
 import {
+  buildEnvironmentPackPromotionQueue,
   buildEnvironmentPackWorkflowCoverage,
   type EnvironmentPackManifest,
   type EnvironmentPackWorkflowCoverage,
@@ -39,35 +40,13 @@ export function getEnvironmentPackStatusBadge(
 export function buildEnvironmentPromotionQueue(
   pack: EnvironmentPackManifest,
 ): EnvironmentPromotionItem[] {
-  const items = new Map<string, EnvironmentPromotionItem>();
-  buildEnvironmentPackWorkflowCoverage(pack).forEach((workflow) => {
-    workflow.phases.forEach((phase) => {
-      phase.missingCapabilities.forEach((capability) => {
-        const id = `missing-capability:${workflow.workflow}:${phase.phase}:${capability}`;
-        items.set(id, {
-          id,
-          kind: 'capability proposal',
-          detail: `Promote "${capability}" into ${workflow.workflow} / ${phase.phase} so this pack can satisfy its declared workflow binding.`,
-        });
-      });
-    });
-  });
-
-  if (pack.evaluators.length === 0) {
-    items.set('missing-evaluators', {
-      id: 'missing-evaluators',
-      kind: 'coverage review',
-      detail: 'Add at least one evaluator so this environment can verify task outcomes before release.',
-    });
-  }
-
-  return Array.from(items.values()).slice(0, 4);
+  return buildEnvironmentPackPromotionQueue(pack, { limit: 4 });
 }
 
 export function countEnvironmentPromotionItems(
   packs: EnvironmentPackManifest[],
 ): number {
-  return packs.reduce((total, pack) => total + buildEnvironmentPromotionQueue(pack).length, 0);
+  return packs.reduce((total, pack) => total + buildEnvironmentPackPromotionQueue(pack).length, 0);
 }
 
 export function buildEnvironmentWorkflowCoverage(
@@ -94,13 +73,6 @@ export function buildEnvironmentActivationSummary(
     lastSyncLabel: formatRelativeSyncTime(syncedAt),
     mountedNamespaces: [`env/${pack.id}/*`],
   };
-}
-
-export function buildEnvironmentCommandSnippet(
-  pack: EnvironmentPackManifest,
-  promotionQueueCount: number,
-): string {
-  return `@env/${pack.id} #open-manifest and review ${pack.policies.length} policies, ${pack.workflowBindings.length} workflow bindings, and ${promotionQueueCount} promotion queue item${promotionQueueCount === 1 ? '' : 's'}`;
 }
 
 export function formatRelativeSyncTime(value?: string | null): string {

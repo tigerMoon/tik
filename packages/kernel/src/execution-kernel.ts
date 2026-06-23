@@ -91,6 +91,12 @@ export class ExecutionKernel {
       rootPath: this.projectPath,
       eventBus: this.eventBus,
       store: workbenchStore,
+      stopTask: (taskId, reason) => {
+        try {
+          void reason;
+          this.control(taskId, { type: 'stop' });
+        } catch {}
+      },
     });
     this.toolScheduler = new ToolScheduler(this.toolRegistry, this.eventBus, {
       awaitToolApproval: async ({ taskId, toolName, input }) => {
@@ -225,6 +231,7 @@ export class ExecutionKernel {
       const response = await this.llm.plan(
         `Task: ${task.description}\nStrategy: ${task.strategy}`,
         contextStr,
+        { cwd: task.projectPath || this.projectPath },
       );
       task.plan = {
         goals: response.goals,

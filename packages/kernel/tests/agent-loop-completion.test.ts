@@ -8,11 +8,130 @@ import type {
   EvaluationSnapshot,
   IContextBuilder,
   ILLMProvider,
+  LLMCallOptions,
   Task,
 } from '@tik/shared';
 import { generateId } from '@tik/shared';
 
 describe('AgentLoop completion semantics', () => {
+  it('passes the task project path to provider calls as cwd', async () => {
+    const eventBus = new EventBus();
+    const toolRegistry = new ToolRegistry();
+    const toolScheduler = new ToolScheduler(toolRegistry, eventBus);
+    let observedOptions: LLMCallOptions | undefined;
+
+    const llm: ILLMProvider = {
+      name: 'mock',
+      async chatWithContext(_messages, _systemPrompt, _context, _tools, options): Promise<ChatResponse> {
+        observedOptions = options;
+        return {
+          content: '无需改代码。当前任务只验证 provider cwd 透传。',
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        };
+      },
+      async chat(): Promise<ChatResponse> {
+        throw new Error('not used');
+      },
+      async plan() {
+        throw new Error('not used');
+      },
+      async complete() {
+        throw new Error('not used');
+      },
+    };
+    const contextBuilder = buildEmptyContextBuilder('/tmp/workspace/packages/api');
+    const aceEngine = buildNoopAceEngine();
+    const loop = new AgentLoop(eventBus, toolScheduler, contextBuilder, llm, aceEngine as any);
+    const task = buildTask('/tmp/workspace/packages/api', 'Review API module');
+    const session = buildSession(task, llm);
+
+    await loop.run(task, session);
+
+    expect(observedOptions?.cwd).toBe('/tmp/workspace/packages/api');
+  });
+
+  it('surfaces task restart context in the provider prompt even when a context renderer is used', async () => {
+    const eventBus = new EventBus();
+    const toolRegistry = new ToolRegistry();
+    const toolScheduler = new ToolScheduler(toolRegistry, eventBus);
+    let observedContext = '';
+
+    const llm: ILLMProvider = {
+      name: 'mock',
+      async chatWithContext(_messages, _systemPrompt, context): Promise<ChatResponse> {
+        observedContext = context;
+        return {
+          content: '无需改代码。当前任务只验证重启上下文透传。',
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        };
+      },
+      async chat(): Promise<ChatResponse> {
+        throw new Error('not used');
+      },
+      async plan() {
+        throw new Error('not used');
+      },
+      async complete() {
+        throw new Error('not used');
+      },
+    };
+    const contextBuilder = buildEmptyContextBuilder('/tmp/workspace/packages/api');
+    const aceEngine = buildNoopAceEngine();
+    const loop = new AgentLoop(
+      eventBus,
+      toolScheduler,
+      contextBuilder,
+      llm,
+      aceEngine as any,
+      undefined,
+      { render: () => '# Rendered Context' },
+    );
+    const task = {
+      ...buildTask('/tmp/workspace/packages/api', 'Handle TIK-85 follow-up'),
+      taskContextSnapshot: {
+        taskId: 'task-mqhs9xfq-42ci',
+        identifier: 'TIK-85',
+        status: 'completed',
+        title: 'Follow up after comment',
+        goal: 'Handle the new operator comment',
+        latestSummary: 'Previous run completed but had a tool warning.',
+        lastAttempt: {
+          attemptNumber: 2,
+          startedAt: '2026-06-18T01:00:00.000Z',
+          finishedAt: '2026-06-18T01:03:00.000Z',
+          outcome: 'completed',
+          error: 'tool unavailable',
+          kernelTaskId: 'kernel-task-old',
+        },
+        recentComments: [{
+          authorKind: 'human' as const,
+          authorId: 'op',
+          body: 'Please verify this comment was handled.',
+          createdAt: '2026-06-18T01:04:00.000Z',
+        }],
+        timelineSummary: [
+          '[2026-06-18T01:02:00.000Z] system/raw: Tool: bash\nError:\ntool unavailable',
+        ],
+        evidenceSummary: {
+          rawEventCount: 2,
+          modifiedFileCount: 1,
+          previewableArtifactCount: 0,
+          latestToolName: 'bash',
+          hasErrorEvidence: true,
+        },
+      },
+    };
+    const session = buildSession(task, llm);
+
+    await loop.run(task, session);
+
+    expect(observedContext).toContain('# Rendered Context');
+    expect(observedContext).toContain('# Task Restart Context');
+    expect(observedContext).toContain('TIK-85');
+    expect(observedContext).toContain('tool unavailable');
+    expect(observedContext).toContain('Please verify this comment was handled.');
+  });
+
   it('marks implementation tasks completed when assistant explicitly concludes no code change is needed', async () => {
     const eventBus = new EventBus();
     const toolRegistry = new ToolRegistry();
@@ -368,3 +487,77 @@ describe('AgentLoop completion semantics', () => {
     expect(calls).toBe(1);
   });
 });
+
+function buildEmptyContextBuilder(cwd: string): IContextBuilder {
+  return {
+    async buildContext() {
+      return {} as any;
+    },
+    async buildFromSession() {
+      return {
+        bootstrap: { cwd, date: '2026-04-03', os: 'darwin' },
+        execution: {
+          repo: {},
+          spec: {},
+          run: {},
+          memory: {},
+        },
+        conversation: {
+          messages: [],
+          summary: '',
+        },
+      } as any;
+    },
+  };
+}
+
+function buildNoopAceEngine() {
+  return {
+    async evaluateIteration(): Promise<EvaluationSnapshot> {
+      return {
+        fitness: 0.1,
+        drift: 0,
+        entropy: 0,
+        converged: false,
+        stableCount: 0,
+        breakdown: [],
+      } as any;
+    },
+    checkConvergence() {
+      return false;
+    },
+  };
+}
+
+function buildTask(projectPath: string, description: string): Task {
+  return {
+    id: generateId(),
+    description,
+    status: 'pending',
+    projectPath,
+    iterations: [],
+    maxIterations: 1,
+    strategy: 'incremental',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+}
+
+function buildSession(task: Task, llm: ILLMProvider): AgentSession {
+  return {
+    sessionId: generateId(),
+    taskId: task.id,
+    messages: [{ role: 'user', content: `Task: ${task.description}` }],
+    loopState: 'running',
+    mode: 'single',
+    agents: {
+      coder: {
+        role: 'coder',
+        systemPrompt: 'coder',
+        llm,
+      },
+    },
+    currentAgent: 'coder',
+    step: 0,
+  };
+}

@@ -6,7 +6,6 @@ import {
   buildSkillBindingsSnippet,
   buildSkillChecklist,
   buildSkillChangeItems,
-  buildSkillCommandSnippet,
   buildSkillDependenciesSnippet,
   buildSkillImpactItems,
   buildSkillManifestRecords,
@@ -32,6 +31,7 @@ const BASE_PACK: EnvironmentPackManifest = {
     { id: 'engineering-policies', kind: 'decision-log', label: 'Engineering Policies' },
   ],
   policies: ['peer-review'],
+  taskLabels: [],
   workflowBindings: [
     {
       workflow: 'feature-delivery',
@@ -58,6 +58,7 @@ const OPS_PACK: EnvironmentPackManifest = {
     { id: 'repo-index', kind: 'repo-index', label: 'Repo Index' },
   ],
   policies: ['pii-redaction'],
+  taskLabels: [],
   workflowBindings: [
     {
       workflow: 'feature-delivery',
@@ -205,8 +206,6 @@ describe('skills view models', () => {
         detail: 'Current manifest observed in 1 pack',
       },
     ]);
-    expect(buildSkillCommandSnippet(apiCompat!))
-      .toContain('@skill/api-compat-check #show-impact review 2 bindings, 2 tools, and 2 selected tasks');
   });
 
   it('humanizes skill ids for sidebar labels', () => {

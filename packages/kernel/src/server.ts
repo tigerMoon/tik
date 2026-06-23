@@ -7,17 +7,24 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import type {
+  AgentLoopPayload,
   CreateTaskInput,
   ControlCommand,
   ExecutionMode,
+  ReviewResult,
   SkillManifestMutationInput,
   TaskWorkspaceBinding,
   WorkbenchTaskRecord,
+  WorkbenchTaskStatus,
 } from '@tik/shared';
 import {
   canRetryWorkbenchTask,
   createEnvironmentPackSelection,
+  isWorkbenchTaskCodexDispatchable,
+  isWorkbenchTaskMaintenance,
+  isWorkbenchTerminalStatus,
   toEnvironmentPackSnapshot,
 } from '@tik/shared';
 import type { ExecutionKernel } from './execution-kernel.js';
@@ -27,6 +34,14 @@ import { WorkspaceOrchestrator } from './workspace-orchestrator.js';
 import { WorkspaceWorktreeManager } from './workspace-worktree-manager.js';
 import { buildEnvironmentPackDashboard } from './environment-pack-dashboard.js';
 import { SkillManifestRegistry } from './skill-manifest-registry.js';
+import { FileTrackerDaemonStateStore } from './tracker-daemon/file-state-store.js';
+import { TrackerDaemon } from './tracker-daemon/tracker-daemon.js';
+import { WorkbenchTrackerLauncher } from './tracker-daemon/workbench-launcher.js';
+import { runWorkbenchKernelTaskInBackground } from './tracker-daemon/workbench-runner.js';
+import { WorkbenchTaskImporter } from './tracker-daemon/workbench-tracker-client.js';
+import { readTrackerWorkflowFile, writeTrackerWorkflowFile } from './tracker-daemon/workflow-loader.js';
+import { parseSlashCommand } from './workbench/comment-commands.js';
+import { WorkbenchTaskError } from './workbench/workbench-service.js';
 
 export interface ServerConfig {
   port: number;
@@ -35,6 +50,16 @@ export interface ServerConfig {
 
 export interface WorkspaceServerOptions {
   workspaceRoot?: string;
+}
+
+interface TrackerListenerStatus {
+  id: string;
+  label: string;
+  status: 'running' | 'stopped' | 'expected' | 'unknown';
+  detail: string;
+  pid?: number;
+  port?: number;
+  session?: string;
 }
 
 interface ResolveWorkspaceDecisionBody {
@@ -62,7 +87,27 @@ interface WorkbenchTaskConfigurationBody {
 interface CreateWorkbenchTaskBody extends WorkbenchTaskConfigurationBody {
   title: string;
   goal: string;
+  description?: string | null;
+  status?: WorkbenchTaskRecord['status'];
+  priority?: number | null;
+  labels?: string[];
+  parentTaskId?: string | null;
+  humanAssignee?: string | null;
   workspaceBinding?: TaskWorkspaceBinding;
+}
+
+interface UpdateV1TaskBody {
+  title?: string;
+  description?: string | null;
+  goal?: string;
+  status?: WorkbenchTaskRecord['status'];
+  priority?: number | null;
+  labels?: string[];
+  parentTaskId?: string | null;
+  humanAssignee?: string | null;
+  assignee?: string | null;
+  createdBy?: string | null;
+  sourceUrl?: string | null;
 }
 
 interface WorkbenchTaskBriefBody {
@@ -73,6 +118,30 @@ interface WorkbenchTaskBriefBody {
 }
 
 interface SkillManifestMutationBody extends SkillManifestMutationInput {}
+
+interface WorkflowFileBody {
+  content?: string;
+}
+
+type AgentLoopReviewRoundBody = Omit<AgentLoopPayload, 'kind'>;
+interface AgentLoopWorktreeReviewRoundBody {
+  rootTaskId?: string;
+  round?: number;
+  maxRounds?: number;
+  repo?: string;
+  title?: string;
+  baseRef?: string;
+  headRef?: string;
+  headSha?: string;
+  idempotencyKey?: string;
+  workspaceBinding?: TaskWorkspaceBinding;
+  allowedScope?: string[];
+  acceptanceCriteria?: string[];
+  reviewFocus?: string[];
+  createdBy?: AgentLoopPayload['createdBy'];
+}
+type AgentLoopFixWorkItemBody = Omit<AgentLoopPayload, 'kind'>;
+type AgentLoopHumanReviewWorkItemBody = Omit<AgentLoopPayload, 'kind'>;
 
 export async function createServer(
   kernel: ExecutionKernel,
@@ -173,6 +242,48 @@ export async function createServer(
       .join('\n\n');
   }
 
+  async function resolveWorkbenchEnvironmentPackBinding(
+    body: WorkbenchTaskConfigurationBody,
+  ) {
+    const requestedPackId = body.environmentPackId?.trim();
+    const activePack = await kernel.environmentPacks.getActivePack();
+    const packs = requestedPackId
+      ? await kernel.environmentPacks.listPacks()
+      : [];
+    const boundPack = requestedPackId
+      ? packs.find((item) => item.id === requestedPackId) || null
+      : activePack;
+
+    if (requestedPackId && !boundPack) {
+      throw new WorkbenchTaskError('environment_pack_not_found', `Environment pack not found: ${requestedPackId}`);
+    }
+
+    if (boundPack) {
+      const invalidSkills = (body.selectedSkills || []).filter((skill) => !boundPack.skills.includes(skill));
+      const invalidKnowledge = (body.selectedKnowledgeIds || []).filter((id) => !boundPack.knowledge.some((entry) => entry.id === id));
+      if (invalidSkills.length > 0 || invalidKnowledge.length > 0) {
+        throw new WorkbenchTaskError(
+          'invalid_environment_selection',
+          `Invalid task configuration. Unknown skills: ${invalidSkills.join(', ') || 'none'}. Unknown knowledge: ${invalidKnowledge.join(', ') || 'none'}.`,
+        );
+      }
+    }
+
+    const requestedSelection = {
+      selectedSkills: body.selectedSkills,
+      selectedKnowledgeIds: body.selectedKnowledgeIds,
+    };
+
+    return {
+      environmentPackSnapshot: boundPack
+        ? toEnvironmentPackSnapshot(boundPack)
+        : undefined,
+      environmentPackSelection: boundPack
+        ? createEnvironmentPackSelection(boundPack, requestedSelection)
+        : undefined,
+    };
+  }
+
   async function launchWorkbenchFollowUpTask(
     workbench: NonNullable<Partial<ExecutionKernel>['workbench']>,
     sourceTask: WorkbenchTaskRecord,
@@ -258,6 +369,8 @@ export async function createServer(
       ...req.body,
       environmentPackSnapshot: req.body.environmentPackSnapshot
         || (activePack ? toEnvironmentPackSnapshot(activePack) : undefined),
+      environmentPackSelection: req.body.environmentPackSelection
+        || (activePack ? createEnvironmentPackSelection(activePack) : undefined),
     });
     const mode: ExecutionMode = req.body.mode || 'single';
     // Run in background — no duplicate task creation
@@ -350,40 +463,13 @@ export async function createServer(
       return { error: 'Workbench service is unavailable' };
     }
 
-    const requestedPackId = req.body.environmentPackId?.trim();
-    const activePack = await kernel.environmentPacks.getActivePack();
-    const packs = requestedPackId
-      ? await kernel.environmentPacks.listPacks()
-      : [];
-    const boundPack = requestedPackId
-      ? packs.find((item) => item.id === requestedPackId) || null
-      : activePack;
-
-    if (requestedPackId && !boundPack) {
-      reply.code(404);
-      return { error: `Environment pack not found: ${requestedPackId}` };
-    }
-
-    const requestedSelection = {
-      selectedSkills: req.body.selectedSkills,
-      selectedKnowledgeIds: req.body.selectedKnowledgeIds,
-    };
-    const environmentPackSnapshot = boundPack
-      ? toEnvironmentPackSnapshot(boundPack)
-      : undefined;
-    const environmentPackSelection = boundPack
-      ? createEnvironmentPackSelection(boundPack, requestedSelection)
-      : undefined;
-
-    if (boundPack) {
-      const invalidSkills = (req.body.selectedSkills || []).filter((skill) => !boundPack.skills.includes(skill));
-      const invalidKnowledge = (req.body.selectedKnowledgeIds || []).filter((id) => !boundPack.knowledge.some((entry) => entry.id === id));
-      if (invalidSkills.length > 0 || invalidKnowledge.length > 0) {
-        reply.code(400);
-        return {
-          error: `Invalid task configuration. Unknown skills: ${invalidSkills.join(', ') || 'none'}. Unknown knowledge: ${invalidKnowledge.join(', ') || 'none'}.`,
-        };
-      }
+    let environmentBinding: Awaited<ReturnType<typeof resolveWorkbenchEnvironmentPackBinding>>;
+    try {
+      environmentBinding = await resolveWorkbenchEnvironmentPackBinding(req.body);
+    } catch (error) {
+      const status = error instanceof WorkbenchTaskError && error.code === 'environment_pack_not_found' ? 404 : 400;
+      reply.code(status);
+      return { error: error instanceof Error ? error.message : String(error) };
     }
 
     const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
@@ -396,14 +482,14 @@ export async function createServer(
     const kernelTask = kernel.taskManager.create({
       description: buildWorkbenchTaskDescription(req.body.title, req.body.goal),
       projectPath: workspaceBinding.effectiveProjectPath,
-      environmentPackSnapshot,
-      environmentPackSelection,
+      environmentPackSnapshot: environmentBinding.environmentPackSnapshot,
+      environmentPackSelection: environmentBinding.environmentPackSelection,
       workspaceBinding,
     });
     const task = await workbench.createTask({
       ...req.body,
-      environmentPackSnapshot,
-      environmentPackSelection,
+      environmentPackSnapshot: environmentBinding.environmentPackSnapshot,
+      environmentPackSelection: environmentBinding.environmentPackSelection,
       workspaceBinding,
     }, kernelTask.id);
     kernel.runTask(kernelTask, 'single').catch(() => {});
@@ -418,6 +504,403 @@ export async function createServer(
     }
 
     return { tasks: await workbench.listTasks() };
+  });
+
+  fastify.get('/api/v1/tasks', async (_req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+    }
+
+    return { tasks: await workbench.listTasks() };
+  });
+
+  fastify.post<{ Body: CreateWorkbenchTaskBody }>('/api/v1/tasks', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+    }
+
+    try {
+      const environmentBinding = await resolveWorkbenchEnvironmentPackBinding(req.body);
+      const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
+      const workspaceBinding = await resolveWorkbenchWorkspaceBinding(
+        workspaceRoot,
+        req.body.workspaceBinding?.effectiveProjectPath || kernel.projectPath,
+        req.body.workspaceBinding,
+      );
+      const task = await workbench.createTask({
+        title: req.body.title,
+        description: req.body.description,
+        goal: req.body.goal,
+        status: req.body.status || 'backlog',
+        priority: req.body.priority,
+        labels: req.body.labels,
+        parentTaskId: req.body.parentTaskId,
+        humanAssignee: req.body.humanAssignee,
+        environmentPackSnapshot: environmentBinding.environmentPackSnapshot,
+        environmentPackSelection: environmentBinding.environmentPackSelection,
+        workspaceBinding,
+      });
+      return { task };
+    } catch (error) {
+      return sendV1CaughtError(reply, error);
+    }
+  });
+
+  fastify.patch<{ Params: { id: string }; Body: UpdateV1TaskBody }>('/api/v1/tasks/:id', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+    }
+
+    try {
+      const task = await workbench.updateTaskTrackerMetadata(req.params.id, req.body);
+      if (!task) {
+        return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
+      }
+      return { task };
+    } catch (error) {
+      return sendV1CaughtError(reply, error);
+    }
+  });
+
+  fastify.post<{ Params: { id: string }; Body: { to: WorkbenchTaskRecord['status']; reason?: string; actor?: 'human' | 'agent' | 'daemon' | 'system' } }>(
+    '/api/v1/tasks/:id/transitions',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        const task = await workbench.transitionTask(req.params.id, req.body.to, {
+          reason: req.body.reason,
+          actor: req.body.actor || 'human',
+        });
+        if (!task) {
+          return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
+        }
+        return { task };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { id: string }; Body: { body: string; authorKind?: 'human' | 'agent' | 'system'; authorId?: string } }>(
+    '/api/v1/tasks/:id/comments',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        const task = await workbench.addComment(req.params.id, {
+          authorKind: req.body.authorKind || 'human',
+          authorId: req.body.authorId,
+          body: req.body.body,
+        });
+        if (!task) {
+          return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
+        }
+        injectHumanCommentIntoActiveTask(kernel, task, req.body);
+        return { task };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { id: string }; Body: { add?: string[]; remove?: string[] } }>(
+    '/api/v1/tasks/:id/labels',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        const task = await workbench.setLabels(req.params.id, req.body);
+        if (!task) {
+          return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
+        }
+        return { task };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { id: string }; Body: { add?: string[]; remove?: string[] } }>(
+    '/api/v1/tasks/:id/dependencies',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        const task = await workbench.setTaskDependencies(req.params.id, req.body);
+        if (!task) {
+          return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
+        }
+        return { task };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Body: AgentLoopReviewRoundBody }>(
+    '/api/v1/agent-loop/review-rounds',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        const task = await workbench.createReviewRound(req.body);
+        return { task };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Body: AgentLoopWorktreeReviewRoundBody }>(
+    '/api/v1/agent-loop/worktree-review-rounds',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        const workspaceBinding = req.body.workspaceBinding
+          || buildDefaultWorkspaceBinding(options?.workspaceRoot || kernel.projectPath || process.cwd(), kernel.projectPath || process.cwd());
+        const projectPath = workspaceBinding.effectiveProjectPath || kernel.projectPath || process.cwd();
+        const headSha = req.body.headSha?.trim() || readGitOutput(projectPath, ['rev-parse', 'HEAD']);
+        const headRef = req.body.headRef?.trim() || readGitOutput(projectPath, ['branch', '--show-current']) || 'HEAD';
+        const baseRef = req.body.baseRef?.trim() || 'HEAD~1';
+        const rootTaskId = req.body.rootTaskId?.trim()
+          || workspaceBinding.laneId
+          || workspaceBinding.projectName
+          || path.basename(projectPath);
+        const repo = req.body.repo?.trim()
+          || workspaceBinding.projectName
+          || path.basename(projectPath);
+        const changeRequestId = `${rootTaskId}:${headSha.slice(0, 12)}`;
+        const task = await workbench.createReviewRound({
+          rootTaskId,
+          round: req.body.round ?? 1,
+          maxRounds: req.body.maxRounds ?? 3,
+          idempotencyKey: req.body.idempotencyKey || [
+            'claude_review',
+            'internal',
+            repo,
+            changeRequestId,
+            headSha,
+            `r${req.body.round ?? 1}`,
+          ].join(':'),
+          changeRequest: {
+            scm: 'internal',
+            repo,
+            id: changeRequestId,
+            type: 'internal_review',
+            title: req.body.title || `Review ${repo} at ${headSha.slice(0, 12)}`,
+            baseRef,
+            headRef,
+            headSha,
+          },
+          workspaceBinding,
+          allowedScope: req.body.allowedScope,
+          acceptanceCriteria: req.body.acceptanceCriteria,
+          reviewFocus: req.body.reviewFocus,
+          createdBy: req.body.createdBy || 'human',
+        });
+        return { task };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Body: AgentLoopFixWorkItemBody }>(
+    '/api/v1/agent-loop/fix-work-items',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        const task = await workbench.createFixWorkItem(req.body);
+        return { task };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Body: AgentLoopHumanReviewWorkItemBody }>(
+    '/api/v1/agent-loop/human-review-work-items',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        const task = await workbench.createHumanReviewWorkItem(req.body);
+        return { task };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { id: string }; Body: { expectedHeadSha: string; actualHeadSha: string } }>(
+    '/api/v1/agent-loop/tasks/:id/stale',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        const task = await workbench.markAgentLoopStale(req.params.id, req.body);
+        if (!task) {
+          return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
+        }
+        return { task };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { id: string }; Body: ReviewResult }>(
+    '/api/v1/agent-loop/tasks/:id/review-result',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        return await workbench.completeAgentLoopReview(req.params.id, req.body);
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.get('/api/v1/tracker/state', async (_req, reply) => {
+    try {
+      const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
+      const state = await FileTrackerDaemonStateStore.forWorkspace(workspaceRoot).load();
+      const tasks = await (kernel as Partial<ExecutionKernel>).workbench?.listTasks?.();
+      return {
+        watching: state.watching ?? false,
+        retries: state.retries,
+        summary: buildTrackerStateSummary(tasks || []),
+        listeners: buildTrackerListeners({
+          workspaceRoot,
+          apiPort: config.port,
+          watching: state.watching ?? false,
+        }),
+        recent: state.recent || [],
+      };
+    } catch (error) {
+      return sendV1CaughtError(reply, error);
+    }
+  });
+
+  fastify.get('/api/v1/workflow', async (_req, reply) => {
+    try {
+      const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
+      return readTrackerWorkflowFile(workspaceRoot);
+    } catch (error) {
+      return sendV1CaughtError(reply, error);
+    }
+  });
+
+  fastify.put<{ Body: WorkflowFileBody }>('/api/v1/workflow', async (req, reply) => {
+    try {
+      if (typeof req.body?.content !== 'string') {
+        return sendV1Error(reply, 400, 'invalid_workflow', 'Workflow content is required.');
+      }
+      const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
+      const saved = await writeTrackerWorkflowFile(workspaceRoot, req.body.content);
+      return {
+        saved: true,
+        path: saved.path,
+        content: saved.content,
+      };
+    } catch (error) {
+      return sendV1CaughtError(reply, error);
+    }
+  });
+
+  fastify.post('/api/v1/tracker/refresh', async (_req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+    }
+
+    try {
+      const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
+      const worktreeManager = new WorkspaceWorktreeManager();
+      const daemon = new TrackerDaemon({
+        importer: new WorkbenchTaskImporter(workbench),
+        stateStore: FileTrackerDaemonStateStore.forWorkspace(workspaceRoot),
+        launcher: new WorkbenchTrackerLauncher(workbench, {
+          workspaceRoot,
+          defaultProjectPath: kernel.projectPath,
+          workspaceName: path.basename(workspaceRoot),
+          resolveExecutionTarget: async (input) => {
+            const target = await worktreeManager.getExecutionTarget({
+              workspaceName: input.workspaceName,
+              workspaceRoot: input.workspaceRoot,
+              projectName: input.projectName,
+              sourceProjectPath: input.sourceProjectPath,
+              laneId: input.laneId,
+            });
+            return {
+              sourceProjectPath: target.sourceProjectPath,
+              effectiveProjectPath: target.effectiveProjectPath,
+              worktreeKind: target.worktree?.kind,
+              worktreePath: target.worktree?.worktreePath,
+            };
+          },
+          createKernelTask: (input) => kernel.taskManager.create(input),
+          runTask: (task, input) => runWorkbenchKernelTaskInBackground(task, {
+            taskId: input.workbenchTaskId,
+            workbench,
+            runTask: (kernelTask) => kernel.runTask(kernelTask as any, 'single'),
+          }),
+          isRunActive: (taskId) => Boolean(kernel.getSession(taskId)),
+          stopTask: (taskId, reason) => {
+            try {
+              kernel.control(taskId, { type: 'stop', reason } as any);
+            } catch {}
+          },
+        }),
+        workspaceRoot,
+        defaultProjectPath: kernel.projectPath,
+      });
+      const result = await daemon.tick();
+      return {
+        queued: false,
+        refreshedAt: new Date().toISOString(),
+        result,
+      };
+    } catch (error) {
+      return sendV1CaughtError(reply, error);
+    }
   });
 
   fastify.get<{ Params: { id: string } }>('/api/workbench/tasks/:id/timeline', async (req, reply) => {
@@ -1019,6 +1502,192 @@ export async function createServer(
   return fastify;
 }
 
+const COMMENT_INJECTION_STATES = new Set<WorkbenchTaskStatus>([
+  'in_progress',
+  'running',
+  'waiting_for_user',
+]);
+
+function injectHumanCommentIntoActiveTask(
+  kernel: ExecutionKernel,
+  task: WorkbenchTaskRecord,
+  body: { body: string; authorKind?: 'human' | 'agent' | 'system' },
+): void {
+  const authorKind = body.authorKind || 'human';
+  const constraint = body.body?.trim();
+  if (
+    authorKind !== 'human'
+    || !constraint
+    || parseSlashCommand(constraint, authorKind)
+    || !COMMENT_INJECTION_STATES.has(task.status)
+  ) {
+    return;
+  }
+
+  try {
+    kernel.control(task.id, { type: 'inject_constraint', constraint });
+  } catch {}
+}
+
+function buildTrackerStateSummary(tasks: WorkbenchTaskRecord[]) {
+  const summary = {
+    activeCandidates: 0,
+    activeRuns: 0,
+    maintenance: 0,
+    staleRunning: 0,
+  };
+
+  for (const task of tasks) {
+    if (isWorkbenchTaskMaintenance(task)) {
+      const hasOpenAttempt = Boolean(task.attempts?.some((attempt) => attempt.kernelTaskId && !attempt.finishedAt));
+      if (!isWorkbenchTerminalStatus(task.status) || hasOpenAttempt) {
+        summary.maintenance += 1;
+      }
+      continue;
+    }
+    const hasOpenAttempt = Boolean(task.attempts?.some((attempt) => attempt.kernelTaskId && !attempt.finishedAt));
+    if (hasOpenAttempt) {
+      summary.activeRuns += 1;
+      continue;
+    }
+    if ((task.status === 'todo' || task.status === 'failed') && isWorkbenchTaskCodexDispatchable(task)) {
+      summary.activeCandidates += 1;
+      continue;
+    }
+    if (task.status === 'running' || task.status === 'in_progress') {
+      summary.staleRunning += 1;
+    }
+  }
+
+  return summary;
+}
+
+function buildTrackerListeners(input: {
+  workspaceRoot: string;
+  apiPort: number;
+  watching: boolean;
+}): TrackerListenerStatus[] {
+  const processLines = readProcessLines();
+  const tmuxSessions = readTmuxSessions();
+  const trackerProcess = findProcessLine(processLines, [
+    'tracker watch',
+    input.workspaceRoot,
+  ]);
+  const apiProcess = findProcessLine(processLines, [
+    'serve',
+    `--project ${input.workspaceRoot}`,
+  ]);
+  const dashboardProcess = findProcessLine(processLines, [
+    '@tik/dashboard',
+    '--port 5174',
+  ]) || findProcessLine(processLines, [
+    'vite',
+    '--port 5174',
+  ]);
+
+  return [
+    buildListenerStatus({
+      id: 'tracker-watch',
+      label: 'Tracker watch',
+      expected: input.watching,
+      processLine: trackerProcess,
+      session: tmuxSessions.find((session) => session.includes('tik-tracker-watch')),
+      fallbackDetail: input.watching
+        ? 'Watch mode is marked active, but the local process was not visible.'
+        : 'Watch mode is not marked active.',
+    }),
+    buildListenerStatus({
+      id: 'api-server',
+      label: 'API server',
+      expected: true,
+      processLine: apiProcess || findProcessByPort(input.apiPort),
+      port: input.apiPort,
+      session: tmuxSessions.find((session) => session.includes(`tik-api-${input.apiPort}`)),
+      fallbackDetail: `API port ${input.apiPort} is expected for this server.`,
+    }),
+    buildListenerStatus({
+      id: 'dashboard',
+      label: 'Dashboard dev server',
+      expected: false,
+      processLine: dashboardProcess || findProcessByPort(5174),
+      port: 5174,
+      session: tmuxSessions.find((session) => session.includes('tik-dashboard-5174')),
+      fallbackDetail: 'Dashboard dev server was not detected on port 5174.',
+    }),
+  ];
+}
+
+function buildListenerStatus(input: {
+  id: string;
+  label: string;
+  expected: boolean;
+  fallbackDetail: string;
+  processLine?: string | null;
+  port?: number;
+  session?: string;
+}): TrackerListenerStatus {
+  const pid = input.processLine ? parseProcessPid(input.processLine) : undefined;
+  const isRunning = Boolean(pid || input.session);
+  const sessionName = input.session?.split(':')[0];
+  const detailParts = [
+    pid ? `pid ${pid}` : null,
+    input.port ? `port ${input.port}` : null,
+    sessionName ? `tmux ${sessionName}` : null,
+  ].filter(Boolean);
+
+  return {
+    id: input.id,
+    label: input.label,
+    status: isRunning ? 'running' : input.expected ? 'expected' : 'stopped',
+    detail: detailParts.length > 0 ? detailParts.join(' · ') : input.fallbackDetail,
+    pid,
+    port: input.port,
+    session: sessionName,
+  };
+}
+
+function readProcessLines(): string[] {
+  const result = spawnSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf-8' });
+  if (result.status !== 0) {
+    return [];
+  }
+  return result.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+}
+
+function readTmuxSessions(): string[] {
+  const result = spawnSync('tmux', ['list-sessions'], { encoding: 'utf-8' });
+  if (result.status !== 0) {
+    return [];
+  }
+  return result.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+}
+
+function findProcessLine(lines: string[], requiredParts: string[]): string | null {
+  return lines.find((line) => requiredParts.every((part) => line.includes(part))) || null;
+}
+
+function findProcessByPort(port: number): string | null {
+  const result = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'], { encoding: 'utf-8' });
+  if (result.status !== 0) {
+    return null;
+  }
+  const line = result.stdout.split('\n').find((item) => /^\S+\s+\d+\s+/.test(item));
+  if (!line) {
+    return null;
+  }
+  const [, pid] = line.trim().split(/\s+/);
+  return pid ? `${pid} lsof:${port}` : line.trim();
+}
+
+function parseProcessPid(line: string): number | undefined {
+  const match = line.trim().match(/^(\d+)/);
+  if (!match) {
+    return undefined;
+  }
+  const pid = Number(match[1]);
+  return Number.isFinite(pid) ? pid : undefined;
+}
+
 function getPreviewContentType(filePath: string): string {
   const extension = path.extname(filePath).toLowerCase();
   switch (extension) {
@@ -1041,4 +1710,52 @@ function getPreviewContentType(filePath: string): string {
     default:
       return 'application/octet-stream';
   }
+}
+
+function buildDefaultWorkspaceBinding(workspaceRoot: string, projectPath: string): TaskWorkspaceBinding {
+  return {
+    workspaceRoot,
+    workspaceName: path.basename(workspaceRoot),
+    effectiveProjectPath: projectPath,
+    projectName: path.basename(projectPath),
+    sourceProjectPath: projectPath,
+    worktreeKind: 'root',
+  };
+}
+
+function readGitOutput(cwd: string, args: string[]): string {
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf-8',
+  });
+  if (result.status !== 0) {
+    const message = result.stderr.trim() || result.stdout.trim() || `git ${args.join(' ')} failed`;
+    throw new WorkbenchTaskError('git_unavailable', message);
+  }
+  return result.stdout.trim();
+}
+
+function sendV1Error(reply: any, statusCode: number, code: string, message: string) {
+  reply.code(statusCode);
+  return {
+    error: {
+      code,
+      message,
+    },
+  };
+}
+
+function sendV1CaughtError(reply: any, error: unknown) {
+  if (error instanceof WorkbenchTaskError) {
+    const status = error.code === 'task_not_found'
+      ? 404
+      : error.code === 'environment_pack_not_found'
+        ? 404
+        : error.code === 'invalid_comment' || error.code === 'invalid_environment_selection'
+        ? 400
+        : 409;
+    return sendV1Error(reply, status, error.code, error.message);
+  }
+
+  return sendV1Error(reply, 500, 'internal_error', error instanceof Error ? error.message : String(error));
 }

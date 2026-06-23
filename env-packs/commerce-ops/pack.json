@@ -32,5 +32,80 @@
       }
     }
   ],
+  "taskLabels": [
+    {
+      "value": "backend",
+      "label": "Backend",
+      "action": "codex_dispatch",
+      "workflow": "feature-delivery",
+      "phase": "implement",
+      "description": "Backend code work in the commerce operations environment."
+    },
+    {
+      "value": "api-compat",
+      "label": "API compatibility",
+      "action": "codex_dispatch",
+      "workflow": "feature-delivery",
+      "phase": "implement",
+      "description": "API compatibility work that Codex can execute with the commerce-ops checks."
+    },
+    {
+      "value": "codex-fix",
+      "label": "Codex fix",
+      "action": "codex_fix",
+      "workflow": "feature-delivery",
+      "phase": "implement",
+      "description": "Fix blocking review issues with Codex.",
+      "aliases": ["needs-codex-fix"]
+    },
+    {
+      "value": "needs-claude-review",
+      "label": "Claude review",
+      "action": "claude_code_review",
+      "workflow": "feature-delivery",
+      "phase": "review",
+      "description": "Ask the Claude Code plugin to review the task.",
+      "aliases": ["claude-review"]
+    },
+    {
+      "value": "needs-human-review",
+      "label": "Human review",
+      "action": "human_review",
+      "workflow": "feature-delivery",
+      "phase": "review",
+      "description": "Route the task to a human reviewer.",
+      "aliases": ["human-review"]
+    },
+    {
+      "value": "incident",
+      "label": "Incident",
+      "action": "human_review",
+      "workflow": "incident-response",
+      "phase": "clarify",
+      "description": "Incident response or RCA work that needs human steering."
+    },
+    {
+      "value": "ops",
+      "label": "Ops",
+      "action": "maintenance_manual",
+      "description": "Operational task; not Codex coding work.",
+      "aliases": ["operation", "operations"]
+    },
+    {
+      "value": "maintenance",
+      "label": "Maintenance",
+      "action": "maintenance_manual",
+      "description": "Manual maintenance task.",
+      "aliases": ["workspace-maintenance"]
+    },
+    {
+      "value": "loop-complete",
+      "label": "Loop complete",
+      "action": "loop_complete",
+      "workflow": "feature-delivery",
+      "phase": "review",
+      "description": "Mark the review loop complete."
+    }
+  ],
   "evaluators": ["risk-evaluator", "architecture-impact-evaluator", "rollout-safety-check"]
 }

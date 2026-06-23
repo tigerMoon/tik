@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveApiBaseUrlForLocation } from './client.js';
+import { resolveApiBaseUrlForLocation, resolveApiErrorMessage } from './client.js';
 
 describe('resolveApiBaseUrlForLocation', () => {
   it('prefers explicit api base urls and trims trailing slash', () => {
@@ -39,5 +39,24 @@ describe('resolveApiBaseUrlForLocation', () => {
       port: '3300',
       origin: 'http://127.0.0.1:3300',
     })).toBe('/api');
+  });
+});
+
+describe('resolveApiErrorMessage', () => {
+  it('prefers v1 error envelope messages', () => {
+    expect(resolveApiErrorMessage({
+      error: {
+        code: 'transition_not_allowed',
+        message: 'Cannot transition backlog to completed.',
+      },
+    }, 'Conflict', 409)).toBe('Cannot transition backlog to completed.');
+  });
+
+  it('prefers Fastify route messages over generic status text', () => {
+    expect(resolveApiErrorMessage({
+      message: 'Route GET:/api/v1/tasks not found',
+      error: 'Not Found',
+      statusCode: 404,
+    }, 'Not Found', 404)).toBe('Route GET:/api/v1/tasks not found');
   });
 });

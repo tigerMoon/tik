@@ -159,6 +159,58 @@ describe('environment pack runtime context', () => {
     expect(envelope?.execution.environment?.activePack.knowledge).toEqual([]);
   });
 
+  it('does not silently fall back when a task-bound environment pack is missing', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-sight-env-pack-'));
+    tempDirs.push(root);
+
+    await fs.mkdir(path.join(root, 'env-packs', 'base-engineering'), { recursive: true });
+    await fs.writeFile(path.join(root, 'env-packs', 'base-engineering', 'pack.json'), JSON.stringify({
+      kind: 'EnvironmentPack',
+      id: 'base-engineering',
+      name: 'Base Engineering',
+      version: '0.1.0',
+      description: 'General delivery pack',
+      tools: ['shell'],
+      skills: ['coder'],
+      knowledge: [],
+      policies: [],
+      workflowBindings: [],
+      evaluators: ['risk-evaluator'],
+    }, null, 2), 'utf-8');
+
+    await fs.mkdir(path.join(root, '.tik'), { recursive: true });
+    await fs.writeFile(path.join(root, '.tik', 'environment-pack.json'), JSON.stringify({
+      activePackId: 'base-engineering',
+      updatedAt: '2026-04-09T00:00:00.000Z',
+    }, null, 2), 'utf-8');
+
+    const engine = new ContextEngine(root);
+    const envelope = await engine.buildFromSession?.(
+      {
+        id: 'task-missing-pack',
+        description: 'Run with the originally bound pack',
+        environmentPackSnapshot: {
+          id: 'commerce-ops',
+          name: 'Commerce Ops',
+          version: '0.2.0',
+        },
+        environmentPackSelection: {
+          selectedSkills: ['release-review'],
+          selectedKnowledgeIds: [],
+        },
+      },
+      {
+        sessionId: 'session-missing-pack',
+        step: 1,
+        currentAgent: 'planner',
+        messages: [],
+      },
+      { agent: 'planner' },
+    );
+
+    expect(envelope?.execution.environment).toBeUndefined();
+  });
+
   it('filters environment pack skills and knowledge to the task-level selection', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-sight-env-pack-'));
     tempDirs.push(root);

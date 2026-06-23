@@ -7,11 +7,22 @@ import {
 } from '../api/client';
 import type { WorkbenchLens } from '../view-models/workbench';
 import {
+  buildWorkbenchAgentLoopSummary,
   buildWorkbenchQueueSignal,
   buildWorkbenchTaskVisibleSummary,
   filterWorkbenchTasksByLens,
-  groupWorkbenchTasks,
 } from '../view-models/workbench';
+import {
+  buildTaskBindingLabel,
+  resolveWorkspaceBindingOption,
+  type WorkspaceBindingOption,
+  type WorkspaceScopeKey,
+} from '../view-models/workspace-hierarchy';
+import { ChipMultiSelect } from './task-detail/ChipMultiSelect';
+import {
+  buildWorkbenchLabelSelectOptions,
+  WorkbenchLabelGuide,
+} from './task-detail/WorkbenchLabelGuide';
 
 interface WorkbenchTaskListProps {
   packs: EnvironmentPackManifest[];
@@ -25,14 +36,41 @@ interface WorkbenchTaskListProps {
   launcherSeedPackId?: string | null;
   launcherSeedSelection?: EnvironmentPackSelection | null;
   launcherSeedSource?: 'focused-task' | 'active-pack';
+  bindingOptions: WorkspaceBindingOption[];
+  selectedBindingKey: WorkspaceScopeKey;
   onSelectTask: (taskId: string) => void;
-  onSelectLens: (lens: WorkbenchLens) => void;
   onCreateTask: (
     title: string,
     goal: string,
     input?: CreateWorkbenchTaskInput,
   ) => Promise<void>;
   onToggleLauncher: (open: boolean) => void;
+}
+
+interface WorkbenchTaskLaunchValidation {
+  valid: boolean;
+  titleError: string | null;
+  goalError: string | null;
+}
+
+const emptyLaunchValidation: WorkbenchTaskLaunchValidation = {
+  valid: true,
+  titleError: null,
+  goalError: null,
+};
+
+export function validateWorkbenchTaskLaunchDraft(input: {
+  title: string;
+  goal: string;
+}): WorkbenchTaskLaunchValidation {
+  const titleError = input.title.trim() ? null : 'Task title is required.';
+  const goalError = input.goal.trim() ? null : 'Task goal is required.';
+
+  return {
+    valid: !titleError && !goalError,
+    titleError,
+    goalError,
+  };
 }
 
 export function WorkbenchTaskList({
@@ -47,8 +85,9 @@ export function WorkbenchTaskList({
   launcherSeedPackId,
   launcherSeedSelection,
   launcherSeedSource = 'active-pack',
+  bindingOptions,
+  selectedBindingKey,
   onSelectTask,
-  onSelectLens,
   onCreateTask,
   onToggleLauncher,
 }: WorkbenchTaskListProps) {
@@ -62,17 +101,30 @@ export function WorkbenchTaskList({
     : launcherSeedSelection;
   const [title, setTitle] = useState('');
   const [goal, setGoal] = useState('');
+  const [status, setStatus] = useState<'backlog' | 'todo'>('backlog');
+  const [priority, setPriority] = useState('');
+  const [labels, setLabels] = useState<string[]>([]);
+  const [assignee, setAssignee] = useState('');
   const [selectedPackId, setSelectedPackId] = useState<string | null>(resolvedLauncherSeedPackId);
+  const [selectedTaskBindingKey, setSelectedTaskBindingKey] = useState<WorkspaceScopeKey>(selectedBindingKey);
   const [submitting, setSubmitting] = useState(false);
+  const [validation, setValidation] = useState<WorkbenchTaskLaunchValidation>(emptyLaunchValidation);
+  const [launchError, setLaunchError] = useState<string | null>(null);
   const launchDialogTitleId = useId();
   const titleInputId = useId();
   const goalInputId = useId();
+  const titleErrorId = useId();
+  const goalErrorId = useId();
+  const launchErrorId = useId();
   const packInputId = useId();
-  const grouped = useMemo(() => groupWorkbenchTasks(tasks), [tasks]);
+  const bindingInputId = useId();
   const lensTasks = useMemo(() => filterWorkbenchTasksByLens(tasks, selectedLens), [tasks, selectedLens]);
-  const todayCount = useMemo(() => filterWorkbenchTasksByLens(tasks, 'today').length, [tasks]);
-  const archivedCount = grouped.archived.length;
   const selectedPack = packs.find((pack) => pack.id === selectedPackId) || null;
+  const selectedPackLabelOptions = useMemo(
+    () => buildWorkbenchLabelSelectOptions(selectedPack),
+    [selectedPack],
+  );
+  const selectedBindingOption = resolveWorkspaceBindingOption(bindingOptions, selectedTaskBindingKey);
   const inheritsFocusedSetup = !!activeTask
     && !!selectedPackId
     && selectedPackId === activeTask.environmentPackSnapshot?.id;
@@ -83,35 +135,20 @@ export function WorkbenchTaskList({
     }
 
     setSelectedPackId(resolvedLauncherSeedPackId);
-  }, [launcherOpen, resolvedLauncherSeedPackId]);
+    setSelectedTaskBindingKey(selectedBindingKey);
+    setStatus('backlog');
+    setValidation(emptyLaunchValidation);
+    setLaunchError(null);
+  }, [launcherOpen, resolvedLauncherSeedPackId, selectedBindingKey]);
 
   return (
     <>
       <section className="queue-card">
       <div className="queue-card-header">
         <div>
-          <div className="queue-card-kicker">Queue · {lensTasks.length}</div>
-          <div className="queue-card-title">sorted by waiting-on-you</div>
+          <div className="queue-card-kicker">Tasks</div>
+          <div className="queue-card-title">{lensTasks.length} task{lensTasks.length === 1 ? '' : 's'}</div>
         </div>
-      </div>
-
-      <div className="task-rail-filters">
-        {[
-          { lens: 'inbox' as const, label: `Inbox ${grouped.attention.length}` },
-          { lens: 'today' as const, label: `Today ${todayCount}` },
-          { lens: 'all' as const, label: `All ${tasks.filter((task) => task.status !== 'archived').length}` },
-          { lens: 'completed' as const, label: `Completed ${grouped.completed.length}` },
-          ...(archivedCount > 0 ? [{ lens: 'archived' as const, label: `Archived ${archivedCount}` }] : []),
-        ].map((entry) => (
-          <button
-            key={entry.lens}
-            type="button"
-            className={`task-rail-filter ${selectedLens === entry.lens ? 'is-active' : ''}`}
-            onClick={() => onSelectLens(entry.lens)}
-          >
-            {entry.label}
-          </button>
-        ))}
       </div>
 
       <div className="task-rail-scroll queue-scroll">
@@ -138,7 +175,7 @@ export function WorkbenchTaskList({
         ) : (
           <div className="task-rail-list queue-task-list">
             {lensTasks.map((task) => (
-              <TaskRailCard
+              <TaskRailRow
                 key={task.id}
                 task={task}
                 active={task.id === activeTaskId}
@@ -179,7 +216,13 @@ export function WorkbenchTaskList({
                 event.preventDefault();
                 const nextTitle = title.trim();
                 const nextGoal = goal.trim();
-                if (!nextTitle || !nextGoal || submitting) {
+                if (submitting) {
+                  return;
+                }
+                const nextValidation = validateWorkbenchTaskLaunchDraft({ title, goal });
+                setValidation(nextValidation);
+                setLaunchError(null);
+                if (!nextValidation.valid) {
                   return;
                 }
                 setSubmitting(true);
@@ -188,11 +231,21 @@ export function WorkbenchTaskList({
                     environmentPackId: selectedPackId || undefined,
                     selectedSkills: inheritsFocusedSetup ? resolvedLauncherSeedSelection?.selectedSkills : undefined,
                     selectedKnowledgeIds: inheritsFocusedSetup ? resolvedLauncherSeedSelection?.selectedKnowledgeIds : undefined,
-                    workspaceBinding: activeTask?.workspaceBinding,
+                    status,
+                    priority: priority ? Number(priority) : null,
+                    labels,
+                    humanAssignee: assignee.trim() || null,
+                    workspaceBinding: selectedBindingOption.binding,
                   });
                   setTitle('');
                   setGoal('');
+                  setPriority('');
+                  setLabels([]);
+                  setAssignee('');
+                  setValidation(emptyLaunchValidation);
                   onToggleLauncher(false);
+                } catch (error) {
+                  setLaunchError(error instanceof Error ? error.message : 'Failed to launch task.');
                 } finally {
                   setSubmitting(false);
                 }
@@ -203,20 +256,48 @@ export function WorkbenchTaskList({
               <input
                 id={titleInputId}
                 value={title}
-                onChange={(event) => setTitle(event.target.value)}
+                onChange={(event) => {
+                  const nextTitle = event.target.value;
+                  setTitle(nextTitle);
+                  setLaunchError(null);
+                  if (validation.titleError) {
+                    setValidation(validateWorkbenchTaskLaunchDraft({ title: nextTitle, goal }));
+                  }
+                }}
                 placeholder="What should the agents work on?"
                 className="task-launch-field"
+                aria-invalid={!!validation.titleError}
+                aria-describedby={validation.titleError ? titleErrorId : undefined}
               />
+              {validation.titleError ? (
+                <div id={titleErrorId} className="task-launch-error">
+                  {validation.titleError}
+                </div>
+              ) : null}
 
               <label htmlFor={goalInputId} className="task-launch-label">Task goal</label>
               <textarea
                 id={goalInputId}
                 value={goal}
-                onChange={(event) => setGoal(event.target.value)}
+                onChange={(event) => {
+                  const nextGoal = event.target.value;
+                  setGoal(nextGoal);
+                  setLaunchError(null);
+                  if (validation.goalError) {
+                    setValidation(validateWorkbenchTaskLaunchDraft({ title, goal: nextGoal }));
+                  }
+                }}
                 rows={3}
                 placeholder="Describe the outcome you want to review in the console"
                 className="task-launch-field task-launch-textarea"
+                aria-invalid={!!validation.goalError}
+                aria-describedby={validation.goalError ? goalErrorId : undefined}
               />
+              {validation.goalError ? (
+                <div id={goalErrorId} className="task-launch-error">
+                  {validation.goalError}
+                </div>
+              ) : null}
 
               <label htmlFor={packInputId} className="task-launch-label">Environment pack</label>
               <select
@@ -237,9 +318,81 @@ export function WorkbenchTaskList({
                     : 'Choose the pack to bind to the new task.')}
               </div>
 
+              <label htmlFor={bindingInputId} className="task-launch-label">Task binding</label>
+              <select
+                id={bindingInputId}
+                value={selectedTaskBindingKey}
+                onChange={(event) => setSelectedTaskBindingKey(event.target.value as WorkspaceScopeKey)}
+                className="task-launch-field"
+              >
+                {bindingOptions.map((option) => (
+                  <option key={option.key} value={option.key}>
+                    {option.kind === 'workspace' ? 'Workspace' : 'Project'} · {option.label}
+                  </option>
+                ))}
+              </select>
+              <div className="task-binding-copy">
+                Currently bound to {selectedBindingOption.kind} · {selectedBindingOption.label}
+                <br />
+                {selectedBindingOption.detail}
+              </div>
+
+              <div className="task-launch-grid">
+                <label className="task-launch-label">
+                  Status
+                  <select
+                    value={status}
+                    onChange={(event) => setStatus(event.target.value as 'backlog' | 'todo')}
+                    className="task-launch-field"
+                  >
+                    <option value="backlog">Backlog</option>
+                    <option value="todo">Todo</option>
+                  </select>
+                </label>
+                <label className="task-launch-label">
+                  Priority
+                  <select
+                    value={priority}
+                    onChange={(event) => setPriority(event.target.value)}
+                    className="task-launch-field"
+                  >
+                    <option value="">None</option>
+                    <option value="1">Urgent</option>
+                    <option value="2">High</option>
+                    <option value="3">Normal</option>
+                    <option value="4">Low</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="task-launch-label">Labels</div>
+              <ChipMultiSelect
+                values={labels}
+                options={selectedPackLabelOptions}
+                placeholder="Add custom label, press Enter"
+                disabled={submitting}
+                onChange={setLabels}
+              />
+              <WorkbenchLabelGuide environment={selectedPack} />
+
+              <label className="task-launch-label">
+                Assignee
+                <input
+                  value={assignee}
+                  onChange={(event) => setAssignee(event.target.value)}
+                  placeholder="human owner"
+                  className="task-launch-field"
+                />
+              </label>
+
               <button type="submit" disabled={submitting} className="task-launch-button">
                 {submitting ? 'Launching…' : 'Launch task'}
               </button>
+              {launchError ? (
+                <div id={launchErrorId} className="task-launch-error task-launch-error-banner" role="alert">
+                  {launchError}
+                </div>
+              ) : null}
             </form>
           </div>
         </div>
@@ -248,7 +401,7 @@ export function WorkbenchTaskList({
   );
 }
 
-function TaskRailCard({
+function TaskRailRow({
   task,
   active,
   onSelect,
@@ -259,15 +412,69 @@ function TaskRailCard({
 }) {
   const taskSummary = buildWorkbenchTaskVisibleSummary(task);
   const queueSignal = buildWorkbenchQueueSignal(task);
+  const agentLoopSummary = buildWorkbenchAgentLoopSummary(task.agentLoop);
   const previewableArtifactPath = task.evidenceSummary?.latestPreviewableArtifactPath;
+  const shortId = task.identifier || task.shortIdentifier || `TIK-${task.id.slice(0, 8).toUpperCase()}`;
+  const updatedAt = formatRelativeDate(task.lastProgressAt || task.updatedAt || task.createdAt);
 
   return (
-    <article className={`task-card queue-task-card ${active ? 'is-active' : ''}`}>
-      <div className="queue-task-top">
-        <div>
-          <div className="queue-task-id">{task.id.slice(0, 8).toUpperCase()}</div>
-          <div className="queue-task-title">{task.title}</div>
+    <article
+      className={`task-card queue-task-card ${active ? 'is-active' : ''}`}
+      role="link"
+      tabIndex={0}
+      aria-label={`Open task ${task.title}`}
+      onClick={onSelect}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onSelect();
+        }
+      }}
+    >
+      <div className="queue-task-body">
+        <div className={`queue-status-dot status-${statusTone(task.status)}`} />
+        <div className="queue-task-main">
+          <div className="queue-task-top">
+            <div className="queue-task-title-line">
+              <span className="queue-task-id">{shortId}</span>
+              <span className="queue-task-title">{task.title}</span>
+            </div>
+            <span className="queue-task-updated">{updatedAt}</span>
+          </div>
+
+          <div className="queue-task-meta">
+            <span className={`queue-status-badge status-${statusTone(task.status)}`}>{humanizeStatus(task.status)}</span>
+            {task.priority ? <span className="queue-priority-dot">P{task.priority}</span> : null}
+            {agentLoopSummary ? (
+              <span className={`queue-signal-badge tone-${agentLoopSummary.tone}`}>{agentLoopSummary.label}</span>
+            ) : null}
+            <span className={`queue-signal-badge tone-${queueSignal.tone}`}>{queueSignal.label}</span>
+            <span className="queue-binding-chip">{buildTaskBindingLabel(task.workspaceBinding)}</span>
+            <span className="queue-pack-chip">{task.environmentPackSnapshot?.id || 'default'}</span>
+            {(task.humanAssignee || task.assignee || task.currentOwner) ? (
+              <span className="queue-pack-chip">{task.humanAssignee || task.assignee || task.currentOwner}</span>
+            ) : null}
+          </div>
+
+          {task.labels?.length ? (
+            <div className="queue-label-row">
+              {task.labels.slice(0, 4).map((label) => <span key={label}>{label}</span>)}
+            </div>
+          ) : null}
+
+          {taskSummary ? (
+            <div className="queue-task-summary">{taskSummary}</div>
+          ) : null}
+
+          {agentLoopSummary ? (
+            <div className="queue-task-evidence">{agentLoopSummary.detail}</div>
+          ) : null}
+
+          <div className="queue-task-evidence">{queueSignal.detail}</div>
         </div>
+      </div>
+
+      <div className="queue-task-side">
         <div className="queue-task-actions">
           {previewableArtifactPath ? (
             <a
@@ -275,37 +482,13 @@ function TaskRailCard({
               target="_blank"
               rel="noreferrer"
               className="queue-task-action queue-task-preview"
+              onClick={(event) => event.stopPropagation()}
             >
               Preview
             </a>
           ) : null}
-          <button
-            type="button"
-            onClick={onSelect}
-            className="queue-task-action queue-task-open"
-          >
-            Open
-          </button>
         </div>
       </div>
-
-      <button
-        type="button"
-        onClick={onSelect}
-        className="queue-task-body"
-      >
-        <div className="queue-task-meta">
-          <span className={`queue-status-badge status-${statusTone(task.status)}`}>{humanizeStatus(task.status)}</span>
-          <span className={`queue-signal-badge tone-${queueSignal.tone}`}>{queueSignal.label}</span>
-          <span className="queue-pack-chip">{task.environmentPackSnapshot?.id || 'default'}</span>
-        </div>
-
-        {taskSummary ? (
-          <div className="queue-task-summary">{taskSummary}</div>
-        ) : null}
-
-        <div className="queue-task-evidence">{queueSignal.detail}</div>
-      </button>
     </article>
   );
 }
@@ -313,9 +496,15 @@ function TaskRailCard({
 function humanizeStatus(status: WorkbenchTaskResponse['status']): string {
   switch (status) {
     case 'waiting_for_user':
+    case 'in_review':
       return 'Review';
     case 'running':
+    case 'in_progress':
       return 'Running';
+    case 'todo':
+      return 'Todo';
+    case 'backlog':
+      return 'Backlog';
     case 'verifying':
       return 'Verify';
     case 'completed':
@@ -335,16 +524,51 @@ function humanizeStatus(status: WorkbenchTaskResponse['status']): string {
   }
 }
 
+function formatRelativeDate(value: string | undefined): string {
+  if (!value) {
+    return 'No activity';
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  const diffMs = Date.now() - date.getTime();
+  const diffMinutes = Math.floor(diffMs / 60000);
+  if (diffMinutes < 1) {
+    return 'now';
+  }
+  if (diffMinutes < 60) {
+    return `${diffMinutes}m`;
+  }
+
+  const diffHours = Math.floor(diffMinutes / 60);
+  if (diffHours < 24) {
+    return `${diffHours}h`;
+  }
+
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays < 7) {
+    return `${diffDays}d`;
+  }
+
+  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
 function statusTone(status: WorkbenchTaskResponse['status']): 'green' | 'blue' | 'yellow' | 'neutral' {
   switch (status) {
     case 'completed':
       return 'green';
     case 'waiting_for_user':
+    case 'in_review':
     case 'failed':
     case 'blocked':
     case 'cancelled':
       return 'yellow';
     case 'running':
+    case 'in_progress':
+    case 'todo':
     case 'verifying':
       return 'blue';
     default:

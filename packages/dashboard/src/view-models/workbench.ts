@@ -1,22 +1,30 @@
-import { isWorkbenchTerminalStatus } from '@tik/shared';
+import { extractModifiedFilesFromEvidenceBody, isWorkbenchTerminalStatus } from '@tik/shared';
 import type {
+  AgentLoopMetadata,
   TaskWorkspaceBinding,
   WorkbenchTaskAdjustmentRecord,
+  WorkbenchTaskCommentRecord,
   WorkbenchTaskEvidenceSummary,
   WorkbenchTaskStatus,
 } from '@tik/shared';
 
 export interface WorkbenchTaskSummary {
   id: string;
+  identifier?: string;
+  shortIdentifier?: string;
   title: string;
   status: WorkbenchTaskStatus;
+  priority?: number | null;
+  labels?: string[];
   latestSummary?: string;
   lastProgressAt?: string;
   createdAt?: string;
   updatedAt?: string;
   evidenceSummary?: WorkbenchTaskEvidenceSummary;
   workspaceBinding?: TaskWorkspaceBinding;
+  agentLoop?: AgentLoopMetadata;
   lastAdjustment?: WorkbenchTaskAdjustmentRecord;
+  comments?: WorkbenchTaskCommentRecord[];
 }
 
 export interface WorkbenchTimelineNode {
@@ -67,6 +75,7 @@ export interface WorkbenchEvidenceDigest {
   toolNames: string[];
   previewableArtifacts: WorkbenchArtifactRecord[];
   modifiedFiles: string[];
+  latestDiffExcerpt?: string;
   latestOutputExcerpt: string;
   latestErrorExcerpt?: string;
   latestToolName?: string;
@@ -80,9 +89,17 @@ export interface WorkbenchAcceptanceSummary {
 }
 
 export interface WorkbenchQueueSignal {
-  tone: 'green' | 'blue' | 'yellow' | 'neutral';
+  tone: 'green' | 'blue' | 'yellow' | 'red' | 'neutral';
   label: string;
   detail: string;
+}
+
+export interface WorkbenchAgentLoopSummary {
+  label: string;
+  detail: string;
+  kindLabel: string;
+  shortHeadSha: string;
+  tone: 'green' | 'blue' | 'yellow' | 'neutral';
 }
 
 export interface WorkbenchLiveRunEntry {
@@ -111,7 +128,7 @@ export interface GroupedWorkbenchTasks<T extends WorkbenchTaskSummary = Workbenc
   archived: T[];
 }
 
-export type WorkbenchLens = 'inbox' | 'today' | 'all' | 'completed' | 'archived';
+export type WorkbenchLens = 'inbox' | 'today' | 'active' | 'review-loop' | 'all' | 'completed' | 'archived' | 'backlog';
 
 export interface WorkbenchFocusSummary {
   lens: WorkbenchLens;
@@ -179,6 +196,13 @@ export interface WorkbenchWorkspaceBindingSummary {
   scopeLabel: string;
 }
 
+export interface WorkbenchRuntimeControlAction {
+  id: 'pause' | 'resume' | 'stop';
+  label: string;
+  pendingLabel: string;
+  danger?: boolean;
+}
+
 const LOW_SIGNAL_LEGACY_EVENTS = new Set([
   'session.message',
   'session.usage',
@@ -205,7 +229,7 @@ const STALE_TERMINAL_SUMMARY_BODIES = new Set([
   'Stale task archived after its runtime record went missing.',
 ]);
 
-type SearchableWorkbenchTaskFields = Partial<Pick<WorkbenchTaskSummary, 'latestSummary'>> & {
+type SearchableWorkbenchTaskFields = Partial<Pick<WorkbenchTaskSummary, 'latestSummary' | 'agentLoop'>> & {
   goal?: string;
   currentOwner?: string;
   waitingReason?: string;
@@ -278,6 +302,15 @@ export function filterWorkbenchTasksByQuery<T extends WorkbenchTaskSummary & Sea
       task.workspaceBinding?.workspaceName,
       task.workspaceBinding?.projectName,
       task.workspaceBinding?.effectiveProjectPath,
+      task.agentLoop?.kind,
+      task.agentLoop?.idempotencyKey,
+      task.agentLoop?.rootTaskId,
+      task.agentLoop?.changeRequest.repo,
+      task.agentLoop?.changeRequest.id,
+      task.agentLoop?.changeRequest.headSha,
+      task.agentLoop?.changeRequest.headRef,
+      task.agentLoop?.changeRequest.baseRef,
+      ...(task.agentLoop?.reviewFocus || []),
     ]
       .filter((value): value is string => typeof value === 'string' && value.length > 0)
       .join(' ')
@@ -314,9 +347,9 @@ export function getNextActiveWorkbenchTaskId<T extends WorkbenchTaskSummary>(
 export function groupWorkbenchTasks<T extends WorkbenchTaskSummary>(tasks: T[]): GroupedWorkbenchTasks<T> {
   const sorted = sortWorkbenchTasks(tasks);
   return {
-    attention: sorted.filter((task) => task.status === 'waiting_for_user' || task.status === 'failed' || task.status === 'blocked' || task.status === 'cancelled'),
-    active: sorted.filter((task) => task.status === 'running' || task.status === 'verifying'),
-    backlog: sorted.filter((task) => task.status === 'new' || task.status === 'paused'),
+    attention: sorted.filter((task) => task.status === 'waiting_for_user' || task.status === 'in_review' || task.status === 'failed' || task.status === 'blocked' || task.status === 'cancelled' || task.priority === 1),
+    active: sorted.filter((task) => task.status === 'todo' || task.status === 'in_progress' || task.status === 'in_review' || task.status === 'running' || task.status === 'verifying'),
+    backlog: sorted.filter((task) => task.status === 'backlog' || task.status === 'new' || task.status === 'paused'),
     completed: sorted.filter((task) => task.status === 'completed'),
     archived: sorted.filter((task) => task.status === 'archived'),
   };
@@ -422,6 +455,38 @@ export function buildWorkbenchWorkspaceBindingSummary(
   };
 }
 
+export function buildWorkbenchAgentLoopSummary(
+  metadata: AgentLoopMetadata | null | undefined,
+): WorkbenchAgentLoopSummary | null {
+  if (!metadata) {
+    return null;
+  }
+
+  const kindLabel = humanizeAgentLoopKind(metadata.kind);
+  const shortHeadSha = (metadata.headSha || metadata.changeRequest.headSha || '').slice(0, 12);
+  const round = metadata.kind === 'human_review'
+    ? `R${metadata.round}`
+    : `R${metadata.round}/${metadata.maxRounds}`;
+  const repoRef = `${metadata.changeRequest.repo}#${metadata.changeRequest.id}`;
+  const staleSuffix = metadata.stale ? ' · stale' : '';
+
+  return {
+    label: `${kindLabel} · ${round}`,
+    detail: `${repoRef} · ${metadata.changeRequest.headRef} · ${shortHeadSha}${staleSuffix}`,
+    kindLabel,
+    shortHeadSha,
+    tone: metadata.stale
+      ? 'yellow'
+      : metadata.kind === 'human_review'
+        ? 'yellow'
+        : metadata.kind === 'codex_fix'
+          ? 'blue'
+          : metadata.kind === 'codex_implement'
+            ? 'green'
+            : 'neutral',
+  };
+}
+
 export function buildWorkbenchOverview<T extends WorkbenchTaskSummary>(tasks: T[]): WorkbenchOverviewMetrics {
   const grouped = groupWorkbenchTasks(tasks);
   return {
@@ -452,10 +517,16 @@ export function filterWorkbenchTasksByLens<T extends WorkbenchTaskSummary>(
         const timestamp = task.lastProgressAt || task.updatedAt || task.createdAt;
         return typeof timestamp === 'string' && timestamp.startsWith(todayPrefix);
       }));
+    case 'active':
+      return grouped.active;
+    case 'review-loop':
+      return sortWorkbenchTasks(tasks.filter((task) => task.status !== 'archived' && Boolean(task.agentLoop)));
     case 'completed':
       return grouped.completed;
     case 'archived':
       return grouped.archived;
+    case 'backlog':
+      return grouped.backlog;
     case 'all':
     default:
       return sortWorkbenchTasks(filterVisibleWorkbenchTasks(tasks));
@@ -663,7 +734,7 @@ export function parseWorkbenchEvidence(item: Pick<WorkbenchTimelineNode, 'body'>
   const toolName = item.body.match(/^Tool:\s*(.+)$/m)?.[1]?.trim();
   const output = extractNamedSection(item.body, 'Output');
   const error = extractNamedSection(item.body, 'Error');
-  const filesModified = extractBulletSection(item.body, 'Files modified');
+  const filesModified = extractModifiedFilesFromEvidenceBody(item.body);
 
   return {
     toolName,
@@ -681,6 +752,7 @@ export function buildWorkbenchEvidenceDigest<T extends Pick<WorkbenchTimelineNod
   const toolNames: string[] = [];
   const previewableArtifacts = new Map<string, WorkbenchArtifactRecord>();
   const modifiedFiles: string[] = [];
+  let latestDiffExcerpt: string | undefined;
   let latestOutputExcerpt = '';
   let latestErrorExcerpt: string | undefined;
   let latestToolName: string | undefined;
@@ -696,6 +768,10 @@ export function buildWorkbenchEvidenceDigest<T extends Pick<WorkbenchTimelineNod
       latestOutputExcerpt = truncateWorkbenchEvidenceText(parsed.output);
       latestToolName = parsed.toolName;
       latestCreatedAt = item.createdAt;
+    }
+
+    if (!latestDiffExcerpt && parsed.output) {
+      latestDiffExcerpt = extractWorkbenchDiffExcerpt(parsed.output);
     }
 
     if (!latestErrorExcerpt && parsed.error) {
@@ -730,6 +806,7 @@ export function buildWorkbenchEvidenceDigest<T extends Pick<WorkbenchTimelineNod
     toolNames,
     previewableArtifacts: Array.from(previewableArtifacts.values()),
     modifiedFiles,
+    latestDiffExcerpt,
     latestOutputExcerpt,
     latestErrorExcerpt,
     latestToolName,
@@ -814,6 +891,35 @@ export function buildWorkbenchQueueSignal(
   const artifactCount = evidenceSummary?.previewableArtifactCount ?? 0;
   const fileCount = evidenceSummary?.modifiedFileCount ?? 0;
   const rawEventCount = evidenceSummary?.rawEventCount ?? 0;
+  const hasErrorEvidence = evidenceSummary?.hasErrorEvidence ?? false;
+
+  if (hasErrorEvidence && task.status !== 'archived') {
+    if (task.status === 'completed') {
+      return {
+        tone: 'yellow',
+        label: 'Run had errors',
+        detail: fileCount > 0
+          ? `Completed with tool errors in evidence · ${formatCount(fileCount, 'file')} touched`
+          : 'Completed with tool errors in evidence. Inspect Activity before accepting output.',
+      };
+    }
+
+    if (task.status === 'failed' || task.status === 'blocked' || task.status === 'cancelled') {
+      return {
+        tone: 'red',
+        label: 'Recover before review',
+        detail: 'Latest evidence contains a tool error. Recover or redirect the task before accepting output.',
+      };
+    }
+
+    return {
+      tone: 'red',
+      label: 'Tool error',
+      detail: rawEventCount > 0
+        ? `${formatCount(rawEventCount, 'evidence event')} recorded · latest run contains a tool error`
+        : 'Latest run contains a tool error. Open Activity for details.',
+    };
+  }
 
   if (task.status === 'waiting_for_user') {
     return artifactCount > 0
@@ -979,13 +1085,24 @@ export function buildWorkbenchOperatorNoteSummary(
   return note ? `Operator note: ${note}` : null;
 }
 
+export function buildWorkbenchLatestCommentSummary(
+  task: Pick<WorkbenchTaskSummary, 'comments'>,
+): string | null {
+  const latestHumanComment = [...(task.comments || [])]
+    .reverse()
+    .find((comment) => comment.authorKind === 'human' && comment.body.trim());
+  const body = latestHumanComment?.body.trim();
+  return body ? `Latest comment: ${body}` : null;
+}
+
 export function buildWorkbenchTaskVisibleSummary(
-  task: Pick<WorkbenchTaskSummary, 'latestSummary' | 'lastAdjustment'> & {
+  task: Pick<WorkbenchTaskSummary, 'latestSummary' | 'lastAdjustment' | 'comments'> & {
     goal?: string;
     waitingReason?: string;
   },
 ): string | null {
   return buildWorkbenchOperatorNoteSummary(task)
+    || buildWorkbenchLatestCommentSummary(task)
     || normalizeWorkbenchSummaryText(task.latestSummary)
     || task.waitingReason?.trim()
     || task.goal?.trim()
@@ -1084,6 +1201,54 @@ function extractBulletSection(body: string, sectionName: string): string[] {
     .filter(Boolean);
 }
 
+function extractWorkbenchDiffExcerpt(output: string, maxLength = 6000): string | undefined {
+  const candidates = [output, ...extractJsonStringValues(output)];
+  for (const candidate of candidates) {
+    const diffStart = candidate.indexOf('diff --git ');
+    if (diffStart < 0) {
+      continue;
+    }
+
+    const diff = candidate.slice(diffStart).trim();
+    if (!diff) {
+      continue;
+    }
+
+    return diff.length <= maxLength ? diff : `${diff.slice(0, maxLength - 1)}…`;
+  }
+
+  return undefined;
+}
+
+function extractJsonStringValues(value: string): string[] {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+    return [];
+  }
+
+  try {
+    return collectJsonStringValues(JSON.parse(trimmed));
+  } catch {
+    return [];
+  }
+}
+
+function collectJsonStringValues(value: unknown): string[] {
+  if (typeof value === 'string') {
+    return [value];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectJsonStringValues(item));
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.values(value).flatMap((item) => collectJsonStringValues(item));
+  }
+
+  return [];
+}
+
 function escapeForRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -1151,4 +1316,275 @@ function compactWorkbenchPath(filePath: string): string {
 
 function formatCount(count: number, label: string): string {
   return `${count} ${label}${count === 1 ? '' : 's'}`;
+}
+
+function humanizeAgentLoopKind(kind: AgentLoopMetadata['kind']): string {
+  switch (kind) {
+    case 'claude_review':
+      return 'Claude review';
+    case 'codex_fix':
+      return 'Codex fix';
+    case 'human_review':
+      return 'Human review';
+    case 'codex_implement':
+    default:
+      return 'Codex implement';
+  }
+}
+
+// ─── Task status banner spec ────────────────────────────────────────────────
+//
+// Drives the conditional banner at the top of the task detail panel. Returns
+// `null` when the task is in a quiet state (running / queued / no decision)
+// so the banner does not render and the activity block becomes the focal
+// surface.
+
+export type TaskStatusBannerTone = 'yellow' | 'red' | 'green' | 'neutral';
+
+export type TaskStatusBannerActionKind = 'primary' | 'secondary' | 'danger';
+
+export type TaskStatusBannerAction =
+  | { id: 'retry'; label: string; kind: TaskStatusBannerActionKind }
+  | { id: 'archive'; label: string; kind: TaskStatusBannerActionKind }
+  | { id: 'cancel'; label: string; kind: TaskStatusBannerActionKind }
+  | { id: 'resume'; label: string; kind: TaskStatusBannerActionKind }
+  | { id: 'stop'; label: string; kind: TaskStatusBannerActionKind }
+  | { id: 'reopen'; label: string; kind: TaskStatusBannerActionKind }
+  | { id: 'unblock'; label: string; kind: TaskStatusBannerActionKind }
+  | { id: 'run-next-pass'; label: string; kind: TaskStatusBannerActionKind };
+
+export interface TaskStatusBannerSpec {
+  tone: TaskStatusBannerTone;
+  icon: '⚠' | '✗' | '✓' | '○' | '⏸';
+  headline: string;
+  detail?: string;
+  // Banner does not render its own action buttons when the decision block
+  // is the source of truth; in that case `actions` stays empty.
+  actions: TaskStatusBannerAction[];
+  // Hint to the panel: the decision block is the authoritative action
+  // surface, banner should not duplicate buttons.
+  decisionDriven: boolean;
+}
+
+interface TaskStatusBannerInput {
+  status: WorkbenchTaskStatus;
+  waitingReason?: string;
+  attempts?: Array<{ attemptNumber: number; outcome?: string; error?: string }>;
+  blockedBy?: Array<{ state?: string | null }>;
+  blockedByTaskIds?: string[];
+}
+
+export function buildTaskStatusBannerSpec(
+  task: TaskStatusBannerInput | null,
+  decisions: Array<{ title?: string; summary?: string }> = [],
+): TaskStatusBannerSpec | null {
+  if (!task) {
+    return null;
+  }
+
+  // Decision pending — yellow banner, no buttons (decision block owns them).
+  if (decisions.length > 0) {
+    const decision = decisions[0];
+    return {
+      tone: 'yellow',
+      icon: '⚠',
+      headline: decision?.title?.trim() || 'Waiting on you',
+      detail: decision?.summary?.trim() || 'Operator review required before the next move.',
+      actions: [],
+      decisionDriven: true,
+    };
+  }
+
+  switch (task.status) {
+    case 'running':
+    case 'in_progress':
+    case 'todo':
+    case 'backlog':
+    case 'verifying':
+    case 'new':
+      return null;
+
+    case 'waiting_for_user':
+      return {
+        tone: 'yellow',
+        icon: '⚠',
+        headline: 'Waiting on you',
+        detail: task.waitingReason?.trim() || 'Operator input is required before the task can continue.',
+        actions: [
+          { id: 'resume', label: 'Resume', kind: 'primary' },
+          { id: 'stop', label: 'Stop', kind: 'danger' },
+        ],
+        decisionDriven: false,
+      };
+
+    case 'in_review':
+      return {
+        tone: 'yellow',
+        icon: '⚠',
+        headline: 'In review',
+        detail: task.waitingReason?.trim() || 'Awaiting human review before the task can move forward.',
+        actions: [
+          { id: 'resume', label: 'Resume', kind: 'primary' },
+          { id: 'stop', label: 'Stop', kind: 'danger' },
+        ],
+        decisionDriven: false,
+      };
+
+    case 'paused':
+      return {
+        tone: 'neutral',
+        icon: '⏸',
+        headline: 'Paused',
+        detail: task.waitingReason?.trim() || 'Task is paused. Resume to continue execution.',
+        actions: [
+          { id: 'resume', label: 'Resume', kind: 'primary' },
+          { id: 'stop', label: 'Stop', kind: 'danger' },
+        ],
+        decisionDriven: false,
+      };
+
+    case 'failed': {
+      const lastAttempt = task.attempts?.at(-1);
+      const headline = lastAttempt
+        ? `Failed on attempt ${lastAttempt.attemptNumber}`
+        : 'Failed';
+      return {
+        tone: 'red',
+        icon: '✗',
+        headline,
+        detail: lastAttempt?.error?.trim() || 'The latest attempt did not finish successfully.',
+        actions: [
+          { id: 'retry', label: 'Retry', kind: 'primary' },
+          { id: 'cancel', label: 'Cancel', kind: 'secondary' },
+        ],
+        decisionDriven: false,
+      };
+    }
+
+    case 'blocked': {
+      const openBlockers = (task.blockedBy || []).filter((blocker) => {
+        const state = blocker.state?.toLowerCase();
+        return state !== 'done' && state !== 'closed' && state !== 'completed' && state !== 'terminal';
+      }).length;
+      const idCount = task.blockedByTaskIds?.length || 0;
+      const blockerCount = openBlockers || idCount;
+      return {
+        tone: 'red',
+        icon: '✗',
+        headline: 'Blocked',
+        detail: blockerCount > 0
+          ? `${formatCount(blockerCount, 'open blocker')}.`
+          : 'Marked blocked. Resolve dependencies before continuing.',
+        actions: [
+          { id: 'unblock', label: 'Mark unblocked', kind: 'primary' },
+          { id: 'cancel', label: 'Cancel', kind: 'secondary' },
+        ],
+        decisionDriven: false,
+      };
+    }
+
+    case 'completed': {
+      const lastAttempt = task.attempts?.at(-1);
+      const headline = lastAttempt
+        ? `Completed on attempt ${lastAttempt.attemptNumber}`
+        : 'Completed';
+      return {
+        tone: 'green',
+        icon: '✓',
+        headline,
+        detail: 'Acceptance evidence is ready below. Archive when satisfied.',
+        actions: [
+          { id: 'run-next-pass', label: 'Run next pass', kind: 'primary' },
+          { id: 'archive', label: 'Archive', kind: 'secondary' },
+        ],
+        decisionDriven: false,
+      };
+    }
+
+    case 'cancelled':
+      return {
+        tone: 'neutral',
+        icon: '○',
+        headline: 'Cancelled',
+        detail: 'Task was cancelled. Reopen to bring it back into the queue.',
+        actions: [{ id: 'reopen', label: 'Reopen', kind: 'primary' }],
+        decisionDriven: false,
+      };
+
+    case 'archived':
+      return {
+        tone: 'neutral',
+        icon: '○',
+        headline: 'Archived',
+        detail: 'Task is archived. Reopen to surface it in the active queue again.',
+        actions: [{ id: 'reopen', label: 'Reopen', kind: 'primary' }],
+        decisionDriven: false,
+      };
+
+    default:
+      return null;
+  }
+}
+
+// ─── Task status transitions (moved from WorkbenchOutputRail) ───────────────
+//
+// Single source of truth so multiple components can drive the same dropdown
+// without duplicating the table.
+
+const ALLOWED_METADATA_TRANSITIONS: Partial<Record<WorkbenchTaskStatus, WorkbenchTaskStatus[]>> = {
+  new: ['new', 'todo', 'running', 'cancelled', 'archived'],
+  backlog: ['backlog', 'todo', 'cancelled', 'archived'],
+  todo: ['todo', 'in_progress', 'running', 'cancelled', 'blocked', 'archived'],
+  in_progress: ['in_progress', 'failed', 'in_review', 'waiting_for_user', 'completed', 'blocked', 'cancelled'],
+  in_review: ['in_review', 'in_progress', 'running', 'cancelled', 'blocked'],
+  running: ['running', 'failed', 'waiting_for_user', 'in_review', 'completed', 'blocked', 'cancelled', 'paused'],
+  waiting_for_user: ['waiting_for_user', 'running', 'in_progress', 'cancelled', 'blocked'],
+  blocked: ['blocked', 'todo', 'cancelled', 'archived'],
+  verifying: ['verifying', 'completed', 'failed', 'cancelled'],
+  completed: ['completed', 'archived', 'todo'],
+  failed: ['failed', 'todo', 'in_progress', 'running', 'archived'],
+  cancelled: ['cancelled', 'archived', 'todo'],
+  paused: ['paused', 'running', 'in_progress', 'cancelled', 'archived'],
+  archived: ['archived', 'todo'],
+};
+
+export function allowedMetadataStatuses(status: WorkbenchTaskStatus): WorkbenchTaskStatus[] {
+  return ALLOWED_METADATA_TRANSITIONS[status] || [status];
+}
+
+export function canPauseTask(status: WorkbenchTaskStatus): boolean {
+  return status === 'in_progress'
+    || status === 'running'
+    || status === 'verifying';
+}
+
+export function canResumeTask(status: WorkbenchTaskStatus): boolean {
+  return status === 'paused' || status === 'in_review' || status === 'waiting_for_user';
+}
+
+export function canStopTask(status: WorkbenchTaskStatus): boolean {
+  return status === 'in_progress'
+    || status === 'running'
+    || status === 'verifying'
+    || status === 'waiting_for_user'
+    || status === 'in_review'
+    || status === 'paused';
+}
+
+export function buildWorkbenchRuntimeControlActions(status: WorkbenchTaskStatus): WorkbenchRuntimeControlAction[] {
+  const actions: WorkbenchRuntimeControlAction[] = [];
+
+  if (canPauseTask(status)) {
+    actions.push({ id: 'pause', label: 'Pause', pendingLabel: 'Pausing...' });
+  }
+
+  if (canResumeTask(status)) {
+    actions.push({ id: 'resume', label: 'Resume', pendingLabel: 'Resuming...' });
+  }
+
+  if (canStopTask(status)) {
+    actions.push({ id: 'stop', label: 'Stop', pendingLabel: 'Stopping...', danger: true });
+  }
+
+  return actions;
 }

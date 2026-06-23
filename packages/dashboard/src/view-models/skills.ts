@@ -356,10 +356,6 @@ export function buildSkillVersionEntries(skill: SkillManifestRecord): SkillVersi
   return entries.filter((entry, index, list) => list.findIndex((item) => item.id === entry.id) === index);
 }
 
-export function buildSkillCommandSnippet(skill: SkillManifestRecord): string {
-  return `@skill/${skill.id} #show-impact review ${skill.bindings.length} bindings, ${skill.requiredTools.length} tools, and ${skill.selectedTaskCount} selected tasks`;
-}
-
 export function buildSkillManifestSnapshot(skill: SkillManifestRecord): SkillManifestSnapshot {
   return {
     skillId: skill.id,

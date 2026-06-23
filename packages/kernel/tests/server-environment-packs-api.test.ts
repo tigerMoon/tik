@@ -180,4 +180,54 @@ describe('environment pack API routes', () => {
       },
     ]);
   });
+
+  it('creates legacy kernel tasks with the active pack selection', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-env-pack-legacy-task-'));
+    tempDirs.push(root);
+    await createPack(root, 'base-engineering', 'Base Engineering');
+
+    let createdInput: any = null;
+    const mockKernel = {
+      projectPath: root,
+      taskManager: {
+        create: (input: any) => {
+          createdInput = input;
+          return { id: 'task-legacy', ...input };
+        },
+      },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      environmentPacks: new EnvironmentPackRegistry(root),
+    };
+
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/tasks',
+      payload: {
+        description: 'Legacy task',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(createdInput.environmentPackSnapshot).toEqual({
+      id: 'base-engineering',
+      name: 'Base Engineering',
+      version: '0.1.0',
+    });
+    expect(createdInput.environmentPackSelection).toEqual({
+      selectedSkills: ['coder'],
+      selectedKnowledgeIds: [],
+    });
+  });
 });

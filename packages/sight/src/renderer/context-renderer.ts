@@ -90,6 +90,11 @@ export class ContextRenderer {
       sections.push(this.renderConversation(envelope.conversation));
     }
 
+    // 10. Operator guidance from human comments (newest last)
+    if (envelope.conversation.operatorComments?.length) {
+      sections.push(this.renderOperatorGuidance(envelope.conversation.operatorComments));
+    }
+
     return sections.join('\n\n---\n\n');
   }
 
@@ -310,10 +315,42 @@ export class ContextRenderer {
     return parts.join('\n\n');
   }
 
+  private renderOperatorGuidance(
+    comments: NonNullable<ConversationContext['operatorComments']>,
+  ): string {
+    const parts: string[] = [
+      '# Operator Guidance',
+      'Recent comments from the human operator. Treat these as authoritative direction; they override prior plan steps unless they conflict with safety.',
+    ];
+
+    for (const comment of comments) {
+      const date = formatOperatorCommentDate(comment.createdAt);
+      const author = comment.authorId?.trim() || 'human';
+      parts.push(`## ${author} (${date})`);
+      parts.push(comment.body);
+    }
+
+    return parts.join('\n\n');
+  }
+
   // ─── Helpers ──────────────────────────────────────────────
 
   private truncate(text: string, maxLen: number): string {
     if (text.length <= maxLen) return text;
     return text.slice(0, maxLen) + '\n[... truncated]';
   }
+}
+
+function formatOperatorCommentDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  // YYYY-MM-DD HH:mm in UTC; matches the audit feel of timeline entries.
+  const yyyy = date.getUTCFullYear();
+  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(date.getUTCDate()).padStart(2, '0');
+  const hh = String(date.getUTCHours()).padStart(2, '0');
+  const min = String(date.getUTCMinutes()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd} ${hh}:${min} UTC`;
 }

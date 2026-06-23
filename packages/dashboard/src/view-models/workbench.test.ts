@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
   applyTaskAdjustmentPreset,
+  allowedMetadataStatuses,
+  buildTaskStatusBannerSpec,
   buildWorkbenchAcceptanceSummary,
   buildWorkbenchEvidenceDigest,
   buildWorkbenchLiveRunEntries,
+  buildWorkbenchAgentLoopSummary,
+  buildWorkbenchLatestCommentSummary,
   buildWorkbenchOperatorNoteSummary,
   buildWorkbenchQueueSignal,
+  buildWorkbenchRuntimeControlActions,
   buildWorkbenchSteeringUpdateInput,
   buildWorkbenchTaskVisibleSummary,
   buildTimelineFeedMetrics,
@@ -139,6 +144,64 @@ describe('workbench view models', () => {
     expect(filterVisibleWorkbenchTasks(tasks, { showArchived: true }).map((task) => task.id)).toEqual(['active', 'archived']);
   });
 
+  it('groups tracker workflow states into backlog, active, and attention lanes', () => {
+    const tasks: WorkbenchTaskSummary[] = [
+      { id: 'backlog', title: 'backlog', status: 'backlog', updatedAt: '2026-04-09T00:00:00.000Z' },
+      { id: 'todo', title: 'todo', status: 'todo', updatedAt: '2026-04-09T00:00:01.000Z' },
+      { id: 'progress', title: 'progress', status: 'in_progress', updatedAt: '2026-04-09T00:00:02.000Z' },
+      { id: 'review', title: 'review', status: 'in_review', updatedAt: '2026-04-09T00:00:03.000Z' },
+      { id: 'urgent', title: 'urgent', status: 'todo', priority: 1, updatedAt: '2026-04-09T00:00:04.000Z' },
+    ];
+
+    const grouped = groupWorkbenchTasks(tasks);
+
+    expect(grouped.backlog.map((task) => task.id)).toEqual(['backlog']);
+    expect(grouped.active.map((task) => task.id)).toEqual(['urgent', 'review', 'progress', 'todo']);
+    expect(grouped.attention.map((task) => task.id)).toEqual(['urgent', 'review']);
+    expect(filterWorkbenchTasksByLens(tasks, 'backlog').map((task) => task.id)).toEqual(['backlog']);
+  });
+
+  it('surfaces agent-loop tasks in review loop lane and search metadata', () => {
+    const tasks: WorkbenchTaskSummary[] = [
+      {
+        id: 'review-task',
+        title: 'Review local changes',
+        status: 'todo',
+        updatedAt: '2026-04-09T00:00:01.000Z',
+        agentLoop: {
+          kind: 'claude_review',
+          rootTaskId: 'local-review',
+          round: 1,
+          maxRounds: 3,
+          headSha: 'abcdef1234567890',
+          idempotencyKey: 'claude_review:internal:tik:local-review:abcdef:r1',
+          changeRequest: {
+            scm: 'internal',
+            repo: 'tik',
+            id: 'local-review:abcdef',
+            type: 'internal_review',
+            baseRef: 'HEAD~1',
+            headRef: 'codex/tik-agent-loop-mvp',
+            headSha: 'abcdef1234567890',
+          },
+          reviewFocus: ['dashboard visibility'],
+        },
+      },
+      { id: 'normal-task', title: 'Normal task', status: 'todo', updatedAt: '2026-04-09T00:00:00.000Z' },
+    ];
+
+    expect(filterWorkbenchTasksByLens(tasks, 'review-loop').map((task) => task.id)).toEqual(['review-task']);
+    expect(filterWorkbenchTasksByQuery(tasks, 'claude_review').map((task) => task.id)).toEqual(['review-task']);
+    expect(filterWorkbenchTasksByQuery(tasks, 'dashboard visibility').map((task) => task.id)).toEqual(['review-task']);
+    expect(buildWorkbenchAgentLoopSummary(tasks[0]?.agentLoop)).toEqual({
+      label: 'Claude review · R1/3',
+      detail: 'tik#local-review:abcdef · codex/tik-agent-loop-mvp · abcdef123456',
+      kindLabel: 'Claude review',
+      shortHeadSha: 'abcdef123456',
+      tone: 'neutral',
+    });
+  });
+
   it('extracts previewable artifact information from raw write_file evidence', () => {
     const parsed = parseWorkbenchEvidence({
       id: 'raw-1',
@@ -160,6 +223,59 @@ describe('workbench view models', () => {
     expect(parsed.filesModified).toEqual(['/Users/huyuehui/ace/tik/src/mock-app.html']);
     expect(parsed.previewableArtifacts).toEqual(['/Users/huyuehui/ace/tik/src/mock-app.html']);
     expect(parsed.output).toContain('Written 8360 bytes');
+  });
+
+  it('extracts modified files from raw git status and git diff shell evidence', () => {
+    const parsed = parseWorkbenchEvidence({
+      id: 'raw-git',
+      kind: 'raw',
+      actor: 'system',
+      body: [
+        'Tool: bash',
+        '',
+        'Output:',
+        ' M packages/dashboard/src/styles/workbench-inbox.css',
+        '?? packages/dashboard/src/styles/workbench-inbox.test.ts',
+        'diff --git a/packages/dashboard/src/App.tsx b/packages/dashboard/src/App.tsx',
+        'index 123..456 100644',
+      ].join('\n'),
+      createdAt: '2026-04-09T00:00:00.000Z',
+    });
+
+    expect(parsed.filesModified).toEqual([
+      'packages/dashboard/src/styles/workbench-inbox.css',
+      'packages/dashboard/src/styles/workbench-inbox.test.ts',
+      'packages/dashboard/src/App.tsx',
+    ]);
+  });
+
+  it('extracts modified files from JSON bash stdout evidence', () => {
+    const parsed = parseWorkbenchEvidence({
+      id: 'raw-json-git',
+      kind: 'raw',
+      actor: 'system',
+      body: [
+        'Tool: bash',
+        '',
+        'Output:',
+        JSON.stringify({
+          command: 'git status --short && git diff -- packages/dashboard/src/styles/workbench-inbox.css',
+          stdout: [
+            '/Users/huyuehui/ace/tik/.workspace/worktrees/tik-805562e6--tik-83',
+            ' M packages/dashboard/src/styles/workbench-inbox.css',
+            '?? packages/dashboard/src/styles/workbench-inbox.test.ts',
+            'diff --git a/packages/dashboard/src/styles/workbench-inbox.css b/packages/dashboard/src/styles/workbench-inbox.css',
+          ].join('\n'),
+          exitCode: 0,
+        }, null, 2),
+      ].join('\n'),
+      createdAt: '2026-04-09T00:00:00.000Z',
+    });
+
+    expect(parsed.filesModified).toEqual([
+      'packages/dashboard/src/styles/workbench-inbox.css',
+      'packages/dashboard/src/styles/workbench-inbox.test.ts',
+    ]);
   });
 
   it('builds an evidence digest with newest artifacts, tools, and latest output excerpts', () => {
@@ -207,6 +323,63 @@ describe('workbench view models', () => {
     });
     expect(digest.latestOutputExcerpt).toContain('Captured a fresh browser screenshot');
     expect(digest.modifiedFiles[0]).toBe('/Users/huyuehui/ace/tik/.tik-artifacts/hero.png');
+  });
+
+  it('counts modified files from shell git evidence in the digest', () => {
+    const digest = buildWorkbenchEvidenceDigest([
+      {
+        id: 'raw-git',
+        kind: 'raw',
+        actor: 'system',
+        body: [
+          'Tool: bash',
+          '',
+          'Output:',
+          ' M packages/dashboard/src/styles/workbench-inbox.css',
+          '?? packages/dashboard/src/styles/workbench-inbox.test.ts',
+          'diff --git a/packages/dashboard/src/styles/workbench-inbox.css b/packages/dashboard/src/styles/workbench-inbox.css',
+        ].join('\n'),
+        createdAt: '2026-04-09T02:00:00.000Z',
+      },
+    ]);
+
+    expect(digest.modifiedFileCount).toBe(2);
+    expect(digest.modifiedFiles).toEqual([
+      'packages/dashboard/src/styles/workbench-inbox.css',
+      'packages/dashboard/src/styles/workbench-inbox.test.ts',
+    ]);
+  });
+
+  it('extracts the latest git diff excerpt for acceptance review', () => {
+    const digest = buildWorkbenchEvidenceDigest([
+      {
+        id: 'raw-diff',
+        kind: 'raw',
+        actor: 'system',
+        body: [
+          'Tool: bash',
+          '',
+          'Output:',
+          JSON.stringify({
+            command: 'git diff -- packages/dashboard/src/App.tsx',
+            stdout: [
+              'diff --git a/packages/dashboard/src/App.tsx b/packages/dashboard/src/App.tsx',
+              'index 1111111..2222222 100644',
+              '--- a/packages/dashboard/src/App.tsx',
+              '+++ b/packages/dashboard/src/App.tsx',
+              '@@ -1,3 +1,4 @@',
+              ' import React from "react";',
+              '+import { TaskCommentsBlock } from "./TaskCommentsBlock";',
+            ].join('\n'),
+            exitCode: 0,
+          }, null, 2),
+        ].join('\n'),
+        createdAt: '2026-04-09T02:00:00.000Z',
+      },
+    ]);
+
+    expect(digest.latestDiffExcerpt).toContain('diff --git a/packages/dashboard/src/App.tsx');
+    expect(digest.latestDiffExcerpt).toContain('+import { TaskCommentsBlock }');
   });
 
   it('derives acceptance summaries from task state and evidence density', () => {
@@ -281,6 +454,36 @@ describe('workbench view models', () => {
       label: 'Decision pending',
       detail: 'Need approval',
     });
+
+    expect(buildWorkbenchQueueSignal({
+      status: 'running',
+      evidenceSummary: {
+        rawEventCount: 12,
+        modifiedFileCount: 2,
+        previewableArtifactCount: 0,
+        latestToolName: 'bash',
+        hasErrorEvidence: true,
+      },
+    })).toEqual({
+      tone: 'red',
+      label: 'Tool error',
+      detail: '12 evidence events recorded · latest run contains a tool error',
+    });
+
+    expect(buildWorkbenchQueueSignal({
+      status: 'completed',
+      evidenceSummary: {
+        rawEventCount: 12,
+        modifiedFileCount: 2,
+        previewableArtifactCount: 0,
+        latestToolName: 'bash',
+        hasErrorEvidence: true,
+      },
+    })).toEqual({
+      tone: 'yellow',
+      label: 'Run had errors',
+      detail: 'Completed with tool errors in evidence · 2 files touched',
+    });
   });
 
   it('surfaces the latest operator note ahead of stale waiting summaries', () => {
@@ -303,6 +506,34 @@ describe('workbench view models', () => {
 
     expect(buildWorkbenchOperatorNoteSummary(task)).toBe('Operator note: 卡通化实现，并把最新产物挂到任务卡上。');
     expect(buildWorkbenchTaskVisibleSummary(task)).toBe('Operator note: 卡通化实现，并把最新产物挂到任务卡上。');
+  });
+
+  it('surfaces the latest human comment on completed task cards', () => {
+    const task: WorkbenchTaskSummary & { goal: string; waitingReason: string } = {
+      id: 'task-comment',
+      title: 'Left align task list',
+      status: 'completed',
+      goal: 'Left align task list',
+      waitingReason: 'Review finished.',
+      latestSummary: 'Task completed and the latest outputs are ready for review.',
+      comments: [
+        {
+          id: 'agent-comment',
+          authorKind: 'agent',
+          body: 'Internal note',
+          createdAt: '2026-04-13T12:00:00.000Z',
+        },
+        {
+          id: 'human-comment',
+          authorKind: 'human',
+          body: '创建mr 并合并到 master',
+          createdAt: '2026-04-13T12:01:00.000Z',
+        },
+      ],
+    };
+
+    expect(buildWorkbenchLatestCommentSummary(task)).toBe('Latest comment: 创建mr 并合并到 master');
+    expect(buildWorkbenchTaskVisibleSummary(task)).toBe('Latest comment: 创建mr 并合并到 master');
   });
 
   it('builds a compact live run log from summaries, decisions, and tool evidence', () => {
@@ -594,5 +825,148 @@ describe('workbench view models', () => {
     expect(getDefaultWorkbenchFeedLens(decisionGroups, { taskStatus: 'waiting_for_user', hasPendingDecision: true })).toBe('decisions');
     expect(getDefaultWorkbenchFeedLens(evidenceGroups, { taskStatus: 'completed' })).toBe('evidence');
     expect(getDefaultWorkbenchFeedLens(evidenceGroups, { taskStatus: 'running' })).toBe('agents');
+  });
+});
+
+describe('task status banner spec', () => {
+  const baseTask = (overrides: Partial<{
+    status: import('@tik/shared').WorkbenchTaskStatus;
+    waitingReason: string;
+    attempts: Array<{ attemptNumber: number; outcome?: string; error?: string }>;
+    blockedBy: Array<{ state?: string | null }>;
+  }> = {}) => ({
+    status: overrides.status ?? 'todo' as import('@tik/shared').WorkbenchTaskStatus,
+    waitingReason: overrides.waitingReason,
+    attempts: overrides.attempts,
+    blockedBy: overrides.blockedBy,
+  });
+
+  it('returns null for active execution states (banner hidden)', () => {
+    expect(buildTaskStatusBannerSpec(baseTask({ status: 'running' }))).toBeNull();
+    expect(buildTaskStatusBannerSpec(baseTask({ status: 'in_progress' }))).toBeNull();
+    expect(buildTaskStatusBannerSpec(baseTask({ status: 'todo' }))).toBeNull();
+    expect(buildTaskStatusBannerSpec(baseTask({ status: 'backlog' }))).toBeNull();
+    expect(buildTaskStatusBannerSpec(baseTask({ status: 'verifying' }))).toBeNull();
+    expect(buildTaskStatusBannerSpec(baseTask({ status: 'new' }))).toBeNull();
+  });
+
+  it('returns null when no task is selected', () => {
+    expect(buildTaskStatusBannerSpec(null, [])).toBeNull();
+  });
+
+  it('renders a decision-driven banner regardless of task status (no buttons)', () => {
+    const spec = buildTaskStatusBannerSpec(
+      baseTask({ status: 'running' }),
+      [{ title: 'Approve high-risk bash', summary: 'Bash will run rm -rf node_modules' }],
+    );
+
+    expect(spec).not.toBeNull();
+    expect(spec!.tone).toBe('yellow');
+    expect(spec!.headline).toBe('Approve high-risk bash');
+    expect(spec!.actions).toEqual([]);
+    expect(spec!.decisionDriven).toBe(true);
+  });
+
+  it('renders waiting_for_user banner with resume + stop actions', () => {
+    const spec = buildTaskStatusBannerSpec(baseTask({
+      status: 'waiting_for_user',
+      waitingReason: 'Operator rejected high-risk bash',
+    }));
+
+    expect(spec).not.toBeNull();
+    expect(spec!.tone).toBe('yellow');
+    expect(spec!.headline).toBe('Waiting on you');
+    expect(spec!.detail).toBe('Operator rejected high-risk bash');
+    expect(spec!.actions.map((action) => action.id)).toEqual(['resume', 'stop']);
+    expect(spec!.decisionDriven).toBe(false);
+  });
+
+  it('renders failed banner with retry + cancel and surfaces last attempt error', () => {
+    const spec = buildTaskStatusBannerSpec(baseTask({
+      status: 'failed',
+      attempts: [
+        { attemptNumber: 1, outcome: 'failed', error: 'connection timeout to magic-trade' },
+        { attemptNumber: 2, outcome: 'failed', error: 'second pass also timed out' },
+      ],
+    }));
+
+    expect(spec).not.toBeNull();
+    expect(spec!.tone).toBe('red');
+    expect(spec!.headline).toBe('Failed on attempt 2');
+    expect(spec!.detail).toBe('second pass also timed out');
+    expect(spec!.actions.map((action) => action.id)).toEqual(['retry', 'cancel']);
+  });
+
+  it('renders blocked banner with open blocker count', () => {
+    const spec = buildTaskStatusBannerSpec(baseTask({
+      status: 'blocked',
+      blockedBy: [
+        { state: 'todo' },
+        { state: 'done' },
+        { state: 'in_progress' },
+      ],
+    }));
+
+    expect(spec).not.toBeNull();
+    expect(spec!.tone).toBe('red');
+    expect(spec!.headline).toBe('Blocked');
+    expect(spec!.detail).toBe('2 open blockers.');
+    expect(spec!.actions.map((action) => action.id)).toEqual(['unblock', 'cancel']);
+  });
+
+  it('renders completed banner with run-next-pass + archive actions', () => {
+    const spec = buildTaskStatusBannerSpec(baseTask({
+      status: 'completed',
+      attempts: [{ attemptNumber: 1, outcome: 'completed' }],
+    }));
+
+    expect(spec).not.toBeNull();
+    expect(spec!.tone).toBe('green');
+    expect(spec!.headline).toBe('Completed on attempt 1');
+    expect(spec!.actions.map((action) => action.id)).toEqual(['run-next-pass', 'archive']);
+  });
+
+  it('renders paused banner with neutral tone', () => {
+    const spec = buildTaskStatusBannerSpec(baseTask({ status: 'paused' }));
+
+    expect(spec).not.toBeNull();
+    expect(spec!.tone).toBe('neutral');
+    expect(spec!.icon).toBe('⏸');
+    expect(spec!.actions.map((action) => action.id)).toEqual(['resume', 'stop']);
+  });
+
+  it('renders cancelled and archived banners with reopen action', () => {
+    const cancelled = buildTaskStatusBannerSpec(baseTask({ status: 'cancelled' }));
+    expect(cancelled!.tone).toBe('neutral');
+    expect(cancelled!.actions.map((action) => action.id)).toEqual(['reopen']);
+
+    const archived = buildTaskStatusBannerSpec(baseTask({ status: 'archived' }));
+    expect(archived!.tone).toBe('neutral');
+    expect(archived!.actions.map((action) => action.id)).toEqual(['reopen']);
+  });
+});
+
+describe('allowedMetadataStatuses', () => {
+  it('always includes the current status as a no-op option', () => {
+    expect(allowedMetadataStatuses('running')).toContain('running');
+    expect(allowedMetadataStatuses('blocked')).toContain('blocked');
+    expect(allowedMetadataStatuses('completed')).toContain('completed');
+  });
+
+  it('disallows reaching unrelated states from completed', () => {
+    expect(allowedMetadataStatuses('completed')).not.toContain('running');
+    expect(allowedMetadataStatuses('completed')).not.toContain('failed');
+  });
+});
+
+describe('buildWorkbenchRuntimeControlActions', () => {
+  it('hides runtime controls for completed tasks', () => {
+    expect(buildWorkbenchRuntimeControlActions('completed')).toEqual([]);
+  });
+
+  it('surfaces only controls that apply to the current runtime state', () => {
+    expect(buildWorkbenchRuntimeControlActions('running').map((action) => action.id)).toEqual(['pause', 'stop']);
+    expect(buildWorkbenchRuntimeControlActions('paused').map((action) => action.id)).toEqual(['resume', 'stop']);
+    expect(buildWorkbenchRuntimeControlActions('waiting_for_user').map((action) => action.id)).toEqual(['resume', 'stop']);
   });
 });

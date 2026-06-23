@@ -7,7 +7,6 @@ import type {
 } from '../api/client';
 import {
   buildEnvironmentActivationSummary,
-  buildEnvironmentCommandSnippet,
   buildEnvironmentPromotionQueue,
   buildEnvironmentWorkflowCoverage,
   countEnvironmentPromotionItems,
@@ -71,9 +70,7 @@ export function WorkbenchEnvironmentView({
   const activation = selectedPack
     ? buildEnvironmentActivationSummary(selectedPack, tasks, activePackId, dashboard?.generatedAt || lastSyncedAt)
     : null;
-  const commandSnippet = selectedPack
-    ? buildEnvironmentCommandSnippet(selectedPack, promotionQueue.length)
-    : '@env/<pack-id> #open-manifest';
+  const selectedPackStatus = selectedPack?.id === activePackId ? 'Active' : 'Ready';
   const boundTasks = useMemo(
     () => dashboardSummary?.latestBoundTasks || tasks
       .filter((task) => task.environmentPackSnapshot?.id === selectedPack?.id)
@@ -82,6 +79,25 @@ export function WorkbenchEnvironmentView({
       .slice(0, 4),
     [dashboardSummary?.latestBoundTasks, selectedPack?.id, tasks],
   );
+  const mountedNamespaceLabel = dashboardSummary?.mountedNamespaces.join(', ')
+    || activation?.mountedNamespaces.join(', ')
+    || `env/${selectedPack?.id || '<pack-id>'}/*`;
+
+  const handleSwitchPack = async () => {
+    if (!selectedPack) {
+      return;
+    }
+
+    setBusyAction('switch');
+    try {
+      await onSwitchPack(selectedPack.id);
+      setFeedback(`${selectedPack.name} is now the active environment.`);
+    } catch (error) {
+      setFeedback((error as Error).message);
+    } finally {
+      setBusyAction(null);
+    }
+  };
 
   if (!selectedPack) {
     return (
@@ -104,9 +120,9 @@ export function WorkbenchEnvironmentView({
         <div className="top-left">
           <h1>Environments</h1>
           <div className="chips">
-            <span className="chip"><span className="dot" style={{ background: 'var(--wb-blue)' }} />{packs.length} packs</span>
-            <span className="chip"><span className="dot" style={{ background: 'var(--wb-green)' }} />{activePackId ? '1 active' : '0 active'}</span>
-            <span className="chip"><span className="dot" style={{ background: 'var(--wb-yellow)' }} />promotion queue {totalPromotionCount}</span>
+            <span className="chip"><span className="dot is-blue" />{packs.length} packs</span>
+            <span className="chip"><span className="dot is-green" />{activePackId ? '1 active' : '0 active'}</span>
+            <span className="chip"><span className="dot is-yellow" />promotion queue {totalPromotionCount}</span>
           </div>
         </div>
         <div className="actions">
@@ -124,17 +140,7 @@ export function WorkbenchEnvironmentView({
             type="button"
             className="btn primary"
             disabled={busyAction !== null || selectedPack.id === activePackId}
-            onClick={async () => {
-              setBusyAction('switch');
-              try {
-                await onSwitchPack(selectedPack.id);
-                setFeedback(`${selectedPack.name} is now the active environment.`);
-              } catch (error) {
-                setFeedback((error as Error).message);
-              } finally {
-                setBusyAction(null);
-              }
-            }}
+            onClick={handleSwitchPack}
           >
             {selectedPack.id === activePackId ? 'Active pack' : 'Switch pack'}
           </button>
@@ -168,16 +174,17 @@ export function WorkbenchEnvironmentView({
           </div>
         </section>
 
-        <div className="environment-center-column">
-          <section className="card selected-head">
+        <section className="card environment-detail-card">
+          <div className="environment-selected-head">
             <div className="card-title">Selected pack</div>
-            <div className="name">{selectedPack.id}</div>
-            <div className="chips" style={{ marginTop: 14 }}>
-              <span className="chip"><span className="dot" style={{ background: selectedPack.id === activePackId ? 'var(--wb-green)' : 'var(--wb-blue)' }} />{selectedPack.id === activePackId ? 'Active' : 'Ready'}</span>
+            <div className="name">{selectedPack.name}</div>
+            <div className="environment-pack-id">{selectedPack.id}</div>
+            <div className="chips environment-selected-chips">
+              <span className="chip"><span className={`dot ${selectedPack.id === activePackId ? 'is-green' : 'is-blue'}`} />{selectedPackStatus}</span>
               <span className="chip">v{selectedPack.version}</span>
               <span className="chip">{selectedPack.workflowBindings.length} workflows</span>
               <span className="chip">{selectedPack.evaluators.length} evaluators</span>
-              <span className="chip"><span className="dot" style={{ background: 'var(--wb-blue)' }} />single-workspace tasks</span>
+              <span className="chip"><span className="dot is-blue" />single-workspace tasks</span>
             </div>
             <p>{selectedPack.description}</p>
             <div className="inline-bar">
@@ -185,7 +192,7 @@ export function WorkbenchEnvironmentView({
                 ? selectedPack.workflowBindings.map((binding) => binding.workflow).join(' · ')
                 : 'No workflow bindings declared'}
             </div>
-          </section>
+          </div>
 
           <section className="module-grid">
             <EnvironmentItemCard title={`Tools · ${selectedPack.tools.length}`} items={selectedPack.tools} />
@@ -196,7 +203,7 @@ export function WorkbenchEnvironmentView({
             <EnvironmentWorkflowCard bindings={selectedPack.workflowBindings} />
             <EnvironmentItemCard title={`Evaluators · ${selectedPack.evaluators.length}`} items={selectedPack.evaluators} />
           </section>
-        </div>
+        </section>
 
         <div className="stack">
           <section className="card">
@@ -223,9 +230,9 @@ export function WorkbenchEnvironmentView({
               </div>
             </div>
             <div className="kv">
-              <div style={{ gridColumn: '1 / span 2' }}>
+              <div className="environment-kv-wide">
                 <div className="k">Mounted namespaces</div>
-                <div className="v">{dashboardSummary?.mountedNamespaces.join(', ') || activation?.mountedNamespaces.join(', ') || `env/${selectedPack.id}/*`}</div>
+                <div className="v">{mountedNamespaceLabel}</div>
               </div>
             </div>
             <div className="environment-bound-task-list">
@@ -277,17 +284,7 @@ export function WorkbenchEnvironmentView({
               <button
                 type="button"
                 className="item environment-action-button"
-                onClick={async () => {
-                  setBusyAction('switch');
-                  try {
-                    await onSwitchPack(selectedPack.id);
-                    setFeedback(`${selectedPack.name} is now the active environment.`);
-                  } catch (error) {
-                    setFeedback((error as Error).message);
-                  } finally {
-                    setBusyAction(null);
-                  }
-                }}
+                onClick={handleSwitchPack}
                 disabled={busyAction !== null || selectedPack.id === activePackId}
               >
                 {selectedPack.id === activePackId ? `Using ${selectedPack.id}` : `Switch to ${selectedPack.id}`}
@@ -345,26 +342,7 @@ export function WorkbenchEnvironmentView({
         </div>
       </section>
 
-      <section className="panel composer">
-        <div className="small" style={{ color: 'var(--wb-muted)' }}>Universal composer</div>
-        <div className="environment-composer-row">
-          <div className="inputbox environment-composer-input">{commandSnippet}</div>
-          <button
-            type="button"
-            className="btn"
-            onClick={async () => {
-              try {
-                await navigator.clipboard.writeText(commandSnippet);
-                setFeedback('Environment command snippet copied.');
-              } catch {
-                setFeedback('Unable to copy the command snippet in this browser.');
-              }
-            }}
-          >
-            Copy snippet
-          </button>
-        </div>
-      </section>
+      {feedback ? <div className="environment-feedback">{feedback}</div> : null}
 
       {manifestOpen ? (
         <section className="card environment-manifest-card">
@@ -387,8 +365,6 @@ export function WorkbenchEnvironmentView({
           <pre className="environment-manifest-pre">{JSON.stringify(selectedPack, null, 2)}</pre>
         </section>
       ) : null}
-
-      {feedback ? <div className="environment-feedback">{feedback}</div> : null}
     </div>
   );
 }

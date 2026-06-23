@@ -166,6 +166,86 @@ describe('WorkbenchService', () => {
     });
   });
 
+  it('counts modified files from raw shell git status and diff evidence', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const store = new WorkbenchStore(root);
+    const eventBus = new EventBus();
+    const service = new WorkbenchService({ rootPath: root, eventBus, store });
+
+    await service.createTask({ title: 'Align task list', goal: 'Fix dashboard alignment' }, 'task-git-evidence');
+
+    eventBus.emit({
+      id: 'evt-git-1',
+      type: EventType.TOOL_RESULT,
+      taskId: 'task-git-evidence',
+      payload: {
+        toolName: 'bash',
+        output: [
+          ' M packages/dashboard/src/styles/workbench-inbox.css',
+          '?? packages/dashboard/src/styles/workbench-inbox.test.ts',
+          'diff --git a/packages/dashboard/src/styles/workbench-inbox.css b/packages/dashboard/src/styles/workbench-inbox.css',
+          'index 123..456 100644',
+        ].join('\n'),
+        durationMs: 14,
+        success: true,
+      },
+      timestamp: Date.now(),
+    });
+
+    const task = await service.readTask('task-git-evidence');
+
+    expect(task?.evidenceSummary).toMatchObject({
+      rawEventCount: 1,
+      modifiedFileCount: 2,
+      previewableArtifactCount: 0,
+      latestToolName: 'bash',
+      hasErrorEvidence: false,
+    });
+  });
+
+  it('counts modified files from JSON bash stdout evidence', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const store = new WorkbenchStore(root);
+    const eventBus = new EventBus();
+    const service = new WorkbenchService({ rootPath: root, eventBus, store });
+
+    await service.createTask({ title: 'Align task list', goal: 'Fix dashboard alignment' }, 'task-json-git-evidence');
+
+    eventBus.emit({
+      id: 'evt-json-git-1',
+      type: EventType.TOOL_RESULT,
+      taskId: 'task-json-git-evidence',
+      payload: {
+        toolName: 'bash',
+        output: {
+          command: 'git status --short && git diff -- packages/dashboard/src/styles/workbench-inbox.css',
+          stdout: [
+            '/Users/huyuehui/ace/tik/.workspace/worktrees/tik-805562e6--tik-83',
+            ' M packages/dashboard/src/styles/workbench-inbox.css',
+            '?? packages/dashboard/src/styles/workbench-inbox.test.ts',
+            'diff --git a/packages/dashboard/src/styles/workbench-inbox.css b/packages/dashboard/src/styles/workbench-inbox.css',
+          ].join('\n'),
+          exitCode: 0,
+        },
+        durationMs: 14,
+        success: true,
+      },
+      timestamp: Date.now(),
+    });
+
+    const task = await service.readTask('task-json-git-evidence');
+
+    expect(task?.evidenceSummary).toMatchObject({
+      rawEventCount: 1,
+      modifiedFileCount: 2,
+      previewableArtifactCount: 0,
+      latestToolName: 'bash',
+      hasErrorEvidence: false,
+    });
+  });
+
   it('suppresses low-signal runtime noise and keeps operator-facing summaries concise', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
     tempDirs.push(root);
@@ -314,6 +394,248 @@ describe('WorkbenchService', () => {
 
     const timeline = await service.readTimeline('task-config');
     expect(timeline.some((item) => item.body.includes('Updated task configuration'))).toBe(true);
+  });
+
+  it('persists tracker fields and appends execution runs on the unified workbench task record', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const eventBus = new EventBus();
+    const store = new WorkbenchStore(root);
+    const service = new WorkbenchService({ rootPath: root, eventBus, store });
+
+    const task = await service.createTask({
+      id: 'linear-task-id',
+      shortIdentifier: 'TIK-42',
+      title: 'Ship daemon',
+      description: 'Build the tracker daemon.',
+      goal: 'Ship a daemon that launches workbench tasks.',
+      state: 'Todo',
+      priority: 1,
+      labels: ['backend', 'orchestration'],
+      blockedBy: [{ id: 'dep-1', shortIdentifier: 'TIK-1', state: 'Done' }],
+      assignee: 'codex',
+      createdBy: 'linear',
+      sourceUrl: 'https://linear.app/acme/issue/TIK-42',
+    });
+
+    const withRun = await service.appendTaskRun(task.id, {
+      runId: 'run-1',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      endedAt: '2026-01-01T00:05:00.000Z',
+      status: 'completed',
+      kernelTaskId: 'kernel-task-1',
+      agentName: 'codex',
+      turnCount: 3,
+    });
+
+    expect(withRun?.id).toBe('linear-task-id');
+    expect(withRun).toMatchObject({
+      shortIdentifier: 'TIK-42',
+      title: 'Ship daemon',
+      description: 'Build the tracker daemon.',
+      goal: 'Ship a daemon that launches workbench tasks.',
+      state: 'Todo',
+      priority: 1,
+      labels: ['backend', 'orchestration'],
+      blockedBy: [{ id: 'dep-1', shortIdentifier: 'TIK-1', state: 'Done' }],
+      assignee: 'codex',
+      createdBy: 'linear',
+      sourceUrl: 'https://linear.app/acme/issue/TIK-42',
+    });
+    expect(withRun?.runs).toEqual([
+      {
+        runId: 'run-1',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        endedAt: '2026-01-01T00:05:00.000Z',
+        status: 'completed',
+        kernelTaskId: 'kernel-task-1',
+        agentName: 'codex',
+        turnCount: 3,
+      },
+    ]);
+
+    const reloaded = await service.readTask('linear-task-id');
+    expect(reloaded?.runs?.[0]?.kernelTaskId).toBe('kernel-task-1');
+  });
+
+  it('transitions tracker task state through the allowed workflow and records an audit timeline', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const eventBus = new EventBus();
+    const store = new WorkbenchStore(root);
+    const service = new WorkbenchService({ rootPath: root, eventBus, store });
+
+    const task = await service.createTask({
+      title: 'Implement tracker task',
+      goal: 'Move through the tracker state machine',
+      status: 'backlog',
+    }, 'task-transition');
+
+    expect(task.status).toBe('backlog');
+
+    const todo = await service.transitionTask(task.id, 'todo', {
+      actor: 'human',
+      reason: 'Ready to dispatch',
+    });
+    const inProgress = await service.transitionTask(task.id, 'in_progress', {
+      actor: 'daemon',
+      reason: 'Dispatch attempt 1',
+    });
+    const completed = await service.transitionTask(task.id, 'completed', {
+      actor: 'agent',
+      reason: 'Agent reported completion',
+    });
+
+    expect(todo?.status).toBe('todo');
+    expect(inProgress?.status).toBe('in_progress');
+    expect(completed?.status).toBe('completed');
+    expect(completed?.latestSummary).toContain('completed');
+
+    const timeline = await service.readTimeline(task.id);
+    expect(timeline.map((item) => item.body)).toEqual(expect.arrayContaining([
+      expect.stringContaining('Ready to dispatch'),
+      expect.stringContaining('Dispatch attempt 1'),
+      expect.stringContaining('Agent reported completion'),
+    ]));
+  });
+
+  it('rejects illegal tracker transitions with a typed code', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const service = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+
+    await service.createTask({
+      title: 'Illegal transition',
+      goal: 'Cannot jump directly from backlog to completed',
+      status: 'backlog',
+    }, 'task-illegal-transition');
+
+    await expect(service.transitionTask('task-illegal-transition', 'completed')).rejects.toMatchObject({
+      code: 'transition_not_allowed',
+    });
+  });
+
+  it('tracks attempts, comments, labels, and dependencies on the same task record', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const service = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+
+    await service.createTask({ title: 'Dependency', goal: 'Finish first', status: 'todo' }, 'task-dep');
+    await service.createTask({ title: 'Main', goal: 'Run with metadata', status: 'todo' }, 'task-main');
+
+    const withDependency = await service.setTaskDependencies('task-main', { add: ['task-dep'] });
+    const attempt = await service.appendAttempt('task-main', {
+      kernelTaskId: 'kernel-task-1',
+      startedAt: '2026-04-09T00:00:00.000Z',
+      turnCount: 2,
+    });
+    const finished = await service.finishAttempt('task-main', attempt.attemptNumber, 'failed', 'boom');
+    const labels = await service.setLabels('task-main', { add: ['Backend', 'P0'], remove: ['missing'] });
+    const comment = await service.addComment('task-main', {
+      authorKind: 'human',
+      authorId: 'huyuehui',
+      body: 'Please retry with smaller scope.',
+    });
+
+    expect(withDependency?.blockedByTaskIds).toEqual(['task-dep']);
+    expect(withDependency?.blockedBy?.[0]).toMatchObject({
+      id: 'task-dep',
+      shortIdentifier: expect.stringMatching(/^TIK-/),
+      state: 'todo',
+    });
+    expect(attempt.attemptNumber).toBe(1);
+    expect(finished?.attempts?.[0]).toMatchObject({
+      attemptNumber: 1,
+      kernelTaskId: 'kernel-task-1',
+      outcome: 'failed',
+      error: 'boom',
+    });
+    expect(labels?.labels).toEqual(['backend', 'p0']);
+    expect(comment?.comments?.[0]).toMatchObject({
+      authorKind: 'human',
+      authorId: 'huyuehui',
+      body: 'Please retry with smaller scope.',
+    });
+  });
+
+  it('assigns a stable TIK identifier when creating a task without tracker metadata', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const service = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+
+    const created = await service.createTask({
+      title: 'Fresh task',
+      goal: 'Needs a stable task identifier immediately',
+      status: 'todo',
+    }, 'task-fresh');
+
+    expect(created.identifier).toBe('TIK-1');
+    expect(created.shortIdentifier).toBe('TIK-1');
+  });
+
+  it('stops the active kernel task and closes the attempt when a running task is cancelled manually', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const stopped: Array<{ taskId: string; reason: string }> = [];
+    const service = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+      stopTask: (taskId, reason) => {
+        stopped.push({ taskId, reason });
+      },
+    });
+
+    await service.createTask({ title: 'Cancelable', goal: 'Stop when user cancels', status: 'in_progress' }, 'task-cancel');
+    await service.appendAttempt('task-cancel', {
+      kernelTaskId: 'kernel-task-cancel-1',
+      startedAt: '2026-04-09T00:00:00.000Z',
+    });
+
+    const cancelled = await service.transitionTask('task-cancel', 'cancelled', {
+      actor: 'human',
+      reason: 'No longer needed',
+    });
+
+    expect(stopped).toEqual([
+      { taskId: 'kernel-task-cancel-1', reason: 'No longer needed' },
+    ]);
+    expect(cancelled?.attempts?.[0]).toMatchObject({
+      kernelTaskId: 'kernel-task-cancel-1',
+      outcome: 'cancelled',
+      error: 'No longer needed',
+    });
+    expect(cancelled?.attempts?.[0]?.finishedAt).toBeTruthy();
+  });
+
+  it('prevents dependency cycles between task blockers', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const service = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+
+    await service.createTask({ title: 'One', goal: 'First', status: 'todo' }, 'task-one');
+    await service.createTask({ title: 'Two', goal: 'Second', status: 'todo' }, 'task-two');
+    await service.setTaskDependencies('task-one', { add: ['task-two'] });
+
+    await expect(service.setTaskDependencies('task-two', { add: ['task-one'] })).rejects.toMatchObject({
+      code: 'dependency_cycle',
+    });
   });
 
   it('rebinds a task to a different environment pack when configuration changes packs', async () => {
@@ -735,5 +1057,115 @@ describe('WorkbenchService', () => {
     expect(task?.status).toBe('archived');
     expect(task?.latestSummary).toBe('Task archived from the active work queue.');
     expect(timeline.some((item) => item.body.includes('late error from stale runtime'))).toBe(false);
+  });
+
+  it('fires a slash-command transition when a human comment includes /done from a legal source state', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const store = new WorkbenchStore(root);
+    const eventBus = new EventBus();
+    const service = new WorkbenchService({ rootPath: root, eventBus, store });
+
+    await service.createTask({
+      title: 'slash command target',
+      goal: 'Test /done from in_progress',
+      status: 'in_progress',
+    }, 'task-slash-done');
+
+    const result = await service.addComment('task-slash-done', {
+      authorKind: 'human',
+      authorId: 'huyuehui',
+      body: '/done',
+    });
+
+    expect(result?.status).toBe('completed');
+    expect(result?.comments?.[0]?.body).toBe('/done');
+
+    const timeline = await service.readTimeline('task-slash-done');
+    const bodies = timeline.map((item) => item.body);
+    expect(bodies.some((b) => b.includes('Comment added:'))).toBe(true);
+    expect(bodies.some((b) => b.includes('Task state changed: in_progress -> completed'))).toBe(true);
+    expect(bodies.some((b) => b.includes('Marked done via comment by huyuehui'))).toBe(true);
+  });
+
+  it('reopens a completed task when a plain human comment requests follow-up work', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const store = new WorkbenchStore(root);
+    const eventBus = new EventBus();
+    const service = new WorkbenchService({ rootPath: root, eventBus, store });
+
+    await service.createTask({
+      title: 'completed tracker task',
+      goal: 'Accept follow-up comments as tracker work',
+      status: 'completed',
+    }, 'task-comment-follow-up');
+
+    const result = await service.addComment('task-comment-follow-up', {
+      authorKind: 'human',
+      authorId: 'huyuehui',
+      body: '创建mr 并合并到 master',
+      createdAt: '2026-06-18T07:01:51.367Z',
+    });
+
+    expect(result?.status).toBe('todo');
+    expect(result?.latestSummary).toBe('Task transitioned to todo: Human comment requested a follow-up run.');
+    expect(result?.comments?.[0]).toMatchObject({
+      authorKind: 'human',
+      authorId: 'huyuehui',
+      body: '创建mr 并合并到 master',
+    });
+
+    const timeline = await service.readTimeline('task-comment-follow-up');
+    const bodies = timeline.map((item) => item.body);
+    expect(bodies.some((b) => b.includes('Comment added:'))).toBe(true);
+    expect(bodies.some((b) => b.includes('Task state changed: completed -> todo'))).toBe(true);
+    expect(bodies.some((b) => b.includes('Human comment requested a follow-up run.'))).toBe(true);
+  });
+
+  it('does not fire a transition when a slash command appears in an agent comment', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const store = new WorkbenchStore(root);
+    const eventBus = new EventBus();
+    const service = new WorkbenchService({ rootPath: root, eventBus, store });
+
+    await service.createTask({
+      title: 'agent comment',
+      goal: 'agents must not self-transition',
+      status: 'in_progress',
+    }, 'task-agent-comment');
+
+    const result = await service.addComment('task-agent-comment', {
+      authorKind: 'agent',
+      authorId: 'supervisor',
+      body: '/done',
+    });
+
+    expect(result?.status).toBe('in_progress');
+    expect(result?.comments?.[0]?.authorKind).toBe('agent');
+  });
+
+  it('treats a slash command targeting an illegal transition as a no-op (comment still saves)', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const store = new WorkbenchStore(root);
+    const eventBus = new EventBus();
+    const service = new WorkbenchService({ rootPath: root, eventBus, store });
+
+    await service.createTask({
+      title: 'illegal transition',
+      goal: '/done from backlog is not allowed',
+      status: 'backlog',
+    }, 'task-illegal');
+
+    const result = await service.addComment('task-illegal', {
+      authorKind: 'human',
+      authorId: 'huyuehui',
+      body: '/done',
+    });
+
+    expect(result?.status).toBe('backlog');
+    expect(result?.comments?.[0]?.body).toBe('/done');
   });
 });

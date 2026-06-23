@@ -4,6 +4,7 @@ import type {
   WorkbenchTaskResponse,
   WorkbenchTimelineResponseItem,
 } from '../api/client';
+import { MarkdownView } from './markdown/MarkdownView';
 import {
   buildTimelineFeedMetrics,
   buildTimelineGroups,
@@ -153,7 +154,7 @@ export function WorkbenchTimeline({
                   ) : (
                     <div className="console-message-body">
                       <div className="console-message-label">{actorLabel(group.summary.actor)}</div>
-                      <div className="console-message-text">{group.summary.body}</div>
+                      <div className="console-message-text"><MarkdownView source={group.summary.body} compact /></div>
                     </div>
                   )}
                   <EvidencePanel items={group.rawItems} />

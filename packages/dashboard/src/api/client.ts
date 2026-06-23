@@ -5,6 +5,8 @@
  */
 
 import type {
+  AgentLoopMetadata,
+  AgentLoopPayload,
   EnvironmentPackManifest,
   EnvironmentPackSelection,
   EnvironmentPackSnapshot,
@@ -13,8 +15,14 @@ import type {
   TaskWorkspaceBinding,
   WorkbenchTaskEvidenceSummary,
   WorkbenchTaskAdjustmentRecord,
+  WorkbenchTaskAttemptRecord,
+  WorkbenchTaskBlockerRecord,
+  WorkbenchTaskCommentRecord,
+  WorkbenchTaskRunRecord,
   WorkbenchTaskStatus,
 } from '@tik/shared';
+
+export type { WorkbenchTaskAttemptRecord, WorkbenchTaskRunRecord } from '@tik/shared';
 
 export interface AgentEvent {
   id: string;
@@ -70,6 +78,12 @@ export interface WorkspaceStatusResponse {
   rootPath: string;
   settings: {
     workspaceName: string;
+    workspaceRoot?: string;
+    workspaceFile?: string;
+    projects?: Array<{
+      name: string;
+      path: string;
+    }>;
     workflowPolicy?: { profile?: string };
   } | null;
   state: {
@@ -170,9 +184,24 @@ export interface WorkspaceDecisionsResponse {
 
 export interface WorkbenchTaskResponse {
   id: string;
+  identifier?: string;
+  shortIdentifier?: string;
   title: string;
+  description?: string | null;
   goal: string;
   status: WorkbenchTaskStatus;
+  state?: string;
+  priority?: number | null;
+  labels?: string[];
+  blockedBy?: WorkbenchTaskBlockerRecord[];
+  blockedByTaskIds?: string[];
+  parentTaskId?: string | null;
+  assignee?: string | null;
+  humanAssignee?: string | null;
+  createdBy?: string | null;
+  sourceUrl?: string | null;
+  comments?: WorkbenchTaskCommentRecord[];
+  attempts?: WorkbenchTaskAttemptRecord[];
   createdAt: string;
   updatedAt: string;
   activeSessionId?: string;
@@ -184,8 +213,10 @@ export interface WorkbenchTaskResponse {
   environmentPackSnapshot?: EnvironmentPackSnapshot;
   environmentPackSelection?: EnvironmentPackSelection;
   workspaceBinding?: TaskWorkspaceBinding;
+  agentLoop?: AgentLoopMetadata;
   lastAdjustment?: WorkbenchTaskAdjustmentRecord;
   evidenceSummary?: WorkbenchTaskEvidenceSummary;
+  runs?: WorkbenchTaskRunRecord[];
 }
 
 export interface WorkbenchTimelineResponseItem {
@@ -285,7 +316,63 @@ export interface UpdateWorkbenchTaskBriefResult {
 
 export interface CreateWorkbenchTaskInput extends Partial<EnvironmentPackSelection> {
   environmentPackId?: string;
+  status?: WorkbenchTaskStatus;
+  priority?: number | null;
+  labels?: string[];
+  parentTaskId?: string | null;
+  humanAssignee?: string | null;
   workspaceBinding?: TaskWorkspaceBinding;
+}
+
+export interface CreateWorktreeReviewRoundInput {
+  rootTaskId?: string;
+  round?: number;
+  maxRounds?: number;
+  repo?: string;
+  title?: string;
+  baseRef?: string;
+  headRef?: string;
+  headSha?: string;
+  idempotencyKey?: string;
+  workspaceBinding?: TaskWorkspaceBinding;
+  allowedScope?: string[];
+  acceptanceCriteria?: string[];
+  reviewFocus?: string[];
+  createdBy?: AgentLoopPayload['createdBy'];
+}
+
+export interface TrackerStateResponse {
+  watching: boolean;
+  retries: Record<string, {
+    taskId: string;
+    shortIdentifier: string;
+    attempt: number;
+    dueAtMs: number;
+    lastError: string;
+    updatedAt: string;
+  }>;
+  summary?: {
+    activeCandidates: number;
+    activeRuns: number;
+    maintenance?: number;
+    staleRunning: number;
+  };
+  listeners?: Array<{
+    id: string;
+    label: string;
+    status: 'running' | 'stopped' | 'expected' | 'unknown';
+    detail: string;
+    pid?: number;
+    port?: number;
+    session?: string;
+  }>;
+  recent: Array<{ type: string; shortIdentifier: string; message: string; createdAt: string }>;
+}
+
+export interface WorkflowFileResponse {
+  path: string;
+  exists: boolean;
+  content: string;
 }
 
 export interface UpdateWorkbenchTaskConfigurationInput extends EnvironmentPackSelection {
@@ -343,12 +430,32 @@ const BASE_URL = resolveApiBaseUrl();
 async function readJsonOrThrow<T>(res: Response): Promise<T> {
   const payload = await res.json().catch(() => null);
   if (!res.ok) {
-    const message = payload && typeof payload === 'object' && 'error' in payload
-      ? String((payload as { error?: unknown }).error || res.statusText || `Request failed: ${res.status}`)
-      : res.statusText || `Request failed: ${res.status}`;
-    throw new Error(message);
+    throw new Error(resolveApiErrorMessage(payload, res.statusText, res.status));
   }
   return payload as T;
+}
+
+export function resolveApiErrorMessage(payload: unknown, statusText: string, status: number): string {
+  if (payload && typeof payload === 'object') {
+    const record = payload as { error?: unknown; message?: unknown };
+    if (record.error && typeof record.error === 'object') {
+      const error = record.error as { message?: unknown; code?: unknown };
+      if (typeof error.message === 'string' && error.message.trim()) {
+        return error.message;
+      }
+      if (typeof error.code === 'string' && error.code.trim()) {
+        return error.code;
+      }
+    }
+    if (typeof record.message === 'string' && record.message.trim()) {
+      return record.message;
+    }
+    if (typeof record.error === 'string' && record.error.trim()) {
+      return record.error;
+    }
+  }
+
+  return statusText || `Request failed: ${status}`;
 }
 
 export async function fetchTasks(): Promise<Task[]> {
@@ -384,7 +491,7 @@ export async function controlTask(id: string, command: unknown): Promise<void> {
 }
 
 export async function fetchWorkbenchTasks(): Promise<WorkbenchTaskResponse[]> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks`);
+  const res = await fetch(`${BASE_URL}/v1/tasks`);
   return (await readJsonOrThrow<{ tasks: WorkbenchTaskResponse[] }>(res)).tasks;
 }
 
@@ -393,12 +500,108 @@ export async function createWorkbenchTask(
   goal: string,
   input?: CreateWorkbenchTaskInput,
 ): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks`, {
+  const res = await fetch(`${BASE_URL}/v1/tasks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ title, goal, ...input }),
   });
   return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
+}
+
+export async function createWorktreeReviewRound(
+  input: CreateWorktreeReviewRoundInput,
+): Promise<WorkbenchTaskResponse> {
+  const res = await fetch(`${BASE_URL}/v1/agent-loop/worktree-review-rounds`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
+}
+
+export async function updateTrackerTask(
+  taskId: string,
+  input: Partial<Pick<WorkbenchTaskResponse, 'title' | 'description' | 'goal' | 'status' | 'priority' | 'labels' | 'parentTaskId' | 'humanAssignee'>>,
+): Promise<WorkbenchTaskResponse> {
+  const res = await fetch(`${BASE_URL}/v1/tasks/${encodeURIComponent(taskId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
+}
+
+export async function transitionTrackerTask(
+  taskId: string,
+  to: WorkbenchTaskStatus,
+  reason?: string,
+): Promise<WorkbenchTaskResponse> {
+  const res = await fetch(`${BASE_URL}/v1/tasks/${encodeURIComponent(taskId)}/transitions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ to, reason }),
+  });
+  return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
+}
+
+export async function addTrackerTaskComment(
+  taskId: string,
+  body: string,
+): Promise<WorkbenchTaskResponse> {
+  const res = await fetch(`${BASE_URL}/v1/tasks/${encodeURIComponent(taskId)}/comments`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body }),
+  });
+  return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
+}
+
+export async function setTrackerTaskLabels(
+  taskId: string,
+  input: { add?: string[]; remove?: string[] },
+): Promise<WorkbenchTaskResponse> {
+  const res = await fetch(`${BASE_URL}/v1/tasks/${encodeURIComponent(taskId)}/labels`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
+}
+
+export async function setTrackerTaskDependencies(
+  taskId: string,
+  input: { add?: string[]; remove?: string[] },
+): Promise<WorkbenchTaskResponse> {
+  const res = await fetch(`${BASE_URL}/v1/tasks/${encodeURIComponent(taskId)}/dependencies`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
+}
+
+export async function fetchTrackerState(): Promise<TrackerStateResponse> {
+  const res = await fetch(`${BASE_URL}/v1/tracker/state`);
+  return readJsonOrThrow<TrackerStateResponse>(res);
+}
+
+export async function refreshTracker(): Promise<{ queued: boolean; refreshedAt: string }> {
+  const res = await fetch(`${BASE_URL}/v1/tracker/refresh`, { method: 'POST' });
+  return readJsonOrThrow(res);
+}
+
+export async function fetchWorkflowFile(): Promise<WorkflowFileResponse> {
+  const res = await fetch(`${BASE_URL}/v1/workflow`);
+  return readJsonOrThrow<WorkflowFileResponse>(res);
+}
+
+export async function saveWorkflowFile(content: string): Promise<WorkflowFileResponse & { saved: boolean }> {
+  const res = await fetch(`${BASE_URL}/v1/workflow`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  });
+  return readJsonOrThrow<WorkflowFileResponse & { saved: boolean }>(res);
 }
 
 export async function updateWorkbenchTaskConfiguration(

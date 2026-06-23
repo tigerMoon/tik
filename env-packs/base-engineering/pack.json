@@ -24,5 +24,79 @@
       }
     }
   ],
+  "taskLabels": [
+    {
+      "value": "implementation",
+      "label": "Implementation",
+      "action": "codex_dispatch",
+      "workflow": "feature-delivery",
+      "phase": "implement",
+      "description": "General engineering implementation task for Codex."
+    },
+    {
+      "value": "backend",
+      "label": "Backend",
+      "action": "codex_dispatch",
+      "workflow": "feature-delivery",
+      "phase": "implement",
+      "description": "Backend code work in the base engineering workflow."
+    },
+    {
+      "value": "docs",
+      "label": "Docs",
+      "action": "codex_dispatch",
+      "workflow": "feature-delivery",
+      "phase": "implement",
+      "description": "Documentation work that Codex can execute."
+    },
+    {
+      "value": "codex-fix",
+      "label": "Codex fix",
+      "action": "codex_fix",
+      "workflow": "feature-delivery",
+      "phase": "implement",
+      "description": "Fix blocking review issues with Codex.",
+      "aliases": ["needs-codex-fix"]
+    },
+    {
+      "value": "needs-claude-review",
+      "label": "Claude review",
+      "action": "claude_code_review",
+      "workflow": "feature-delivery",
+      "phase": "review",
+      "description": "Ask the Claude Code plugin to review the task.",
+      "aliases": ["claude-review"]
+    },
+    {
+      "value": "needs-human-review",
+      "label": "Human review",
+      "action": "human_review",
+      "workflow": "feature-delivery",
+      "phase": "review",
+      "description": "Route the task to a human reviewer.",
+      "aliases": ["human-review"]
+    },
+    {
+      "value": "worktree",
+      "label": "Worktree",
+      "action": "maintenance_manual",
+      "description": "Workspace or worktree maintenance; not Codex coding work."
+    },
+    {
+      "value": "maintenance",
+      "label": "Maintenance",
+      "action": "maintenance_manual",
+      "description": "Manual maintenance task.",
+      "aliases": ["workspace-maintenance"]
+    },
+    {
+      "value": "loop-complete",
+      "label": "Loop complete",
+      "action": "loop_complete",
+      "workflow": "feature-delivery",
+      "phase": "review",
+      "description": "Mark the review loop complete."
+    }
+  ],
   "evaluators": ["risk-evaluator", "rollout-safety-check"]
 }

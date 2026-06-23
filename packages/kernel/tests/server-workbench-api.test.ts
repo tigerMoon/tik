@@ -1,14 +1,38 @@
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createServer } from '../src/server.js';
 import { EventBus } from '../src/event-bus.js';
 import { WorkbenchStore } from '../src/workbench/workbench-store.js';
 import { WorkbenchService } from '../src/workbench/workbench-service.js';
+import type { EnvironmentPackSnapshot } from '@tik/shared';
 
 const tempDirs: string[] = [];
 const servers: Array<{ close: () => Promise<unknown> }> = [];
+
+const TEST_ENVIRONMENT_SNAPSHOT: EnvironmentPackSnapshot = {
+  id: 'test-engineering',
+  name: 'Test Engineering',
+  version: '1.0.0',
+  taskLabels: [
+    {
+      value: 'backend',
+      label: 'Backend',
+      action: 'codex_dispatch',
+      description: 'Backend implementation work.',
+      aliases: [],
+    },
+    {
+      value: 'worktree',
+      label: 'Worktree',
+      action: 'maintenance_manual',
+      description: 'Manual workspace maintenance.',
+      aliases: ['workspace-maintenance'],
+    },
+  ],
+};
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
@@ -16,6 +40,238 @@ afterEach(async () => {
 });
 
 describe('workbench API routes', () => {
+  it('publishes a current worktree review round with workspace binding', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+    spawnSync('git', ['init'], { cwd: root });
+    spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: root });
+    spawnSync('git', ['config', 'user.name', 'Tik Test'], { cwd: root });
+    await fs.writeFile(path.join(root, 'README.md'), '# Tik\n', 'utf-8');
+    spawnSync('git', ['add', 'README.md'], { cwd: root });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: root });
+    const headSha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf-8' }).stdout.trim();
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/agent-loop/worktree-review-rounds',
+      payload: {
+        rootTaskId: 'local-review',
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: 'tik-test',
+          projectName: 'tik-test',
+          sourceProjectPath: root,
+          effectiveProjectPath: root,
+          laneId: 'local',
+          worktreeKind: 'root',
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().task).toMatchObject({
+      status: 'todo',
+      labels: ['agent-loop', 'claude-review', 'needs-claude-review'],
+      workspaceBinding: {
+        effectiveProjectPath: root,
+        laneId: 'local',
+      },
+      agentLoop: {
+        kind: 'claude_review',
+        rootTaskId: 'local-review',
+        headSha,
+        changeRequest: {
+          scm: 'internal',
+          repo: 'tik-test',
+          type: 'internal_review',
+          headSha,
+        },
+      },
+    });
+  });
+
+  it('exposes Tik-native agent-loop review round and review-result endpoints', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const payload = {
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      idempotencyKey: 'claude_review:gitlab:group/project:456:abc123:r1',
+      changeRequest: {
+        scm: 'gitlab',
+        repo: 'group/project',
+        id: '456',
+        type: 'merge_request',
+        url: 'https://gitlab.example.com/group/project/-/merge_requests/456',
+        baseRef: 'main',
+        headRef: 'agent/TASK-123-codex',
+        headSha: 'abc123',
+      },
+    };
+
+    const first = await server.inject({
+      method: 'POST',
+      url: '/api/v1/agent-loop/review-rounds',
+      payload,
+    });
+    const second = await server.inject({
+      method: 'POST',
+      url: '/api/v1/agent-loop/review-rounds',
+      payload,
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect(second.json().task.id).toBe(first.json().task.id);
+    expect(first.json().task.agentLoop).toMatchObject({
+      kind: 'claude_review',
+      rootTaskId: 'TASK-123',
+      headSha: 'abc123',
+      idempotencyKey: payload.idempotencyKey,
+    });
+
+    const reviewResult = await server.inject({
+      method: 'POST',
+      url: `/api/v1/agent-loop/tasks/${first.json().task.id}/review-result`,
+      payload: {
+        verdict: 'request_changes',
+        headShaReviewed: 'abc123',
+        blockingIssues: [{
+          title: 'Missing backwards compatibility',
+          file: 'src/api/message.ts',
+          reason: 'The new required field breaks old callers.',
+          suggestedFix: 'Keep it optional.',
+        }],
+        markdown: '## Blocking Issues',
+      },
+    });
+
+    expect(reviewResult.statusCode).toBe(200);
+    expect(reviewResult.json().task.id).toBe(first.json().task.id);
+    expect(reviewResult.json().reviewTask.status).toBe('todo');
+    expect(reviewResult.json().task.agentLoop).toMatchObject({
+      kind: 'codex_fix',
+      phase: 'needs_codex_fix',
+      previousHeadSha: 'abc123',
+      nextReviewRound: 2,
+    });
+    expect(reviewResult.json().task.labels).toEqual(['agent-loop', 'codex-fix', 'needs-codex-fix']);
+    expect((await workbench.listTasks())).toHaveLength(1);
+  });
+
+  it('returns typed v1 errors for invalid agent-loop review results', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const reviewTask = await workbench.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      idempotencyKey: 'review-result-mismatch',
+      changeRequest: {
+        scm: 'gitlab',
+        repo: 'group/project',
+        id: '456',
+        type: 'merge_request',
+        baseRef: 'main',
+        headRef: 'agent/TASK-123-codex',
+        headSha: 'abc123',
+      },
+    });
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/v1/agent-loop/tasks/${reviewTask.id}/review-result`,
+      payload: {
+        verdict: 'approve',
+        headShaReviewed: 'def456',
+        blockingIssues: [],
+        markdown: 'Reviewed another sha.',
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: {
+        code: 'head_sha_mismatch',
+        message: expect.stringContaining('does not match'),
+      },
+    });
+  });
+
   it('creates tasks and serves timeline and decision data', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
@@ -115,7 +371,536 @@ describe('workbench API routes', () => {
     expect(decisionsResponse.json().decisions).toEqual([]);
   });
 
-  it('creates tasks with an explicit environment binding instead of relying on the active pack', async () => {
+  it('exposes tracker task CRUD and mutation endpoints under /api/v1', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const eventBus = new EventBus();
+    const store = new WorkbenchStore(root);
+    const workbench = new WorkbenchService({ rootPath: root, eventBus, store });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: {
+        getActivePack: async () => null,
+        listPacks: async () => [],
+      },
+      taskManager: {
+        create: () => ({ id: 'unused-kernel-task' }),
+      },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const createResponse = await server.inject({
+      method: 'POST',
+      url: '/api/v1/tasks',
+      payload: {
+        title: 'Tracker task',
+        goal: 'Use tik as the tracker',
+        status: 'backlog',
+        priority: 1,
+        labels: ['Backend', 'Tracker'],
+        humanAssignee: 'huyuehui',
+      },
+    });
+
+    expect(createResponse.statusCode).toBe(200);
+    expect(createResponse.json().task).toMatchObject({
+      title: 'Tracker task',
+      status: 'backlog',
+      priority: 1,
+      labels: ['backend', 'tracker'],
+      humanAssignee: 'huyuehui',
+    });
+    expect(createResponse.json().task.identifier).toMatch(/^TIK-/);
+
+    const taskId = createResponse.json().task.id;
+
+    const transitionResponse = await server.inject({
+      method: 'POST',
+      url: `/api/v1/tasks/${taskId}/transitions`,
+      payload: { to: 'todo', reason: 'Ready' },
+    });
+    expect(transitionResponse.statusCode).toBe(200);
+    expect(transitionResponse.json().task.status).toBe('todo');
+
+    const labelsResponse = await server.inject({
+      method: 'POST',
+      url: `/api/v1/tasks/${taskId}/labels`,
+      payload: { add: ['P0'], remove: ['tracker'] },
+    });
+    expect(labelsResponse.statusCode).toBe(200);
+    expect(labelsResponse.json().task.labels).toEqual(['backend', 'p0']);
+
+    const commentResponse = await server.inject({
+      method: 'POST',
+      url: `/api/v1/tasks/${taskId}/comments`,
+      payload: { body: 'Looks ready to run.' },
+    });
+    expect(commentResponse.statusCode).toBe(200);
+    expect(commentResponse.json().task.comments[0].body).toBe('Looks ready to run.');
+
+    const dependency = await workbench.createTask({
+      title: 'Dependency',
+      goal: 'Finish first',
+      status: 'todo',
+    }, 'task-dependency');
+    const dependenciesResponse = await server.inject({
+      method: 'POST',
+      url: `/api/v1/tasks/${taskId}/dependencies`,
+      payload: { add: [dependency.id] },
+    });
+    expect(dependenciesResponse.statusCode).toBe(200);
+    expect(dependenciesResponse.json().task.blockedByTaskIds).toEqual([dependency.id]);
+
+    const listResponse = await server.inject({ method: 'GET', url: '/api/v1/tasks' });
+    expect(listResponse.statusCode).toBe(200);
+    expect(listResponse.json().tasks.map((task: { id: string }) => task.id)).toContain(taskId);
+  });
+
+  it('injects human comments into active tracker tasks as runtime constraints', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const eventBus = new EventBus();
+    const store = new WorkbenchStore(root);
+    const workbench = new WorkbenchService({ rootPath: root, eventBus, store });
+    const controlCalls: Array<Record<string, unknown>> = [];
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: {
+        getActivePack: async () => null,
+        listPacks: async () => [],
+      },
+      taskManager: {
+        create: () => ({ id: 'unused-kernel-task' }),
+      },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: (taskId: string, command: Record<string, unknown>) => {
+        controlCalls.push({ taskId, ...command });
+      },
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+
+    const activeTask = await workbench.createTask({
+      title: 'Active task',
+      goal: 'Keep working',
+      status: 'running',
+    }, 'task-active-comment');
+    const backlogTask = await workbench.createTask({
+      title: 'Backlog task',
+      goal: 'Wait for launch',
+      status: 'backlog',
+    }, 'task-backlog-comment');
+
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const activeResponse = await server.inject({
+      method: 'POST',
+      url: `/api/v1/tasks/${activeTask.id}/comments`,
+      payload: { body: '创建mr 并合并到 master' },
+    });
+    expect(activeResponse.statusCode).toBe(200);
+
+    const backlogResponse = await server.inject({
+      method: 'POST',
+      url: `/api/v1/tasks/${backlogTask.id}/comments`,
+      payload: { body: 'Keep this note for later.' },
+    });
+    expect(backlogResponse.statusCode).toBe(200);
+
+    const agentResponse = await server.inject({
+      method: 'POST',
+      url: `/api/v1/tasks/${activeTask.id}/comments`,
+      payload: { authorKind: 'agent', body: 'Agent progress note.' },
+    });
+    expect(agentResponse.statusCode).toBe(200);
+
+    const slashCommandResponse = await server.inject({
+      method: 'POST',
+      url: `/api/v1/tasks/${activeTask.id}/comments`,
+      payload: { body: '/done' },
+    });
+    expect(slashCommandResponse.statusCode).toBe(200);
+
+    expect(controlCalls).toEqual([
+      {
+        taskId: activeTask.id,
+        type: 'inject_constraint',
+        constraint: '创建mr 并合并到 master',
+      },
+    ]);
+  });
+
+  it('returns typed /api/v1 error envelopes for invalid task transitions', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: {
+        getActivePack: async () => null,
+        listPacks: async () => [],
+      },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+
+    const task = await workbench.createTask({
+      title: 'Invalid',
+      goal: 'Cannot jump',
+      status: 'backlog',
+    }, 'task-invalid-api');
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/v1/tasks/${task.id}/transitions`,
+      payload: { to: 'completed' },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: {
+        code: 'transition_not_allowed',
+        message: expect.stringContaining('Cannot transition'),
+      },
+    });
+  });
+
+  it('runs a workbench-backed tracker tick from /api/v1/tracker/refresh', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    let createdKernelTaskId = 0;
+    let runTaskCalls = 0;
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: {
+        getActivePack: async () => null,
+        listPacks: async () => [],
+      },
+      taskManager: {
+        create: () => {
+          createdKernelTaskId += 1;
+          return { id: `kernel-refresh-${createdKernelTaskId}` };
+        },
+      },
+      runTask: async () => {
+        runTaskCalls += 1;
+        return { status: 'pending' };
+      },
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+
+    const task = await workbench.createTask({
+      title: 'Dispatch me',
+      goal: 'Refresh should run tracker tick',
+      status: 'todo',
+      labels: ['backend'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+    }, 'task-refresh-dispatch');
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/tracker/refresh',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().result.dispatched).toEqual([task.identifier]);
+    expect(runTaskCalls).toBe(1);
+    const updatedTask = await workbench.readTask(task.id);
+    expect(updatedTask?.status).toBe('in_progress');
+    expect(updatedTask?.attempts).toEqual([
+      expect.objectContaining({
+        attemptNumber: 1,
+        kernelTaskId: 'kernel-refresh-1',
+      }),
+    ]);
+  });
+
+  it('returns persisted tracker watching and recent state from /api/v1/tracker/state', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    await fs.mkdir(path.join(root, '.tik', 'tracker-daemon'), { recursive: true });
+    await fs.writeFile(
+      path.join(root, '.tik', 'tracker-daemon', 'state.json'),
+      JSON.stringify({
+        watching: true,
+        retries: {},
+        recent: [
+          {
+            type: 'dispatched',
+            shortIdentifier: 'TIK-1',
+            message: 'TIK-1 dispatched',
+            createdAt: '2026-01-01T00:00:00.000Z',
+          },
+        ],
+      }),
+      'utf-8',
+    );
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      title: 'Runnable task',
+      goal: 'Ready for tracker',
+      status: 'todo',
+      labels: ['backend'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+    }, 'task-runnable');
+    await workbench.createTask({
+      title: 'Workspace cleanup',
+      goal: 'Clean stale worktrees',
+      status: 'todo',
+      labels: ['worktree'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+    }, 'task-maintenance');
+    await workbench.createTask({
+      title: 'Stale running task',
+      goal: 'Lost its kernel session',
+      status: 'running',
+      labels: ['backend'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+    }, 'task-stale-running');
+    await workbench.createTask({
+      title: 'Real running task',
+      goal: 'Has an open attempt',
+      status: 'in_progress',
+      attempts: [{
+        attemptNumber: 1,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        kernelTaskId: 'kernel-live',
+      }],
+    }, 'task-live-running');
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({ method: 'GET', url: '/api/v1/tracker/state' });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body).toMatchObject({
+      watching: true,
+      retries: {},
+      summary: {
+        activeCandidates: 1,
+        activeRuns: 1,
+        maintenance: 1,
+        staleRunning: 1,
+      },
+      recent: [
+        {
+          type: 'dispatched',
+          shortIdentifier: 'TIK-1',
+          message: 'TIK-1 dispatched',
+          createdAt: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+    });
+    expect(body.listeners).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'tracker-watch',
+        label: 'Tracker watch',
+      }),
+      expect.objectContaining({
+        id: 'api-server',
+        label: 'API server',
+        port: 0,
+      }),
+      expect.objectContaining({
+        id: 'dashboard',
+        label: 'Dashboard dev server',
+      }),
+    ]));
+    expect(body.listeners.find((listener: { id: string }) => listener.id === 'tracker-watch')?.status)
+      .toMatch(/^(running|expected)$/);
+  });
+
+  it('does not mark tracker watch mode as active after a manual refresh tick', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      title: 'Manual tick only',
+      goal: 'Refresh should not imply watch mode',
+      status: 'todo',
+    }, 'task-manual-watch');
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'kernel-manual-watch-1' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const refresh = await server.inject({ method: 'POST', url: '/api/v1/tracker/refresh' });
+    expect(refresh.statusCode).toBe(200);
+
+    const state = await server.inject({ method: 'GET', url: '/api/v1/tracker/state' });
+    expect(state.statusCode).toBe(200);
+    expect(state.json().watching).toBe(false);
+  });
+
+  it('reads and writes the workspace WORKFLOW.md through /api/v1/workflow', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workflowPath = path.join(root, '.tik', 'WORKFLOW.md');
+    await fs.mkdir(path.dirname(workflowPath), { recursive: true });
+    await fs.writeFile(workflowPath, [
+      '---',
+      'polling:',
+      '  interval_ms: 3000',
+      '---',
+      'Implement {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: {
+        getActivePack: async () => null,
+        listPacks: async () => [],
+      },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const readResponse = await server.inject({ method: 'GET', url: '/api/v1/workflow' });
+    expect(readResponse.statusCode).toBe(200);
+    expect(readResponse.json()).toMatchObject({
+      exists: true,
+      path: workflowPath,
+    });
+    expect(readResponse.json().content).toContain('interval_ms: 3000');
+
+    const nextContent = [
+      '---',
+      'polling:',
+      '  interval_ms: 4500',
+      '---',
+      'Implement {{ task.title }}.',
+    ].join('\n');
+    const writeResponse = await server.inject({
+      method: 'PUT',
+      url: '/api/v1/workflow',
+      payload: { content: nextContent },
+    });
+
+    expect(writeResponse.statusCode).toBe(200);
+    expect(writeResponse.json()).toMatchObject({
+      saved: true,
+      path: workflowPath,
+    });
+    await expect(fs.readFile(workflowPath, 'utf-8')).resolves.toBe(`${nextContent}\n`);
+  });
+
+  it('creates legacy and v1 tasks with an explicit environment binding instead of relying on the active pack', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
 
@@ -230,6 +1015,29 @@ describe('workbench API routes', () => {
     expect(createdTaskInput?.environmentPackSelection).toEqual({
       selectedSkills: ['coder', 'test-runner'],
       selectedKnowledgeIds: ['repo-index'],
+    });
+
+    const v1Response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/tasks',
+      payload: {
+        title: 'Plan preview validation',
+        goal: 'Queue a manual preview validation pass',
+        environmentPackId: 'base-engineering',
+        selectedSkills: ['coder'],
+        selectedKnowledgeIds: ['runbooks'],
+      },
+    });
+
+    expect(v1Response.statusCode).toBe(200);
+    expect(v1Response.json().task.environmentPackSnapshot).toEqual({
+      id: 'base-engineering',
+      name: 'Base Engineering',
+      version: '0.1.0',
+    });
+    expect(v1Response.json().task.environmentPackSelection).toEqual({
+      selectedSkills: ['coder'],
+      selectedKnowledgeIds: ['runbooks'],
     });
   });
 

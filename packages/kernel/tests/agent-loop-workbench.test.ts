@@ -1,0 +1,432 @@
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { EventBus } from '../src/event-bus.js';
+import { WorkbenchService, WorkbenchTaskError } from '../src/workbench/workbench-service.js';
+import { WorkbenchStore } from '../src/workbench/workbench-store.js';
+
+const tempDirs: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
+});
+
+async function makeService() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-agent-loop-workbench-'));
+  tempDirs.push(root);
+  const service = new WorkbenchService({
+    rootPath: root,
+    eventBus: new EventBus(),
+    store: new WorkbenchStore(root),
+  });
+  return { root, service };
+}
+
+const changeRequestRef = {
+  scm: 'gitlab' as const,
+  repo: 'group/project',
+  id: '456',
+  type: 'merge_request' as const,
+  url: 'https://gitlab.example.com/group/project/-/merge_requests/456',
+  baseRef: 'main',
+  headRef: 'agent/TASK-123-codex',
+  headSha: 'abc123',
+};
+
+const workspaceBinding = {
+  workspaceRoot: '/workspace',
+  workspaceName: 'tik',
+  projectName: 'tik',
+  sourceProjectPath: '/workspace/tik',
+  effectiveProjectPath: '/workspace/tik',
+  laneId: 'review',
+  worktreeKind: 'git-worktree' as const,
+  worktreePath: '/workspace/.workspace/worktrees/tik--review',
+};
+
+describe('WorkbenchService agent loop work items', () => {
+  it('creates review rounds idempotently by idempotencyKey', async () => {
+    const { service } = await makeService();
+
+    const first = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'claude_review:gitlab:group/project:456:abc123:r1',
+    });
+    const second = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'claude_review:gitlab:group/project:456:abc123:r1',
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(await service.listTasks()).toHaveLength(1);
+    expect(first).toMatchObject({
+      status: 'todo',
+      agentLoop: {
+        kind: 'claude_review',
+        rootTaskId: 'TASK-123',
+        round: 1,
+        maxRounds: 3,
+        headSha: 'abc123',
+        idempotencyKey: 'claude_review:gitlab:group/project:456:abc123:r1',
+        changeRequest: changeRequestRef,
+      },
+    });
+    expect(first.labels).toEqual(['agent-loop', 'claude-review', 'needs-claude-review']);
+  });
+
+  it('requests review on an existing root task instead of creating a child work item', async () => {
+    const { service } = await makeService();
+    const rootTask = await service.createTask({
+      title: 'Implement feature',
+      goal: 'Ship the feature and request review.',
+      status: 'completed',
+      labels: ['feature'],
+    }, 'TASK-123');
+
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: rootTask.id,
+      round: 2,
+      maxRounds: 3,
+      changeRequest: {
+        ...changeRequestRef,
+        headSha: 'def456',
+      },
+      idempotencyKey: 'review-existing-root',
+    });
+
+    expect(reviewTask.id).toBe(rootTask.id);
+    expect(await service.listTasks()).toHaveLength(1);
+    expect(reviewTask).toMatchObject({
+      status: 'todo',
+      labels: ['agent-loop', 'claude-review', 'feature', 'needs-claude-review'],
+      agentLoop: {
+        kind: 'claude_review',
+        phase: 'needs_claude_review',
+        round: 2,
+        headSha: 'def456',
+      },
+    });
+  });
+
+  it('keeps worktree binding on review rounds and follow-up fix phases', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-with-binding',
+      workspaceBinding,
+    });
+
+    expect(reviewTask.workspaceBinding).toEqual(workspaceBinding);
+
+    const completed = await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'request_changes',
+      headShaReviewed: 'abc123',
+      blockingIssues: [{
+        title: 'Missing regression coverage',
+        file: 'packages/kernel/src/workbench/workbench-service.ts',
+        reason: 'The new loop path needs a focused test.',
+      }],
+      nonBlockingSuggestions: [],
+      testsNeeded: ['Add binding propagation regression test.'],
+      markdown: 'Binding regression found.',
+    });
+
+    expect(completed.task.id).toBe(reviewTask.id);
+    expect(completed.task.agentLoop?.kind).toBe('codex_fix');
+    expect(completed.task.workspaceBinding).toEqual(workspaceBinding);
+  });
+
+  it('marks stale review tasks blocked and records expected and actual head shas', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-stale',
+    });
+
+    const stale = await service.markAgentLoopStale(reviewTask.id, {
+      expectedHeadSha: 'abc123',
+      actualHeadSha: 'def456',
+    });
+
+    expect(stale?.status).toBe('blocked');
+    expect(stale?.agentLoop?.stale).toEqual({
+      expectedHeadSha: 'abc123',
+      actualHeadSha: 'def456',
+    });
+    const timeline = await service.readTimeline(reviewTask.id);
+    expect(timeline.map((item) => item.body).join('\n')).toContain('expected head sha abc123');
+    expect(timeline.map((item) => item.body).join('\n')).toContain('actual head sha def456');
+  });
+
+  it('moves the same task to codex fix when review returns blocking issues', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-blocking',
+    });
+
+    const completed = await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'request_changes',
+      headShaReviewed: 'abc123',
+      blockingIssues: [{
+        title: 'Missing backwards compatibility',
+        file: 'src/api/message.ts',
+        line: 88,
+        reason: 'The new required field breaks old callers.',
+        suggestedFix: 'Keep the field optional.',
+      }],
+      nonBlockingSuggestions: [],
+      testsNeeded: ['Add request-without-store test.'],
+      markdown: '## Blocking Issues\n\nMissing backwards compatibility.',
+    });
+
+    expect(completed.reviewTask.status).toBe('todo');
+    expect(completed.task).toMatchObject({
+      id: reviewTask.id,
+      status: 'todo',
+      agentLoop: {
+        kind: 'codex_fix',
+        phase: 'needs_codex_fix',
+        rootTaskId: 'TASK-123',
+        round: 1,
+        nextReviewRound: 2,
+        headSha: 'abc123',
+        previousHeadSha: 'abc123',
+        blockingIssues: [
+          expect.objectContaining({ title: 'Missing backwards compatibility' }),
+        ],
+      },
+    });
+    expect(completed.task.labels).toEqual(['agent-loop', 'codex-fix', 'needs-codex-fix']);
+    expect(completed.task.comments?.at(-1)?.body).toContain('"nextPhase": "needs_codex_fix"');
+    expect(await service.listTasks()).toHaveLength(1);
+  });
+
+  it('returns the same task to Claude review for the next round after a Codex fix', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-next-round',
+    });
+    const fixNeeded = await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'request_changes',
+      headShaReviewed: 'abc123',
+      blockingIssues: [{
+        title: 'Missing backwards compatibility',
+        file: 'src/api/message.ts',
+        reason: 'The new required field breaks old callers.',
+      }],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Fix needed.',
+    });
+
+    const nextReview = await service.createReviewRound({
+      rootTaskId: fixNeeded.task.id,
+      round: 1,
+      maxRounds: 3,
+      changeRequest: {
+        ...changeRequestRef,
+        headSha: 'def456',
+      },
+      idempotencyKey: 'review-next-round:def456',
+    });
+
+    expect(nextReview.id).toBe(reviewTask.id);
+    expect(nextReview).toMatchObject({
+      status: 'todo',
+      labels: ['agent-loop', 'claude-review', 'needs-claude-review'],
+      agentLoop: {
+        kind: 'claude_review',
+        phase: 'needs_claude_review',
+        round: 2,
+        headSha: 'def456',
+      },
+    });
+    expect(await service.listTasks()).toHaveLength(1);
+  });
+
+  it('moves the same task to human review when review has no blocking issues', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-clean',
+    });
+
+    const completed = await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'approve',
+      headShaReviewed: 'abc123',
+      blockingIssues: [],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Ready for human review.',
+    });
+
+    expect(completed.task).toMatchObject({
+      id: reviewTask.id,
+      status: 'in_review',
+      agentLoop: {
+        kind: 'human_review',
+        phase: 'needs_human_review',
+        rootTaskId: 'TASK-123',
+        round: 1,
+        headSha: 'abc123',
+      },
+    });
+    expect(completed.task.labels).toEqual(['agent-loop', 'human-review', 'needs-human-review']);
+    expect(await service.listTasks()).toHaveLength(1);
+  });
+
+  it('lets a human approve the human review phase with /approve', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-human-approve',
+    });
+    await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'approve',
+      headShaReviewed: 'abc123',
+      blockingIssues: [],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Ready for human review.',
+    });
+
+    const approved = await service.addComment(reviewTask.id, {
+      authorKind: 'human',
+      authorId: 'operator',
+      body: '/approve',
+    });
+
+    expect(approved).toMatchObject({
+      status: 'completed',
+      labels: ['agent-loop', 'loop-complete'],
+      agentLoop: {
+        phase: 'complete',
+      },
+    });
+    const timeline = await service.readTimeline(reviewTask.id);
+    expect(timeline.map((item) => item.body).join('\n')).toContain('Human review approved');
+  });
+
+  it('lets a human request another Codex pass from human review with /retry', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-human-retry',
+    });
+    await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'approve',
+      headShaReviewed: 'abc123',
+      blockingIssues: [],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Ready for human review.',
+    });
+
+    const retry = await service.addComment(reviewTask.id, {
+      authorKind: 'human',
+      authorId: 'operator',
+      body: '/retry\nPlease address the deployment note first.',
+    });
+
+    expect(retry).toMatchObject({
+      status: 'todo',
+      labels: ['agent-loop', 'codex-fix', 'needs-codex-fix'],
+      agentLoop: {
+        kind: 'codex_fix',
+        phase: 'needs_codex_fix',
+      },
+    });
+  });
+
+  it('escalates the same task to human review instead of another fix after max rounds', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 3,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-max-rounds',
+    });
+
+    const completed = await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'request_changes',
+      headShaReviewed: 'abc123',
+      blockingIssues: [{
+        title: 'Still broken',
+        file: 'src/api/message.ts',
+        reason: 'The same blocking issue remains.',
+        suggestedFix: 'Escalate to a human.',
+      }],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Still blocked.',
+    });
+
+    expect(completed.task).toMatchObject({
+      id: reviewTask.id,
+      status: 'in_review',
+      agentLoop: {
+        kind: 'human_review',
+        phase: 'needs_human_review',
+        round: 3,
+        headSha: 'abc123',
+      },
+    });
+    expect(completed.task.agentLoop?.blockingIssues).toEqual([
+      expect.objectContaining({ title: 'Still broken' }),
+    ]);
+    expect(await service.listTasks()).toHaveLength(1);
+  });
+
+  it('rejects approve review results that do not match the task head sha', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-mismatch',
+    });
+
+    await expect(service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'approve',
+      headShaReviewed: 'def456',
+      blockingIssues: [],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Reviewed another sha.',
+    })).rejects.toMatchObject({
+      code: 'head_sha_mismatch',
+    } satisfies Partial<WorkbenchTaskError>);
+  });
+});

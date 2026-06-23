@@ -118,9 +118,17 @@ describe('CodexHarnessAdapter', () => {
     });
 
     expect(start).toHaveBeenCalled();
-    expect(request).toHaveBeenCalledWith('initialize', expect.anything());
-    expect(request).toHaveBeenCalledWith('thread/start', expect.objectContaining({ cwd: '/tmp/project' }));
-    expect(request).toHaveBeenCalledWith('turn/start', expect.objectContaining({ threadId: 'thread-1' }));
+    expect(request).toHaveBeenCalledWith('initialize', expect.anything(), undefined);
+    expect(request).toHaveBeenCalledWith(
+      'thread/start',
+      expect.objectContaining({ cwd: '/tmp/project' }),
+      expect.anything(),
+    );
+    expect(request).toHaveBeenCalledWith(
+      'turn/start',
+      expect.objectContaining({ threadId: 'thread-1' }),
+      expect.anything(),
+    );
     expect(textChunks.join('')).toBe('hello');
     expect(providerEvents[0]).toMatchObject({ type: 'tool.called', toolName: 'bash' });
     expect(providerEvents[1]).toMatchObject({ type: 'tool.result', toolName: 'bash', success: true });

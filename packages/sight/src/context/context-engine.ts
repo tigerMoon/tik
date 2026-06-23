@@ -136,6 +136,13 @@ export class ContextEngine implements IContextBuilder {
       })),
       compactSummary: session.contextSummary || compacted.summary,
       sessionMemory: session.compactMemory,
+      operatorComments: task.recentComments?.length
+        ? task.recentComments.map((comment: { authorId?: string; body: string; createdAt: string }) => ({
+            authorId: comment.authorId,
+            body: comment.body,
+            createdAt: comment.createdAt,
+          }))
+        : undefined,
     };
 
     // 5. Package envelope

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { EnvironmentPackManifest } from './environment-pack.js';
 import {
   applyEnvironmentPackSelection,
+  buildEnvironmentPackPromotionQueue,
   buildEnvironmentPackWorkflowCoverage,
   getEnvironmentPackCapabilitySource,
 } from './environment-pack.js';
@@ -26,6 +27,15 @@ const PACK: EnvironmentPackManifest = {
         implement: ['figma-to-react'],
         verify: ['frontend-preview', 'ux-consistency-evaluator'],
       },
+    },
+  ],
+  taskLabels: [
+    {
+      value: 'frontend',
+      label: 'Frontend',
+      action: 'codex_dispatch',
+      description: 'Frontend implementation work.',
+      aliases: [],
     },
   ],
   evaluators: ['ux-consistency-evaluator'],
@@ -101,5 +111,36 @@ describe('environment pack capability helpers', () => {
         ],
       },
     ]);
+  });
+
+  it('builds promotion queue items with a shared limit option', () => {
+    const pack: EnvironmentPackManifest = {
+      ...PACK,
+      workflowBindings: [
+        {
+          workflow: 'feature-delivery',
+          phases: {
+            plan: ['missing-plan'],
+            review: ['missing-review'],
+            verify: ['frontend-preview'],
+          },
+        },
+      ],
+      evaluators: [],
+    };
+
+    expect(buildEnvironmentPackPromotionQueue(pack, { limit: 2 })).toEqual([
+      {
+        id: 'missing-capability:feature-delivery:plan:missing-plan',
+        kind: 'capability proposal',
+        detail: 'Promote "missing-plan" into feature-delivery / plan so this pack can satisfy its declared workflow binding.',
+      },
+      {
+        id: 'missing-capability:feature-delivery:review:missing-review',
+        kind: 'capability proposal',
+        detail: 'Promote "missing-review" into feature-delivery / review so this pack can satisfy its declared workflow binding.',
+      },
+    ]);
+    expect(buildEnvironmentPackPromotionQueue(pack)).toHaveLength(3);
   });
 });

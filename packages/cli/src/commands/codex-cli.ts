@@ -410,7 +410,7 @@ export class CodexCliProvider implements ILLMProvider {
     this.harnessSessionManager = new CodexHarnessSessionManager(projectPath);
   }
 
-  async plan(prompt: string, context: string): Promise<LLMPlanResponse> {
+  async plan(prompt: string, context: string, options?: LLMCallOptions): Promise<LLMPlanResponse> {
     const result = await this.runCodex(
       [
         'You are generating a plan only for Tik.',
@@ -424,6 +424,7 @@ export class CodexCliProvider implements ILLMProvider {
         context.slice(0, 30000),
       ].join('\n'),
       false,
+      options,
     );
 
     const parsed = this.parseJsonResponse(result.content);
@@ -622,11 +623,12 @@ export class CodexCliProvider implements ILLMProvider {
       throw new Error('Codex CLI is not logged in. Run `codex login` first.');
     }
 
-    const beforeFiles = await this.captureChangedFiles();
+    const cwd = options?.cwd || this.projectPath;
+    const beforeFiles = await this.captureChangedFiles(cwd);
     const providerSessionId = options?.providerSessionId;
     const sessionKey = providerSessionId
-      ? this.buildHarnessSessionKey(providerSessionId, allowWrites)
-      : `transient:${this.promptFingerprint(prompt)}:${allowWrites ? 'write' : 'read'}:${this.model || 'default'}`;
+      ? this.buildHarnessSessionKey(providerSessionId, allowWrites, cwd)
+      : `transient:${this.promptFingerprint(prompt)}:${allowWrites ? 'write' : 'read'}:${this.model || 'default'}:${cwd}`;
     const transientSession = !providerSessionId;
     const signal = options?.signal;
     if (signal?.aborted) {
@@ -643,7 +645,7 @@ export class CodexCliProvider implements ILLMProvider {
       harnessResult = await this.harnessSessionManager.runTurn({
         sessionKey,
         prompt,
-        cwd: this.projectPath,
+        cwd,
         model: this.model,
         allowWrites,
         signal,
@@ -659,7 +661,7 @@ export class CodexCliProvider implements ILLMProvider {
     if (aborted) {
       throw new Error(typeof signal?.reason === 'string' ? signal.reason : 'Codex execution aborted by Tik.');
     }
-    const afterFiles = await this.captureChangedFiles();
+    const afterFiles = await this.captureChangedFiles(cwd);
     const changedFiles = [...afterFiles].filter((file) => !beforeFiles.has(file));
 
     return {
@@ -676,13 +678,13 @@ export class CodexCliProvider implements ILLMProvider {
     };
   }
 
-  private buildHarnessSessionKey(providerSessionId: string, allowWrites: boolean): string {
+  private buildHarnessSessionKey(providerSessionId: string, allowWrites: boolean, cwd: string): string {
     return [
       this.name,
       providerSessionId,
       this.model || 'default',
       allowWrites ? 'write' : 'read',
-      this.projectPath,
+      cwd,
     ].join('|');
   }
 
@@ -714,8 +716,9 @@ export class CodexCliProvider implements ILLMProvider {
     abortedReason?: string;
   }> {
     return new Promise((resolve, reject) => {
+      const cwd = options?.cwd || this.projectPath;
       const child = spawn('codex', args, {
-        cwd: this.projectPath,
+        cwd,
         env: {
           ...process.env,
           NO_COLOR: '1',
@@ -773,7 +776,7 @@ export class CodexCliProvider implements ILLMProvider {
                 && parsed.item?.type === 'command_execution'
               ) {
                 const normalized = normalizeCodexShellCommand(parsed.item.command || '');
-                const hasWorkspaceChanges = this.hasNewWorkspaceChanges(beforeFiles);
+                const hasWorkspaceChanges = this.hasNewWorkspaceChanges(beforeFiles, cwd);
                 if (this.isValidationLikeCommand(normalized) && !hasWorkspaceChanges) {
                   policyViolation = [
                     'Patch-first policy violation: validation/build command attempted before the first relevant code change.',
@@ -809,7 +812,7 @@ export class CodexCliProvider implements ILLMProvider {
                 && parsed.item?.type === 'command_execution'
               ) {
                 const normalized = normalizeCodexShellCommand(parsed.item.command || '');
-                const currentChangedFiles = this.captureChangedFilesSync();
+                const currentChangedFiles = this.captureChangedFilesSync(cwd);
                 const currentChangedFileCount = currentChangedFiles.size;
                 const hasWorkspaceChanges = currentChangedFileCount > beforeFiles.size;
                 const stopDecision = shouldStopForPostPatchValidation(
@@ -901,12 +904,12 @@ export class CodexCliProvider implements ILLMProvider {
     return isValidationLikeCommandValue(normalizedCommand);
   }
 
-  private hasNewWorkspaceChanges(beforeFiles: Set<string>): boolean {
-    return this.captureChangedFilesSync().size > beforeFiles.size;
+  private hasNewWorkspaceChanges(beforeFiles: Set<string>, cwd = this.projectPath): boolean {
+    return this.captureChangedFilesSync(cwd).size > beforeFiles.size;
   }
 
-  private captureChangedFilesSync(): Set<string> {
-    const result = spawnSync('git', ['-C', this.projectPath, 'status', '--porcelain'], {
+  private captureChangedFilesSync(cwd = this.projectPath): Set<string> {
+    const result = spawnSync('git', ['-C', cwd, 'status', '--porcelain'], {
       encoding: 'utf-8',
     });
     if (result.status !== 0) return new Set<string>();
@@ -920,8 +923,8 @@ export class CodexCliProvider implements ILLMProvider {
     );
   }
 
-  private async captureChangedFiles(): Promise<Set<string>> {
-    const result = spawnSync('git', ['-C', this.projectPath, 'status', '--porcelain'], {
+  private async captureChangedFiles(cwd = this.projectPath): Promise<Set<string>> {
+    const result = spawnSync('git', ['-C', cwd, 'status', '--porcelain'], {
       encoding: 'utf-8',
     });
     if (result.status !== 0) return new Set<string>();

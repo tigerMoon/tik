@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import type { EnvironmentPackManifest } from '@tik/shared';
 import {
   buildEnvironmentActivationSummary,
-  buildEnvironmentCommandSnippet,
   buildEnvironmentPromotionQueue,
   buildEnvironmentWorkflowCoverage,
   countEnvironmentPromotionItems,
@@ -22,6 +21,7 @@ const PACK: EnvironmentPackManifest = {
     { id: 'repo-index', kind: 'repo-index', label: 'Repo Index' },
   ],
   policies: ['prod-change-requires-approval', 'pii-redaction'],
+  taskLabels: [],
   workflowBindings: [
     {
       workflow: 'feature-delivery',
@@ -58,6 +58,28 @@ describe('environment view models', () => {
     ]);
 
     expect(countEnvironmentPromotionItems([PACK])).toBe(1);
+  });
+
+  it('counts the full promotion backlog instead of the displayed queue slice', () => {
+    const pack: EnvironmentPackManifest = {
+      ...PACK,
+      workflowBindings: [
+        {
+          workflow: 'feature-delivery',
+          phases: {
+            one: ['missing-one'],
+            two: ['missing-two'],
+            three: ['missing-three'],
+            four: ['missing-four'],
+            five: ['missing-five'],
+          },
+        },
+      ],
+      evaluators: [],
+    };
+
+    expect(buildEnvironmentPromotionQueue(pack)).toHaveLength(4);
+    expect(countEnvironmentPromotionItems([pack])).toBe(6);
   });
 
   it('reports workflow coverage across skills, tools, and evaluators', () => {
@@ -159,10 +181,5 @@ describe('environment view models', () => {
     });
 
     vi.useRealTimers();
-  });
-
-  it('builds a command snippet for the selected environment', () => {
-    expect(buildEnvironmentCommandSnippet(PACK, 2))
-      .toContain('@env/commerce-ops #open-manifest');
   });
 });

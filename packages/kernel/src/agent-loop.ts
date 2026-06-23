@@ -253,6 +253,7 @@ export class AgentLoop {
           contextStr = this.contextRenderer
             ? this.contextRenderer.render(envelope)
             : this.buildContextString(task, envelope.execution, strategy);
+          contextStr = this.appendTaskContextSnapshot(contextStr, task);
         } else {
           likelyTargetPaths = [];
           const context = await this.contextBuilder.buildContext(task.id, iterationNumber, {
@@ -261,6 +262,7 @@ export class AgentLoop {
             environmentPackSelection: task.environmentPackSelection,
           });
           contextStr = this.buildContextString(task, context, strategy);
+          contextStr = this.appendTaskContextSnapshot(contextStr, task);
         }
 
         this.emitEvent(EventType.CONTEXT_BUILT, task.id, {
@@ -292,7 +294,7 @@ export class AgentLoop {
         let implementationHintInjected = false;
         let implementationActionForced = false;
         let forcedSummaryAttempted = false;
-        let lastResponse = await this.callLLM(agent, session, contextStr, toolDefs);
+        let lastResponse = await this.callLLM(agent, session, contextStr, toolDefs, task);
         this.emitUsageEvent(task.id, session, actingAgent, iterationNumber, lastResponse.usage);
 
         for (let toolRound = 0; toolRound < MAX_TOOL_ROUNDS; toolRound++) {
@@ -363,7 +365,7 @@ export class AgentLoop {
 
             implementationActionForced = true;
             const implementationToolDefs = this.getImplementationToolDefs(toolDefs);
-            lastResponse = await this.callLLM(agent, session, contextStr, implementationToolDefs);
+            lastResponse = await this.callLLM(agent, session, contextStr, implementationToolDefs, task);
             this.emitUsageEvent(task.id, session, actingAgent, iterationNumber, lastResponse.usage);
             continue;
           }
@@ -391,7 +393,7 @@ export class AgentLoop {
               content: 'You already have enough evidence to conclude the current implementation status. Do not run more local verification probes. Summarize the finding clearly, state whether code changes are needed, and stop calling tools.',
             });
 
-            lastResponse = await this.callLLM(agent, session, contextStr, toolDefs);
+            lastResponse = await this.callLLM(agent, session, contextStr, toolDefs, task);
             this.emitUsageEvent(task.id, session, actingAgent, iterationNumber, lastResponse.usage);
             continue;
           }
@@ -412,7 +414,7 @@ export class AgentLoop {
 
               implementationActionForced = true;
               const implementationToolDefs = this.getImplementationToolDefs(toolDefs);
-              lastResponse = await this.callLLM(agent, session, contextStr, implementationToolDefs);
+              lastResponse = await this.callLLM(agent, session, contextStr, implementationToolDefs, task);
               this.emitUsageEvent(task.id, session, actingAgent, iterationNumber, lastResponse.usage);
               continue;
             }
@@ -468,7 +470,7 @@ export class AgentLoop {
           if (session.loopState !== 'running') break;
 
           // Call LLM again with tool results in message history
-          lastResponse = await this.callLLM(agent, session, contextStr, toolDefs);
+          lastResponse = await this.callLLM(agent, session, contextStr, toolDefs, task);
           this.emitUsageEvent(task.id, session, actingAgent, iterationNumber, lastResponse.usage);
         }
 
@@ -668,12 +670,13 @@ export class AgentLoop {
     session: AgentSession,
     contextStr: string,
     toolDefs: LLMToolDef[],
+    task: Task,
   ) {
     let lastError: Error | undefined;
 
     for (let attempt = 0; attempt <= AgentLoop.LLM_MAX_RETRIES; attempt++) {
       try {
-        return await this.callLLMOnce(agent, session, contextStr, toolDefs);
+        return await this.callLLMOnce(agent, session, contextStr, toolDefs, task);
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         const isRetryable = this.isRetryableError(lastError);
@@ -699,6 +702,7 @@ export class AgentLoop {
     session: AgentSession,
     contextStr: string,
     toolDefs: LLMToolDef[],
+    task: Task,
   ) {
     const getProviderToolType = (toolName: string): 'read' | 'write' | 'exec' => {
       if (toolName === 'read_file' || toolName === 'grep' || toolName === 'glob' || toolName.startsWith('git_')) {
@@ -738,8 +742,10 @@ export class AgentLoop {
     };
 
     // Build streaming options
+    const providerCwd = task.projectPath || process.cwd();
     const llmOptions: LLMCallOptions | undefined = this.onStreamChunk
       ? {
+          cwd: providerCwd,
           providerSessionId: `${session.taskId}:${session.sessionId}:${session.currentAgent}`,
           onTextChunk: (text: string) => {
             this.onStreamChunk!(text, { taskId: session.taskId, agent: session.currentAgent });
@@ -747,6 +753,7 @@ export class AgentLoop {
           onProviderEvent: emitProviderRuntimeEvent,
         }
       : {
+          cwd: providerCwd,
           providerSessionId: `${session.taskId}:${session.sessionId}:${session.currentAgent}`,
           onProviderEvent: emitProviderRuntimeEvent,
         };
@@ -1166,6 +1173,71 @@ export class AgentLoop {
       '',
       `Context:\n${JSON.stringify(context, null, 2).slice(0, 20000)}`,
     ].join('\n');
+  }
+
+  private appendTaskContextSnapshot(contextStr: string, task: Task): string {
+    const rendered = this.renderTaskContextSnapshot(task);
+    return rendered ? `${contextStr}\n\n---\n\n${rendered}` : contextStr;
+  }
+
+  private renderTaskContextSnapshot(task: Task): string {
+    const snapshot = task.taskContextSnapshot;
+    if (!snapshot) {
+      return '';
+    }
+
+    const lines = [
+      '# Task Restart Context',
+      'This is task-local history from prior runs. Use it to continue the same task; treat newer operator comments as the current direction.',
+      `- Task: ${snapshot.identifier || snapshot.shortIdentifier || snapshot.taskId}`,
+      `- Status before dispatch: ${snapshot.status}`,
+      `- Title: ${snapshot.title}`,
+      `- Goal: ${snapshot.goal}`,
+    ];
+
+    if (snapshot.latestSummary) {
+      lines.push(`- Latest summary: ${snapshot.latestSummary}`);
+    }
+
+    if (snapshot.lastAttempt) {
+      const attempt = snapshot.lastAttempt;
+      lines.push([
+        '- Last attempt:',
+        `  - Number: ${attempt.attemptNumber}`,
+        `  - Outcome: ${attempt.outcome || 'unknown'}`,
+        attempt.kernelTaskId ? `  - Kernel task: ${attempt.kernelTaskId}` : undefined,
+        attempt.finishedAt ? `  - Finished at: ${attempt.finishedAt}` : undefined,
+        attempt.error ? `  - Error: ${attempt.error}` : undefined,
+      ].filter(Boolean).join('\n'));
+    }
+
+    if (snapshot.evidenceSummary) {
+      const evidence = snapshot.evidenceSummary;
+      lines.push([
+        '- Evidence summary:',
+        `  - Raw events: ${evidence.rawEventCount}`,
+        `  - Modified files: ${evidence.modifiedFileCount}`,
+        `  - Previewable artifacts: ${evidence.previewableArtifactCount}`,
+        evidence.latestToolName ? `  - Latest tool: ${evidence.latestToolName}` : undefined,
+        evidence.latestPreviewableArtifactPath ? `  - Latest artifact: ${evidence.latestPreviewableArtifactPath}` : undefined,
+        `  - Has error evidence: ${evidence.hasErrorEvidence ? 'yes' : 'no'}`,
+      ].filter(Boolean).join('\n'));
+    }
+
+    if (snapshot.timelineSummary?.length) {
+      lines.push('## Recent Timeline');
+      lines.push(...snapshot.timelineSummary.map((item) => `- ${item}`));
+    }
+
+    if (snapshot.recentComments?.length) {
+      lines.push('## Recent Operator Comments');
+      for (const comment of snapshot.recentComments) {
+        const author = comment.authorId?.trim() || 'human';
+        lines.push(`- ${author} (${comment.createdAt}): ${comment.body}`);
+      }
+    }
+
+    return lines.join('\n');
   }
 
   private extractLikelyTargetPaths(envelope: RuntimeContextEnvelope, projectPath: string): string[] {
@@ -1596,7 +1668,9 @@ export class AgentLoop {
     ].join('\n');
 
     const contextStr = JSON.stringify(context, null, 2);
-    const response = await this.llmProvider.plan(prompt, contextStr);
+    const response = await this.llmProvider.plan(prompt, contextStr, {
+      cwd: task.projectPath || process.cwd(),
+    });
 
     return {
       goals: response.goals,

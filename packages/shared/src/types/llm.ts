@@ -12,7 +12,7 @@ export interface ILLMProvider {
   name: string;
 
   /** Generate a plan from context */
-  plan(prompt: string, context: string): Promise<LLMPlanResponse>;
+  plan(prompt: string, context: string, options?: LLMCallOptions): Promise<LLMPlanResponse>;
 
   /** Generate a completion */
   complete(prompt: string, options?: LLMCallOptions): Promise<string>;
@@ -37,6 +37,8 @@ export interface ILLMProvider {
 // ─── LLM Call Options ───────────────────────────────────────
 
 export interface LLMCallOptions {
+  /** Working directory for provider-native execution and instruction discovery. */
+  cwd?: string;
   /** Callback for streaming text chunks */
   onTextChunk?: (text: string) => void;
   /** Callback when a tool_use block is fully received */

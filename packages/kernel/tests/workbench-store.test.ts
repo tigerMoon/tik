@@ -173,6 +173,66 @@ describe('WorkbenchStore', () => {
     expect(snapshot.session).toBeNull();
     expect(snapshot.timeline).toEqual([goodTimelineItem]);
   });
+
+  it('backfills stable tracker identifiers for legacy tasks in creation order', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-store-'));
+    tempDirs.push(root);
+    const store = new WorkbenchStore(root);
+    await fs.mkdir(path.join(root, '.tik', 'workbench'), { recursive: true });
+    await fs.writeFile(path.join(root, '.tik', 'workbench', 'index.json'), JSON.stringify({
+      tasks: [
+        {
+          id: 'legacy-later',
+          title: 'Later task',
+          goal: 'Second',
+          status: 'running',
+          createdAt: '2026-04-09T00:00:02.000Z',
+          updatedAt: '2026-04-09T00:00:02.000Z',
+        },
+        {
+          id: 'legacy-earlier',
+          title: 'Earlier task',
+          goal: 'First',
+          status: 'running',
+          createdAt: '2026-04-09T00:00:01.000Z',
+          updatedAt: '2026-04-09T00:00:01.000Z',
+        },
+      ],
+      decisions: [],
+      evidences: [],
+    }), 'utf-8');
+
+    const tasks = await store.listTasks();
+    const byId = new Map(tasks.map((task) => [task.id, task]));
+
+    expect(byId.get('legacy-earlier')?.identifier).toBe('TIK-1');
+    expect(byId.get('legacy-earlier')?.shortIdentifier).toBe('TIK-1');
+    expect(byId.get('legacy-later')?.identifier).toBe('TIK-2');
+    expect(byId.get('legacy-later')?.shortIdentifier).toBe('TIK-2');
+
+    const reloaded = await store.readTaskBundle('legacy-earlier');
+    expect(reloaded.task?.identifier).toBe('TIK-1');
+  });
+
+  it('assigns a stable TIK identifier during upsert so new tasks never surface a hex fallback', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-store-'));
+    tempDirs.push(root);
+    const store = new WorkbenchStore(root);
+
+    await store.upsertTask({
+      id: 'task-no-identifier',
+      title: 'Needs an identifier',
+      goal: 'Allocate a stable tracker id immediately',
+      status: 'todo',
+      createdAt: '2026-04-09T00:00:00.000Z',
+      updatedAt: '2026-04-09T00:00:00.000Z',
+    });
+
+    const task = (await store.readTaskBundle('task-no-identifier')).task;
+
+    expect(task?.identifier).toBe('TIK-1');
+    expect(task?.shortIdentifier).toBe('TIK-1');
+  });
 });
 
 async function runWithDelayedFirstIndexWrite(

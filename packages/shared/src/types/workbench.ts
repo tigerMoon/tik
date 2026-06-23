@@ -3,6 +3,10 @@ import type { TaskWorkspaceBinding } from './task.js';
 
 export type WorkbenchTaskStatus =
   | 'new'
+  | 'backlog'
+  | 'todo'
+  | 'in_progress'
+  | 'in_review'
   | 'running'
   | 'waiting_for_user'
   | 'blocked'
@@ -21,11 +25,116 @@ export type WorkbenchActor =
   | 'reviewer'
   | 'system';
 
+export type AgentLoopWorkItemKind =
+  | 'codex_implement'
+  | 'codex_fix'
+  | 'claude_review'
+  | 'human_review';
+
+export type ChangeRequestScm = 'github' | 'gitlab' | 'internal';
+
+export type ChangeRequestType = 'pull_request' | 'merge_request' | 'internal_review';
+
+export interface ChangeRequestRef {
+  scm: ChangeRequestScm;
+  repo: string;
+  id: string;
+  type?: ChangeRequestType;
+  url?: string;
+  title?: string;
+  baseRef: string;
+  headRef: string;
+  headSha: string;
+  status?: 'open' | 'merged' | 'closed';
+  ciStatus?: 'pending' | 'success' | 'failed' | 'unknown';
+}
+
+export interface BlockingIssue {
+  title: string;
+  file: string;
+  line?: number;
+  reason: string;
+  suggestedFix?: string;
+}
+
+export interface NonBlockingSuggestion {
+  title: string;
+  file?: string;
+  line?: number;
+  reason: string;
+}
+
+export interface ReviewResult {
+  verdict: 'request_changes' | 'comment' | 'approve';
+  headShaReviewed: string;
+  currentHeadSha?: string;
+  blockingIssues: BlockingIssue[];
+  nonBlockingSuggestions?: NonBlockingSuggestion[];
+  testsNeeded?: string[];
+  markdown: string;
+  reviewerWorkerId?: string;
+}
+
+export interface AgentLoopMetadata {
+  kind: AgentLoopWorkItemKind;
+  phase?: 'needs_claude_review' | 'claude_reviewing' | 'needs_codex_fix' | 'codex_fixing' | 'needs_human_review' | 'stale' | 'complete';
+  rootTaskId: string;
+  round: number;
+  maxRounds: number;
+  nextReviewRound?: number;
+  headSha?: string;
+  previousHeadSha?: string;
+  idempotencyKey: string;
+  changeRequest: ChangeRequestRef;
+  createdBy?: 'human' | 'codex' | 'claude' | 'system';
+  allowedScope?: string[];
+  acceptanceCriteria?: string[];
+  reviewFocus?: string[];
+  blockingIssues?: BlockingIssue[];
+  reviewResult?: ReviewResult;
+  stale?: {
+    expectedHeadSha: string;
+    actualHeadSha: string;
+  };
+}
+
+export interface AgentLoopPayload {
+  kind: AgentLoopWorkItemKind;
+  rootTaskId: string;
+  round: number;
+  maxRounds?: number;
+  changeRequest: ChangeRequestRef;
+  idempotencyKey?: string;
+  previousHeadSha?: string;
+  nextReviewRound?: number;
+  allowedScope?: string[];
+  acceptanceCriteria?: string[];
+  reviewFocus?: string[];
+  blockingIssues?: BlockingIssue[];
+  createdBy?: AgentLoopMetadata['createdBy'];
+  workspaceBinding?: TaskWorkspaceBinding;
+}
+
 export interface WorkbenchTaskRecord {
   id: string;
+  identifier?: string;
+  shortIdentifier?: string;
   title: string;
+  description?: string | null;
   goal: string;
   status: WorkbenchTaskStatus;
+  state?: string;
+  priority?: number | null;
+  labels?: string[];
+  blockedBy?: WorkbenchTaskBlockerRecord[];
+  blockedByTaskIds?: string[];
+  parentTaskId?: string | null;
+  assignee?: string | null;
+  humanAssignee?: string | null;
+  createdBy?: string | null;
+  sourceUrl?: string | null;
+  comments?: WorkbenchTaskCommentRecord[];
+  attempts?: WorkbenchTaskAttemptRecord[];
   createdAt: string;
   updatedAt: string;
   activeSessionId?: string;
@@ -37,8 +146,45 @@ export interface WorkbenchTaskRecord {
   environmentPackSnapshot?: EnvironmentPackSnapshot;
   environmentPackSelection?: EnvironmentPackSelection;
   workspaceBinding?: TaskWorkspaceBinding;
+  agentLoop?: AgentLoopMetadata;
   lastAdjustment?: WorkbenchTaskAdjustmentRecord;
   evidenceSummary?: WorkbenchTaskEvidenceSummary;
+  runs?: WorkbenchTaskRunRecord[];
+}
+
+export interface WorkbenchTaskBlockerRecord {
+  id?: string | null;
+  shortIdentifier?: string | null;
+  state?: string | null;
+}
+
+export interface WorkbenchTaskRunRecord {
+  runId: string;
+  startedAt: string;
+  endedAt?: string;
+  status: 'running' | 'stopping' | 'stopped' | 'completed' | 'failed' | 'cancelled';
+  kernelTaskId?: string;
+  agentName?: string;
+  turnCount?: number;
+  errorReason?: string;
+}
+
+export interface WorkbenchTaskCommentRecord {
+  id: string;
+  authorKind: 'human' | 'agent' | 'system';
+  authorId?: string;
+  body: string;
+  createdAt: string;
+}
+
+export interface WorkbenchTaskAttemptRecord {
+  attemptNumber: number;
+  startedAt: string;
+  finishedAt?: string;
+  outcome?: 'completed' | 'failed' | 'cancelled' | 'stalled';
+  error?: string;
+  kernelTaskId?: string;
+  turnCount?: number;
 }
 
 export interface WorkbenchTaskEvidenceSummary {
@@ -111,11 +257,30 @@ export interface WorkbenchTimelineItem {
 }
 
 export interface CreateWorkbenchTaskInput {
+  id?: string;
+  identifier?: string;
+  shortIdentifier?: string;
   title: string;
+  description?: string | null;
   goal: string;
+  status?: WorkbenchTaskStatus;
+  state?: string;
+  priority?: number | null;
+  labels?: string[];
+  blockedBy?: WorkbenchTaskBlockerRecord[];
+  blockedByTaskIds?: string[];
+  parentTaskId?: string | null;
+  assignee?: string | null;
+  humanAssignee?: string | null;
+  createdBy?: string | null;
+  sourceUrl?: string | null;
+  comments?: WorkbenchTaskCommentRecord[];
+  attempts?: WorkbenchTaskAttemptRecord[];
+  runs?: WorkbenchTaskRunRecord[];
   environmentPackSnapshot?: EnvironmentPackSnapshot;
   environmentPackSelection?: EnvironmentPackSelection;
   workspaceBinding?: TaskWorkspaceBinding;
+  agentLoop?: AgentLoopMetadata;
 }
 
 export function isWorkbenchTerminalStatus(
@@ -128,6 +293,8 @@ export function canRetryWorkbenchTask(
   status: WorkbenchTaskStatus,
 ): boolean {
   return status === 'new'
+    || status === 'backlog'
+    || status === 'todo'
     || status === 'failed'
     || status === 'cancelled'
     || status === 'paused'
@@ -139,6 +306,8 @@ export function canArchiveWorkbenchTask(
   status: WorkbenchTaskStatus,
 ): boolean {
   return status === 'new'
+    || status === 'backlog'
+    || status === 'todo'
     || status === 'failed'
     || status === 'cancelled'
     || status === 'paused'

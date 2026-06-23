@@ -1,0 +1,17 @@
+{
+  "name": "agent-loop-claude-review",
+  "description": "Claude Code reviewer plugin for Tik-native agent-loop work items.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Tik"
+  },
+  "homepage": "https://github.com/local/tik",
+  "repository": "https://github.com/local/tik",
+  "license": "MIT",
+  "keywords": [
+    "tik",
+    "agent-loop",
+    "review",
+    "claude-code"
+  ]
+}

@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import {
-  buildEnvironmentPackWorkflowCoverage,
+  buildEnvironmentPackPromotionQueue,
   type EnvironmentPackManifest,
   type WorkbenchTaskRecord,
 } from '@tik/shared';
@@ -82,30 +82,7 @@ function buildEnvironmentPackDashboardSummary(
 function buildPromotionQueue(
   pack: EnvironmentPackManifest,
 ): EnvironmentPromotionQueueItem[] {
-  const items = new Map<string, EnvironmentPromotionQueueItem>();
-
-  for (const workflow of buildEnvironmentPackWorkflowCoverage(pack)) {
-    for (const phase of workflow.phases) {
-      for (const capability of phase.missingCapabilities) {
-        const id = `missing-capability:${workflow.workflow}:${phase.phase}:${capability}`;
-        items.set(id, {
-          id,
-          kind: 'capability proposal',
-          detail: `Promote "${capability}" into ${workflow.workflow} / ${phase.phase} so this pack can satisfy its declared workflow binding.`,
-        });
-      }
-    }
-  }
-
-  if (pack.evaluators.length === 0) {
-    items.set('missing-evaluators', {
-      id: 'missing-evaluators',
-      kind: 'coverage review',
-      detail: 'Add at least one evaluator so this environment can verify task outcomes before release.',
-    });
-  }
-
-  return Array.from(items.values()).slice(0, 6);
+  return buildEnvironmentPackPromotionQueue(pack, { limit: 6 });
 }
 
 function getTaskTimestamp(task: WorkbenchTaskRecord): string {

@@ -28,7 +28,8 @@ export class WorkbenchStore {
   async upsertTask(task: WorkbenchTaskRecord): Promise<void> {
     await this.withIndexLock(async () => {
       const index = await this.readIndex();
-      index.tasks = [...index.tasks.filter((item) => item.id !== task.id), task];
+      const { normalizedTask } = this.normalizeTaskIdentifiers(task, index.tasks);
+      index.tasks = [...index.tasks.filter((item) => item.id !== task.id), normalizedTask];
       await this.writeIndex(index);
     });
   }
@@ -41,7 +42,14 @@ export class WorkbenchStore {
   }
 
   async listTasks(): Promise<WorkbenchTaskRecord[]> {
-    return this.withIndexLock(async () => (await this.readIndex()).tasks);
+    return this.withIndexLock(async () => {
+      const index = await this.readIndex();
+      const { tasks, changed } = this.backfillTaskIdentifiers(index.tasks);
+      if (changed) {
+        await this.writeIndex({ ...index, tasks });
+      }
+      return tasks;
+    });
   }
 
   async appendTimelineItem(item: WorkbenchTimelineItem): Promise<void> {
@@ -78,7 +86,11 @@ export class WorkbenchStore {
   async readTaskBundle(taskId: string): Promise<WorkbenchTaskBundle> {
     const task = await this.withIndexLock(async () => {
       const index = await this.readIndex();
-      return index.tasks.find((item) => item.id === taskId) ?? null;
+      const { tasks, changed } = this.backfillTaskIdentifiers(index.tasks);
+      if (changed) {
+        await this.writeIndex({ ...index, tasks });
+      }
+      return tasks.find((item) => item.id === taskId) ?? null;
     });
     const timeline = await this.readJsonLines<WorkbenchTimelineItem>(path.join(this.timelineDir(), `${taskId}.jsonl`));
 
@@ -114,6 +126,83 @@ export class WorkbenchStore {
 
   private async writeIndex(index: WorkbenchIndexFile): Promise<void> {
     await this.writeJsonFileAtomic(this.indexPath(), index);
+  }
+
+  private backfillTaskIdentifiers(tasks: WorkbenchTaskRecord[]): { tasks: WorkbenchTaskRecord[]; changed: boolean } {
+    let changed = false;
+    const nextIdentifier = this.buildNextIdentifier(tasks);
+
+    const legacyTasks = [...tasks]
+      .filter((task) => !task.identifier || !task.shortIdentifier)
+      .sort((left, right) => {
+        const createdDelta = (left.createdAt || '').localeCompare(right.createdAt || '');
+        if (createdDelta !== 0) return createdDelta;
+        return left.id.localeCompare(right.id);
+      });
+    const generatedById = new Map<string, string>();
+
+    for (const task of legacyTasks) {
+      generatedById.set(task.id, task.identifier || task.shortIdentifier || nextIdentifier());
+    }
+
+    const normalized = tasks.map((task) => {
+      const identifier = task.identifier || task.shortIdentifier || generatedById.get(task.id);
+      if (!identifier) {
+        return task;
+      }
+      if (task.identifier === identifier && task.shortIdentifier === identifier) {
+        return task;
+      }
+      changed = true;
+      return {
+        ...task,
+        identifier,
+        shortIdentifier: identifier,
+      };
+    });
+
+    return { tasks: normalized, changed };
+  }
+
+  private normalizeTaskIdentifiers(
+    task: WorkbenchTaskRecord,
+    existingTasks: WorkbenchTaskRecord[],
+  ): { normalizedTask: WorkbenchTaskRecord; changed: boolean } {
+    const identifier = task.identifier || task.shortIdentifier || this.buildNextIdentifier(existingTasks)();
+    if (task.identifier === identifier && task.shortIdentifier === identifier) {
+      return { normalizedTask: task, changed: false };
+    }
+    return {
+      normalizedTask: {
+        ...task,
+        identifier,
+        shortIdentifier: identifier,
+      },
+      changed: true,
+    };
+  }
+
+  private buildNextIdentifier(tasks: WorkbenchTaskRecord[]): () => string {
+    const usedNumbers = new Set<number>();
+
+    for (const task of tasks) {
+      const identifier = task.identifier || task.shortIdentifier;
+      const match = identifier?.match(/^TIK-(\d+)$/i);
+      if (match) {
+        usedNumbers.add(Number(match[1]));
+      }
+    }
+
+    let nextNumber = 1;
+    return () => {
+      while (usedNumbers.has(nextNumber)) {
+        nextNumber += 1;
+      }
+      const identifier = `TIK-${nextNumber}`;
+      usedNumbers.add(nextNumber);
+      nextNumber += 1;
+      return identifier;
+    };
   }
 
   private async withIndexLock<T>(operation: () => Promise<T>): Promise<T> {

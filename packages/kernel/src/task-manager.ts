@@ -30,7 +30,7 @@ export class TaskManager {
 
   create(input: CreateTaskInput): Task {
     const task: Task = {
-      id: generateTaskId(),
+      id: input.id || generateTaskId(),
       description: input.description,
       status: 'pending',
       projectPath: input.projectPath,
@@ -42,6 +42,8 @@ export class TaskManager {
       environmentPackSnapshot: input.environmentPackSnapshot,
       environmentPackSelection: input.environmentPackSelection,
       workspaceBinding: input.workspaceBinding,
+      recentComments: input.recentComments,
+      taskContextSnapshot: input.taskContextSnapshot,
     };
 
     this.tasks.set(task.id, task);

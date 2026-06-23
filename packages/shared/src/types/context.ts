@@ -241,6 +241,12 @@ export interface ConversationContext {
   sessionMemory?: SessionCompactMemory;
   /** Token usage snapshot */
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+  /** Recent human comments surfaced into the agent prompt as operator guidance. */
+  operatorComments?: Array<{
+    authorId?: string;
+    body: string;
+    createdAt: string;
+  }>;
 }
 
 // ─── Tool Result Reference (Phase 2.8) ──────────────────────

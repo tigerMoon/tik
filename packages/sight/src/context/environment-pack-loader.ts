@@ -21,6 +21,9 @@ export class EnvironmentPackLoader {
     const preferredPack = preferredPackId
       ? packs.find((pack) => pack.id === preferredPackId)
       : undefined;
+    if (preferredPackId && !preferredPack) {
+      return undefined;
+    }
     const activePack = activeState.activePackId
       ? packs.find((pack) => pack.id === activeState.activePackId)
       : undefined;

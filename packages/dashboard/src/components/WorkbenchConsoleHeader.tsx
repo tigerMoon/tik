@@ -13,8 +13,10 @@ interface WorkbenchConsoleHeaderProps {
   bootstrapping?: boolean;
   refreshing?: boolean;
   liveStatus?: 'live' | 'connecting' | 'offline' | 'idle';
+  publishingReviewRound?: boolean;
   onToggleFilter: () => void;
   onNewTask: () => void;
+  onPublishReviewRound?: () => Promise<void>;
   onRefresh?: () => Promise<void>;
 }
 
@@ -28,8 +30,10 @@ export function WorkbenchConsoleHeader({
   bootstrapping = false,
   refreshing = false,
   liveStatus = 'idle',
+  publishingReviewRound = false,
   onToggleFilter,
   onNewTask,
+  onPublishReviewRound,
   onRefresh,
 }: WorkbenchConsoleHeaderProps) {
   const activePack = activeTask?.environmentPackSnapshot
@@ -44,13 +48,19 @@ export function WorkbenchConsoleHeader({
         : 'Idle';
   const laneLabel = selectedLens === 'inbox'
     ? 'Inbox'
+    : selectedLens === 'active'
+    ? 'Active'
+    : selectedLens === 'review-loop'
+      ? 'Review loop'
     : selectedLens === 'completed'
       ? 'Completed'
       : selectedLens === 'archived'
         ? 'Archived'
         : selectedLens === 'today'
           ? 'Today'
-          : 'Tasks';
+          : selectedLens === 'backlog'
+            ? 'Backlog'
+            : 'Tasks';
 
   return (
     <header className="console-topbar">
@@ -107,6 +117,16 @@ export function WorkbenchConsoleHeader({
           onClick={onNewTask}
         >
           New task
+        </button>
+        <button
+          type="button"
+          className="console-ghost-button"
+          disabled={publishingReviewRound}
+          onClick={() => {
+            void onPublishReviewRound?.();
+          }}
+        >
+          {publishingReviewRound ? 'Publishing' : 'Publish review'}
         </button>
         <button
           type="button"
