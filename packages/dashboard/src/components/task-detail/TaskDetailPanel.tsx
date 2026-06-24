@@ -5,6 +5,7 @@ import type {
   UpdateWorkbenchTaskBriefResult,
   UpdateWorkbenchTaskConfigurationInput,
   WorkbenchDecisionResponse,
+  WorkbenchArtifactRecord,
   WorkbenchTaskResponse,
   WorkbenchTimelineResponseItem,
 } from '../../api/client';
@@ -20,6 +21,7 @@ import { TaskActivityBlock } from './TaskActivityBlock';
 import { TaskAcceptanceBlock } from './TaskAcceptanceBlock';
 import { TaskExecutionSetupBlock } from './TaskExecutionSetupBlock';
 import { TaskCommentsBlock } from './TaskCommentsBlock';
+import { TaskArtifactRail } from './TaskArtifactRail';
 import { TaskPropertiesRail } from './TaskPropertiesRail';
 
 interface TaskDetailPanelProps {
@@ -28,6 +30,7 @@ interface TaskDetailPanelProps {
   packs: EnvironmentPackManifest[];
   timeline: WorkbenchTimelineResponseItem[];
   decisions: WorkbenchDecisionResponse[];
+  artifacts?: WorkbenchArtifactRecord[];
   resolvingDecisionId?: string | null;
   retrying: boolean;
   archiving: boolean;
@@ -55,6 +58,12 @@ interface TaskDetailPanelProps {
     input: Partial<Pick<WorkbenchTaskResponse, 'status' | 'priority' | 'labels' | 'parentTaskId' | 'humanAssignee'>>,
   ) => Promise<void>;
   onAddTaskComment: (task: WorkbenchTaskResponse, body: string) => Promise<void>;
+  onGenerateArtifact?: (taskId: string) => Promise<void>;
+  onAcceptArtifact?: (artifactId: string) => Promise<void>;
+  onRejectArtifact?: (artifactId: string, reason: string) => Promise<void>;
+  onOpenArtifact?: (artifactId: string) => void;
+  generatingArtifact?: boolean;
+  busyArtifactId?: string | null;
   /** Banner stop/resume route through this. */
   onControlTask: (taskId: string, action: 'pause' | 'resume' | 'stop') => Promise<void>;
 }
@@ -66,6 +75,7 @@ export function TaskDetailPanel(props: TaskDetailPanelProps) {
     packs,
     timeline,
     decisions,
+    artifacts = [],
     resolvingDecisionId,
     retrying,
     archiving,
@@ -82,6 +92,12 @@ export function TaskDetailPanel(props: TaskDetailPanelProps) {
     onSaveTaskConfiguration,
     onUpdateTaskMetadata,
     onAddTaskComment,
+    onGenerateArtifact,
+    onAcceptArtifact,
+    onRejectArtifact,
+    onOpenArtifact,
+    generatingArtifact,
+    busyArtifactId,
     onControlTask,
   } = props;
 
@@ -171,7 +187,18 @@ export function TaskDetailPanel(props: TaskDetailPanelProps) {
 
         <TaskActivityBlock task={task} timeline={timeline} />
 
-        <TaskAcceptanceBlock task={task} timeline={timeline} decisions={decisions} />
+        <TaskAcceptanceBlock task={task} timeline={timeline} decisions={decisions} artifacts={artifacts} />
+
+        <TaskArtifactRail
+          task={task}
+          artifacts={artifacts}
+          loading={generatingArtifact}
+          busyArtifactId={busyArtifactId}
+          onGenerate={onGenerateArtifact || (async () => {})}
+          onAccept={onAcceptArtifact || (async () => {})}
+          onReject={onRejectArtifact || (async () => {})}
+          onOpenArtifact={onOpenArtifact || (() => {})}
+        />
 
         <TaskExecutionSetupBlock
           task={task}

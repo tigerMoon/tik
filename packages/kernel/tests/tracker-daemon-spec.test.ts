@@ -6,11 +6,24 @@ import { TrackerDaemon } from '../src/tracker-daemon/tracker-daemon.js';
 import { loadTrackerWorkflow } from '../src/tracker-daemon/workflow-loader.js';
 import { LinearTaskImporter } from '../src/tracker-daemon/linear-tracker-client.js';
 import { JsonTaskImporter } from '../src/tracker-daemon/json-tracker-client.js';
+import { FileAgentRunStore } from '../src/agent-runners/agent-run-store.js';
 import type {
+  AgentRunHandle,
+  AgentRunInput,
+  AgentRunCompletion,
+  AgentRunStatusSnapshot,
+  AgentRuntimeRunner,
+  ArtifactCandidate,
+  PreparedRun,
+} from '../src/agent-runners/agent-runtime-runner.js';
+import type {
+  AgentRuntimeName,
   TrackerDaemonStateStore,
   TrackerDaemonWorkLauncher,
+  TrackerWorkflowDefinition,
   TrackedTask,
   TrackedTaskStateKind,
+  WorkbenchPort,
 } from '../src/tracker-daemon/types.js';
 
 const tempDirs: string[] = [];
@@ -65,7 +78,11 @@ class RecordingLauncher implements TrackerDaemonWorkLauncher {
   launched: Array<{ task: TrackedTask; prompt?: string; projectPath: string }> = [];
   stopped: Array<{ taskId: string; reason: string }> = [];
   hooks: string[] = [];
+  runtimeStarts: Array<{ task: TrackedTask; runId: string; attempt: number; projectPath: string }> = [];
+  runtimeFinishes: Array<{ taskId: string; runId: string; attemptNumber: number; completion: AgentRunCompletion }> = [];
   private nextId = 1;
+
+  constructor(private readonly workbench?: WorkbenchPort) {}
 
   async launchTask(task: TrackedTask, input: { projectPath: string; prompt?: string }) {
     this.launched.push({ task, prompt: input.prompt, projectPath: input.projectPath });
@@ -83,6 +100,191 @@ class RecordingLauncher implements TrackerDaemonWorkLauncher {
   async cleanupWorkspace(input: { task: TrackedTask }): Promise<void> {
     this.hooks.push(`cleanup:${input.task.shortIdentifier}`);
   }
+
+  async markRuntimeRunStarted(
+    task: TrackedTask,
+    input: { runId: string; attempt: number; projectPath: string; runner: AgentRuntimeName },
+  ): Promise<{ attemptNumber: number } | void> {
+    this.runtimeStarts.push({ task, runId: input.runId, attempt: input.attempt, projectPath: input.projectPath });
+    if (!this.workbench) return undefined;
+    const existing = await this.workbench.readTask?.(task.id);
+    if (!existing) {
+      await this.workbench.createTask({
+        id: task.id,
+        shortIdentifier: task.shortIdentifier,
+        title: task.title,
+        goal: task.description || task.title,
+        status: 'todo',
+      } as any, task.id);
+    }
+    const current = await this.workbench.readTask?.(task.id);
+    const attemptNumber = ((current?.attempts || []).length) + 1;
+    await this.workbench.appendAttempt?.(task.id, {
+      attemptNumber,
+      startedAt: '2026-01-01T00:00:00.000Z',
+      kernelTaskId: input.runId,
+      turnCount: input.attempt,
+    });
+    await this.workbench.appendTaskRun?.(task.id, {
+      runId: input.runId,
+      startedAt: '2026-01-01T00:00:00.000Z',
+      status: 'running',
+      kernelTaskId: input.runId,
+      agentName: input.runner,
+      turnCount: input.attempt,
+    } as any);
+    return { attemptNumber };
+  }
+
+  async markRuntimeRunFinished(
+    taskId: string,
+    input: { runId: string; attemptNumber: number; completion: AgentRunCompletion },
+  ): Promise<void> {
+    this.runtimeFinishes.push({ taskId, runId: input.runId, attemptNumber: input.attemptNumber, completion: input.completion });
+    if (!this.workbench) return;
+    const status = input.completion.status === 'completed' ? 'completed' : 'failed';
+    await this.workbench.finishAttempt?.(
+      taskId,
+      input.attemptNumber,
+      input.completion.status === 'completed' ? 'completed' : 'failed',
+      input.completion.error,
+    );
+    await this.workbench.appendTaskRun?.(taskId, {
+      runId: input.runId,
+      startedAt: '2026-01-01T00:00:00.000Z',
+      endedAt: '2026-01-01T00:00:01.000Z',
+      status,
+      kernelTaskId: input.runId,
+      errorReason: input.completion.error,
+    } as any);
+    await this.workbench.transitionTask?.(taskId, input.completion.status === 'completed' ? 'in_review' : 'blocked');
+  }
+}
+
+class RecordingRuntimeRunner implements AgentRuntimeRunner {
+  readonly name: AgentRuntimeName;
+  preparedInputs: AgentRunInput[] = [];
+  startedInputs: PreparedRun[] = [];
+  startError?: Error;
+  completion?: Promise<AgentRunCompletion>;
+
+  constructor(name: AgentRuntimeName) {
+    this.name = name;
+  }
+
+  async prepare(input: AgentRunInput): Promise<PreparedRun> {
+    this.preparedInputs.push(input);
+    return {
+      runId: input.runId,
+      runner: this.name,
+      mode: this.name === 'claude-code' ? 'claude_print' : 'codex_app_server',
+      cwd: input.projectPath,
+      prompt: input.renderedPrompt,
+    };
+  }
+
+  async start(input: PreparedRun): Promise<AgentRunHandle> {
+    this.startedInputs.push(input);
+    if (this.startError) throw this.startError;
+    return {
+      runId: input.runId,
+      startedAt: '2026-01-01T00:00:00.000Z',
+      completion: this.completion,
+      stop: async () => undefined,
+    };
+  }
+
+  async stop(): Promise<void> {}
+
+  async getStatus(): Promise<AgentRunStatusSnapshot> {
+    return 'running';
+  }
+
+  async collectTranscript() {
+    return [];
+  }
+
+  async collectDiff() {
+    return { changedFiles: [] };
+  }
+
+  async collectArtifacts(): Promise<ArtifactCandidate[]> {
+    return [];
+  }
+
+  async cleanup(): Promise<void> {}
+}
+
+class MemoryWorkbenchPort implements WorkbenchPort {
+  tasks = new Map<string, {
+    id: string;
+    status: 'todo' | 'in_progress' | 'in_review' | 'failed' | 'blocked';
+    attempts: Array<{ attemptNumber: number; startedAt: string; finishedAt?: string; outcome?: 'completed' | 'failed'; kernelTaskId?: string; error?: string }>;
+    runs: Array<{ runId: string; startedAt: string; endedAt?: string; status: 'running' | 'completed' | 'failed'; kernelTaskId?: string; agentName?: string; errorReason?: string }>;
+  }>();
+
+  constructor(initial: Array<{ id: string; status?: 'todo' | 'in_progress' | 'in_review' | 'failed' | 'blocked' }> = []) {
+    for (const item of initial) {
+      this.tasks.set(item.id, {
+        id: item.id,
+        status: item.status || 'todo',
+        attempts: [],
+        runs: [],
+      });
+    }
+  }
+
+  async createTask(input: any, taskId?: string) {
+    const id = taskId || input.id;
+    const task = {
+      id,
+      status: input.status || 'todo',
+      attempts: input.attempts || [],
+      runs: input.runs || [],
+    };
+    this.tasks.set(id, task);
+    return task as any;
+  }
+
+  async readTask(taskId: string) {
+    return this.tasks.get(taskId) as any || null;
+  }
+
+  async transitionTask(taskId: string, to: any) {
+    const task = this.tasks.get(taskId);
+    if (!task) return null;
+    task.status = to;
+    return task as any;
+  }
+
+  async appendAttempt(taskId: string, input: any) {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error(`missing task ${taskId}`);
+    const attempt = {
+      attemptNumber: input.attemptNumber || task.attempts.length + 1,
+      startedAt: input.startedAt || '2026-01-01T00:00:00.000Z',
+      kernelTaskId: input.kernelTaskId,
+    };
+    task.status = 'in_progress';
+    task.attempts.push(attempt);
+    return attempt as any;
+  }
+
+  async finishAttempt(taskId: string, attemptNumber: number, outcome: 'completed' | 'failed', error?: string) {
+    const task = this.tasks.get(taskId);
+    if (!task) return null;
+    task.attempts = task.attempts.map((attempt) => attempt.attemptNumber === attemptNumber
+      ? { ...attempt, finishedAt: '2026-01-01T00:00:01.000Z', outcome, error }
+      : attempt);
+    return task as any;
+  }
+
+  async appendTaskRun(taskId: string, run: any) {
+    const task = this.tasks.get(taskId);
+    if (!task) return null;
+    task.runs = [...task.runs.filter((item) => item.runId !== run.runId), run];
+    return task as any;
+  }
 }
 
 function task(id: string, shortIdentifier: string, stateKind: TrackedTaskStateKind = 'active'): TrackedTask {
@@ -97,6 +299,44 @@ function task(id: string, shortIdentifier: string, stateKind: TrackedTaskStateKi
     blockedBy: [],
     sourceUrl: `https://linear.local/${shortIdentifier}`,
     repository: { name: 'repo', path: '/repo/default' },
+  };
+}
+
+function workflowV2(input: {
+  root?: string;
+  runner?: AgentRuntimeName;
+  mode?: 'codex_exec' | 'codex_app_server' | 'claude_print' | 'claude_hooked';
+  renderPrompt?: (task: TrackedTask, attempt: number) => string;
+} = {}): TrackerWorkflowDefinition {
+  const runner = input.runner || 'codex';
+  const mode = input.mode || (runner === 'claude-code' ? 'claude_print' : 'codex_app_server');
+  return {
+    version: 2,
+    path: input.root ? path.join(input.root, '.tik', 'WORKFLOW.md') : undefined,
+    workflowConfigHash: 'config-hash',
+    workflowPromptHash: 'prompt-hash',
+    config: {
+      tracker: { kind: 'json', activeStates: ['Todo'], terminalStates: ['Done'] },
+      polling: { intervalMs: 1000, maxConcurrentAgents: 3 },
+      workspace: {
+        root: '.tik/workspaces',
+        cleanupTerminal: false,
+        hooks: { afterCreate: [], beforeRun: [], afterRun: [], beforeRemove: [] },
+      },
+      agent: { timeoutMs: 1000 },
+      selector: { includeLabels: ['ready'], excludeLabels: [] },
+      routing: { defaultRunner: runner, defaultMode: mode, rules: [] },
+      concurrency: { lock: 'repository_branch', respectLabels: [] },
+      sandbox: { envWhitelist: [] },
+      hooks: { root: '.tik/hooks', timeoutMs: 30_000, allowExecutableOnly: true },
+    },
+    promptTemplate: 'Implement {{ task.shortIdentifier }}',
+    renderPrompt(taskInput, renderInput) {
+      return input.renderPrompt?.(taskInput, renderInput?.attempt || 0) || `Implement ${taskInput.shortIdentifier}`;
+    },
+    resolveRouting() {
+      return { runner, mode, matchedSource: 'default' };
+    },
   };
 }
 
@@ -245,6 +485,131 @@ describe('tracker-daemon Symphony spec behavior', () => {
     expect(rendered).toContain('- tracker');
   });
 
+  it('loads workflow v2 hashes and resolves explicit runner labels before rules', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-v2-'));
+    tempDirs.push(root);
+    await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'selector:',
+      '  include_labels: [ready]',
+      'routing:',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
+      '  rules:',
+      '    - labels_any: [type:docs]',
+      '      runner: claude-code',
+      '      mode: claude_print',
+      'sandbox:',
+      '  env_whitelist: [GITHUB_TOKEN]',
+      '---',
+      'Review {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workflow = await loadTrackerWorkflow(root);
+    const resolved = workflow.resolveRouting?.({
+      ...task('task-1', 'TIK-1'),
+      labels: ['ready', 'runner:codex', 'type:docs'],
+    });
+
+    expect(workflow.version).toBe(2);
+    expect(workflow.workflowConfigHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(workflow.workflowPromptHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(resolved).toMatchObject({
+      runner: 'codex',
+      mode: 'codex_app_server',
+      matchedSource: 'explicit-label',
+    });
+  });
+
+  it('fails workflow v2 routing for conflicting explicit runner labels', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-v2-'));
+    tempDirs.push(root);
+    await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
+      '---',
+      'Implement {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workflow = await loadTrackerWorkflow(root);
+
+    expect(() => workflow.resolveRouting?.({
+      ...task('task-1', 'TIK-1'),
+      labels: ['ready', 'runner:codex', 'runner:claude'],
+    })).toThrow('Conflicting explicit runner labels');
+  });
+
+  it('fails workflow v2 routing when no rule matches and no default runner is configured', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-v2-'));
+    tempDirs.push(root);
+    await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  rules:',
+      '    - labels_any: [type:docs]',
+      '      runner: claude-code',
+      '      mode: claude_print',
+      '---',
+      'Implement {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workflow = await loadTrackerWorkflow(root);
+
+    expect(() => workflow.resolveRouting?.({
+      ...task('task-1', 'TIK-1'),
+      labels: ['ready', 'type:implement'],
+    })).toThrow('No workflow routing rule matched');
+  });
+
+  it('rejects workflow v2 hooks outside .tik/hooks', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-v2-'));
+    tempDirs.push(root);
+    await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
+      'workspace:',
+      '  hooks:',
+      '    before_run: echo unsafe',
+      '---',
+      'Implement {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    await expect(loadTrackerWorkflow(root)).rejects.toThrow('Workflow v2 hook must be under .tik/hooks');
+  });
+
+  it('accepts executable workflow v2 hooks under .tik/hooks', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-v2-'));
+    tempDirs.push(root);
+    await fs.mkdir(path.join(root, '.tik', 'hooks'), { recursive: true });
+    const hookPath = path.join(root, '.tik', 'hooks', 'before-run.sh');
+    await fs.writeFile(hookPath, '#!/bin/sh\nexit 0\n', 'utf-8');
+    await fs.chmod(hookPath, 0o755);
+    await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
+      'workspace:',
+      '  hooks:',
+      '    before_run: .tik/hooks/before-run.sh',
+      '---',
+      'Implement {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workflow = await loadTrackerWorkflow(root);
+
+    expect(workflow.config.workspace.hooks.beforeRun).toEqual(['.tik/hooks/before-run.sh']);
+  });
+
   it('enforces bounded concurrency when dispatching active tasks', async () => {
     const importer = new MemoryTaskImporter([
       task('task-1', 'TIK-1'),
@@ -267,6 +632,437 @@ describe('tracker-daemon Symphony spec behavior', () => {
     expect(result.dispatched).toEqual(['TIK-1', 'TIK-2']);
     expect(result.skipped).toContainEqual({ shortIdentifier: 'TIK-3', reason: 'concurrency-limit' });
     expect(launcher.launched).toHaveLength(2);
+  });
+
+  it('skips workflow v2 tasks missing the ready label before dispatch', async () => {
+    const importer = new MemoryTaskImporter([
+      { ...task('task-1', 'TIK-1'), labels: ['type:implement'] },
+    ]);
+    const launcher = new RecordingLauncher();
+    const daemon = new TrackerDaemon({
+      importer,
+      stateStore: new MemoryStateStore(),
+      launcher,
+      workspaceRoot: '/workspace',
+      defaultProjectPath: '/repo/default',
+      workflow: {
+        version: 2,
+        workflowConfigHash: 'config-hash',
+        workflowPromptHash: 'prompt-hash',
+        config: {
+          tracker: { kind: 'json', activeStates: ['Todo'], terminalStates: ['Done'] },
+          polling: { intervalMs: 1000, maxConcurrentAgents: 3 },
+          workspace: {
+            root: '.tik/workspaces',
+            cleanupTerminal: false,
+            hooks: { afterCreate: [], beforeRun: [], afterRun: [], beforeRemove: [] },
+          },
+          agent: { timeoutMs: 1000 },
+          selector: { includeLabels: ['ready'], excludeLabels: [] },
+          routing: { defaultRunner: 'codex', defaultMode: 'codex_app_server', rules: [] },
+          concurrency: { lock: 'repository_branch', respectLabels: [] },
+          sandbox: { envWhitelist: [] },
+          hooks: { root: '.tik/hooks', timeoutMs: 30_000, allowExecutableOnly: true },
+        },
+        promptTemplate: 'Implement {{ task.shortIdentifier }}',
+        renderPrompt(taskInput) {
+          return `Implement ${taskInput.shortIdentifier}`;
+        },
+        resolveRouting() {
+          return { runner: 'codex', mode: 'codex_app_server', matchedSource: 'default' };
+        },
+      },
+    });
+
+    const result = await daemon.tick();
+
+    expect(result.dispatched).toEqual([]);
+    expect(result.skipped).toContainEqual({ shortIdentifier: 'TIK-1', reason: 'skipped, missing label ready' });
+    expect(launcher.launched).toHaveLength(0);
+  });
+
+  it('applies the workflow v2 repository branch lock before starting runners', async () => {
+    const importer = new MemoryTaskImporter([
+      { ...task('task-1', 'TIK-1'), labels: ['ready'] },
+      { ...task('task-2', 'TIK-2'), labels: ['ready'] },
+    ]);
+    const launcher = new RecordingLauncher();
+    const daemon = new TrackerDaemon({
+      importer,
+      stateStore: new MemoryStateStore(),
+      launcher,
+      workspaceRoot: '/workspace',
+      defaultProjectPath: '/repo/default',
+      maxConcurrentAgents: 3,
+      workflow: {
+        version: 2,
+        workflowConfigHash: 'config-hash',
+        workflowPromptHash: 'prompt-hash',
+        config: {
+          tracker: { kind: 'json', activeStates: ['Todo'], terminalStates: ['Done'] },
+          polling: { intervalMs: 1000, maxConcurrentAgents: 3 },
+          workspace: {
+            root: '.tik/workspaces',
+            cleanupTerminal: false,
+            hooks: { afterCreate: [], beforeRun: [], afterRun: [], beforeRemove: [] },
+          },
+          agent: { timeoutMs: 1000 },
+          selector: { includeLabels: ['ready'], excludeLabels: [] },
+          routing: { defaultRunner: 'codex', defaultMode: 'codex_app_server', rules: [] },
+          concurrency: { lock: 'repository_branch', respectLabels: [] },
+          sandbox: { envWhitelist: [] },
+          hooks: { root: '.tik/hooks', timeoutMs: 30_000, allowExecutableOnly: true },
+        },
+        promptTemplate: 'Implement {{ task.shortIdentifier }}',
+        renderPrompt(taskInput) {
+          return `Implement ${taskInput.shortIdentifier}`;
+        },
+        resolveRouting() {
+          return { runner: 'codex', mode: 'codex_app_server', matchedSource: 'default' };
+        },
+      },
+    });
+
+    const result = await daemon.tick();
+
+    expect(result.dispatched).toEqual(['TIK-1']);
+    expect(result.skipped).toContainEqual({ shortIdentifier: 'TIK-2', reason: 'repository-branch-lock' });
+    expect(launcher.launched).toHaveLength(1);
+  });
+
+  it('records workflow v2 dispatches as AgentRun metadata and events', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-v2-runs-'));
+    tempDirs.push(root);
+    const importer = new MemoryTaskImporter([
+      { ...task('task-1', 'TIK-1'), labels: ['ready', 'runner:codex'] },
+    ]);
+    const launcher = new RecordingLauncher();
+    const agentRunStore = new FileAgentRunStore(root);
+    const daemon = new TrackerDaemon({
+      importer,
+      stateStore: new MemoryStateStore(),
+      launcher,
+      workspaceRoot: root,
+      defaultProjectPath: '/repo/default',
+      now: () => 1_000,
+      agentRunStore,
+      workflow: {
+        version: 2,
+        path: path.join(root, '.tik', 'WORKFLOW.md'),
+        workflowConfigHash: 'config-hash',
+        workflowPromptHash: 'prompt-hash',
+        config: {
+          tracker: { kind: 'json', activeStates: ['Todo'], terminalStates: ['Done'] },
+          polling: { intervalMs: 1000, maxConcurrentAgents: 3 },
+          workspace: {
+            root: '.tik/workspaces',
+            cleanupTerminal: false,
+            hooks: { afterCreate: [], beforeRun: [], afterRun: [], beforeRemove: [] },
+          },
+          agent: { timeoutMs: 1000 },
+          selector: { includeLabels: ['ready'], excludeLabels: [] },
+          routing: { defaultRunner: 'codex', defaultMode: 'codex_app_server', rules: [] },
+          concurrency: { lock: 'repository_branch', respectLabels: [] },
+          sandbox: { envWhitelist: [] },
+          hooks: { root: '.tik/hooks', timeoutMs: 30_000, allowExecutableOnly: true },
+        },
+        promptTemplate: 'Implement {{ task.shortIdentifier }}',
+        renderPrompt(taskInput) {
+          return `Implement ${taskInput.shortIdentifier}`;
+        },
+        resolveRouting() {
+          return { runner: 'codex', mode: 'codex_app_server', matchedSource: 'explicit-label' };
+        },
+      },
+    });
+
+    const result = await daemon.tick();
+    const runs = await agentRunStore.listRuns();
+    const events = await agentRunStore.readEvents('tik-1-attempt-0-1000');
+
+    expect(result.dispatched).toEqual(['TIK-1']);
+    expect(runs[0]).toMatchObject({
+      id: 'tik-1-attempt-0-1000',
+      taskId: 'task-1',
+      shortIdentifier: 'TIK-1',
+      runner: 'codex',
+      runnerMode: 'codex_app_server',
+      status: 'running',
+      workflowConfigHash: 'config-hash',
+      workflowPromptHash: 'prompt-hash',
+    });
+    expect(events.map((event) => event.kind)).toEqual(['run.start']);
+  });
+
+  it('dispatches workflow v2 tasks through a configured runtime runner without using the legacy launcher', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-v2-direct-runner-'));
+    tempDirs.push(root);
+    const importer = new MemoryTaskImporter([
+      { ...task('task-1', 'TIK-1'), labels: ['ready', 'review'], repository: { name: 'tik', path: path.join(root, 'repo') } },
+    ]);
+    const launcher = new RecordingLauncher();
+    const agentRunStore = new FileAgentRunStore(root);
+    const runtimeRunner = new RecordingRuntimeRunner('claude-code');
+    const daemon = new TrackerDaemon({
+      importer,
+      stateStore: new MemoryStateStore(),
+      launcher,
+      workspaceRoot: root,
+      defaultProjectPath: path.join(root, 'repo'),
+      now: () => 1_000,
+      agentRunStore,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({
+        root,
+        runner: 'claude-code',
+        mode: 'claude_print',
+        renderPrompt: (trackedTask, attempt) => `Review ${trackedTask.shortIdentifier} attempt ${attempt}.`,
+      }),
+    });
+
+    const result = await daemon.tick();
+    const runs = await agentRunStore.listRuns();
+    const events = await agentRunStore.readEvents('tik-1-attempt-0-1000');
+
+    expect(result.dispatched).toEqual(['TIK-1']);
+    expect(launcher.launched).toHaveLength(0);
+    expect(runtimeRunner.preparedInputs[0]).toMatchObject({
+      runId: 'tik-1-attempt-0-1000',
+      attempt: 0,
+      renderedPrompt: 'Review TIK-1 attempt 0.',
+      workspaceRoot: root,
+      projectPath: path.join(root, 'repo'),
+      labels: ['ready', 'review'],
+      artifactOutputDir: path.join(root, '.tik', 'artifacts', 'TIK-1', 'attempt-0'),
+    });
+    expect(runtimeRunner.startedInputs[0]).toMatchObject({
+      runId: 'tik-1-attempt-0-1000',
+      runner: 'claude-code',
+      mode: 'claude_print',
+      prompt: 'Review TIK-1 attempt 0.',
+    });
+    expect(runs[0]).toMatchObject({
+      id: 'tik-1-attempt-0-1000',
+      runner: 'claude-code',
+      runnerMode: 'claude_print',
+      status: 'running',
+    });
+    expect(events.map((event) => event.kind)).toEqual(['run.start']);
+  });
+
+  it('marks direct workflow v2 runtime runs on the workbench so repeat ticks do not redispatch them', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-v2-direct-workbench-'));
+    tempDirs.push(root);
+    const sourceProjectPath = path.join(root, 'repo');
+    const workbench = new MemoryWorkbenchPort([{ id: 'task-1', status: 'todo' }]);
+    const importer = new MemoryTaskImporter([
+      {
+        ...task('task-1', 'TIK-1'),
+        sourceKind: 'workbench',
+        labels: ['ready', 'runner:claude'],
+        repository: {
+          name: 'tik',
+          executionPath: path.join(root, '.tik', 'worktrees', 'tik-1'),
+          path: path.join(root, '.tik', 'worktrees', 'tik-1'),
+          sourcePath: sourceProjectPath,
+        },
+      },
+    ]);
+    const launcher = new RecordingLauncher(workbench);
+    const runtimeRunner = new RecordingRuntimeRunner('claude-code');
+    const daemon = new TrackerDaemon({
+      importer,
+      stateStore: new MemoryStateStore(),
+      launcher,
+      workspaceRoot: root,
+      defaultProjectPath: sourceProjectPath,
+      now: () => 1_000,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({ root, runner: 'claude-code', mode: 'claude_print' }),
+    });
+
+    const first = await daemon.tick();
+    importer.tasks = [{
+      ...importer.tasks[0]!,
+      state: 'in_progress',
+      activeKernelTaskId: 'tik-1-attempt-0-1000',
+      activeAttemptStartedAt: '2026-01-01T00:00:00.000Z',
+    }];
+    const second = await daemon.tick();
+    const taskRecord = await workbench.readTask('task-1');
+
+    expect(first.dispatched).toEqual(['TIK-1']);
+    expect(second.dispatched).toEqual([]);
+    expect(second.skipped).toContainEqual({ shortIdentifier: 'TIK-1', reason: 'already-running' });
+    expect(runtimeRunner.startedInputs).toHaveLength(1);
+    expect(runtimeRunner.preparedInputs[0]?.projectPath).toBe(path.join(root, '.tik', 'worktrees', 'tik-1'));
+    expect(taskRecord?.status).toBe('in_progress');
+    expect(taskRecord?.attempts).toEqual([
+      expect.objectContaining({
+        attemptNumber: 1,
+        kernelTaskId: 'tik-1-attempt-0-1000',
+      }),
+    ]);
+    expect(taskRecord?.runs).toEqual([
+      expect.objectContaining({
+        runId: 'tik-1-attempt-0-1000',
+        status: 'running',
+        kernelTaskId: 'tik-1-attempt-0-1000',
+        agentName: 'claude-code',
+      }),
+    ]);
+  });
+
+  it('records direct workflow v2 runtime completion on AgentRunStore and Workbench', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-v2-direct-complete-'));
+    tempDirs.push(root);
+    let completeRun: (completion: AgentRunCompletion) => void = () => undefined;
+    const workbench = new MemoryWorkbenchPort([{ id: 'task-1', status: 'todo' }]);
+    const importer = new MemoryTaskImporter([
+      { ...task('task-1', 'TIK-1'), sourceKind: 'workbench', labels: ['ready'], repository: { name: 'tik', path: path.join(root, 'repo') } },
+    ]);
+    const launcher = new RecordingLauncher(workbench);
+    const agentRunStore = new FileAgentRunStore(root);
+    const runtimeRunner = new RecordingRuntimeRunner('codex');
+    runtimeRunner.completion = new Promise((resolve) => {
+      completeRun = resolve;
+    });
+    const daemon = new TrackerDaemon({
+      importer,
+      stateStore: new MemoryStateStore(),
+      launcher,
+      workspaceRoot: root,
+      defaultProjectPath: path.join(root, 'repo'),
+      now: () => 1_000,
+      agentRunStore,
+      runtimeRunners: { codex: runtimeRunner },
+      workflow: workflowV2({ root, runner: 'codex', mode: 'codex_app_server' }),
+    });
+
+    await daemon.tick();
+    completeRun({ status: 'completed', artifactIds: ['artifact-1'] });
+
+    await waitFor(async () => {
+      const run = await agentRunStore.readRun('tik-1-attempt-0-1000');
+      return run.status === 'completed_by_agent';
+    });
+    const run = await agentRunStore.readRun('tik-1-attempt-0-1000');
+    const events = await agentRunStore.readEvents('tik-1-attempt-0-1000');
+    const taskRecord = await workbench.readTask('task-1');
+
+    expect(run).toMatchObject({
+      status: 'completed_by_agent',
+      artifactIds: ['artifact-1'],
+    });
+    expect(events.map((event) => event.kind)).toEqual(['run.start', 'run.complete']);
+    expect(taskRecord?.status).toBe('in_review');
+    expect(taskRecord?.attempts?.[0]).toMatchObject({
+      attemptNumber: 1,
+      outcome: 'completed',
+      kernelTaskId: 'tik-1-attempt-0-1000',
+    });
+    expect(taskRecord?.runs?.[0]).toMatchObject({
+      runId: 'tik-1-attempt-0-1000',
+      status: 'completed',
+    });
+  });
+
+  it('records workflow v2 runtime runner start failures and schedules retry', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-v2-direct-runner-fail-'));
+    tempDirs.push(root);
+    const importer = new MemoryTaskImporter([
+      { ...task('task-1', 'TIK-1'), labels: ['ready'] },
+    ]);
+    const launcher = new RecordingLauncher();
+    const agentRunStore = new FileAgentRunStore(root);
+    const runtimeRunner = new RecordingRuntimeRunner('claude-code');
+    runtimeRunner.startError = new Error('claude unavailable');
+    const stateStore = new MemoryStateStore();
+    const daemon = new TrackerDaemon({
+      importer,
+      stateStore,
+      launcher,
+      workspaceRoot: root,
+      defaultProjectPath: '/repo/default',
+      now: () => 1_000,
+      retry: {
+        initialDelayMs: 100,
+        maxDelayMs: 1_000,
+        maxAttempts: 3,
+      },
+      agentRunStore,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({ root, runner: 'claude-code', mode: 'claude_print' }),
+    });
+
+    const result = await daemon.tick();
+    const run = await agentRunStore.readRun('tik-1-attempt-0-1000');
+    const events = await agentRunStore.readEvents('tik-1-attempt-0-1000');
+
+    expect(result.dispatched).toEqual([]);
+    expect(result.failed).toEqual([{ shortIdentifier: 'TIK-1', error: 'claude unavailable' }]);
+    expect(launcher.launched).toHaveLength(0);
+    expect(stateStore.state.retries['task-1']).toMatchObject({
+      taskId: 'task-1',
+      shortIdentifier: 'TIK-1',
+      attempt: 1,
+      dueAtMs: 1_100,
+      lastError: 'claude unavailable',
+    });
+    expect(run).toMatchObject({
+      id: 'tik-1-attempt-0-1000',
+      status: 'failed',
+      failure: {
+        kind: 'runtime_error',
+        message: 'claude unavailable',
+        retryable: true,
+      },
+    });
+    expect(events.map((event) => event.kind)).toEqual(['run.start', 'run.fail']);
+  });
+
+  it('does not redispatch workflow v2 runtime completion failures without an explicit task update', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-v2-runtime-fail-'));
+    tempDirs.push(root);
+    const failedTask = { ...task('task-1', 'TIK-1'), labels: ['ready'] };
+    const importer = new MemoryTaskImporter([failedTask]);
+    const workbench = new MemoryWorkbenchPort([{ id: 'task-1' }]);
+    const launcher = new RecordingLauncher(workbench);
+    const runtimeRunner = new RecordingRuntimeRunner('codex');
+    runtimeRunner.completion = Promise.resolve({
+      status: 'failed',
+      error: 'Codex App Server request timed out: initialize',
+    });
+    const daemon = new TrackerDaemon({
+      importer,
+      stateStore: new MemoryStateStore(),
+      launcher,
+      workspaceRoot: root,
+      defaultProjectPath: '/repo/default',
+      now: () => 1_000,
+      runtimeRunners: { codex: runtimeRunner },
+      workflow: workflowV2({ root, runner: 'codex', mode: 'codex_app_server' }),
+    });
+
+    const first = await daemon.tick();
+    await waitFor(async () => launcher.runtimeFinishes.length === 1);
+    failedTask.state = 'Blocked';
+    failedTask.stateKind = 'blocked';
+    failedTask.activeKernelTaskId = null;
+
+    const second = await daemon.tick();
+
+    expect(first.dispatched).toEqual(['TIK-1']);
+    expect(launcher.runtimeFinishes[0]).toMatchObject({
+      taskId: 'task-1',
+      completion: {
+        status: 'failed',
+        error: 'Codex App Server request timed out: initialize',
+      },
+    });
+    expect(second.dispatched).toEqual([]);
+    expect(second.skipped).toEqual([{ shortIdentifier: 'TIK-1', reason: 'blocked' }]);
+    expect(runtimeRunner.startedInputs).toHaveLength(1);
   });
 
   it('sorts dispatch by priority, creation time, then short identifier instead of importer return order', async () => {
@@ -698,9 +1494,9 @@ describe('tracker-daemon Symphony spec behavior', () => {
   });
 });
 
-async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
+async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 100): Promise<void> {
   const startedAt = Date.now();
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() - startedAt > timeoutMs) {
       throw new Error('Timed out waiting for predicate.');
     }

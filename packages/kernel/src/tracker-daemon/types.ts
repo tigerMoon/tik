@@ -1,12 +1,17 @@
 import type {
+  AgentLoopMetadata,
+  AgentRunRecord,
+  RunEvent,
   CreateWorkbenchTaskInput,
   CreateTaskInput,
   TaskWorkspaceBinding,
   WorkbenchTaskBlockerRecord,
+  WorkbenchTaskCommentRecord,
   WorkbenchTaskRecord,
   WorkbenchTaskRunRecord,
   WorkbenchTimelineItem,
 } from '@tik/shared';
+import type { AgentRunCompletion } from '../agent-runners/agent-runtime-runner.js';
 
 export type TrackedTaskStateKind = 'active' | 'blocked' | 'terminal';
 
@@ -19,6 +24,8 @@ export interface TrackedTaskBlocker extends WorkbenchTaskBlockerRecord {
 export interface TrackedTaskRepositoryRef {
   name?: string;
   path?: string;
+  executionPath?: string;
+  sourcePath?: string;
   workspaceFile?: string;
 }
 
@@ -41,6 +48,10 @@ export interface TrackedTask {
   activeKernelTaskId?: string | null;
   activeAttemptStartedAt?: string | null;
   sourceKind?: 'workbench' | 'external';
+  agentLoop?: AgentLoopMetadata;
+  comments?: WorkbenchTaskCommentRecord[];
+  timeline?: WorkbenchTimelineItem[];
+  latestSummary?: string;
 }
 
 export interface TrackedTaskImporter {
@@ -90,12 +101,21 @@ export interface TrackerDaemonStateStore {
   save(state: TrackerDaemonState): Promise<void>;
 }
 
+export interface AgentRunStorePort {
+  createRun(record: AgentRunRecord): Promise<AgentRunRecord>;
+  appendEvent(event: RunEvent): Promise<void>;
+}
+
 export interface TrackerDaemonLaunchInput {
   workspaceRoot: string;
   projectPath: string;
   workspaceBinding?: TaskWorkspaceBinding;
   prompt?: string;
   attempt?: number;
+  runId?: string;
+  workflowConfigHash?: string;
+  workflowPromptHash?: string;
+  routing?: TrackerWorkflowRoutingResolution;
 }
 
 export interface TrackerDaemonLaunchResult {
@@ -109,8 +129,30 @@ export interface TrackerDaemonWorkLauncher {
   markAttemptFailed?(taskId: string, error: string): Promise<void>;
   isRunActive?(kernelTaskId: string): Promise<boolean> | boolean;
   stopRun(input: { taskId: string; reason: string; task: TrackedTask; run: TrackerRunRecord }): Promise<void>;
-  runHook?(name: string, input: { task: TrackedTask; workspaceRoot: string; projectPath: string; run?: TrackerRunRecord }): Promise<void>;
+  runHook?(name: string, input: {
+    task: TrackedTask;
+    workspaceRoot: string;
+    projectPath: string;
+    run?: TrackerRunRecord;
+    workflowVersion?: TrackerWorkflowVersion;
+    envWhitelist?: string[];
+  }): Promise<void>;
   cleanupWorkspace?(input: { task: TrackedTask; workspaceRoot: string; projectPath: string; run?: TrackerRunRecord }): Promise<void>;
+  markRuntimeRunStarted?(task: TrackedTask, input: {
+    runId: string;
+    attempt: number;
+    projectPath: string;
+    runner: AgentRuntimeName;
+    mode: AgentRuntimeMode;
+    startedAt: string;
+  }): Promise<{ attemptNumber?: number } | void>;
+  markRuntimeRunFinished?(taskId: string, input: {
+    runId: string;
+    attemptNumber: number;
+    completion: AgentRunCompletion;
+    endedAt: string;
+    runner?: AgentRuntimeName;
+  }): Promise<void>;
 }
 
 export interface TrackerDaemonRetryConfig {
@@ -154,12 +196,71 @@ export interface TrackerWorkflowConfig {
   agent: {
     timeoutMs: number;
   };
+  selector?: TrackerWorkflowSelectorConfig;
+  routing?: TrackerWorkflowRoutingConfig;
+  concurrency?: TrackerWorkflowConcurrencyConfig;
+  sandbox?: TrackerWorkflowSandboxConfig;
+  hooks?: TrackerWorkflowHooksConfig;
+}
+
+export type TrackerWorkflowVersion = 1 | 2;
+
+export type AgentRuntimeName = 'codex' | 'claude-code';
+
+export type AgentRuntimeMode =
+  | 'codex_exec'
+  | 'codex_app_server'
+  | 'claude_print'
+  | 'claude_hooked';
+
+export interface TrackerWorkflowSelectorConfig {
+  includeLabels: string[];
+  excludeLabels: string[];
+}
+
+export interface TrackerWorkflowRoutingRule {
+  labelsAny: string[];
+  runner: AgentRuntimeName;
+  mode: AgentRuntimeMode;
+}
+
+export interface TrackerWorkflowRoutingConfig {
+  defaultRunner?: AgentRuntimeName;
+  defaultMode?: AgentRuntimeMode;
+  rules: TrackerWorkflowRoutingRule[];
+}
+
+export interface TrackerWorkflowConcurrencyConfig {
+  lock?: 'repository_branch' | 'none';
+  respectLabels: string[];
+}
+
+export interface TrackerWorkflowSandboxConfig {
+  envWhitelist: string[];
+}
+
+export interface TrackerWorkflowHooksConfig {
+  root: string;
+  timeoutMs: number;
+  allowExecutableOnly: boolean;
+}
+
+export interface TrackerWorkflowRoutingResolution {
+  runner: AgentRuntimeName;
+  mode: AgentRuntimeMode;
+  matchedSource: 'explicit-label' | `rule[${number}]` | 'default';
+  matchedLabels?: string[];
 }
 
 export interface TrackerWorkflowDefinition {
+  version?: TrackerWorkflowVersion;
+  path?: string;
+  workflowConfigHash?: string;
+  workflowPromptHash?: string;
   config: TrackerWorkflowConfig;
   promptTemplate: string;
   renderPrompt(task: TrackedTask, input?: { attempt?: number }): string;
+  resolveRouting?(task: TrackedTask): TrackerWorkflowRoutingResolution;
 }
 
 export interface TrackerDaemonWatchHandle {
@@ -186,7 +287,14 @@ export interface WorkbenchLaunchTaskOptions {
   runTask?: (task: { id: string }, input: { workbenchTaskId: string }) => Promise<unknown> | unknown;
   isRunActive?: (kernelTaskId: string) => Promise<boolean> | boolean;
   stopTask?: (taskId: string, reason: string) => Promise<unknown> | unknown;
-  runHook?: (name: string, input: { task: TrackedTask; workspaceRoot: string; projectPath: string; run?: TrackerRunRecord }) => Promise<unknown> | unknown;
+  runHook?: (name: string, input: {
+    task: TrackedTask;
+    workspaceRoot: string;
+    projectPath: string;
+    run?: TrackerRunRecord;
+    workflowVersion?: TrackerWorkflowVersion;
+    envWhitelist?: string[];
+  }) => Promise<unknown> | unknown;
   cleanupWorkspace?: (input: { task: TrackedTask; workspaceRoot: string; projectPath: string; run?: TrackerRunRecord }) => Promise<unknown> | unknown;
   createKernelTask?: (input: {
     id?: string;
@@ -204,6 +312,13 @@ export interface WorkbenchPort {
   readTimeline?(taskId: string): Promise<WorkbenchTimelineItem[]>;
   listTasks?(): Promise<WorkbenchTaskRecord[]>;
   transitionTask?(taskId: string, to: WorkbenchTaskRecord['status'], input?: { reason?: string; actor?: 'human' | 'agent' | 'daemon' | 'system' }): Promise<WorkbenchTaskRecord | null>;
+  addComment?(taskId: string, input: Omit<WorkbenchTaskCommentRecord, 'id' | 'createdAt'> & { id?: string; createdAt?: string }): Promise<WorkbenchTaskRecord | null>;
+  advanceReviewLoopAfterRuntime?(taskId: string, input: {
+    runner: AgentRuntimeName;
+    status: 'completed' | 'failed' | 'cancelled';
+    stdout?: string;
+    runId?: string;
+  }): Promise<WorkbenchTaskRecord | null>;
   updateTaskTrackerMetadata?(taskId: string, input: {
     title?: string;
     description?: string | null;

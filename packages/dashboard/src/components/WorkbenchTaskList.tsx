@@ -1,7 +1,7 @@
 import React, { useEffect, useId, useMemo, useState } from 'react';
 import type { EnvironmentPackManifest, EnvironmentPackSelection } from '@tik/shared';
 import {
-  buildWorkbenchArtifactPreviewUrl,
+  buildWorkbenchArtifactLinkPreviewUrl,
   type CreateWorkbenchTaskInput,
   type WorkbenchTaskResponse,
 } from '../api/client';
@@ -413,7 +413,11 @@ function TaskRailRow({
   const taskSummary = buildWorkbenchTaskVisibleSummary(task);
   const queueSignal = buildWorkbenchQueueSignal(task);
   const agentLoopSummary = buildWorkbenchAgentLoopSummary(task.agentLoop);
-  const previewableArtifactPath = task.evidenceSummary?.latestPreviewableArtifactPath;
+  const previewUrl = buildWorkbenchArtifactLinkPreviewUrl({
+    artifactId: task.evidenceSummary?.latestArtifactId,
+    versionId: task.evidenceSummary?.latestArtifactVersionId,
+    filePath: task.evidenceSummary?.latestPreviewableArtifactPath,
+  });
   const shortId = task.identifier || task.shortIdentifier || `TIK-${task.id.slice(0, 8).toUpperCase()}`;
   const updatedAt = formatRelativeDate(task.lastProgressAt || task.updatedAt || task.createdAt);
 
@@ -476,9 +480,9 @@ function TaskRailRow({
 
       <div className="queue-task-side">
         <div className="queue-task-actions">
-          {previewableArtifactPath ? (
+          {previewUrl ? (
             <a
-              href={buildWorkbenchArtifactPreviewUrl(previewableArtifactPath)}
+              href={previewUrl}
               target="_blank"
               rel="noreferrer"
               className="queue-task-action queue-task-preview"

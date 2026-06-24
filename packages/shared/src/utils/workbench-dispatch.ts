@@ -15,6 +15,11 @@ const CODEX_DISPATCH_LABEL_ACTIONS = new Set<WorkbenchLabelAction>([
   'codex_dispatch',
   'codex_fix',
 ]);
+const WORKFLOW_DISPATCH_LABEL_ACTIONS = new Set<WorkbenchLabelAction>([
+  'codex_dispatch',
+  'codex_fix',
+  'claude_code_review',
+]);
 
 export type WorkbenchDispatchTask = Pick<WorkbenchTaskRecord, 'agentLoop' | 'labels' | 'status'>;
 export type WorkbenchDispatchEnvironmentTask = Pick<WorkbenchTaskRecord, 'agentLoop' | 'environmentPackSnapshot' | 'labels' | 'status'>;
@@ -55,6 +60,23 @@ export function isWorkbenchTaskCodexDispatchable(task: WorkbenchDispatchEnvironm
     && phase !== 'needs_human_review'
     && phase !== 'stale'
     && phase !== 'complete';
+}
+
+export function isWorkbenchTaskWorkflowDispatchable(task: WorkbenchDispatchEnvironmentTask): boolean {
+  if (!isWorkbenchDispatchCandidateStatus(task.status)) {
+    return false;
+  }
+
+  if (isWorkbenchTaskMaintenance(task)) {
+    return false;
+  }
+
+  const labelActions = (task.labels || []).map((label) => getWorkbenchLabelAction(task.environmentPackSnapshot, label));
+  if (labelActions.some((action) => action === 'human_review' || action === 'loop_complete')) {
+    return false;
+  }
+
+  return labelActions.some((action) => WORKFLOW_DISPATCH_LABEL_ACTIONS.has(action));
 }
 
 function isWorkbenchDispatchCandidateStatus(status: WorkbenchTaskStatus): boolean {

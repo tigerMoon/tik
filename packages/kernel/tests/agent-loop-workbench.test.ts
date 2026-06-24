@@ -368,6 +368,50 @@ describe('WorkbenchService agent loop work items', () => {
     });
   });
 
+  it('lets a human retry a blocked Codex fix phase without changing loop ownership', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-blocked-codex-retry',
+    });
+    const completed = await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'request_changes',
+      headShaReviewed: 'abc123',
+      blockingIssues: [{
+        title: 'Missing retry path',
+        file: 'packages/kernel/src/workbench/workbench-service.ts',
+        reason: 'Blocked fix phases need an explicit human retry command.',
+      }],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Please add a retry path.',
+    });
+    await service.transitionTask(completed.task.id, 'blocked', {
+      actor: 'daemon',
+      reason: 'Runtime failed and should wait for explicit retry.',
+    });
+
+    const retry = await service.addComment(completed.task.id, {
+      authorKind: 'human',
+      authorId: 'operator',
+      body: '/retry\nThe runner is fixed; retry the Codex pass.',
+    });
+
+    expect(retry).toMatchObject({
+      status: 'todo',
+      labels: ['agent-loop', 'codex-fix', 'needs-codex-fix'],
+      agentLoop: {
+        kind: 'codex_fix',
+        phase: 'needs_codex_fix',
+      },
+    });
+    const timeline = await service.readTimeline(completed.task.id);
+    expect(timeline.map((item) => item.body).join('\n')).toContain('Human requested retry for blocked agent loop phase needs_codex_fix.');
+  });
+
   it('escalates the same task to human review instead of another fix after max rounds', async () => {
     const { service } = await makeService();
     const reviewTask = await service.createReviewRound({

@@ -89,5 +89,6 @@ export {
 } from './workbench-labels.js';
 export {
   isWorkbenchTaskCodexDispatchable,
+  isWorkbenchTaskWorkflowDispatchable,
   isWorkbenchTaskMaintenance,
 } from './workbench-dispatch.js';

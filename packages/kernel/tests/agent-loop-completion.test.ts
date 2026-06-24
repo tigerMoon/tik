@@ -132,6 +132,108 @@ describe('AgentLoop completion semantics', () => {
     expect(observedContext).toContain('Please verify this comment was handled.');
   });
 
+  it('serializes tool calls after the first write in an LLM round', async () => {
+    const eventBus = new EventBus();
+    const toolRegistry = new ToolRegistry();
+    const executionOrder: string[] = [];
+    let readStartedBeforeWriteFinished = false;
+    let writeHasFinished = false;
+    let finishWrite!: () => void;
+    const writeFinished = new Promise<void>((resolve) => {
+      finishWrite = resolve;
+    });
+
+    toolRegistry.register({
+      name: 'read_file',
+      description: 'Read a file',
+      type: 'read',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+      async execute(input: { path: string }) {
+        executionOrder.push(`start:${input.path}`);
+        readStartedBeforeWriteFinished = !writeHasFinished;
+        executionOrder.push(`finish:${input.path}`);
+        return {
+          success: true,
+          output: `read ${input.path}`,
+          durationMs: 1,
+        };
+      },
+    } as any);
+
+    toolRegistry.register({
+      name: 'write_file',
+      description: 'Write a file',
+      type: 'write',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } } },
+      async execute(input: { path: string }) {
+        executionOrder.push(`start:${input.path}`);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        executionOrder.push(`finish:${input.path}`);
+        writeHasFinished = true;
+        finishWrite();
+        return {
+          success: true,
+          output: `wrote ${input.path}`,
+          durationMs: 1,
+          filesModified: [input.path],
+        };
+      },
+    } as any);
+
+    const toolScheduler = new ToolScheduler(toolRegistry, eventBus);
+    let calls = 0;
+    const llm: ILLMProvider = {
+      name: 'mock',
+      async chatWithContext(): Promise<ChatResponse> {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            content: 'Patch then inspect the patched file.',
+            toolCalls: [
+              { id: 'write-1', name: 'write_file', arguments: { path: 'src/app.ts', content: 'patched' } },
+              { id: 'read-1', name: 'read_file', arguments: { path: 'src/app.test.ts' } },
+            ],
+            usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          };
+        }
+        return {
+          content: '已完成代码修改。',
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        };
+      },
+      async chat(): Promise<ChatResponse> {
+        throw new Error('not used');
+      },
+      async plan() {
+        throw new Error('not used');
+      },
+      async complete() {
+        throw new Error('not used');
+      },
+    };
+
+    const task = buildTask('/tmp/workspace/packages/api', 'Implement API module patch');
+    const session = buildSession(task, llm);
+    const loop = new AgentLoop(
+      eventBus,
+      toolScheduler,
+      buildEmptyContextBuilder(task.projectPath!),
+      llm,
+      buildNoopAceEngine() as any,
+    );
+
+    await loop.run(task, session);
+    await writeFinished;
+
+    expect(executionOrder).toEqual([
+      'start:src/app.ts',
+      'finish:src/app.ts',
+      'start:src/app.test.ts',
+      'finish:src/app.test.ts',
+    ]);
+    expect(readStartedBeforeWriteFinished).toBe(false);
+  });
+
   it('marks implementation tasks completed when assistant explicitly concludes no code change is needed', async () => {
     const eventBus = new EventBus();
     const toolRegistry = new ToolRegistry();

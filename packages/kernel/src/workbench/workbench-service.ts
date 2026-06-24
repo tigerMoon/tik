@@ -10,6 +10,7 @@ import type {
   AgentLoopMetadata,
   AgentLoopPayload,
   AgentEvent,
+  ArtifactKind,
   BlockingIssue,
   CreateWorkbenchTaskInput,
   IEventBus,
@@ -18,6 +19,8 @@ import type {
   ToolCalledPayload,
   ToolResultPayload,
   WorkbenchActor,
+  WorkbenchArtifactRecord,
+  WorkbenchArtifactVersion,
   WorkbenchDecisionRecord,
   WorkbenchTaskAttemptRecord,
   WorkbenchTaskCommentRecord,
@@ -27,6 +30,19 @@ import type {
   WorkbenchTaskStatus,
   WorkbenchTimelineItem,
 } from '@tik/shared';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import type {
+  AppendArtifactVersionInput,
+  ArtifactFilter,
+  ArtifactPreviewPayload,
+  ArtifactRegistry,
+  CreateArtifactInput,
+} from '../artifacts/artifact-registry.js';
+import {
+  renderArtifactTemplate,
+  type ArtifactTemplateName,
+} from '../artifacts/artifact-templates.js';
 import { WorkbenchStore } from './workbench-store.js';
 import { shouldRequestDecisionForTool } from './workbench-decision-policy.js';
 import { parseSlashCommand } from './comment-commands.js';
@@ -36,6 +52,7 @@ interface WorkbenchServiceOptions {
   rootPath: string;
   eventBus: IEventBus;
   store: WorkbenchStore;
+  artifacts?: ArtifactRegistry;
   stopTask?: (taskId: string, reason: string) => void;
 }
 
@@ -61,7 +78,7 @@ const ALLOWED_TASK_TRANSITIONS: Record<WorkbenchTaskStatus, WorkbenchTaskStatus[
   backlog: ['todo', 'cancelled', 'archived'],
   todo: ['in_progress', 'running', 'cancelled', 'blocked', 'archived'],
   in_progress: ['failed', 'in_review', 'waiting_for_user', 'completed', 'blocked', 'cancelled'],
-  in_review: ['in_progress', 'running', 'cancelled', 'blocked'],
+  in_review: ['todo', 'in_progress', 'running', 'completed', 'cancelled', 'blocked'],
   running: ['failed', 'waiting_for_user', 'in_review', 'completed', 'blocked', 'cancelled', 'paused'],
   waiting_for_user: ['running', 'in_progress', 'cancelled', 'blocked'],
   blocked: ['todo', 'cancelled', 'archived'],
@@ -76,12 +93,14 @@ const ALLOWED_TASK_TRANSITIONS: Record<WorkbenchTaskStatus, WorkbenchTaskStatus[
 export class WorkbenchService {
   private readonly eventBus: IEventBus;
   private readonly store: WorkbenchStore;
+  private readonly artifacts?: ArtifactRegistry;
   private readonly stopTask?: (taskId: string, reason: string) => void;
   private eventQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: WorkbenchServiceOptions) {
     this.eventBus = options.eventBus;
     this.store = options.store;
+    this.artifacts = options.artifacts;
     this.stopTask = options.stopTask;
     this.eventBus.onAny((event) => {
       this.eventQueue = this.eventQueue.then(
@@ -418,6 +437,7 @@ export class WorkbenchService {
       assignee?: string | null;
       createdBy?: string | null;
       sourceUrl?: string | null;
+      workspaceBinding?: WorkbenchTaskRecord['workspaceBinding'];
     },
   ): Promise<WorkbenchTaskRecord | null> {
     const bundle = await this.store.readTaskBundle(taskId);
@@ -443,6 +463,7 @@ export class WorkbenchService {
       assignee: input.assignee !== undefined ? input.assignee : bundle.task.assignee,
       createdBy: input.createdBy !== undefined ? input.createdBy : bundle.task.createdBy,
       sourceUrl: input.sourceUrl !== undefined ? input.sourceUrl : bundle.task.sourceUrl,
+      workspaceBinding: input.workspaceBinding !== undefined ? input.workspaceBinding : bundle.task.workspaceBinding,
       updatedAt,
     };
 
@@ -509,6 +530,8 @@ export class WorkbenchService {
         lastProgressAt: updatedAt,
         latestSummary: this.summaryForAgentLoopPhase(phase, metadata),
         workspaceBinding: effectiveInput.workspaceBinding || rootTask.workspaceBinding,
+        environmentPackSnapshot: effectiveInput.environmentPackSnapshot || rootTask.environmentPackSnapshot,
+        environmentPackSelection: effectiveInput.environmentPackSelection || rootTask.environmentPackSelection,
         agentLoop: {
           ...(rootTask.agentLoop || {}),
           ...metadata,
@@ -541,6 +564,8 @@ export class WorkbenchService {
       parentTaskId: undefined,
       createdBy: metadata.createdBy || 'system',
       workspaceBinding: input.workspaceBinding,
+      environmentPackSnapshot: input.environmentPackSnapshot,
+      environmentPackSelection: input.environmentPackSelection,
       agentLoop: {
         ...metadata,
         phase: this.phaseForAgentLoopKind(metadata.kind),
@@ -693,6 +718,27 @@ export class WorkbenchService {
     };
   }
 
+  async advanceReviewLoopAfterRuntime(
+    taskId: string,
+    input: {
+      runner: 'codex' | 'claude-code';
+      status: 'completed' | 'failed' | 'cancelled';
+      stdout?: string;
+      runId?: string;
+    },
+  ): Promise<WorkbenchTaskRecord | null> {
+    if (input.status !== 'completed') {
+      return null;
+    }
+    if (input.runner === 'claude-code') {
+      return this.advanceAfterClaudeReviewRuntime(taskId, input.stdout || '', input.runId);
+    }
+    if (input.runner === 'codex') {
+      return this.advanceAfterCodexFixRuntime(taskId);
+    }
+    return null;
+  }
+
   async listTasks(): Promise<WorkbenchTaskRecord[]> {
     await this.drainEventQueue();
     const tasks = await this.store.listTasks();
@@ -718,6 +764,134 @@ export class WorkbenchService {
   async readTimeline(taskId: string): Promise<WorkbenchTimelineItem[]> {
     await this.drainEventQueue();
     return (await this.store.readTaskBundle(taskId)).timeline;
+  }
+
+  async listArtifacts(filter?: ArtifactFilter): Promise<WorkbenchArtifactRecord[]> {
+    await this.drainEventQueue();
+    return this.artifacts?.list(filter) || [];
+  }
+
+  async readArtifact(id: string): Promise<WorkbenchArtifactRecord | null> {
+    await this.drainEventQueue();
+    return this.artifacts?.get(id) || null;
+  }
+
+  async listArtifactVersions(id: string): Promise<WorkbenchArtifactVersion[]> {
+    await this.drainEventQueue();
+    return this.artifacts?.listVersions(id) || [];
+  }
+
+  async readArtifactPreview(artifactId: string, versionId?: string): Promise<ArtifactPreviewPayload | null> {
+    await this.drainEventQueue();
+    return this.artifacts?.readPreview(artifactId, versionId) || null;
+  }
+
+  async createArtifact(input: CreateArtifactInput): Promise<WorkbenchArtifactRecord> {
+    if (!this.artifacts) {
+      throw new WorkbenchTaskError('artifacts_unavailable', 'Artifact registry is unavailable.');
+    }
+    const artifact = await this.artifacts.create(input);
+    await this.appendArtifactTimelineItem(artifact, 'created');
+    return artifact;
+  }
+
+  async generateArtifactForTask(
+    taskId: string,
+    template: ArtifactTemplateName = 'task-review',
+  ): Promise<WorkbenchArtifactRecord> {
+    await this.drainEventQueue();
+    const bundle = await this.store.readTaskBundle(taskId);
+    if (!bundle.task) {
+      throw new WorkbenchTaskError('task_not_found', `Workbench task not found: ${taskId}`);
+    }
+    const projectedTask = await this.projectTaskState(bundle.task, bundle.timeline);
+    const existingArtifacts = await this.artifacts?.list({ taskId }) || [];
+    const rendered = renderArtifactTemplate({
+      template,
+      task: projectedTask,
+      timeline: bundle.timeline,
+      artifacts: existingArtifacts,
+    });
+    const provenance = this.buildArtifactProvenance(bundle.timeline);
+    const currentTemplateArtifact = existingArtifacts
+      .filter((artifact) => artifact.producedBy.template === template)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+
+    if (currentTemplateArtifact) {
+      return this.appendArtifactVersion({
+        artifactId: currentTemplateArtifact.id,
+        content: rendered.content,
+        contentType: rendered.contentType,
+        extension: rendered.extension,
+        sourceEventIds: provenance.sourceEventIds,
+        sourceEvidenceIds: provenance.sourceEvidenceIds,
+        changedFiles: provenance.changedFiles,
+        validationRefs: provenance.validationRefs,
+        decisionIds: provenance.decisionIds,
+        summary: rendered.summary,
+      });
+    }
+
+    return this.createArtifact({
+      taskId,
+      workspaceId: projectedTask.workspaceBinding?.workspaceName,
+      projectId: projectedTask.workspaceBinding?.projectName,
+      sessionId: projectedTask.activeSessionId,
+      title: rendered.title,
+      kind: rendered.kind,
+      content: rendered.content,
+      contentType: rendered.contentType,
+      extension: rendered.extension,
+      sourceEventIds: provenance.sourceEventIds,
+      sourceEvidenceIds: provenance.sourceEvidenceIds,
+      changedFiles: provenance.changedFiles,
+      validationRefs: provenance.validationRefs,
+      decisionIds: provenance.decisionIds,
+      producedBy: {
+        template,
+      },
+      summary: rendered.summary,
+      tags: rendered.tags,
+    });
+  }
+
+  async appendArtifactVersion(input: AppendArtifactVersionInput): Promise<WorkbenchArtifactRecord> {
+    if (!this.artifacts) {
+      throw new WorkbenchTaskError('artifacts_unavailable', 'Artifact registry is unavailable.');
+    }
+    const artifact = await this.artifacts.appendVersion(input);
+    await this.appendArtifactTimelineItem(artifact, 'updated');
+    await this.moveTaskToArtifactReview(artifact);
+    return artifact;
+  }
+
+  async acceptArtifact(id: string, actor?: string): Promise<WorkbenchArtifactRecord> {
+    if (!this.artifacts) {
+      throw new WorkbenchTaskError('artifacts_unavailable', 'Artifact registry is unavailable.');
+    }
+    const artifact = await this.artifacts.accept(id, actor);
+    await this.appendArtifactTimelineItem(artifact, 'accepted');
+    await this.completeTaskAfterArtifactAcceptance(artifact);
+    return artifact;
+  }
+
+  async rejectArtifact(id: string, reason: string, actor?: string): Promise<WorkbenchArtifactRecord> {
+    if (!this.artifacts) {
+      throw new WorkbenchTaskError('artifacts_unavailable', 'Artifact registry is unavailable.');
+    }
+    const artifact = await this.artifacts.reject(id, reason, actor);
+    await this.appendArtifactTimelineItem(artifact, 'rejected');
+    await this.reopenTaskAfterArtifactRejection(artifact, reason);
+    return artifact;
+  }
+
+  async archiveArtifact(id: string, actor?: string): Promise<WorkbenchArtifactRecord> {
+    if (!this.artifacts) {
+      throw new WorkbenchTaskError('artifacts_unavailable', 'Artifact registry is unavailable.');
+    }
+    const artifact = await this.artifacts.archive(id, actor);
+    await this.appendArtifactTimelineItem(artifact, 'archived');
+    return artifact;
   }
 
   async readPendingDecisions(taskId: string): Promise<WorkbenchDecisionRecord[]> {
@@ -1066,9 +1240,10 @@ export class WorkbenchService {
     task: WorkbenchTaskRecord,
     timeline: WorkbenchTimelineItem[] = [],
   ): Promise<WorkbenchTaskRecord> {
+    const artifacts = await this.artifacts?.list({ taskId: task.id });
     const projectedTask: WorkbenchTaskRecord = {
       ...task,
-      evidenceSummary: this.buildTaskEvidenceSummary(timeline),
+      evidenceSummary: this.buildTaskEvidenceSummary(timeline, artifacts || []),
     };
 
     if (
@@ -1125,9 +1300,10 @@ export class WorkbenchService {
     const rawItem = this.buildRawTimelineItem(event, task.id, createdAt);
     if (rawItem) {
       await this.store.appendTimelineItem(rawItem);
+      await this.registerPreviewableArtifacts(event, task, rawItem, createdAt);
     }
 
-    const nextStatus = this.mapTaskStatus(task.status, event);
+    const nextStatus = await this.mapTaskStatus(task.status, event, task.id);
     const waitingDecision = task.waitingDecisionId
       ? await this.store.readDecision(task.waitingDecisionId)
       : null;
@@ -1142,6 +1318,10 @@ export class WorkbenchService {
       currentOwner: 'supervisor',
       status: nextStatus,
     };
+    if (event.type === EventType.TASK_COMPLETED && nextStatus === 'in_review') {
+      nextTask.latestSummary = 'Task completed and is awaiting artifact acceptance.';
+      nextTask.waitingReason = 'Latest review artifact needs acceptance.';
+    }
 
     if (event.type === EventType.SESSION_STARTED) {
       const payload = event.payload as { sessionId?: string };
@@ -1317,7 +1497,11 @@ export class WorkbenchService {
     )) ?? null;
   }
 
-  private mapTaskStatus(currentStatus: WorkbenchTaskStatus, event: AgentEvent): WorkbenchTaskStatus {
+  private async mapTaskStatus(
+    currentStatus: WorkbenchTaskStatus,
+    event: AgentEvent,
+    taskId: string,
+  ): Promise<WorkbenchTaskStatus> {
     if (
       currentStatus === 'paused'
       && event.type !== EventType.TASK_RESUMED
@@ -1340,7 +1524,7 @@ export class WorkbenchService {
       case EventType.TASK_PAUSED:
         return 'paused';
       case EventType.TASK_COMPLETED:
-        return 'completed';
+        return await this.hasPendingReviewArtifact(taskId) ? 'in_review' : 'completed';
       case EventType.TASK_FAILED:
         return 'failed';
       case EventType.TASK_CANCELLED:
@@ -1507,6 +1691,43 @@ export class WorkbenchService {
     if (!task?.agentLoop) {
       return null;
     }
+    const currentPhase = task.agentLoop.phase || this.phaseForAgentLoopKind(task.agentLoop.kind);
+    if (command === 'retry' && task.status === 'blocked') {
+      const status = this.statusForAgentLoopRetryPhase(currentPhase);
+      if (!status) {
+        return null;
+      }
+      const updatedAt = new Date().toISOString();
+      const summary = `Human requested retry for blocked agent loop phase ${currentPhase}.`;
+      const updatedTask: WorkbenchTaskRecord = {
+        ...task,
+        status,
+        labels: this.applyAgentLoopLabels(task.labels, currentPhase),
+        updatedAt,
+        lastProgressAt: updatedAt,
+        waitingReason: status === 'in_review' ? task.waitingReason : undefined,
+        waitingDecisionId: status === 'in_review' ? task.waitingDecisionId : undefined,
+        latestSummary: summary,
+        agentLoop: {
+          ...task.agentLoop,
+          phase: currentPhase,
+        },
+      };
+
+      await this.store.appendTimelineItem({
+        id: generateId(),
+        taskId,
+        kind: 'summary',
+        actor: 'user',
+        body: [
+          summary,
+          `Reason: ${reason}`,
+        ].join('\n'),
+        createdAt: updatedAt,
+      });
+      await this.store.upsertTask(updatedTask);
+      return this.projectTaskState(updatedTask, bundle.timeline);
+    }
     if (task.agentLoop.phase !== 'needs_human_review' && task.agentLoop.kind !== 'human_review') {
       return null;
     }
@@ -1549,6 +1770,135 @@ export class WorkbenchService {
           : 'Human review requested another Codex fix pass.',
         `Reason: ${reason}`,
       ].join('\n'),
+      createdAt: updatedAt,
+    });
+    await this.store.upsertTask(updatedTask);
+    return this.projectTaskState(updatedTask, bundle.timeline);
+  }
+
+  private statusForAgentLoopRetryPhase(
+    phase: NonNullable<AgentLoopMetadata['phase']>,
+  ): WorkbenchTaskStatus | null {
+    switch (phase) {
+      case 'needs_codex_fix':
+      case 'codex_fixing':
+      case 'needs_claude_review':
+      case 'claude_reviewing':
+        return 'todo';
+      case 'needs_human_review':
+      case 'stale':
+        return 'in_review';
+      case 'complete':
+        return null;
+    }
+  }
+
+  private async advanceAfterClaudeReviewRuntime(
+    taskId: string,
+    stdout: string,
+    runId?: string,
+  ): Promise<WorkbenchTaskRecord | null> {
+    const bundle = await this.store.readTaskBundle(taskId);
+    const task = bundle.task;
+    if (!task) {
+      return null;
+    }
+
+    const decision = classifyClaudeReviewOutput(stdout);
+    const updatedAt = new Date().toISOString();
+    await this.addComment(taskId, {
+      authorKind: 'agent',
+      authorId: 'claude-code',
+      body: buildClaudeReviewComment(stdout, decision, runId),
+      createdAt: updatedAt,
+    });
+
+    const currentBundle = await this.store.readTaskBundle(taskId);
+    const currentTask = currentBundle.task || task;
+    const nextPhase: NonNullable<AgentLoopMetadata['phase']> = decision === 'blocking'
+      ? 'needs_codex_fix'
+      : 'needs_human_review';
+    const nextStatus: WorkbenchTaskStatus = decision === 'blocking' ? 'todo' : 'in_review';
+    const normalizedExistingLabels = normalizeLabels(currentTask.labels) || [];
+    const labels = currentTask.agentLoop
+      ? this.applyAgentLoopLabels(normalizedExistingLabels, nextPhase)
+      : applyReviewLoopLabels(normalizedExistingLabels, nextPhase);
+    const updatedTask: WorkbenchTaskRecord = {
+      ...currentTask,
+      status: nextStatus,
+      labels,
+      updatedAt,
+      lastProgressAt: updatedAt,
+      latestSummary: decision === 'blocking'
+        ? 'Claude review found blocking issues; Codex fix is needed.'
+        : 'Claude review completed without blocking issues; human review is needed.',
+      agentLoop: currentTask.agentLoop
+        ? {
+            ...currentTask.agentLoop,
+            kind: decision === 'blocking' ? 'codex_fix' : 'human_review',
+            phase: nextPhase,
+            previousHeadSha: currentTask.agentLoop.headSha || currentTask.agentLoop.changeRequest.headSha,
+            nextReviewRound: decision === 'blocking'
+              ? currentTask.agentLoop.round + 1
+              : undefined,
+          }
+        : currentTask.agentLoop,
+    };
+    await this.store.appendTimelineItem({
+      id: generateId(),
+      taskId,
+      kind: 'summary',
+      actor: 'reviewer',
+      body: decision === 'blocking'
+        ? 'Claude review output was recorded and routed to Codex fix.'
+        : 'Claude review output was recorded and routed to human review.',
+      createdAt: updatedAt,
+    });
+    await this.store.upsertTask(updatedTask);
+    const finalBundle = await this.store.readTaskBundle(taskId);
+    return finalBundle.task ? this.projectTaskState(finalBundle.task, finalBundle.timeline) : updatedTask;
+  }
+
+  private async advanceAfterCodexFixRuntime(taskId: string): Promise<WorkbenchTaskRecord | null> {
+    const bundle = await this.store.readTaskBundle(taskId);
+    const task = bundle.task;
+    if (!task) {
+      return null;
+    }
+    const normalizedLabels = normalizeLabels(task.labels) || [];
+    const hasFixLabel = normalizedLabels.some((label) => label === 'needs-codex-fix' || label === 'codex-fix');
+    if (!hasFixLabel && task.agentLoop?.kind !== 'codex_fix' && task.agentLoop?.phase !== 'needs_codex_fix') {
+      return null;
+    }
+
+    const updatedAt = new Date().toISOString();
+    const nextRound = task.agentLoop?.nextReviewRound || (task.agentLoop?.round ? task.agentLoop.round + 1 : undefined);
+    const labels = task.agentLoop
+      ? this.applyAgentLoopLabels(normalizedLabels, 'needs_claude_review')
+      : applyReviewLoopLabels(normalizedLabels, 'needs_claude_review');
+    const updatedTask: WorkbenchTaskRecord = {
+      ...task,
+      status: 'todo',
+      labels,
+      updatedAt,
+      lastProgressAt: updatedAt,
+      latestSummary: 'Codex fix completed; Claude review is needed for the next loop round.',
+      agentLoop: task.agentLoop
+        ? {
+            ...task.agentLoop,
+            kind: 'claude_review',
+            phase: 'needs_claude_review',
+            round: nextRound || task.agentLoop.round,
+            previousHeadSha: task.agentLoop.headSha || task.agentLoop.changeRequest.headSha,
+          }
+        : task.agentLoop,
+    };
+    await this.store.appendTimelineItem({
+      id: generateId(),
+      taskId,
+      kind: 'summary',
+      actor: 'coder',
+      body: 'Codex fix runtime completed; task returned to Claude review.',
       createdAt: updatedAt,
     });
     await this.store.upsertTask(updatedTask);
@@ -2003,6 +2353,7 @@ export class WorkbenchService {
       kind: 'raw',
       actor: 'system',
       body,
+      evidenceIds: [event.id],
       createdAt,
     };
   }
@@ -2051,6 +2402,7 @@ export class WorkbenchService {
 
   private buildTaskEvidenceSummary(
     timeline: WorkbenchTimelineItem[],
+    artifacts: WorkbenchArtifactRecord[] = [],
   ): WorkbenchTaskEvidenceSummary {
     const rawItems = [...timeline]
       .filter((item) => item.kind === 'raw')
@@ -2076,7 +2428,7 @@ export class WorkbenchService {
       }
     }
 
-    return {
+    const summary: WorkbenchTaskEvidenceSummary = {
       rawEventCount: rawItems.length,
       modifiedFileCount: modifiedFiles.size,
       previewableArtifactCount: previewableArtifacts.size,
@@ -2085,22 +2437,35 @@ export class WorkbenchService {
       latestToolName,
       hasErrorEvidence,
     };
+
+    if (artifacts.length > 0) {
+      summary.latestArtifactId = artifacts[0]?.id;
+      summary.latestArtifactVersionId = artifacts[0]?.latestVersionId;
+      summary.artifactCount = artifacts.length;
+      summary.needsReviewArtifactCount = artifacts.filter((artifact) => artifact.status === 'needs_review').length;
+      summary.acceptedArtifactCount = artifacts.filter((artifact) => artifact.status === 'accepted').length;
+    }
+
+    return summary;
   }
 
   private parseTaskEvidence(body: string): {
     toolName?: string;
     filesModified: string[];
     previewableArtifacts: string[];
+    output?: string;
     error?: string;
   } {
     const toolName = body.match(/^Tool:\s*(.+)$/m)?.[1]?.trim();
     const filesModified = extractModifiedFilesFromEvidenceBody(body);
+    const output = this.extractNamedSection(body, 'Output');
     const error = this.extractNamedSection(body, 'Error');
 
     return {
       toolName,
       filesModified,
       previewableArtifacts: filesModified.filter((filePath) => this.isPreviewableArtifactPath(filePath)),
+      output,
       error,
     };
   }
@@ -2124,6 +2489,245 @@ export class WorkbenchService {
       || lowered.endsWith('.json')
       || lowered.endsWith('.svg')
     );
+  }
+
+  private async registerPreviewableArtifacts(
+    event: AgentEvent,
+    task: WorkbenchTaskRecord,
+    rawItem: WorkbenchTimelineItem,
+    createdAt: string,
+  ): Promise<void> {
+    if (!this.artifacts || event.type !== EventType.TOOL_RESULT) {
+      return;
+    }
+
+    const payload = event.payload as ToolResultPayload;
+    const parsed = this.parseTaskEvidence(rawItem.body);
+    const previewableFiles = parsed.previewableArtifacts;
+    if (previewableFiles.length === 0) {
+      return;
+    }
+
+    for (const filePath of previewableFiles) {
+      const resolved = path.resolve(filePath);
+      const relativeToRoot = path.relative(this.options.rootPath, resolved);
+      if (relativeToRoot.startsWith('..') || path.isAbsolute(relativeToRoot)) {
+        continue;
+      }
+
+      try {
+        const content = await fs.readFile(resolved);
+        await this.artifacts.create({
+          taskId: task.id,
+          workspaceId: task.workspaceBinding?.workspaceName,
+          projectId: task.workspaceBinding?.projectName,
+          sessionId: task.activeSessionId,
+          title: `Preview: ${path.basename(filePath)}`,
+          description: `Automatically registered from ${payload.toolName} output.`,
+          kind: this.artifactKindForPath(filePath),
+          status: 'previewable',
+          content,
+          contentType: this.contentTypeForPath(filePath),
+          extension: this.extensionForPath(filePath),
+          sourceEventIds: [event.id],
+          sourceEvidenceIds: [rawItem.id],
+          changedFiles: [filePath],
+          producedBy: {
+            tool: payload.toolName,
+          },
+          summary: `Previewable artifact registered at ${createdAt}.`,
+          tags: ['auto-preview'],
+        });
+      } catch {
+        // Evidence should remain usable even when an artifact path cannot be safely registered.
+      }
+    }
+  }
+
+  private async appendArtifactTimelineItem(
+    artifact: WorkbenchArtifactRecord,
+    action: 'created' | 'updated' | 'accepted' | 'rejected' | 'archived',
+  ): Promise<void> {
+    await this.store.appendTimelineItem({
+      id: generateId(),
+      taskId: artifact.taskId,
+      kind: 'summary',
+      actor: action === 'accepted' || action === 'rejected' ? 'user' : 'system',
+      body: `Artifact ${action}: ${artifact.title} (v${artifact.version}, ${artifact.status}).`,
+      createdAt: new Date().toISOString(),
+      evidenceIds: artifact.sourceEvidenceIds,
+    });
+  }
+
+  private async moveTaskToArtifactReview(artifact: WorkbenchArtifactRecord): Promise<void> {
+    const bundle = await this.store.readTaskBundle(artifact.taskId);
+    if (!bundle.task || bundle.task.status === 'archived') {
+      return;
+    }
+
+    const updatedAt = new Date().toISOString();
+    await this.store.upsertTask({
+      ...bundle.task,
+      status: 'in_review',
+      updatedAt,
+      lastProgressAt: updatedAt,
+      waitingReason: 'Latest review artifact needs acceptance.',
+      waitingDecisionId: undefined,
+      latestSummary: `Artifact updated and awaiting acceptance: ${artifact.title}.`,
+    });
+  }
+
+  private async completeTaskAfterArtifactAcceptance(artifact: WorkbenchArtifactRecord): Promise<void> {
+    const bundle = await this.store.readTaskBundle(artifact.taskId);
+    if (!bundle.task || bundle.task.status === 'archived') {
+      return;
+    }
+
+    const artifacts = await this.artifacts?.list({ taskId: artifact.taskId }) || [];
+    if (artifacts.some((item) => item.status === 'needs_review' || item.status === 'rejected' || item.status === 'draft')) {
+      return;
+    }
+
+    const updatedAt = new Date().toISOString();
+    await this.store.upsertTask({
+      ...bundle.task,
+      status: 'completed',
+      updatedAt,
+      lastProgressAt: updatedAt,
+      waitingReason: undefined,
+      waitingDecisionId: undefined,
+      latestSummary: `Review artifact accepted: ${artifact.title}.`,
+    });
+  }
+
+  private async reopenTaskAfterArtifactRejection(
+    artifact: WorkbenchArtifactRecord,
+    reason: string,
+  ): Promise<void> {
+    const bundle = await this.store.readTaskBundle(artifact.taskId);
+    if (!bundle.task || bundle.task.status === 'archived') {
+      return;
+    }
+
+    const updatedAt = new Date().toISOString();
+    await this.store.upsertTask({
+      ...bundle.task,
+      status: 'todo',
+      updatedAt,
+      lastProgressAt: updatedAt,
+      waitingReason: undefined,
+      waitingDecisionId: undefined,
+      latestSummary: `Artifact changes requested for ${artifact.title}: ${reason.trim()}`,
+    });
+  }
+
+  private async hasPendingReviewArtifact(taskId: string): Promise<boolean> {
+    const artifacts = await this.artifacts?.list({ taskId }) || [];
+    if (artifacts.length === 0) {
+      return false;
+    }
+
+    const latest = artifacts[0];
+    return latest.status !== 'accepted' && latest.status !== 'archived';
+  }
+
+  private buildArtifactProvenance(timeline: WorkbenchTimelineItem[]): {
+    sourceEventIds: string[];
+    sourceEvidenceIds: string[];
+    changedFiles: string[];
+    validationRefs: string[];
+    decisionIds: string[];
+  } {
+    const sourceEventIds = new Set<string>();
+    const sourceEvidenceIds = new Set<string>();
+    const changedFiles = new Set<string>();
+    const validationRefs = new Set<string>();
+    const decisionIds = new Set<string>();
+
+    for (const item of timeline) {
+      item.evidenceIds?.forEach((id) => {
+        sourceEventIds.add(id);
+        sourceEvidenceIds.add(id);
+      });
+      if (item.decisionId) {
+        decisionIds.add(item.decisionId);
+      }
+      if (item.kind !== 'raw') {
+        continue;
+      }
+      const parsed = this.parseTaskEvidence(item.body);
+      parsed.filesModified.forEach((filePath) => changedFiles.add(filePath));
+      if (parsed.toolName && this.isValidationToolEvidence(parsed)) {
+        validationRefs.add(`${parsed.toolName}: ${firstNonEmptyLine(parsed.output || parsed.error || item.body)}`);
+      }
+    }
+
+    return {
+      sourceEventIds: Array.from(sourceEventIds),
+      sourceEvidenceIds: Array.from(sourceEvidenceIds),
+      changedFiles: Array.from(changedFiles),
+      validationRefs: Array.from(validationRefs),
+      decisionIds: Array.from(decisionIds),
+    };
+  }
+
+  private isValidationToolEvidence(parsed: { toolName?: string; output?: string; error?: string }): boolean {
+    if (!parsed.toolName) {
+      return false;
+    }
+    const haystack = `${parsed.toolName}\n${parsed.output || ''}\n${parsed.error || ''}`.toLowerCase();
+    return (
+      parsed.toolName === 'bash'
+      || haystack.includes('test')
+      || haystack.includes('typecheck')
+      || haystack.includes('lint')
+      || haystack.includes('build')
+      || haystack.includes('verify')
+    );
+  }
+
+  private extensionForPath(filePath: string): CreateArtifactInput['extension'] {
+    const extension = path.extname(filePath).replace(/^\./, '').toLowerCase();
+    if (extension === 'htm') {
+      return 'html';
+    }
+    if (extension === 'md') {
+      return 'md';
+    }
+    if (extension === 'svg' || extension === 'json' || extension === 'txt' || extension === 'diff' || extension === 'html') {
+      return extension;
+    }
+    return 'txt';
+  }
+
+  private artifactKindForPath(filePath: string): ArtifactKind {
+    const extension = this.extensionForPath(filePath);
+    if (extension === 'md') {
+      return 'markdown';
+    }
+    if (extension === 'txt') {
+      return 'text';
+    }
+    return extension;
+  }
+
+  private contentTypeForPath(filePath: string): string {
+    const extension = this.extensionForPath(filePath);
+    switch (extension) {
+      case 'html':
+        return 'text/html';
+      case 'md':
+        return 'text/markdown';
+      case 'svg':
+        return 'image/svg+xml';
+      case 'json':
+        return 'application/json';
+      case 'diff':
+        return 'text/x-diff';
+      case 'txt':
+      default:
+        return 'text/plain';
+    }
   }
 
   private mapTransitionActor(actor: WorkbenchTaskTransitionActor): WorkbenchActor {
@@ -2182,4 +2786,97 @@ function normalizeLabels(labels: string[] | undefined): string[] | undefined {
 
 function canonicalTransitionStatus(status: WorkbenchTaskStatus): WorkbenchTaskStatus {
   return TRANSITION_ALIASES[status] || status;
+}
+
+function classifyClaudeReviewOutput(stdout: string): 'blocking' | 'clean' {
+  const normalized = stdout.toLowerCase();
+  if (
+    /\b(no|none|zero)\s+blocking\b/.test(normalized)
+    || normalized.includes('no blocking findings')
+    || normalized.includes('no blocking issues')
+    || normalized.includes('ready for human review')
+    || normalized.includes('approved')
+  ) {
+    return 'clean';
+  }
+  if (
+    normalized.includes('blocking finding')
+    || normalized.includes('blocking issue')
+    || normalized.includes('request changes')
+    || normalized.includes('requested changes')
+    || normalized.includes('must fix')
+    || normalized.includes('[p0]')
+    || normalized.includes('[p1]')
+  ) {
+    return 'blocking';
+  }
+  return 'clean';
+}
+
+function buildClaudeReviewComment(
+  stdout: string,
+  decision: 'blocking' | 'clean',
+  runId?: string,
+): string {
+  return [
+    `Claude Code review output${runId ? ` for run ${runId}` : ''}:`,
+    '',
+    stdout.trim() || '(Claude Code completed without stdout.)',
+    '',
+    `Tik review-loop decision: ${decision === 'blocking' ? 'needs Codex fix' : 'needs human review'}.`,
+  ].join('\n');
+}
+
+function applyReviewLoopLabels(
+  labels: string[],
+  phase: NonNullable<AgentLoopMetadata['phase']>,
+): string[] {
+  const managedLabels = new Set([
+    'needs-claude-review',
+    'claude-reviewing',
+    'needs-codex-fix',
+    'codex-fixing',
+    'needs-human-review',
+    'stale-head',
+    'loop-complete',
+    'claude-review',
+    'codex-fix',
+    'human-review',
+    'codex-implement',
+  ]);
+  const next = new Set(labels.filter((label) => !managedLabels.has(label)));
+  switch (phase) {
+    case 'needs_claude_review':
+      next.add('needs-claude-review');
+      next.add('claude-review');
+      break;
+    case 'needs_codex_fix':
+      next.add('needs-codex-fix');
+      next.add('codex-fix');
+      break;
+    case 'needs_human_review':
+      next.add('needs-human-review');
+      next.add('human-review');
+      break;
+    case 'complete':
+      next.add('loop-complete');
+      break;
+    case 'claude_reviewing':
+      next.add('claude-reviewing');
+      next.add('claude-review');
+      break;
+    case 'codex_fixing':
+      next.add('codex-fixing');
+      next.add('codex-fix');
+      break;
+    case 'stale':
+      next.add('stale-head');
+      next.add('human-review');
+      break;
+  }
+  return Array.from(next).sort();
+}
+
+function firstNonEmptyLine(value: string): string {
+  return value.split('\n').map((line) => line.trim()).find(Boolean) || 'recorded validation evidence';
 }

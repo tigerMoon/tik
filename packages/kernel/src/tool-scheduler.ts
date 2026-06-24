@@ -5,6 +5,10 @@
  * - READ tools: parallel execution
  * - WRITE tools: serial execution
  * - EXEC tools: blocking execution
+ *
+ * Batch execution preserves action order around side effects: leading reads in
+ * a dependency level may run in parallel, then the first write/exec and every
+ * following action in that level runs serially.
  */
 
 import type {
@@ -204,31 +208,7 @@ export class ToolScheduler implements IToolScheduler {
         break;
       }
 
-      // Execute ready actions (parallel for reads, serial for writes)
-      const readActions = ready.filter(i => {
-        const tool = this.registry.get(actions[i].toolName);
-        return tool?.type === 'read';
-      });
-      const otherActions = ready.filter(i => !readActions.includes(i));
-
-      // Run reads in parallel
-      if (readActions.length > 0) {
-        const readResults = await Promise.all(
-          readActions.map(i =>
-            this.execute(actions[i].toolName, actions[i].input, context),
-          ),
-        );
-        readActions.forEach((actionIdx, resultIdx) => {
-          results[actionIdx] = readResults[resultIdx];
-          completed.add(actionIdx);
-        });
-      }
-
-      // Run writes/execs serially
-      for (const i of otherActions) {
-        results[i] = await this.execute(actions[i].toolName, actions[i].input, context);
-        completed.add(i);
-      }
+      await this.executeReadyActions(ready, actions, results, completed, context);
     }
 
     return results;
@@ -242,6 +222,47 @@ export class ToolScheduler implements IToolScheduler {
   }
 
   // ─── Private Methods ──────────────────────────────────────
+
+  private async executeReadyActions(
+    ready: number[],
+    actions: Array<{ toolName: string; input: unknown; dependsOn?: number[] }>,
+    results: ToolResult[],
+    completed: Set<number>,
+    context: ToolContext,
+  ): Promise<void> {
+    let cursor = 0;
+    let readParallelAllowed = true;
+
+    while (cursor < ready.length) {
+      const actionIndex = ready[cursor];
+      const tool = this.registry.get(actions[actionIndex].toolName);
+
+      if (readParallelAllowed && tool?.type === 'read') {
+        const readBatch: number[] = [];
+        while (cursor < ready.length) {
+          const readIndex = ready[cursor];
+          const readTool = this.registry.get(actions[readIndex].toolName);
+          if (readTool?.type !== 'read') break;
+          readBatch.push(readIndex);
+          cursor += 1;
+        }
+
+        const readResults = await Promise.all(
+          readBatch.map((i) => this.execute(actions[i].toolName, actions[i].input, context)),
+        );
+        readBatch.forEach((i, resultIndex) => {
+          results[i] = readResults[resultIndex];
+          completed.add(i);
+        });
+        continue;
+      }
+
+      readParallelAllowed = false;
+      results[actionIndex] = await this.execute(actions[actionIndex].toolName, actions[actionIndex].input, context);
+      completed.add(actionIndex);
+      cursor += 1;
+    }
+  }
 
   private executeSerial(tool: Tool, input: unknown, context: ToolContext): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {

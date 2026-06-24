@@ -58,4 +58,78 @@ describe('buildTaskImporterFromCli', () => {
       workbench,
     })).toThrow(/Linear runtime import is no longer supported/i);
   });
+
+  it('uses workflow v2 workbench importing so environment review labels can be routed', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-cli-tracker-'));
+    tempDirs.push(root);
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      id: 'review-task',
+      shortIdentifier: 'TIK-101',
+      title: 'Review workspace changes',
+      goal: 'Review the current worktree.',
+      status: 'todo',
+      labels: ['needs-claude-review'],
+      environmentPackSnapshot: {
+        id: 'base-engineering',
+        name: 'Base Engineering',
+        version: '0.1.0',
+        taskLabels: [{
+          value: 'needs-claude-review',
+          label: 'Claude review',
+          action: 'claude_code_review',
+          description: 'Review with Claude Code.',
+          aliases: ['claude-review'],
+        }],
+      },
+    }, 'review-task');
+
+    const importer = buildTaskImporterFromCli({
+      workspaceRoot: root,
+      workflow: {
+        version: 2,
+        config: {
+          tracker: {
+            kind: 'json',
+            activeStates: ['todo'],
+            terminalStates: ['completed'],
+          },
+          polling: {
+            intervalMs: 30_000,
+            maxConcurrentAgents: 1,
+          },
+          workspace: {
+            root: '.tik/workspaces',
+            cleanupTerminal: false,
+            hooks: {
+              afterCreate: [],
+              beforeRun: [],
+              afterRun: [],
+              beforeRemove: [],
+            },
+          },
+          agent: {
+            timeoutMs: 1_000,
+          },
+        },
+        promptTemplate: 'Review {{ task.shortIdentifier }}.',
+        renderPrompt(task) {
+          return `Review ${task.shortIdentifier}.`;
+        },
+      },
+      workbench,
+    });
+
+    await expect(importer.listCandidateTasks()).resolves.toEqual([
+      expect.objectContaining({
+        id: 'review-task',
+        shortIdentifier: 'TIK-101',
+        labels: ['needs-claude-review'],
+      }),
+    ]);
+  });
 });

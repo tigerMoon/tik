@@ -10,20 +10,28 @@ import {
 } from '@tik/shared';
 import {
   addTrackerTaskComment,
+  acceptWorkbenchArtifact,
+  archiveWorkbenchArtifact,
   archiveWorkbenchTask,
   controlTask,
   createWorkbenchTask,
   createWorktreeReviewRound,
+  fetchWorkbenchArtifact,
+  fetchWorkbenchArtifacts,
+  fetchWorkbenchArtifactVersions,
   fetchEnvironmentPackDashboard,
   fetchEnvironmentPacks,
   fetchSkillManifestRegistry,
   fetchTrackerState,
+  fetchWorkbenchTaskArtifacts,
   fetchWorkbenchDecisions,
   fetchWorkbenchTasks,
   fetchWorkbenchTimeline,
   fetchWorkflowFile,
   fetchWorkspaceStatus,
+  generateWorkbenchTaskArtifact,
   publishSkillManifest,
+  rejectWorkbenchArtifact,
   retryWorkbenchTask,
   refreshTracker,
   resolveWorkbenchDecision,
@@ -41,9 +49,13 @@ import {
   type UpdateWorkbenchTaskBriefResult,
   type WorkflowFileResponse,
   type WorkbenchTaskAttemptRecord,
+  type WorkbenchArtifactRecord,
+  type WorkbenchArtifactVersion,
   type WorkbenchTaskResponse,
   type WorkbenchTaskRunRecord,
 } from './api/client';
+import { ArtifactDetail } from './components/ArtifactDetail';
+import { ArtifactGallery } from './components/ArtifactGallery';
 import { WorkbenchConsoleHeader } from './components/WorkbenchConsoleHeader';
 import { WorkbenchEnvironmentView } from './components/WorkbenchEnvironmentView';
 import { WorkbenchSkillsView } from './components/WorkbenchSkillsView';
@@ -71,7 +83,7 @@ import {
 import { buildSkillManifestMutationInput, buildSkillPublishMutationInput } from './view-models/skills';
 import { useStore } from './hooks/store';
 
-type WorkbenchSurface = 'workbench' | 'environments' | 'skills' | 'tracker';
+type WorkbenchSurface = 'workbench' | 'artifacts' | 'environments' | 'skills' | 'tracker';
 
 function useCompactLayout(): boolean {
   const [compact, setCompact] = useState(() => (typeof window !== 'undefined' ? window.innerWidth < 1100 : false));
@@ -150,6 +162,15 @@ export function App() {
   const [workspaceStatus, setWorkspaceStatus] = useState<Awaited<ReturnType<typeof fetchWorkspaceStatus>> | null>(null);
   const [trackerState, setTrackerState] = useState<TrackerStateResponse | null>(null);
   const [workflowFile, setWorkflowFile] = useState<WorkflowFileResponse | null>(null);
+  const [artifacts, setArtifacts] = useState<WorkbenchArtifactRecord[]>([]);
+  const [taskArtifacts, setTaskArtifacts] = useState<WorkbenchArtifactRecord[]>([]);
+  const [activeArtifactId, setActiveArtifactId] = useState<string | null>(null);
+  const [activeArtifact, setActiveArtifact] = useState<WorkbenchArtifactRecord | null>(null);
+  const [artifactVersions, setArtifactVersions] = useState<WorkbenchArtifactVersion[]>([]);
+  const [refreshingArtifacts, setRefreshingArtifacts] = useState(false);
+  const [artifactBusyAction, setArtifactBusyAction] = useState<'accept' | 'reject' | 'archive' | null>(null);
+  const [taskArtifactBusyId, setTaskArtifactBusyId] = useState<string | null>(null);
+  const [generatingTaskArtifact, setGeneratingTaskArtifact] = useState(false);
   const [savingSkillId, setSavingSkillId] = useState<string | null>(null);
   const [publishingSkillId, setPublishingSkillId] = useState<string | null>(null);
   const compact = useCompactLayout();
@@ -181,6 +202,7 @@ export function App() {
     + Object.keys(trackerState?.retries || {}).length;
   const visibleTaskCount = filteredTasks.filter((task) => task.status !== 'archived').length;
   const archivedCount = groupedTasks.archived.length;
+  const artifactNeedsReviewCount = artifacts.filter((artifact) => artifact.status === 'needs_review').length;
   const liveStatusLabel = liveStatus === 'live'
     ? 'Live'
     : liveStatus === 'connecting'
@@ -288,15 +310,49 @@ export function App() {
   };
 
   const reloadTaskDetails = async (taskId: string) => {
-    const [nextTasks, nextTimeline, nextDecisions] = await Promise.all([
+    const [nextTasks, nextTimeline, nextDecisions, nextTaskArtifacts] = await Promise.all([
       fetchWorkbenchTasks(),
       fetchWorkbenchTimeline(taskId),
       fetchWorkbenchDecisions(taskId),
+      fetchWorkbenchTaskArtifacts(taskId).catch(() => []),
     ]);
     setTasks(nextTasks);
     setTimeline(nextTimeline);
     setDecisions(nextDecisions);
+    setTaskArtifacts(nextTaskArtifacts);
     setTimelineError(null);
+  };
+
+  const refreshArtifacts = async (options?: { silent?: boolean }) => {
+    if (!options?.silent) {
+      setRefreshingArtifacts(true);
+    }
+    try {
+      const nextArtifacts = await fetchWorkbenchArtifacts();
+      setArtifacts(nextArtifacts);
+      const resolvedArtifactId = activeArtifactId && nextArtifacts.some((artifact) => artifact.id === activeArtifactId)
+        ? activeArtifactId
+        : nextArtifacts[0]?.id || null;
+      if (resolvedArtifactId !== activeArtifactId) {
+        setActiveArtifactId(resolvedArtifactId);
+      }
+      setTimelineError(null);
+    } catch (error) {
+      setTimelineError((error as Error).message);
+    } finally {
+      if (!options?.silent) {
+        setRefreshingArtifacts(false);
+      }
+    }
+  };
+
+  const reloadArtifactDetails = async (artifactId: string) => {
+    const [artifact, versions] = await Promise.all([
+      fetchWorkbenchArtifact(artifactId),
+      fetchWorkbenchArtifactVersions(artifactId),
+    ]);
+    setActiveArtifact(artifact);
+    setArtifactVersions(versions);
   };
 
   const refreshTrackerState = async () => {
@@ -460,17 +516,81 @@ export function App() {
     }
   };
 
+  const handleArtifactAccept = async (artifactId: string) => {
+    setArtifactBusyAction('accept');
+    setTaskArtifactBusyId(artifactId);
+    try {
+      const artifact = await acceptWorkbenchArtifact(artifactId);
+      await Promise.all([
+        refreshArtifacts({ silent: true }),
+        reloadArtifactDetails(artifact.id),
+        artifact.taskId === activeTaskId ? reloadTaskDetails(artifact.taskId) : Promise.resolve(),
+      ]);
+    } finally {
+      setArtifactBusyAction(null);
+      setTaskArtifactBusyId(null);
+    }
+  };
+
+  const handleArtifactReject = async (artifactId: string, reason: string) => {
+    setArtifactBusyAction('reject');
+    setTaskArtifactBusyId(artifactId);
+    try {
+      const artifact = await rejectWorkbenchArtifact(artifactId, reason);
+      await Promise.all([
+        refreshArtifacts({ silent: true }),
+        reloadArtifactDetails(artifact.id),
+        artifact.taskId === activeTaskId ? reloadTaskDetails(artifact.taskId) : Promise.resolve(),
+      ]);
+    } finally {
+      setArtifactBusyAction(null);
+      setTaskArtifactBusyId(null);
+    }
+  };
+
+  const handleArtifactArchive = async (artifactId: string) => {
+    setArtifactBusyAction('archive');
+    setTaskArtifactBusyId(artifactId);
+    try {
+      const artifact = await archiveWorkbenchArtifact(artifactId);
+      await Promise.all([
+        refreshArtifacts({ silent: true }),
+        reloadArtifactDetails(artifact.id),
+        artifact.taskId === activeTaskId ? reloadTaskDetails(artifact.taskId) : Promise.resolve(),
+      ]);
+    } finally {
+      setArtifactBusyAction(null);
+      setTaskArtifactBusyId(null);
+    }
+  };
+
+  const handleGenerateTaskArtifact = async (taskId: string) => {
+    setGeneratingTaskArtifact(true);
+    try {
+      const artifact = await generateWorkbenchTaskArtifact(taskId);
+      setActiveArtifactId(artifact.id);
+      await Promise.all([
+        refreshArtifacts({ silent: true }),
+        reloadTaskDetails(taskId),
+        reloadArtifactDetails(artifact.id),
+      ]);
+    } finally {
+      setGeneratingTaskArtifact(false);
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
 
     const loadTasks = async () => {
       try {
-        const [nextTasks, packState, dashboard, registryResponse, workspaceStatusResponse] = await Promise.all([
+        const [nextTasks, packState, dashboard, registryResponse, workspaceStatusResponse, artifactsResponse] = await Promise.all([
           fetchWorkbenchTasks(),
           fetchEnvironmentPacks(),
           fetchEnvironmentPackDashboard().catch(() => null),
           fetchSkillManifestRegistry().catch(() => null),
           fetchWorkspaceStatus().catch(() => null),
+          fetchWorkbenchArtifacts().catch(() => []),
         ]);
         if (cancelled) {
           return;
@@ -489,6 +609,8 @@ export function App() {
         if (workspaceStatusResponse) {
           setWorkspaceStatus(workspaceStatusResponse);
         }
+        setArtifacts(artifactsResponse);
+        setActiveArtifactId((current) => current || artifactsResponse[0]?.id || null);
       } catch (error) {
         if (!cancelled) {
           setTimelineError((error as Error).message);
@@ -538,6 +660,7 @@ export function App() {
     if (!activeTaskId || !tasks.some((task) => task.id === activeTaskId)) {
       setTimeline([]);
       setDecisions([]);
+      setTaskArtifacts([]);
       setTimelineError(null);
       return () => {
         cancelled = true;
@@ -546,15 +669,17 @@ export function App() {
 
     const loadTaskDetails = async () => {
       try {
-        const [nextTimeline, nextDecisions] = await Promise.all([
+        const [nextTimeline, nextDecisions, nextTaskArtifacts] = await Promise.all([
           fetchWorkbenchTimeline(activeTaskId),
           fetchWorkbenchDecisions(activeTaskId),
+          fetchWorkbenchTaskArtifacts(activeTaskId).catch(() => []),
         ]);
         if (cancelled) {
           return;
         }
         setTimeline(nextTimeline);
         setDecisions(nextDecisions);
+        setTaskArtifacts(nextTaskArtifacts);
         setTimelineError(null);
       } catch (error) {
         if (!cancelled) {
@@ -688,6 +813,50 @@ export function App() {
     void Promise.all([refreshTrackerState(), refreshWorkflowFile()]);
   }, [activeSurface]);
 
+  useEffect(() => {
+    if (activeSurface !== 'artifacts') {
+      return;
+    }
+
+    void refreshArtifacts();
+  }, [activeSurface]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!activeArtifactId) {
+      setActiveArtifact(null);
+      setArtifactVersions([]);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const loadArtifactDetails = async () => {
+      try {
+        const [artifact, versions] = await Promise.all([
+          fetchWorkbenchArtifact(activeArtifactId),
+          fetchWorkbenchArtifactVersions(activeArtifactId),
+        ]);
+        if (cancelled) {
+          return;
+        }
+        setActiveArtifact(artifact);
+        setArtifactVersions(versions);
+        setTimelineError(null);
+      } catch (error) {
+        if (!cancelled) {
+          setTimelineError((error as Error).message);
+        }
+      }
+    };
+
+    void loadArtifactDetails();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeArtifactId]);
+
   return (
     <div className={`inbox-shell ${compact ? 'is-compact' : ''}`}>
       <aside className="inbox-sidebar panel">
@@ -784,6 +953,7 @@ export function App() {
         <nav className="inbox-nav sidebar-lower-nav">
           <div className="sidebar-section-label">Capabilities</div>
           {[
+            { label: 'Artifacts', count: artifactNeedsReviewCount || artifacts.length, active: activeSurface === 'artifacts', onClick: () => { setActiveSurface('artifacts'); setLauncherOpen(false); } },
             { label: 'Skills', count: skillRegistry.length, active: activeSurface === 'skills', onClick: () => { setActiveSurface('skills'); setLauncherOpen(false); } },
             { label: 'Environments', count: packs.length, active: activeSurface === 'environments', onClick: () => { setActiveSurface('environments'); setLauncherOpen(false); } },
             { label: 'Tracker', count: trackerSidebarCount, active: activeSurface === 'tracker', onClick: () => { setActiveSurface('tracker'); setLauncherOpen(false); } },
@@ -866,6 +1036,47 @@ export function App() {
               setActiveTask(taskId);
             }}
           />
+        ) : activeSurface === 'artifacts' ? (
+          <section className="artifact-surface">
+            <ArtifactGallery
+              artifacts={artifacts}
+              tasks={tasks}
+              selectedArtifactId={activeArtifactId}
+              loading={refreshingArtifacts}
+              onSelectArtifact={(artifactId) => setActiveArtifactId(artifactId)}
+              onOpenTask={(taskId) => {
+                setActiveSurface('workbench');
+                setWorkbenchView('detail');
+                resetWorkbenchScroll();
+                setAutoFocusLane(false);
+                setSelectedScopeKey('workspace');
+                setSelectedLens('all');
+                setLauncherOpen(false);
+                setActiveTask(taskId);
+              }}
+              onRefresh={() => refreshArtifacts()}
+            />
+            <ArtifactDetail
+              artifact={activeArtifact}
+              versions={artifactVersions}
+              task={activeArtifact ? tasks.find((task) => task.id === activeArtifact.taskId) || null : null}
+              loading={refreshingArtifacts}
+              busyAction={artifactBusyAction}
+              onAccept={handleArtifactAccept}
+              onReject={handleArtifactReject}
+              onArchive={handleArtifactArchive}
+              onOpenTask={(taskId) => {
+                setActiveSurface('workbench');
+                setWorkbenchView('detail');
+                resetWorkbenchScroll();
+                setAutoFocusLane(false);
+                setSelectedScopeKey('workspace');
+                setSelectedLens('all');
+                setLauncherOpen(false);
+                setActiveTask(taskId);
+              }}
+            />
+          </section>
         ) : activeSurface === 'environments' ? (
           <WorkbenchEnvironmentView
             packs={packs}
@@ -989,6 +1200,7 @@ export function App() {
                   packs={packs}
                   timeline={timeline}
                   decisions={decisions}
+                  artifacts={taskArtifacts}
                   resolvingDecisionId={resolvingDecisionId}
                   retrying={activeTask ? retryingTaskId === activeTask.id : false}
                   archiving={activeTask ? archivingTaskId === activeTask.id : false}
@@ -1063,6 +1275,16 @@ export function App() {
                   }}
                   onUpdateTaskMetadata={handleTaskMetadataChange}
                   onAddTaskComment={handleAddTaskComment}
+                  onGenerateArtifact={handleGenerateTaskArtifact}
+                  onAcceptArtifact={handleArtifactAccept}
+                  onRejectArtifact={handleArtifactReject}
+                  onOpenArtifact={(artifactId) => {
+                    setActiveArtifactId(artifactId);
+                    setActiveSurface('artifacts');
+                    setLauncherOpen(false);
+                  }}
+                  generatingArtifact={generatingTaskArtifact}
+                  busyArtifactId={taskArtifactBusyId}
                   onControlTask={async (taskId, action) => {
                     setControllingTask({ taskId, action });
                     try {

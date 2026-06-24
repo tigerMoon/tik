@@ -10,6 +10,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '@tik/shared';
+import { safeResolve } from './path-safety.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -87,9 +88,9 @@ export const editFileTool: Tool = {
       old_string: string;
       new_string: string;
     };
-    const resolved = path.resolve(context.cwd, filePath);
 
     try {
+      const resolved = await safeResolve(context.cwd, filePath);
       const content = await fs.readFile(resolved, 'utf-8');
 
       if (!content.includes(old_string)) {
@@ -124,7 +125,7 @@ export const editFileTool: Tool = {
       return {
         success: false,
         output: null,
-        error: `Failed to edit ${resolved}: ${(err as Error).message}`,
+        error: `Failed to edit ${filePath}: ${(err as Error).message}`,
         durationMs: Date.now() - start,
       };
     }

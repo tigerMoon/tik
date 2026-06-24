@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { EnvironmentPackSnapshot } from '../types/environment-pack.js';
+import type { WorkbenchDispatchEnvironmentTask } from './workbench-dispatch.js';
 import {
   getWorkbenchLabelAction,
   getWorkbenchLabelDefinition,
   isWorkbenchTaskCodexDispatchable,
+  isWorkbenchTaskWorkflowDispatchable,
   isWorkbenchTaskMaintenance,
   normalizeWorkbenchLabel,
 } from './index.js';
@@ -75,20 +77,26 @@ describe('workbench label routing', () => {
   });
 
   it('routes environment-declared Claude review labels away from Codex dispatch', () => {
-    expect(isWorkbenchTaskCodexDispatchable({
+    const task: WorkbenchDispatchEnvironmentTask = {
       status: 'todo',
       labels: ['needs-claude-review'],
       agentLoop: undefined,
       environmentPackSnapshot: engineeringSnapshot,
-    })).toBe(false);
+    };
+
+    expect(isWorkbenchTaskCodexDispatchable(task)).toBe(false);
+    expect(isWorkbenchTaskWorkflowDispatchable(task)).toBe(true);
   });
 
   it('allows environment-declared codex fix labels through the Codex dispatch lane', () => {
-    expect(isWorkbenchTaskCodexDispatchable({
+    const task: WorkbenchDispatchEnvironmentTask = {
       status: 'todo',
       labels: ['needs-codex-fix'],
       agentLoop: undefined,
       environmentPackSnapshot: engineeringSnapshot,
-    })).toBe(true);
+    };
+
+    expect(isWorkbenchTaskCodexDispatchable(task)).toBe(true);
+    expect(isWorkbenchTaskWorkflowDispatchable(task)).toBe(true);
   });
 });

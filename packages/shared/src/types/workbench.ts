@@ -113,6 +113,8 @@ export interface AgentLoopPayload {
   blockingIssues?: BlockingIssue[];
   createdBy?: AgentLoopMetadata['createdBy'];
   workspaceBinding?: TaskWorkspaceBinding;
+  environmentPackSnapshot?: EnvironmentPackSnapshot;
+  environmentPackSelection?: EnvironmentPackSelection;
 }
 
 export interface WorkbenchTaskRecord {
@@ -193,8 +195,100 @@ export interface WorkbenchTaskEvidenceSummary {
   previewableArtifactCount: number;
   latestPreviewableArtifactPath?: string;
   latestPreviewableArtifactCreatedAt?: string;
+  latestArtifactId?: string;
+  latestArtifactVersionId?: string;
+  artifactCount?: number;
+  needsReviewArtifactCount?: number;
+  acceptedArtifactCount?: number;
   latestToolName?: string;
   hasErrorEvidence: boolean;
+}
+
+export type ArtifactKind =
+  | 'html'
+  | 'markdown'
+  | 'svg'
+  | 'json'
+  | 'text'
+  | 'diff'
+  | 'report'
+  | 'dashboard'
+  | 'checklist'
+  | 'timeline'
+  | 'comparison';
+
+export type ArtifactStatus =
+  | 'draft'
+  | 'previewable'
+  | 'needs_review'
+  | 'accepted'
+  | 'rejected'
+  | 'superseded'
+  | 'archived';
+
+export type ArtifactVisibility =
+  | 'local'
+  | 'workspace'
+  | 'project'
+  | 'exported';
+
+export interface WorkbenchArtifactRecord {
+  id: string;
+  taskId: string;
+  workspaceId?: string;
+  projectId?: string;
+  sessionId?: string;
+  attemptId?: string;
+  title: string;
+  description?: string;
+  kind: ArtifactKind;
+  status: ArtifactStatus;
+  visibility: ArtifactVisibility;
+  latestVersionId: string;
+  version: number;
+  safeRelativePath: string;
+  contentType: string;
+  sizeBytes: number;
+  contentHash: string;
+  sourceEventIds: string[];
+  sourceEvidenceIds: string[];
+  changedFiles?: string[];
+  validationRefs?: string[];
+  decisionIds?: string[];
+  producedBy: {
+    agent?: string;
+    provider?: string;
+    model?: string;
+    tool?: string;
+    template?: string;
+  };
+  summary?: string;
+  risks?: string[];
+  tags?: string[];
+  createdAt: string;
+  updatedAt: string;
+  acceptedAt?: string;
+  acceptedBy?: string;
+  rejectedAt?: string;
+  rejectedBy?: string;
+  rejectionReason?: string;
+}
+
+export interface WorkbenchArtifactVersion {
+  id: string;
+  artifactId: string;
+  version: number;
+  safeRelativePath: string;
+  contentType: string;
+  sizeBytes: number;
+  contentHash: string;
+  sourceEventIds: string[];
+  sourceEvidenceIds: string[];
+  changedFiles?: string[];
+  validationRefs?: string[];
+  decisionIds?: string[];
+  summary?: string;
+  createdAt: string;
 }
 
 export interface WorkbenchTaskAdjustmentRecord {

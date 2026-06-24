@@ -7,7 +7,7 @@
     "build": "pnpm run typecheck && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run"
   },
   "dependencies": {
     "@tik/shared": "workspace:*",

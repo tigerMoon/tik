@@ -15,18 +15,24 @@ import type {
 } from '@tik/shared';
 import { generateId } from '@tik/shared';
 
+export interface EventBusOptions {
+  maxHistoryPerTask?: number;
+}
+
 export class EventBus implements IEventBus {
   private emitter: EventEmitter;
   private eventHistory: Map<string, AgentEvent[]>;
   private streams: Map<string, Set<(event: AgentEvent) => void>>;
   private globalStreams: Set<(event: AgentEvent) => void>;
+  private maxHistoryPerTask: number;
 
-  constructor() {
+  constructor(options: EventBusOptions = {}) {
     this.emitter = new EventEmitter();
     this.emitter.setMaxListeners(100); // Allow many subscribers
     this.eventHistory = new Map();
     this.streams = new Map();
     this.globalStreams = new Set();
+    this.maxHistoryPerTask = options.maxHistoryPerTask ?? 1000;
   }
 
   emit(event: AgentEvent): void {
@@ -34,7 +40,11 @@ export class EventBus implements IEventBus {
     if (!this.eventHistory.has(event.taskId)) {
       this.eventHistory.set(event.taskId, []);
     }
-    this.eventHistory.get(event.taskId)!.push(event);
+    const history = this.eventHistory.get(event.taskId)!;
+    history.push(event);
+    if (history.length > this.maxHistoryPerTask) {
+      history.splice(0, history.length - this.maxHistoryPerTask);
+    }
 
     // Emit to type-specific subscribers
     this.emitter.emit(event.type, event);

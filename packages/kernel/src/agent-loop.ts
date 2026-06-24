@@ -48,6 +48,7 @@ import type {
 } from '@tik/shared';
 import {
   EventType,
+  PLAN_READ_ONLY_TOOL_POLICY,
   generateId,
   now,
   formatDuration,
@@ -836,32 +837,38 @@ export class AgentLoop {
       implementationReady: sessionMemorySuggestsImplementation(session.compactMemory || session.contextSummary),
     };
 
-    // Classify tools: EXEC tools must be sequential, READ+WRITE can be parallel
-    // LLM decided these tools are independent (same response), so safe to parallelize
-    const execToolNames = new Set<string>();
+    // Classify tools deterministically. Reads before the first side-effecting
+    // tool can run together; after a write/exec, preserve call order.
+    const toolTypes = new Map<string, 'read' | 'write' | 'exec'>();
     const allTools = this.toolScheduler['registry'].list();
     for (const t of allTools) {
-      if (t.type === 'exec') execToolNames.add(t.name);
+      toolTypes.set(t.name, t.type);
     }
 
-    // Split into groups: non-EXEC → parallel batch, EXEC → sequential
+    // Split into groups: initial reads → parallel batch, first write/exec and
+    // everything after it → sequential. This avoids read/write races in one
+    // LLM round without relying on the model to judge independence.
     type CallGroup = { parallel: boolean; calls: typeof toolCalls };
     const groups: CallGroup[] = [];
+    let readParallelAllowed = true;
 
     for (const call of toolCalls) {
-      const isExec = execToolNames.has(call.name);
+      const toolType = toolTypes.get(call.name) || 'exec';
       const lastGroup = groups[groups.length - 1];
 
-      if (!isExec) {
-        // READ and WRITE tools can be parallelized
+      if (readParallelAllowed && toolType === 'read') {
         if (lastGroup?.parallel) {
           lastGroup.calls.push(call);
         } else {
           groups.push({ parallel: true, calls: [call] });
         }
       } else {
-        // EXEC tools must be sequential (side effects)
-        groups.push({ parallel: false, calls: [call] });
+        readParallelAllowed = false;
+        if (lastGroup && !lastGroup.parallel) {
+          lastGroup.calls.push(call);
+        } else {
+          groups.push({ parallel: false, calls: [call] });
+        }
       }
     }
 
@@ -877,7 +884,7 @@ export class AgentLoop {
     // Execute each group
     for (const group of groups) {
       if (group.parallel && group.calls.length > 1) {
-        // Execute READ tools in parallel
+        // Execute the initial read-only batch in parallel.
         const results = await Promise.all(
           group.calls.map(async (call) => {
             const start = now();
@@ -1048,53 +1055,7 @@ export class AgentLoop {
     // If it's a Zod schema, extract properties from its shape
     if (schema && typeof schema === 'object' && '_def' in schema) {
       try {
-        const def = schema._def;
-        // ZodObject
-        if (def.typeName === 'ZodObject' && schema.shape) {
-          const properties: Record<string, any> = {};
-          const required: string[] = [];
-
-          for (const [key, value] of Object.entries(schema.shape)) {
-            const fieldDef = (value as any)?._def;
-            if (!fieldDef) continue;
-
-            let prop: Record<string, any> = { type: 'string' };
-
-            // Unwrap ZodOptional
-            let innerDef = fieldDef;
-            let isOptional = false;
-            if (innerDef.typeName === 'ZodOptional') {
-              isOptional = true;
-              innerDef = innerDef.innerType?._def || innerDef;
-            }
-
-            // Map Zod types to JSON Schema
-            switch (innerDef.typeName) {
-              case 'ZodString': prop = { type: 'string' }; break;
-              case 'ZodNumber': prop = { type: 'number' }; break;
-              case 'ZodBoolean': prop = { type: 'boolean' }; break;
-              case 'ZodArray': prop = { type: 'array' }; break;
-              default: prop = { type: 'string' }; break;
-            }
-
-            // Add description if available
-            if (innerDef.description) {
-              prop.description = innerDef.description;
-            } else if (fieldDef.description) {
-              prop.description = fieldDef.description;
-            }
-
-            properties[key] = prop;
-            if (!isOptional) required.push(key);
-          }
-
-          const result: Record<string, unknown> = {
-            type: 'object',
-            properties,
-          };
-          if (required.length > 0) result.required = required;
-          return result;
-        }
+        return this.zodToJsonSchema(schema);
       } catch {
         // Fall through to default
       }
@@ -1102,6 +1063,86 @@ export class AgentLoop {
 
     // Fallback: empty object schema
     return { type: 'object', properties: {} };
+  }
+
+  private zodToJsonSchema(schema: any): Record<string, any> {
+    const def = schema?._def;
+    if (!def?.typeName) {
+      return { type: 'string' };
+    }
+
+    const description = def.description;
+    const withDescription = (json: Record<string, any>) => {
+      if (description) {
+        return { ...json, description };
+      }
+      return json;
+    };
+
+    switch (def.typeName) {
+      case 'ZodString':
+        return withDescription({ type: 'string' });
+      case 'ZodNumber':
+        return withDescription({ type: 'number' });
+      case 'ZodBoolean':
+        return withDescription({ type: 'boolean' });
+      case 'ZodLiteral':
+        return withDescription({ const: def.value, type: typeof def.value });
+      case 'ZodEnum':
+        return withDescription({ type: 'string', enum: def.values });
+      case 'ZodNativeEnum':
+        return withDescription({ enum: Object.values(def.values) });
+      case 'ZodArray':
+        return withDescription({
+          type: 'array',
+          items: this.zodToJsonSchema(def.type),
+        });
+      case 'ZodUnion':
+        return withDescription({
+          anyOf: (def.options || []).map((option: any) => this.zodToJsonSchema(option)),
+        });
+      case 'ZodDiscriminatedUnion':
+        return withDescription({
+          anyOf: Array.from(def.options?.values?.() || []).map((option: any) => this.zodToJsonSchema(option)),
+        });
+      case 'ZodObject': {
+        const shape = typeof def.shape === 'function' ? def.shape() : schema.shape;
+        const properties: Record<string, any> = {};
+        const required: string[] = [];
+
+        for (const [key, value] of Object.entries(shape || {})) {
+          properties[key] = this.zodToJsonSchema(value);
+          if (!this.isOptionalZod(value)) {
+            required.push(key);
+          }
+        }
+
+        const result: Record<string, any> = {
+          type: 'object',
+          properties,
+        };
+        if (required.length > 0) result.required = required;
+        return withDescription(result);
+      }
+      case 'ZodOptional':
+      case 'ZodNullable':
+      case 'ZodDefault':
+      case 'ZodCatch':
+      case 'ZodEffects':
+        return withDescription(this.zodToJsonSchema(def.innerType || def.schema));
+      case 'ZodRecord':
+        return withDescription({
+          type: 'object',
+          additionalProperties: this.zodToJsonSchema(def.valueType),
+        });
+      default:
+        return withDescription({ type: 'string' });
+    }
+  }
+
+  private isOptionalZod(schema: any): boolean {
+    const typeName = schema?._def?.typeName;
+    return typeName === 'ZodOptional' || typeName === 'ZodDefault' || typeName === 'ZodCatch';
   }
 
   private getAgentSpec(agent: AgentRuntime | undefined): AgentSpec | undefined {
@@ -1670,6 +1711,8 @@ export class AgentLoop {
     const contextStr = JSON.stringify(context, null, 2);
     const response = await this.llmProvider.plan(prompt, contextStr, {
       cwd: task.projectPath || process.cwd(),
+      allowWrites: false,
+      toolPolicy: PLAN_READ_ONLY_TOOL_POLICY,
     });
 
     return {

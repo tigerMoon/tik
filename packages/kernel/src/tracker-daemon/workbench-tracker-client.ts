@@ -1,4 +1,4 @@
-import { isWorkbenchTaskCodexDispatchable } from '@tik/shared';
+import { isWorkbenchTaskCodexDispatchable, isWorkbenchTaskWorkflowDispatchable } from '@tik/shared';
 import type { WorkbenchTaskRecord, WorkbenchTaskStatus } from '@tik/shared';
 import type {
   TrackedTask,
@@ -8,6 +8,7 @@ import type {
 } from './types.js';
 
 const WORKBENCH_SOURCE = 'workbench';
+type WorkbenchTaskDispatchPredicate = (task: WorkbenchTaskRecord) => boolean;
 
 export class WorkbenchTaskImporter implements TrackedTaskImporter {
   constructor(private readonly workbench: WorkbenchPort) {}
@@ -50,7 +51,55 @@ export class WorkbenchTaskImporter implements TrackedTaskImporter {
   }
 }
 
-function taskToTrackedTask(task: WorkbenchTaskRecord): TrackedTask {
+export class WorkflowV2WorkbenchTaskImporter implements TrackedTaskImporter {
+  constructor(
+    private readonly workbench: WorkbenchPort,
+    private readonly defaultProjectPath: string,
+  ) {}
+
+  async listCandidateTasks(): Promise<TrackedTask[]> {
+    const tasks = await this.listWorkbenchTasks();
+    return tasks
+      .filter((task) => isWorkbenchTaskWorkflowDispatchable(task) || hasOpenTrackerAttempt(task))
+      .map((task) => taskToTrackedTask(task, this.defaultProjectPath, isWorkbenchTaskWorkflowDispatchable));
+  }
+
+  async listOpenAttemptTasks(): Promise<TrackedTask[]> {
+    const tasks = await this.listWorkbenchTasks();
+    return tasks
+      .filter(hasOpenTrackerAttempt)
+      .map((task) => taskToTrackedTask(task, this.defaultProjectPath, isWorkbenchTaskWorkflowDispatchable));
+  }
+
+  async fetchTaskStatesByIds(taskIds: string[]): Promise<TrackedTask[]> {
+    const tasks = await Promise.all(taskIds.map(async (taskId) => this.workbench.readTask?.(taskId)));
+    return tasks
+      .filter((task): task is WorkbenchTaskRecord => Boolean(task))
+      .map((task) => taskToTrackedTask(task, this.defaultProjectPath, isWorkbenchTaskWorkflowDispatchable));
+  }
+
+  async fetchTasksByStates(stateNames: string[]): Promise<TrackedTask[]> {
+    const stateSet = new Set(stateNames.map((state) => state.toLowerCase()));
+    const tasks = await this.listWorkbenchTasks();
+    return tasks
+      .filter((task) => isWorkbenchTaskWorkflowDispatchable(task) || hasOpenTrackerAttempt(task))
+      .filter((task) => stateSet.has(task.status.toLowerCase()) || (task.state && stateSet.has(task.state.toLowerCase())))
+      .map((task) => taskToTrackedTask(task, this.defaultProjectPath, isWorkbenchTaskWorkflowDispatchable));
+  }
+
+  private async listWorkbenchTasks(): Promise<WorkbenchTaskRecord[]> {
+    if (!this.workbench.listTasks) {
+      throw new Error('Workbench task importer requires listTasks support.');
+    }
+    return this.workbench.listTasks();
+  }
+}
+
+function taskToTrackedTask(
+  task: WorkbenchTaskRecord,
+  defaultProjectPath?: string,
+  isDispatchable: WorkbenchTaskDispatchPredicate = isWorkbenchTaskCodexDispatchable,
+): TrackedTask {
   const identifier = task.identifier || task.shortIdentifier || task.id.slice(0, 8).toUpperCase();
   const latestOpenAttempt = (task.attempts || [])
     .filter((attempt) => attempt.kernelTaskId && !attempt.finishedAt)
@@ -63,16 +112,25 @@ function taskToTrackedTask(task: WorkbenchTaskRecord): TrackedTask {
     description: task.description ?? task.goal,
     priority: task.priority ?? null,
     state: task.status,
-    stateKind: stateKindFromTask(task),
+    stateKind: stateKindFromTask(task, isDispatchable),
     sourceUrl: task.sourceUrl,
     labels: task.labels || [],
     blockedBy: buildBlockers(task),
     repository: task.workspaceBinding
       ? {
           name: task.workspaceBinding.projectName,
-          path: task.workspaceBinding.sourceProjectPath || task.workspaceBinding.effectiveProjectPath,
+          path: task.workspaceBinding.effectiveProjectPath || task.workspaceBinding.sourceProjectPath,
+          executionPath: task.workspaceBinding.effectiveProjectPath || task.workspaceBinding.sourceProjectPath,
+          sourcePath: task.workspaceBinding.sourceProjectPath || task.workspaceBinding.effectiveProjectPath,
           workspaceFile: task.workspaceBinding.workspaceFile,
         }
+      : defaultProjectPath
+        ? {
+            name: defaultProjectPath.split(/[\\/]/).filter(Boolean).at(-1),
+            path: defaultProjectPath,
+            executionPath: defaultProjectPath,
+            sourcePath: defaultProjectPath,
+          }
       : undefined,
     assignee: task.humanAssignee ?? task.assignee ?? null,
     createdBy: task.createdBy,
@@ -81,7 +139,14 @@ function taskToTrackedTask(task: WorkbenchTaskRecord): TrackedTask {
     activeKernelTaskId: latestOpenAttempt?.kernelTaskId || null,
     activeAttemptStartedAt: latestOpenAttempt?.startedAt || null,
     sourceKind: WORKBENCH_SOURCE,
+    agentLoop: task.agentLoop,
+    comments: task.comments,
+    latestSummary: task.latestSummary,
   };
+}
+
+function hasOpenTrackerAttempt(task: WorkbenchTaskRecord): boolean {
+  return Boolean(task.attempts?.some((attempt) => attempt.kernelTaskId && !attempt.finishedAt));
 }
 
 function buildBlockers(task: WorkbenchTaskRecord): TrackedTask['blockedBy'] {
@@ -93,12 +158,15 @@ function buildBlockers(task: WorkbenchTaskRecord): TrackedTask['blockedBy'] {
   return [...explicit, ...idOnlyBlockers];
 }
 
-function stateKindFromTask(task: WorkbenchTaskRecord): TrackedTaskStateKind {
+function stateKindFromTask(
+  task: WorkbenchTaskRecord,
+  isDispatchable: WorkbenchTaskDispatchPredicate,
+): TrackedTaskStateKind {
   const statusKind = stateKindFromStatus(task.status);
   if (statusKind !== 'active') {
     return statusKind;
   }
-  return isWorkbenchTaskCodexDispatchable(task) ? 'active' : 'blocked';
+  return isDispatchable(task) ? 'active' : 'blocked';
 }
 
 function stateKindFromStatus(status: WorkbenchTaskStatus): TrackedTaskStateKind {

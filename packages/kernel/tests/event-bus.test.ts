@@ -3,6 +3,26 @@ import { EventType } from '@tik/shared';
 import { EventBus } from '../src/event-bus.js';
 
 describe('EventBus', () => {
+  it('caps per-task history so long-running tasks do not grow without bound', () => {
+    const bus = new EventBus({ maxHistoryPerTask: 3 });
+
+    for (let index = 0; index < 5; index += 1) {
+      bus.emit({
+        id: `evt-${index}`,
+        type: EventType.SESSION_MESSAGE,
+        taskId: 'task-long-running',
+        payload: { index },
+        timestamp: index,
+      });
+    }
+
+    expect(bus.history('task-long-running').map((event) => event.id)).toEqual([
+      'evt-2',
+      'evt-3',
+      'evt-4',
+    ]);
+  });
+
   it('streams events for a single task through the task-specific stream', async () => {
     const bus = new EventBus();
     const iterator = bus.stream('task-1');

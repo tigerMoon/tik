@@ -10,6 +10,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '@tik/shared';
+import { safeResolve } from './path-safety.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -126,9 +127,9 @@ export const readFileTool: Tool = {
   async execute(input: unknown, context: ToolContext): Promise<ToolResult> {
     const start = Date.now();
     const { path: filePath } = input as { path: string };
-    const resolved = path.resolve(context.cwd, filePath);
 
     try {
+      const resolved = await safeResolve(context.cwd, filePath);
       const stat = await fs.stat(resolved);
       if (stat.isDirectory()) {
         return {
@@ -145,7 +146,7 @@ export const readFileTool: Tool = {
       return {
         success: false,
         output: null,
-        error: `Failed to read ${resolved}: ${(err as Error).message}`,
+        error: `Failed to read ${filePath}: ${(err as Error).message}`,
         durationMs: Date.now() - start,
       };
     }
@@ -165,9 +166,9 @@ export const writeFileTool: Tool = {
   async execute(input: unknown, context: ToolContext): Promise<ToolResult> {
     const start = Date.now();
     const { path: filePath, content } = input as { path: string; content: string };
-    const resolved = path.resolve(context.cwd, filePath);
 
     try {
+      const resolved = await safeResolve(context.cwd, filePath);
       await fs.mkdir(path.dirname(resolved), { recursive: true });
       await fs.writeFile(resolved, content, 'utf-8');
       return {
@@ -180,7 +181,7 @@ export const writeFileTool: Tool = {
       return {
         success: false,
         output: null,
-        error: `Failed to write ${resolved}: ${(err as Error).message}`,
+        error: `Failed to write ${filePath}: ${(err as Error).message}`,
         durationMs: Date.now() - start,
       };
     }

@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { resolveApiBaseUrlForLocation, resolveApiErrorMessage } from './client.js';
+import {
+  buildWorkbenchArtifactLinkPreviewUrl,
+  buildWorkbenchArtifactVersionPreviewUrl,
+  resolveApiBaseUrlForLocation,
+  resolveApiErrorMessage,
+} from './client.js';
 
 describe('resolveApiBaseUrlForLocation', () => {
   it('prefers explicit api base urls and trims trailing slash', () => {
@@ -58,5 +63,25 @@ describe('resolveApiErrorMessage', () => {
       error: 'Not Found',
       statusCode: 404,
     }, 'Not Found', 404)).toBe('Route GET:/api/v1/tasks not found');
+  });
+});
+
+describe('artifact preview urls', () => {
+  it('builds artifact-id preview URLs for first-class artifact previews', () => {
+    expect(buildWorkbenchArtifactVersionPreviewUrl('art_abc', 'ver_123')).toBe(
+      '/api/workbench/artifacts/art_abc/versions/ver_123/preview',
+    );
+  });
+
+  it('prefers artifact-id preview URLs and only falls back to legacy paths when ids are missing', () => {
+    expect(buildWorkbenchArtifactLinkPreviewUrl({
+      artifactId: 'art_abc',
+      versionId: 'ver_123',
+      filePath: '/tmp/preview.html',
+    })).toBe('/api/workbench/artifacts/art_abc/versions/ver_123/preview');
+
+    expect(buildWorkbenchArtifactLinkPreviewUrl({
+      filePath: '/tmp/preview.html',
+    })).toBe('/api/workbench/artifacts/preview?path=%2Ftmp%2Fpreview.html');
   });
 });

@@ -24,7 +24,7 @@ import type {
   ChatMessage,
   AgentRole,
 } from '@tik/shared';
-import { EventType, createEnvironmentPackSelection, generateId, now, toEnvironmentPackSnapshot } from '@tik/shared';
+import { EventType, PLAN_READ_ONLY_TOOL_POLICY, createEnvironmentPackSelection, generateId, now, toEnvironmentPackSnapshot } from '@tik/shared';
 import { EventBus } from './event-bus.js';
 import { ToolRegistry, ToolScheduler } from './tool-scheduler.js';
 import { TaskManager } from './task-manager.js';
@@ -37,6 +37,7 @@ import { BUILTIN_AGENTS } from './agent/builtin-agents.js';
 import { selectCoderAgentId } from './agent/coder-routing.js';
 import { WorkbenchStore } from './workbench/workbench-store.js';
 import { WorkbenchService } from './workbench/workbench-service.js';
+import { FileArtifactRegistry } from './artifacts/artifact-registry.js';
 import { shouldRequestDecisionForTool } from './workbench/workbench-decision-policy.js';
 import { EnvironmentPackRegistry } from './environment-pack-registry.js';
 
@@ -87,10 +88,12 @@ export class ExecutionKernel {
     this.taskManager = new TaskManager(this.eventBus);
     this.toolRegistry = new ToolRegistry();
     const workbenchStore = new WorkbenchStore(this.projectPath);
+    const artifactRegistry = new FileArtifactRegistry({ rootPath: this.projectPath });
     this.workbench = new WorkbenchService({
       rootPath: this.projectPath,
       eventBus: this.eventBus,
       store: workbenchStore,
+      artifacts: artifactRegistry,
       stopTask: (taskId, reason) => {
         try {
           void reason;
@@ -231,7 +234,11 @@ export class ExecutionKernel {
       const response = await this.llm.plan(
         `Task: ${task.description}\nStrategy: ${task.strategy}`,
         contextStr,
-        { cwd: task.projectPath || this.projectPath },
+        {
+          cwd: task.projectPath || this.projectPath,
+          allowWrites: false,
+          toolPolicy: PLAN_READ_ONLY_TOOL_POLICY,
+        },
       );
       task.plan = {
         goals: response.goals,

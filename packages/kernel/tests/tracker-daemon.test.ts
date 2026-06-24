@@ -1,15 +1,27 @@
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { EventType, type EnvironmentPackSnapshot } from '@tik/shared';
 import { EventBus } from '../src/event-bus.js';
 import { FileTrackerDaemonStateStore } from '../src/tracker-daemon/file-state-store.js';
 import { TrackerDaemon } from '../src/tracker-daemon/tracker-daemon.js';
-import { WorkbenchTaskImporter } from '../src/tracker-daemon/workbench-tracker-client.js';
+import { WorkbenchTaskImporter, WorkflowV2WorkbenchTaskImporter } from '../src/tracker-daemon/workbench-tracker-client.js';
 import { WorkbenchTrackerLauncher } from '../src/tracker-daemon/workbench-launcher.js';
 import { runWorkbenchKernelTaskInBackground } from '../src/tracker-daemon/workbench-runner.js';
 import type {
+  AgentRunHandle,
+  AgentRunInput,
+  AgentRunStatusSnapshot,
+  AgentRuntimeRunner,
+  ArtifactCandidate,
+  PreparedRun,
+} from '../src/agent-runners/agent-runtime-runner.js';
+import type {
+  AgentRuntimeMode,
+  AgentRuntimeName,
+  TrackerWorkflowDefinition,
   TrackerDaemonStateStore,
   TrackerDaemonWorkLauncher,
   TrackedTask,
@@ -165,6 +177,78 @@ class RecordingLauncher implements TrackerDaemonWorkLauncher {
   }
 }
 
+class CompletingRuntimeRunner implements AgentRuntimeRunner {
+  readonly name: AgentRuntimeName;
+  preparedInputs: AgentRunInput[] = [];
+  startedInputs: PreparedRun[] = [];
+  stdoutText = '';
+  private statuses = new Map<string, AgentRunStatusSnapshot>();
+
+  constructor(name: AgentRuntimeName) {
+    this.name = name;
+  }
+
+  async prepare(input: AgentRunInput): Promise<PreparedRun> {
+    this.preparedInputs.push(input);
+    const runDir = path.join(input.workspaceRoot, '.tik', 'runs', input.runId);
+    await fs.mkdir(runDir, { recursive: true });
+    const promptFile = path.join(runDir, 'prompt.md');
+    await fs.writeFile(promptFile, input.renderedPrompt, 'utf-8');
+    return {
+      runId: input.runId,
+      runner: this.name,
+      mode: input.runnerMode,
+      cwd: input.projectPath,
+      prompt: input.renderedPrompt,
+      promptFile,
+    };
+  }
+
+  async start(input: PreparedRun): Promise<AgentRunHandle> {
+    this.startedInputs.push(input);
+    this.statuses.set(input.runId, 'running');
+    if (this.stdoutText && input.promptFile) {
+      await fs.writeFile(path.join(path.dirname(input.promptFile), 'stdout.log'), this.stdoutText, 'utf-8');
+    }
+    const completion = Promise.resolve({ status: 'completed' as const }).then((result) => {
+      this.statuses.set(input.runId, result.status);
+      return result;
+    });
+    return {
+      runId: input.runId,
+      startedAt: new Date().toISOString(),
+      completion,
+      stop: async () => {
+        this.statuses.set(input.runId, 'cancelled');
+      },
+    };
+  }
+
+  async stop(runId: string): Promise<void> {
+    this.statuses.set(runId, 'cancelled');
+  }
+
+  async getStatus(runId: string): Promise<AgentRunStatusSnapshot> {
+    return this.statuses.get(runId) || 'unknown';
+  }
+
+  async collectTranscript() {
+    return [];
+  }
+
+  async collectDiff() {
+    return { changedFiles: [] };
+  }
+
+  async collectArtifacts(): Promise<ArtifactCandidate[]> {
+    return [];
+  }
+
+  async cleanup(runId: string): Promise<void> {
+    await this.stop(runId);
+  }
+}
+
 function task(id: string, shortIdentifier: string, stateKind: TrackedTaskStateKind = 'active'): TrackedTask {
   return {
     id,
@@ -179,6 +263,60 @@ function task(id: string, shortIdentifier: string, stateKind: TrackedTaskStateKi
     repository: {
       name: 'tik',
       path: '/repo/tik',
+    },
+  };
+}
+
+function workflowV2(input: {
+  root: string;
+  runner: AgentRuntimeName;
+  mode: AgentRuntimeMode;
+  renderPrompt?: (task: TrackedTask, attempt: number) => string;
+}): TrackerWorkflowDefinition {
+  return {
+    version: 2,
+    path: path.join(input.root, '.tik', 'WORKFLOW.md'),
+    workflowConfigHash: 'config-hash',
+    workflowPromptHash: 'prompt-hash',
+    config: {
+      tracker: {
+        kind: 'json',
+        activeStates: ['todo', 'in_progress', 'running', 'failed'],
+        terminalStates: ['completed', 'cancelled', 'archived'],
+      },
+      polling: { intervalMs: 1_000, maxConcurrentAgents: 3 },
+      workspace: {
+        root: '.tik/workspaces',
+        cleanupTerminal: false,
+        hooks: { afterCreate: [], beforeRun: [], afterRun: [], beforeRemove: [] },
+      },
+      agent: { timeoutMs: 10_000 },
+      routing: {
+        rules: [{
+          labelsAny: input.runner === 'claude-code'
+            ? ['needs-claude-review']
+            : ['needs-codex-fix'],
+          runner: input.runner,
+          mode: input.mode,
+        }],
+      },
+      concurrency: { lock: 'repository_branch', respectLabels: [] },
+      sandbox: { envWhitelist: [] },
+      hooks: { root: '.tik/hooks', timeoutMs: 30_000, allowExecutableOnly: true },
+    },
+    promptTemplate: 'Review {{ task.shortIdentifier }}',
+    renderPrompt(taskInput, renderInput) {
+      return input.renderPrompt?.(taskInput, renderInput?.attempt || 0) || `Review ${taskInput.shortIdentifier}.`;
+    },
+    resolveRouting() {
+      return {
+        runner: input.runner,
+        mode: input.mode,
+        matchedSource: 'rule[0]',
+        matchedLabels: input.runner === 'claude-code'
+          ? ['needs-claude-review']
+          : ['needs-codex-fix'],
+      };
     },
   };
 }
@@ -221,6 +359,14 @@ async function makeHarness() {
     },
   });
   return { root, workbench, importer, stateStore, launcher, daemon };
+}
+
+async function runGit(cwd: string, args: string[]): Promise<string> {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf-8' });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.stdout || `git ${args.join(' ')} failed`);
+  }
+  return result.stdout.trim();
 }
 
 describe('TrackerDaemon', () => {
@@ -822,6 +968,415 @@ describe('TrackerDaemon', () => {
     ]);
   });
 
+  it('marks environment-routed Claude review tasks active for workflow v2 dispatch', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      id: 'task-claude-review',
+      shortIdentifier: 'TIK-101',
+      title: 'Review workspace changes',
+      goal: 'Review the current worktree.',
+      status: 'todo',
+      labels: ['needs-claude-review'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+    }, 'task-claude-review');
+
+    const legacyImporter = new WorkbenchTaskImporter(workbench);
+    const workflowImporter = new WorkflowV2WorkbenchTaskImporter(workbench, root);
+
+    await expect(legacyImporter.listCandidateTasks()).resolves.toEqual([]);
+    await expect(workflowImporter.listCandidateTasks()).resolves.toEqual([
+      expect.objectContaining({
+        id: 'task-claude-review',
+        shortIdentifier: 'TIK-101',
+        labels: ['needs-claude-review'],
+        stateKind: 'active',
+        repository: expect.objectContaining({
+          path: root,
+          executionPath: root,
+        }),
+      }),
+    ]);
+  });
+
+  it('injects a Tik-generated diff summary into Claude review prompts', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    await fs.writeFile(path.join(repo, 'feature.ts'), 'export const oldValue = 1;\n', 'utf-8');
+    await runGit(repo, ['init']);
+    await runGit(repo, ['config', 'user.email', 'test@example.com']);
+    await runGit(repo, ['config', 'user.name', 'Tik Test']);
+    await runGit(repo, ['add', 'feature.ts']);
+    await runGit(repo, ['commit', '-m', 'init']);
+    await fs.writeFile(path.join(repo, 'feature.ts'), 'export const newValue = 2;\n', 'utf-8');
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      id: 'task-review-context',
+      shortIdentifier: 'TIK-REVIEW',
+      title: 'Review current diff',
+      goal: 'Review the current diff.',
+      status: 'todo',
+      labels: ['needs-claude-review'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    }, 'task-review-context');
+
+    const runtimeRunner = new CompletingRuntimeRunner('claude-code');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({
+        root,
+        runner: 'claude-code',
+        mode: 'claude_print',
+        renderPrompt: (trackedTask) => `Review ${trackedTask.shortIdentifier}.`,
+      }),
+    });
+
+    const result = await daemon.tick();
+
+    expect(result.dispatched).toEqual(['TIK-REVIEW']);
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('Tik-generated review context');
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('git status --short');
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('M feature.ts');
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('feature.ts');
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('-export const oldValue = 1;');
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('+export const newValue = 2;');
+    await waitForWorkbenchTask(workbench, 'task-review-context', (candidate) => candidate?.status === 'in_review');
+  });
+
+  it('records Claude review output as a task comment and routes blocking reviews to Codex fix', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      id: 'task-review-output',
+      shortIdentifier: 'TIK-OUTPUT',
+      title: 'Review output loop',
+      goal: 'Review and fix blockers.',
+      status: 'todo',
+      labels: ['needs-claude-review'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    }, 'task-review-output');
+    const runtimeRunner = new CompletingRuntimeRunner('claude-code');
+    runtimeRunner.stdoutText = [
+      '## Blocking Findings',
+      '',
+      '- packages/kernel/src/tracker-daemon/tracker-daemon.ts: Claude output is not written back to the task.',
+    ].join('\n');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({ root, runner: 'claude-code', mode: 'claude_print' }),
+    });
+
+    await daemon.tick();
+
+    const updated = await waitForWorkbenchTask(workbench, 'task-review-output', (candidate) => (
+      candidate?.status === 'todo'
+      && candidate.labels?.includes('needs-codex-fix')
+      && Boolean(candidate.comments?.some((comment) => comment.authorId === 'claude-code'))
+    ));
+    expect(updated?.comments?.at(-1)).toMatchObject({
+      authorKind: 'agent',
+      authorId: 'claude-code',
+      body: expect.stringContaining('## Blocking Findings'),
+    });
+    expect(updated?.labels).toEqual(['codex-fix', 'needs-codex-fix']);
+    expect(updated?.latestSummary).toContain('Claude review found blocking issues');
+  });
+
+  it('routes clean Claude review output to human review without triggering Codex fix', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      id: 'task-review-clean',
+      shortIdentifier: 'TIK-CLEAN',
+      title: 'Clean review loop',
+      goal: 'Review and hand to human.',
+      status: 'todo',
+      labels: ['needs-claude-review'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    }, 'task-review-clean');
+    const runtimeRunner = new CompletingRuntimeRunner('claude-code');
+    runtimeRunner.stdoutText = 'No blocking findings. Ready for human review.\n';
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({ root, runner: 'claude-code', mode: 'claude_print' }),
+    });
+
+    await daemon.tick();
+
+    const updated = await waitForWorkbenchTask(workbench, 'task-review-clean', (candidate) => (
+      candidate?.status === 'in_review'
+      && candidate.labels?.includes('needs-human-review')
+    ));
+    expect(updated?.labels).toEqual(['human-review', 'needs-human-review']);
+    expect(updated?.comments?.at(-1)?.body).toContain('No blocking findings');
+  });
+
+  it('returns Codex fix completions to Claude review for the next loop round', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      id: 'task-fix-complete',
+      shortIdentifier: 'TIK-FIX',
+      title: 'Fix review blockers',
+      goal: 'Fix blockers and request another review.',
+      status: 'todo',
+      labels: ['needs-codex-fix', 'codex-fix'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+      agentLoop: {
+        kind: 'codex_fix',
+        phase: 'needs_codex_fix',
+        rootTaskId: 'task-fix-complete',
+        round: 1,
+        maxRounds: 3,
+        nextReviewRound: 2,
+        headSha: 'abc123',
+        previousHeadSha: 'abc123',
+        idempotencyKey: 'fix-complete',
+        changeRequest: {
+          scm: 'internal',
+          repo: 'repo',
+          id: 'repo:abc123',
+          type: 'internal_review',
+          baseRef: 'HEAD~1',
+          headRef: 'worktree',
+          headSha: 'abc123',
+        },
+      },
+    }, 'task-fix-complete');
+    const runtimeRunner = new CompletingRuntimeRunner('codex');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { codex: runtimeRunner },
+      workflow: workflowV2({ root, runner: 'codex', mode: 'codex_app_server' }),
+    });
+
+    await daemon.tick();
+
+    const updated = await waitForWorkbenchTask(workbench, 'task-fix-complete', (candidate) => (
+      candidate?.status === 'todo'
+      && candidate.labels?.includes('needs-claude-review')
+      && candidate.agentLoop?.kind === 'claude_review'
+    ));
+    expect(updated).toMatchObject({
+      status: 'todo',
+      labels: ['agent-loop', 'claude-review', 'needs-claude-review'],
+      agentLoop: {
+        kind: 'claude_review',
+        phase: 'needs_claude_review',
+        round: 2,
+        previousHeadSha: 'abc123',
+      },
+    });
+  });
+
+  it('renders a Tik-generated fix prompt for Codex agent-loop phases', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      id: 'task-fix-prompt',
+      shortIdentifier: 'TIK-FIX-PROMPT',
+      title: 'Fix review blockers',
+      goal: 'Fix blockers and request another review.',
+      description: 'Kind: claude_review\nRoot task: tik\nRound: 1/3',
+      status: 'todo',
+      labels: ['agent-loop', 'codex-fix', 'needs-codex-fix'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+      comments: [{
+        id: 'comment-claude-review',
+        authorKind: 'agent',
+        authorId: 'claude-code',
+        body: '## Blocking Findings\n\n- packages/kernel/src/tracker-daemon/tracker-daemon.ts: Codex fix prompt is using the Claude review prompt.',
+        createdAt: '2026-06-24T00:00:00.000Z',
+      }],
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+      agentLoop: {
+        kind: 'codex_fix',
+        phase: 'needs_codex_fix',
+        rootTaskId: 'task-fix-prompt',
+        round: 2,
+        maxRounds: 3,
+        nextReviewRound: 3,
+        headSha: 'abc123',
+        previousHeadSha: 'abc123',
+        idempotencyKey: 'fix-prompt',
+        changeRequest: {
+          scm: 'internal',
+          repo: 'repo',
+          id: 'repo:abc123',
+          type: 'internal_review',
+          baseRef: 'HEAD~1',
+          headRef: 'worktree',
+          headSha: 'abc123',
+        },
+        reviewResult: {
+          verdict: 'request_changes',
+          headShaReviewed: 'abc123',
+          blockingIssues: [{
+            title: 'Codex fix prompt used the Claude review instructions',
+            file: 'packages/kernel/src/tracker-daemon/tracker-daemon.ts',
+            reason: 'The fix lane should receive fix instructions, not read-only review instructions.',
+            suggestedFix: 'Render a Tik-generated Codex fix prompt from agent-loop metadata.',
+          }],
+          nonBlockingSuggestions: [],
+          testsNeeded: [],
+          markdown: '## Blocking Findings\n\nCodex fix prompt used the Claude review instructions.',
+        },
+      },
+    }, 'task-fix-prompt');
+
+    const runtimeRunner = new CompletingRuntimeRunner('codex');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { codex: runtimeRunner },
+      workflow: workflowV2({
+        root,
+        runner: 'codex',
+        mode: 'codex_exec',
+        renderPrompt: () => [
+          'For `needs-claude-review` tasks, perform a read-only review.',
+          'Do not edit files.',
+        ].join('\n'),
+      }),
+    });
+
+    await daemon.tick();
+
+    const renderedPrompt = runtimeRunner.preparedInputs[0]?.renderedPrompt || '';
+    expect(renderedPrompt).toContain('Tik-generated Codex fix context');
+    expect(renderedPrompt).toContain('Codex fix prompt used the Claude review instructions');
+    expect(renderedPrompt).toContain('Render a Tik-generated Codex fix prompt from agent-loop metadata.');
+    expect(renderedPrompt).toContain('Recent agent review comments');
+    expect(renderedPrompt).not.toContain('For `needs-claude-review` tasks');
+    expect(renderedPrompt).not.toContain('Do not edit files.');
+    await waitForWorkbenchTask(workbench, 'task-fix-prompt', (candidate) => (
+      candidate?.status === 'todo'
+      && candidate.labels?.includes('needs-claude-review')
+      && candidate.agentLoop?.kind === 'claude_review'
+    ));
+  });
+
   it('stops open workspace maintenance attempts instead of keeping them in the Codex lane', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
     tempDirs.push(root);
@@ -937,7 +1492,7 @@ describe('TrackerDaemon', () => {
     ]);
   });
 
-  it('imports workbench tasks from their source project path instead of their previous worktree path', async () => {
+  it('imports workbench tasks with an execution path and a separate source project path', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
     tempDirs.push(root);
     const sourceProjectPath = path.join(root, 'repo');
@@ -972,7 +1527,8 @@ describe('TrackerDaemon', () => {
 
     expect(tasks[0]?.repository).toMatchObject({
       name: 'tik',
-      path: sourceProjectPath,
+      path: previousWorktreePath,
+      sourcePath: sourceProjectPath,
     });
   });
 

@@ -13,6 +13,8 @@ import type {
   SkillManifestMutationInput,
   SkillManifestRegistryEntry,
   TaskWorkspaceBinding,
+  WorkbenchArtifactRecord,
+  WorkbenchArtifactVersion,
   WorkbenchTaskEvidenceSummary,
   WorkbenchTaskAdjustmentRecord,
   WorkbenchTaskAttemptRecord,
@@ -22,7 +24,12 @@ import type {
   WorkbenchTaskStatus,
 } from '@tik/shared';
 
-export type { WorkbenchTaskAttemptRecord, WorkbenchTaskRunRecord } from '@tik/shared';
+export type {
+  WorkbenchArtifactRecord,
+  WorkbenchArtifactVersion,
+  WorkbenchTaskAttemptRecord,
+  WorkbenchTaskRunRecord,
+} from '@tik/shared';
 
 export interface AgentEvent {
   id: string;
@@ -659,6 +666,77 @@ export async function fetchWorkbenchDecisions(taskId: string): Promise<Workbench
   return (await readJsonOrThrow<{ decisions: WorkbenchDecisionResponse[] }>(res)).decisions;
 }
 
+export interface FetchWorkbenchArtifactsInput {
+  taskId?: string;
+  status?: string;
+  kind?: string;
+  tag?: string;
+  workspaceId?: string;
+  projectId?: string;
+}
+
+export async function fetchWorkbenchArtifacts(input: FetchWorkbenchArtifactsInput = {}): Promise<WorkbenchArtifactRecord[]> {
+  const query = new URLSearchParams();
+  Object.entries(input).forEach(([key, value]) => {
+    if (value) {
+      query.set(key, value);
+    }
+  });
+  const res = await fetch(`${BASE_URL}/workbench/artifacts${query.size ? `?${query}` : ''}`);
+  return (await readJsonOrThrow<{ artifacts: WorkbenchArtifactRecord[] }>(res)).artifacts;
+}
+
+export async function fetchWorkbenchTaskArtifacts(taskId: string): Promise<WorkbenchArtifactRecord[]> {
+  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/artifacts`);
+  return (await readJsonOrThrow<{ artifacts: WorkbenchArtifactRecord[] }>(res)).artifacts;
+}
+
+export async function fetchWorkbenchArtifact(artifactId: string): Promise<WorkbenchArtifactRecord> {
+  const res = await fetch(`${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}`);
+  return (await readJsonOrThrow<{ artifact: WorkbenchArtifactRecord }>(res)).artifact;
+}
+
+export async function fetchWorkbenchArtifactVersions(artifactId: string): Promise<WorkbenchArtifactVersion[]> {
+  const res = await fetch(`${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}/versions`);
+  return (await readJsonOrThrow<{ versions: WorkbenchArtifactVersion[] }>(res)).versions;
+}
+
+export async function generateWorkbenchTaskArtifact(taskId: string, template = 'task-review'): Promise<WorkbenchArtifactRecord> {
+  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/artifacts/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ template }),
+  });
+  return (await readJsonOrThrow<{ artifact: WorkbenchArtifactRecord }>(res)).artifact;
+}
+
+export async function acceptWorkbenchArtifact(artifactId: string): Promise<WorkbenchArtifactRecord> {
+  const res = await fetch(`${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}/accept`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ actor: 'dashboard' }),
+  });
+  return (await readJsonOrThrow<{ artifact: WorkbenchArtifactRecord }>(res)).artifact;
+}
+
+export async function rejectWorkbenchArtifact(artifactId: string, reason: string): Promise<WorkbenchArtifactRecord> {
+  const res = await fetch(`${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}/reject`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ actor: 'dashboard', reason }),
+  });
+  return (await readJsonOrThrow<{ artifact: WorkbenchArtifactRecord }>(res)).artifact;
+}
+
+export async function archiveWorkbenchArtifact(artifactId: string): Promise<WorkbenchArtifactRecord> {
+  const res = await fetch(`${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}/archive`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ actor: 'dashboard' }),
+  });
+  return (await readJsonOrThrow<{ artifact: WorkbenchArtifactRecord }>(res)).artifact;
+}
+
 export async function resolveWorkbenchDecision(
   taskId: string,
   decisionId: string,
@@ -677,6 +755,21 @@ export async function resolveWorkbenchDecision(
 
 export function buildWorkbenchArtifactPreviewUrl(filePath: string): string {
   return `${BASE_URL}/workbench/artifacts/preview?path=${encodeURIComponent(filePath)}`;
+}
+
+export function buildWorkbenchArtifactVersionPreviewUrl(artifactId: string, versionId: string): string {
+  return `${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}/versions/${encodeURIComponent(versionId)}/preview`;
+}
+
+export function buildWorkbenchArtifactLinkPreviewUrl(input: {
+  artifactId?: string;
+  versionId?: string;
+  filePath?: string;
+}): string | null {
+  if (input.artifactId && input.versionId) {
+    return buildWorkbenchArtifactVersionPreviewUrl(input.artifactId, input.versionId);
+  }
+  return input.filePath ? buildWorkbenchArtifactPreviewUrl(input.filePath) : null;
 }
 
 export async function fetchEnvironmentPacks(): Promise<EnvironmentPacksResponse> {

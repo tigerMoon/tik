@@ -4,10 +4,18 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createServer } from '../src/server.js';
+import { FileArtifactRegistry } from '../src/artifacts/artifact-registry.js';
 import { EventBus } from '../src/event-bus.js';
 import { WorkbenchStore } from '../src/workbench/workbench-store.js';
 import { WorkbenchService } from '../src/workbench/workbench-service.js';
-import type { EnvironmentPackSnapshot } from '@tik/shared';
+import { EventType, type EnvironmentPackSnapshot } from '@tik/shared';
+import type {
+  AgentRunHandle,
+  AgentRunInput,
+  AgentRunStatusSnapshot,
+  AgentRuntimeRunner,
+  PreparedRun,
+} from '../src/agent-runners/agent-runtime-runner.js';
 
 const tempDirs: string[] = [];
 const servers: Array<{ close: () => Promise<unknown> }> = [];
@@ -34,12 +42,123 @@ const TEST_ENVIRONMENT_SNAPSHOT: EnvironmentPackSnapshot = {
   ],
 };
 
+class CompletingRuntimeRunner implements AgentRuntimeRunner {
+  readonly name = 'claude-code' as const;
+  preparedInputs: AgentRunInput[] = [];
+  startedInputs: PreparedRun[] = [];
+  private statuses = new Map<string, AgentRunStatusSnapshot>();
+
+  async prepare(input: AgentRunInput): Promise<PreparedRun> {
+    this.preparedInputs.push(input);
+    return {
+      runId: input.runId,
+      runner: this.name,
+      mode: input.runnerMode,
+      cwd: input.projectPath,
+      prompt: input.renderedPrompt,
+    };
+  }
+
+  async start(input: PreparedRun): Promise<AgentRunHandle> {
+    this.startedInputs.push(input);
+    this.statuses.set(input.runId, 'running');
+    const completion = Promise.resolve({ status: 'completed' as const }).then((result) => {
+      this.statuses.set(input.runId, result.status);
+      return result;
+    });
+    return {
+      runId: input.runId,
+      startedAt: new Date().toISOString(),
+      completion,
+      stop: async () => {
+        this.statuses.set(input.runId, 'cancelled');
+      },
+    };
+  }
+
+  async stop(runId: string): Promise<void> {
+    this.statuses.set(runId, 'cancelled');
+  }
+
+  async getStatus(runId: string): Promise<AgentRunStatusSnapshot> {
+    return this.statuses.get(runId) || 'unknown';
+  }
+
+  async collectTranscript() {
+    return [];
+  }
+
+  async collectDiff() {
+    return { changedFiles: [] };
+  }
+
+  async collectArtifacts() {
+    return [];
+  }
+
+  async cleanup(runId: string): Promise<void> {
+    await this.stop(runId);
+  }
+}
+
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
   await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
 });
 
 describe('workbench API routes', () => {
+  it('requires bearer auth for mutating routes when an API token is configured', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root, apiToken: 'test-token' },
+    );
+    servers.push(server);
+
+    const unauthenticated = await server.inject({
+      method: 'POST',
+      url: '/api/v1/tasks',
+      payload: { title: 'Auth check', goal: 'Require auth for mutation' },
+    });
+    const invalid = await server.inject({
+      method: 'POST',
+      url: '/api/v1/tasks',
+      headers: { authorization: 'Bearer wrong-token' },
+      payload: { title: 'Auth check', goal: 'Require auth for mutation' },
+    });
+    const authenticated = await server.inject({
+      method: 'POST',
+      url: '/api/v1/tasks',
+      headers: { authorization: 'Bearer test-token' },
+      payload: { title: 'Auth check', goal: 'Require auth for mutation' },
+    });
+
+    expect(unauthenticated.statusCode).toBe(401);
+    expect(invalid.statusCode).toBe(401);
+    expect(authenticated.statusCode).toBe(200);
+    expect(authenticated.json().task.title).toBe('Auth check');
+  });
+
   it('publishes a current worktree review round with workspace binding', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
@@ -111,6 +230,286 @@ describe('workbench API routes', () => {
           headSha,
         },
       },
+    });
+  });
+
+  it('binds the active environment pack to worktree review rounds so tracker can route them', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+    spawnSync('git', ['init'], { cwd: root });
+    spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: root });
+    spawnSync('git', ['config', 'user.name', 'Tik Test'], { cwd: root });
+    await fs.writeFile(path.join(root, 'README.md'), '# Tik\n', 'utf-8');
+    spawnSync('git', ['add', 'README.md'], { cwd: root });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: root });
+    await fs.mkdir(path.join(root, '.tik'), { recursive: true });
+    await fs.writeFile(path.join(root, '.tik', 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  rules:',
+      '    - labels_any: [needs-claude-review]',
+      '      runner: claude-code',
+      '      mode: claude_print',
+      '---',
+      'Review {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: {
+        getActivePack: async () => ({
+          kind: 'EnvironmentPack',
+          id: 'review-loop',
+          name: 'Review Loop',
+          version: '1.0.0',
+          description: 'Agent review loop pack',
+          tools: [],
+          skills: [],
+          knowledge: [],
+          policies: [],
+          workflowBindings: [],
+          taskLabels: [
+            {
+              value: 'needs-claude-review',
+              label: 'Claude review',
+              action: 'claude_code_review',
+              description: 'Ask Claude Code to review the task.',
+              aliases: ['claude-review'],
+            },
+          ],
+          evaluators: [],
+        }),
+        listPacks: async () => [],
+      },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const createResponse = await server.inject({
+      method: 'POST',
+      url: '/api/v1/agent-loop/worktree-review-rounds',
+      payload: {
+        rootTaskId: 'local-review',
+      },
+    });
+
+    expect(createResponse.statusCode).toBe(200);
+    const task = createResponse.json().task;
+    expect(task.environmentPackSnapshot).toMatchObject({
+      id: 'review-loop',
+      taskLabels: [
+        expect.objectContaining({
+          value: 'needs-claude-review',
+          action: 'claude_code_review',
+        }),
+      ],
+    });
+
+    const preview = await server.inject({
+      method: 'GET',
+      url: `/api/v1/tasks/${task.id}/routing-preview`,
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json()).toMatchObject({
+      runnable: true,
+      routing: {
+        runner: 'claude-code',
+        mode: 'claude_print',
+        matchedLabels: ['needs-claude-review'],
+      },
+    });
+  });
+
+  it('updates task workspace binding through the v1 task patch endpoint', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+    const sourceProjectPath = path.join(root, 'repo');
+    const originalProjectPath = path.join(root, 'old-worktree');
+    const effectiveProjectPath = path.join(root, 'repo');
+    await fs.mkdir(sourceProjectPath, { recursive: true });
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const task = await workbench.createTask({
+      title: 'Review workspace changes',
+      goal: 'Review current worktree',
+      status: 'todo',
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik-test',
+        projectName: 'tik-test',
+        sourceProjectPath,
+        effectiveProjectPath: originalProjectPath,
+        laneId: 'old',
+        worktreeKind: 'git-worktree',
+      },
+    }, 'task-rebind');
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({
+      method: 'PATCH',
+      url: `/api/v1/tasks/${task.id}`,
+      payload: {
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: 'tik-test',
+          projectName: 'tik-test',
+          sourceProjectPath,
+          effectiveProjectPath,
+          laneId: 'root',
+          worktreeKind: 'root',
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().task.workspaceBinding).toMatchObject({
+      sourceProjectPath,
+      effectiveProjectPath,
+      laneId: 'root',
+      worktreeKind: 'root',
+    });
+  });
+
+  it('rejects workspace binding updates outside the workspace root or while running', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+    const sourceProjectPath = path.join(root, 'repo');
+    await fs.mkdir(sourceProjectPath, { recursive: true });
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const task = await workbench.createTask({
+      title: 'Review workspace changes',
+      goal: 'Review current worktree',
+      status: 'todo',
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik-test',
+        projectName: 'tik-test',
+        sourceProjectPath,
+        effectiveProjectPath: sourceProjectPath,
+        laneId: 'root',
+        worktreeKind: 'root',
+      },
+    }, 'task-rebind-guarded');
+    const runningTask = await workbench.createTask({
+      title: 'Running task',
+      goal: 'Cannot rebind while running',
+      status: 'in_progress',
+      attempts: [{
+        attemptNumber: 1,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        kernelTaskId: 'kernel-running',
+      }],
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik-test',
+        projectName: 'tik-test',
+        sourceProjectPath,
+        effectiveProjectPath: sourceProjectPath,
+        laneId: 'root',
+        worktreeKind: 'root',
+      },
+    }, 'task-rebind-running');
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const outsideResponse = await server.inject({
+      method: 'PATCH',
+      url: `/api/v1/tasks/${task.id}`,
+      payload: {
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: 'tik-test',
+          projectName: 'tik-test',
+          sourceProjectPath: root,
+          effectiveProjectPath: os.tmpdir(),
+          laneId: 'outside',
+          worktreeKind: 'root',
+        },
+      },
+    });
+    const runningResponse = await server.inject({
+      method: 'PATCH',
+      url: `/api/v1/tasks/${runningTask.id}`,
+      payload: {
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: 'tik-test',
+          projectName: 'tik-test',
+          sourceProjectPath,
+          effectiveProjectPath: sourceProjectPath,
+          laneId: 'root',
+          worktreeKind: 'root',
+        },
+      },
+    });
+
+    expect(outsideResponse.statusCode).toBe(409);
+    expect(outsideResponse.json().error).toMatchObject({
+      code: 'invalid_workspace_binding',
+    });
+    expect(runningResponse.statusCode).toBe(409);
+    expect(runningResponse.json().error).toMatchObject({
+      code: 'task_running',
     });
   });
 
@@ -672,6 +1071,236 @@ describe('workbench API routes', () => {
     ]);
   });
 
+  it('routes and manually runs a workflow v2 task through the workbench API', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+    const sourceProjectPath = path.join(root, 'source');
+    const effectiveProjectPath = path.join(root, 'worktree');
+    await fs.mkdir(sourceProjectPath, { recursive: true });
+    await fs.mkdir(effectiveProjectPath, { recursive: true });
+    await fs.mkdir(path.join(root, '.tik'), { recursive: true });
+    await fs.writeFile(path.join(root, '.tik', 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'selector:',
+      '  include_labels: [ready]',
+      'routing:',
+      '  rules:',
+      '    - labels_any: [runner:claude]',
+      '      runner: claude-code',
+      '      mode: claude_print',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
+      'concurrency:',
+      '  lock: repository_branch',
+      '---',
+      'Implement {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const runtimeRunner = new CompletingRuntimeRunner();
+    let createdKernelTaskId = 0;
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: {
+        create: () => {
+          createdKernelTaskId += 1;
+          return { id: `kernel-v2-${createdKernelTaskId}` };
+        },
+      },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const task = await workbench.createTask({
+      title: 'Workflow v2 task',
+      goal: 'Manual run should use workflow v2 routing',
+      status: 'todo',
+      labels: ['ready', 'runner:claude'],
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik-test',
+        projectName: 'tik-test',
+        sourceProjectPath,
+        effectiveProjectPath,
+        worktreeKind: 'git-worktree',
+      },
+    }, 'task-workflow-v2-run');
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root, runtimeRunners: { 'claude-code': runtimeRunner } },
+    );
+    servers.push(server);
+
+    const preview = await server.inject({
+      method: 'GET',
+      url: `/api/v1/tasks/${task.id}/routing-preview`,
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json()).toMatchObject({
+      runnable: true,
+      routing: {
+        runner: 'claude-code',
+        mode: 'claude_print',
+        matchedSource: 'explicit-label',
+      },
+    });
+    const run = await server.inject({
+      method: 'POST',
+      url: `/api/v1/tasks/${task.id}/run`,
+    });
+    expect(run.statusCode).toBe(200);
+    expect(run.json().result.dispatched).toEqual([task.shortIdentifier]);
+    expect(run.json().result.failed).toEqual([]);
+
+    expect(runtimeRunner.preparedInputs[0]).toMatchObject({
+      projectPath: effectiveProjectPath,
+      runnerMode: 'claude_print',
+      renderedPrompt: 'Implement TIK-1.',
+    });
+    expect(runtimeRunner.startedInputs[0]).toMatchObject({
+      cwd: effectiveProjectPath,
+      mode: 'claude_print',
+    });
+    const runsIndex = await fs.readFile(path.join(root, '.tik', 'runs', 'agent-runs.jsonl'), 'utf-8');
+    expect(runsIndex).toContain(task.id);
+    const runId = JSON.parse(runsIndex.trim().split(/\r?\n/)[0]).id;
+    await waitFor(async () => {
+      const metadata = await readJsonIfReady(path.join(root, '.tik', 'runs', runId, 'metadata.json'));
+      return metadata.status === 'completed_by_agent';
+    });
+    await waitFor(async () => (await workbench.readTask(task.id))?.status === 'in_review');
+  });
+
+  it('reports blocked workflow v2 tasks as not runnable in routing preview', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+    await fs.mkdir(path.join(root, '.tik'), { recursive: true });
+    await fs.writeFile(path.join(root, '.tik', 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  rules:',
+      '    - labels_any: [backend]',
+      '      runner: codex',
+      '      mode: codex_app_server',
+      '---',
+      'Implement {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+
+    const task = await workbench.createTask({
+      title: 'Blocked task',
+      goal: 'Do not route blocked tasks',
+      status: 'blocked',
+      labels: ['backend'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+    }, 'task-blocked-routing-preview');
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/api/v1/tasks/${task.id}/routing-preview`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      runnable: false,
+      reason: 'blocked',
+    });
+  });
+
+  it('dispatches workflow v2 tasks from /api/v1/tracker/refresh only when environment labels map to actions', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+    await fs.mkdir(path.join(root, '.tik'), { recursive: true });
+    await fs.writeFile(path.join(root, '.tik', 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  rules:',
+      '    - labels_any: [backend]',
+      '      runner: codex',
+      '      mode: codex_app_server',
+      '---',
+      'Implement {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'kernel-v2-refresh-1' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const task = await workbench.createTask({
+      title: 'Workflow v2 refresh task',
+      goal: 'Refresh should use workflow v2 environment label routing',
+      status: 'todo',
+      labels: ['backend'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+    }, 'task-workflow-v2-refresh');
+    await workbench.createTask({
+      title: 'Fallback should not dispatch',
+      goal: 'Refresh should not use workflow v2 default routing without an environment action label',
+      status: 'todo',
+      labels: ['ready'],
+    }, 'task-workflow-v2-no-fallback');
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({ method: 'POST', url: '/api/v1/tracker/refresh' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().result.dispatched).toEqual([task.shortIdentifier]);
+  });
+
   it('returns persisted tracker watching and recent state from /api/v1/tracker/state', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
@@ -787,6 +1416,11 @@ describe('workbench API routes', () => {
     ]));
     expect(body.listeners.find((listener: { id: string }) => listener.id === 'tracker-watch')?.status)
       .toMatch(/^(running|expected)$/);
+    const dashboard = body.listeners.find((listener: { id: string }) => listener.id === 'dashboard');
+    expect(dashboard).toMatchObject({
+      id: 'dashboard',
+      port: 5173,
+    });
   });
 
   it('does not mark tracker watch mode as active after a manual refresh tick', async () => {
@@ -1949,8 +2583,12 @@ describe('workbench API routes', () => {
     tempDirs.push(root);
 
     const previewPath = path.join(root, 'src', 'mock-app.html');
+    const unsafePath = path.join(root, 'src', 'run.sh');
+    const symlinkPath = path.join(root, 'src', 'hosts-link.html');
     await fs.mkdir(path.dirname(previewPath), { recursive: true });
     await fs.writeFile(previewPath, '<!doctype html><title>Preview</title><h1>Snake</h1>', 'utf-8');
+    await fs.writeFile(unsafePath, 'echo nope', 'utf-8');
+    await fs.symlink('/etc/hosts', symlinkPath);
 
     const eventBus = new EventBus();
     const store = new WorkbenchStore(root);
@@ -1985,5 +2623,284 @@ describe('workbench API routes', () => {
       url: `/api/workbench/artifacts/preview?path=${encodeURIComponent('/etc/hosts')}`,
     });
     expect(blockedResponse.statusCode).toBe(403);
+
+    const unsafeExtensionResponse = await server.inject({
+      method: 'GET',
+      url: `/api/workbench/artifacts/preview?path=${encodeURIComponent(unsafePath)}`,
+    });
+    expect(unsafeExtensionResponse.statusCode).toBe(415);
+
+    const symlinkEscapeResponse = await server.inject({
+      method: 'GET',
+      url: `/api/workbench/artifacts/preview?path=${encodeURIComponent(symlinkPath)}`,
+    });
+    expect(symlinkEscapeResponse.statusCode).toBe(403);
+  });
+
+  it('exposes first-class artifact registry routes and artifact-id preview', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const eventBus = new EventBus();
+    const store = new WorkbenchStore(root);
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus,
+      store,
+      artifacts: new FileArtifactRegistry({ rootPath: root }),
+    });
+    await workbench.createTask({
+      title: 'Review artifact API',
+      goal: 'Publish a task review artifact',
+    }, 'task-artifacts');
+
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'legacy-task-1' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+
+    const server = await createServer(mockKernel as any, { port: 0, host: '127.0.0.1' }, { workspaceRoot: root });
+    servers.push(server);
+
+    const createResponse = await server.inject({
+      method: 'POST',
+      url: '/api/workbench/artifacts',
+      payload: {
+        taskId: 'task-artifacts',
+        title: 'Task Review: artifact API',
+        kind: 'report',
+        content: '<h1>Artifact API</h1>',
+        contentType: 'text/html',
+        extension: 'html',
+        sourceEventIds: ['evt-create'],
+        sourceEvidenceIds: ['ev-create'],
+        validationRefs: ['pnpm --filter @tik/kernel test'],
+        producedBy: { provider: 'codex', template: 'task-review' },
+        tags: ['review'],
+      },
+    });
+
+    expect(createResponse.statusCode).toBe(200);
+    const artifact = createResponse.json().artifact;
+    expect(artifact).toMatchObject({
+      taskId: 'task-artifacts',
+      title: 'Task Review: artifact API',
+      status: 'needs_review',
+      version: 1,
+      latestVersionId: expect.any(String),
+    });
+
+    const listResponse = await server.inject({
+      method: 'GET',
+      url: '/api/workbench/artifacts?status=needs_review&tag=review',
+    });
+    expect(listResponse.statusCode).toBe(200);
+    expect(listResponse.json().artifacts.map((item: { id: string }) => item.id)).toEqual([artifact.id]);
+
+    const taskArtifactsResponse = await server.inject({
+      method: 'GET',
+      url: '/api/workbench/tasks/task-artifacts/artifacts',
+    });
+    expect(taskArtifactsResponse.statusCode).toBe(200);
+    expect(taskArtifactsResponse.json().artifacts[0].id).toBe(artifact.id);
+
+    const appendResponse = await server.inject({
+      method: 'POST',
+      url: `/api/workbench/artifacts/${artifact.id}/versions`,
+      payload: {
+        content: '<h1>Artifact API v2</h1>',
+        contentType: 'text/html',
+        extension: 'html',
+        sourceEventIds: ['evt-update'],
+        sourceEvidenceIds: ['ev-update'],
+      },
+    });
+    expect(appendResponse.statusCode).toBe(200);
+    expect(appendResponse.json().artifact.version).toBe(2);
+
+    const versionsResponse = await server.inject({
+      method: 'GET',
+      url: `/api/workbench/artifacts/${artifact.id}/versions`,
+    });
+    expect(versionsResponse.statusCode).toBe(200);
+    expect(versionsResponse.json().versions.map((version: { version: number }) => version.version)).toEqual([1, 2]);
+
+    const previewResponse = await server.inject({
+      method: 'GET',
+      url: `/api/workbench/artifacts/${artifact.id}/versions/${appendResponse.json().artifact.latestVersionId}/preview`,
+    });
+    expect(previewResponse.statusCode).toBe(200);
+    expect(previewResponse.headers['content-type']).toContain('text/html');
+    expect(previewResponse.body).toContain('Artifact API v2');
+
+    const acceptResponse = await server.inject({
+      method: 'POST',
+      url: `/api/workbench/artifacts/${artifact.id}/accept`,
+      payload: { actor: 'reviewer' },
+    });
+    expect(acceptResponse.statusCode).toBe(200);
+    expect(acceptResponse.json().artifact.status).toBe('accepted');
+
+    const rejectResponse = await server.inject({
+      method: 'POST',
+      url: `/api/workbench/artifacts/${artifact.id}/reject`,
+      payload: { reason: 'Need one more screenshot', actor: 'reviewer' },
+    });
+    expect(rejectResponse.statusCode).toBe(200);
+    expect(rejectResponse.json().artifact).toMatchObject({
+      status: 'rejected',
+      rejectionReason: 'Need one more screenshot',
+    });
+
+    const timeline = await workbench.readTimeline('task-artifacts');
+    expect(timeline.map((item) => item.body)).toContain('Artifact rejected: Task Review: artifact API (v2, rejected).');
+  });
+
+  it('generates task-review artifacts as versions with provenance and renders markdown previews as HTML', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const eventBus = new EventBus();
+    const store = new WorkbenchStore(root);
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus,
+      store,
+      artifacts: new FileArtifactRegistry({ rootPath: root }),
+    });
+    await workbench.createTask({
+      title: 'Review artifact generation',
+      goal: 'Produce a task review artifact with provenance',
+    }, 'task-generate-artifact');
+
+    const changedFile = path.join(root, 'src', 'review.html');
+    await fs.mkdir(path.dirname(changedFile), { recursive: true });
+    await fs.writeFile(changedFile, '<h1>Review</h1>', 'utf-8');
+    eventBus.emit({
+      id: 'evt-write-preview',
+      type: EventType.TOOL_RESULT,
+      taskId: 'task-generate-artifact',
+      payload: {
+        toolName: 'write_file',
+        output: 'Wrote preview',
+        durationMs: 12,
+        success: true,
+        filesModified: [changedFile],
+      },
+      timestamp: Date.now(),
+    });
+    eventBus.emit({
+      id: 'evt-test-run',
+      type: EventType.TOOL_RESULT,
+      taskId: 'task-generate-artifact',
+      payload: {
+        toolName: 'bash',
+        output: 'pnpm test\nTests passed',
+        durationMs: 33,
+        success: true,
+      },
+      timestamp: Date.now(),
+    });
+
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'legacy-task-1' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+
+    const server = await createServer(mockKernel as any, { port: 0, host: '127.0.0.1' }, { workspaceRoot: root });
+    servers.push(server);
+
+    const firstGenerateResponse = await server.inject({
+      method: 'POST',
+      url: '/api/workbench/tasks/task-generate-artifact/artifacts/generate',
+      payload: { template: 'task-review' },
+    });
+    expect(firstGenerateResponse.statusCode).toBe(200);
+    const firstArtifact = firstGenerateResponse.json().artifact;
+    expect(firstArtifact).toMatchObject({
+      taskId: 'task-generate-artifact',
+      version: 1,
+      sourceEventIds: ['evt-write-preview', 'evt-test-run'],
+      changedFiles: [changedFile],
+    });
+    expect(firstArtifact.sourceEvidenceIds.length).toBeGreaterThan(0);
+    expect(firstArtifact.validationRefs).toEqual(expect.arrayContaining(['bash: pnpm test']));
+
+    const secondGenerateResponse = await server.inject({
+      method: 'POST',
+      url: '/api/workbench/tasks/task-generate-artifact/artifacts/generate',
+      payload: { template: 'task-review' },
+    });
+    expect(secondGenerateResponse.statusCode).toBe(200);
+    const secondArtifact = secondGenerateResponse.json().artifact;
+    expect(secondArtifact.id).toBe(firstArtifact.id);
+    expect(secondArtifact.version).toBe(2);
+
+    const taskArtifactsResponse = await server.inject({
+      method: 'GET',
+      url: '/api/workbench/tasks/task-generate-artifact/artifacts',
+    });
+    expect(taskArtifactsResponse.json().artifacts
+      .filter((artifact: { producedBy?: { template?: string } }) => artifact.producedBy?.template === 'task-review')
+      .map((artifact: { id: string }) => artifact.id)).toEqual([firstArtifact.id]);
+
+    const previewResponse = await server.inject({
+      method: 'GET',
+      url: `/api/workbench/artifacts/${secondArtifact.id}/versions/${secondArtifact.latestVersionId}/preview`,
+    });
+    expect(previewResponse.statusCode).toBe(200);
+    expect(previewResponse.headers['content-type']).toContain('text/html');
+    expect(previewResponse.body).toContain('<h1>Task Review: Review artifact generation</h1>');
+    expect(previewResponse.body).toContain('<li>');
   });
 });
+
+async function waitForFile(filePath: string, timeoutMs = 200): Promise<void> {
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      await fs.stat(filePath);
+      return;
+    } catch {
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error(`Timed out waiting for file: ${filePath}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+}
+
+async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 300): Promise<void> {
+  const startedAt = Date.now();
+  while (!(await predicate())) {
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error('Timed out waiting for predicate.');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function readJsonIfReady(filePath: string): Promise<any> {
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8');
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}

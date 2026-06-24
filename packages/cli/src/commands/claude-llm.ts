@@ -9,6 +9,9 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import { PLAN_READ_ONLY_TOOL_POLICY } from '@tik/shared';
 import type {
   ILLMProvider,
   LLMPlanResponse,
@@ -23,7 +26,7 @@ export function hasClaudeCredentials(): boolean {
   return !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
 }
 
-// ─── Tool Definitions for plan generation ────────────────────
+// ─── Read-only Tool Definitions for plan generation ──────────
 
 const PLAN_TOOLS: Anthropic.Tool[] = [
   {
@@ -33,31 +36,6 @@ const PLAN_TOOLS: Anthropic.Tool[] = [
       type: 'object' as const,
       properties: { path: { type: 'string', description: 'File path to read' } },
       required: ['path'],
-    },
-  },
-  {
-    name: 'write_file',
-    description: 'Write content to a file (creates parent directories)',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        path: { type: 'string', description: 'File path to write' },
-        content: { type: 'string', description: 'Content to write' },
-      },
-      required: ['path', 'content'],
-    },
-  },
-  {
-    name: 'edit_file',
-    description: 'Edit a file by replacing a specific string',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        path: { type: 'string', description: 'File path' },
-        old_string: { type: 'string', description: 'String to find' },
-        new_string: { type: 'string', description: 'Replacement string' },
-      },
-      required: ['path', 'old_string', 'new_string'],
     },
   },
   {
@@ -80,17 +58,6 @@ const PLAN_TOOLS: Anthropic.Tool[] = [
         glob: { type: 'string', description: 'File filter (e.g. "*.java")' },
       },
       required: ['pattern'],
-    },
-  },
-  {
-    name: 'bash',
-    description: 'Execute a shell command',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        command: { type: 'string', description: 'Shell command to execute' },
-      },
-      required: ['command'],
     },
   },
   {
@@ -163,16 +130,20 @@ export class ClaudeLLMProvider implements ILLMProvider {
     );
   }
 
-  async plan(prompt: string, context: string): Promise<LLMPlanResponse> {
+  async plan(prompt: string, context: string, options?: LLMCallOptions): Promise<LLMPlanResponse> {
+    const toolPolicy = options?.toolPolicy || PLAN_READ_ONLY_TOOL_POLICY;
+    const allowedTools = new Set(toolPolicy.allowedTools);
+    const planTools = PLAN_TOOLS.filter((tool) => allowedTools.has(tool.name));
     const systemPrompt = `You are Tik, an AI agent that executes software engineering tasks.
 
 Your workflow:
 1. EXPLORE: Use tools to understand the codebase (read files, search, list directories)
-2. PLAN: Once you understand the code, make the actual changes (write files, edit files)
+2. PLAN: Propose the concrete implementation steps without changing the workspace
 
-You are working on a real project. Use tools to explore first, then implement.
-When you have enough understanding, proceed to make changes.
-After making all changes, respond with a text summary (no more tool calls).`;
+You are working on a real project in plan-only mode.
+Plan-only mode must not mutate the workspace or run shell commands.
+Use only the provided read-only tools to explore.
+When you have enough understanding, respond with a text plan summary (no more tool calls).`;
 
     const userMessage = `Task: ${prompt}\n\nProject Context:\n${context.slice(0, 30000)}`;
 
@@ -190,7 +161,7 @@ After making all changes, respond with a text summary (no more tool calls).`;
         model: this.model,
         max_tokens: 4096,
         system: systemPrompt,
-        tools: PLAN_TOOLS,
+        tools: planTools,
         messages,
       });
 
@@ -234,7 +205,12 @@ After making all changes, respond with a text summary (no more tool calls).`;
       // Execute each tool and build tool_result messages
       const toolResults: Anthropic.ToolResultBlockParam[] = [];
       for (const block of toolUseBlocks) {
-        const result = await this.executeTool(block.name, block.input as Record<string, unknown>);
+        const result = await this.executePlanTool(
+          block.name,
+          block.input as Record<string, unknown>,
+          allowedTools,
+          options?.cwd || process.cwd(),
+        );
 
         allActions.push({
           tool: block.name,
@@ -264,56 +240,46 @@ After making all changes, respond with a text summary (no more tool calls).`;
   }
 
   /**
-   * Execute a tool locally during the planning phase.
-   * This enables the multi-turn explore → plan → execute loop.
+   * Execute a read-only tool locally during the planning phase.
    */
-  private async executeTool(
+  private async executePlanTool(
     name: string,
     input: Record<string, unknown>,
+    allowedTools = new Set<string>(PLAN_READ_ONLY_TOOL_POLICY.allowedTools),
+    cwd = process.cwd(),
   ): Promise<{ success: boolean; output: unknown; error?: string }> {
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
-    const fs = await import('node:fs/promises');
     const execFileAsync = promisify(execFile);
+
+    if (!allowedTools.has(name)) {
+      return {
+        success: false,
+        output: null,
+        error: `Tool ${name} is not allowed during ${PLAN_READ_ONLY_TOOL_POLICY.phase} generation`,
+      };
+    }
 
     try {
       switch (name) {
-        case 'bash': {
-          const cmd = String(input.command || '');
-          const { stdout, stderr } = await execFileAsync('bash', ['-c', cmd], {
-            timeout: 30_000,
-            maxBuffer: 1024 * 1024 * 5,
-          });
-          return { success: true, output: stdout + (stderr ? `\nSTDERR: ${stderr}` : '') };
-        }
         case 'read_file': {
-          const content = await fs.readFile(String(input.path), 'utf-8');
+          const content = await fs.readFile(await resolvePlanToolPath(cwd, String(input.path)), 'utf-8');
           return { success: true, output: content };
-        }
-        case 'write_file': {
-          const { mkdir } = await import('node:fs/promises');
-          const { dirname } = await import('node:path');
-          await mkdir(dirname(String(input.path)), { recursive: true });
-          await fs.writeFile(String(input.path), String(input.content), 'utf-8');
-          return { success: true, output: `Written ${String(input.content).length} bytes to ${input.path}` };
-        }
-        case 'edit_file': {
-          const content = await fs.readFile(String(input.path), 'utf-8');
-          if (!content.includes(String(input.old_string))) {
-            return { success: false, output: null, error: 'String not found' };
-          }
-          await fs.writeFile(String(input.path), content.replace(String(input.old_string), String(input.new_string)), 'utf-8');
-          return { success: true, output: `Edited ${input.path}` };
         }
         case 'glob': {
           const { stdout } = await execFileAsync('find', ['.', '-name', String(input.pattern), '-maxdepth', '5'], {
+            cwd,
             timeout: 10_000,
           });
           return { success: true, output: stdout };
         }
         case 'grep': {
           try {
-            const { stdout } = await execFileAsync('grep', ['-rn', '--max-count=30', String(input.pattern), String(input.path || '.')], {
+            const searchPath = input.path
+              ? await resolvePlanToolPath(cwd, String(input.path))
+              : cwd;
+            const { stdout } = await execFileAsync('grep', ['-rn', '--max-count=30', String(input.pattern), searchPath], {
+              cwd,
               timeout: 10_000,
             });
             return { success: true, output: stdout };
@@ -322,15 +288,15 @@ After making all changes, respond with a text summary (no more tool calls).`;
           }
         }
         case 'git_status': {
-          const { stdout } = await execFileAsync('git', ['status', '--short'], { timeout: 5_000 });
+          const { stdout } = await execFileAsync('git', ['status', '--short'], { cwd, timeout: 5_000 });
           return { success: true, output: stdout };
         }
         case 'git_diff': {
-          const { stdout } = await execFileAsync('git', ['diff', '--stat'], { timeout: 5_000 });
+          const { stdout } = await execFileAsync('git', ['diff', '--stat'], { cwd, timeout: 5_000 });
           return { success: true, output: stdout };
         }
         case 'git_log': {
-          const { stdout } = await execFileAsync('git', ['log', '--oneline', '-n', String(input.count || 10)], { timeout: 5_000 });
+          const { stdout } = await execFileAsync('git', ['log', '--oneline', '-n', String(input.count || 10)], { cwd, timeout: 5_000 });
           return { success: true, output: stdout };
         }
         default:
@@ -599,5 +565,70 @@ After making all changes, respond with a text summary (no more tool calls).`;
         cacheCreateTokens: cacheCreate,
       },
     };
+  }
+}
+
+async function resolvePlanToolPath(cwdInput: string, requestedPath: string): Promise<string> {
+  if (!requestedPath || !requestedPath.trim()) {
+    throw new Error('Path is required.');
+  }
+  const cwd = path.resolve(cwdInput);
+  const realCwd = await fs.realpath(cwd);
+  const resolved = path.isAbsolute(requestedPath)
+    ? path.resolve(requestedPath)
+    : path.resolve(cwd, requestedPath);
+
+  if (requestedPath.replace(/\\/g, '/').split('/').includes('..')) {
+    throw new Error(`Refusing parent traversal outside the planning workspace: ${requestedPath}`);
+  }
+  if (!isWithin(cwd, resolved)) {
+    throw new Error(`Refusing path outside the planning workspace: ${requestedPath}`);
+  }
+
+  const realParent = await resolveExistingPlanToolParent(cwd, path.dirname(resolved));
+  if (!isWithin(realCwd, realParent)) {
+    throw new Error(`Refusing symlink escape outside the planning workspace: ${requestedPath}`);
+  }
+
+  const realTarget = await resolvePlanToolTarget(path.join(realParent, path.basename(resolved)));
+  if (!isWithin(realCwd, realTarget)) {
+    throw new Error(`Refusing symlink escape outside the planning workspace: ${requestedPath}`);
+  }
+
+  return realTarget;
+}
+
+function isWithin(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+async function resolveExistingPlanToolParent(cwd: string, targetDir: string): Promise<string> {
+  let current = path.resolve(targetDir);
+
+  while (isWithin(cwd, current)) {
+    try {
+      return await fs.realpath(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+
+  throw new Error(`Refusing path outside the planning workspace: ${targetDir}`);
+}
+
+async function resolvePlanToolTarget(resolved: string): Promise<string> {
+  try {
+    return await fs.realpath(resolved);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
+    return resolved;
   }
 }

@@ -37,6 +37,9 @@ export * from './types/workbench.js';
 // Environment Packs
 export * from './types/environment-pack.js';
 
+// Agent runs
+export * from './types/agent-run.js';
+
 // Skill manifests
 export * from './types/skill-manifest.js';
 

@@ -10,6 +10,8 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import type {
   AgentLoopPayload,
+  ArtifactKind,
+  ArtifactStatus,
   CreateTaskInput,
   ControlCommand,
   ExecutionMode,
@@ -38,10 +40,16 @@ import { FileTrackerDaemonStateStore } from './tracker-daemon/file-state-store.j
 import { TrackerDaemon } from './tracker-daemon/tracker-daemon.js';
 import { WorkbenchTrackerLauncher } from './tracker-daemon/workbench-launcher.js';
 import { runWorkbenchKernelTaskInBackground } from './tracker-daemon/workbench-runner.js';
-import { WorkbenchTaskImporter } from './tracker-daemon/workbench-tracker-client.js';
-import { readTrackerWorkflowFile, writeTrackerWorkflowFile } from './tracker-daemon/workflow-loader.js';
+import { WorkbenchTaskImporter, WorkflowV2WorkbenchTaskImporter } from './tracker-daemon/workbench-tracker-client.js';
+import { loadTrackerWorkflow, readTrackerWorkflowFile, resolveTrackerWorkflowPath, writeTrackerWorkflowFile } from './tracker-daemon/workflow-loader.js';
+import { FileAgentRunStore } from './agent-runners/agent-run-store.js';
+import { createDefaultRuntimeRunners } from './agent-runners/default-runtime-runners.js';
+import type { AgentRuntimeName, TrackedTask } from './tracker-daemon/types.js';
+import type { AgentRuntimeRunner } from './agent-runners/agent-runtime-runner.js';
 import { parseSlashCommand } from './workbench/comment-commands.js';
 import { WorkbenchTaskError } from './workbench/workbench-service.js';
+import type { ArtifactTemplateName } from './artifacts/artifact-templates.js';
+import { normalizeArtifactExtension } from './artifacts/artifact-security.js';
 
 export interface ServerConfig {
   port: number;
@@ -50,6 +58,8 @@ export interface ServerConfig {
 
 export interface WorkspaceServerOptions {
   workspaceRoot?: string;
+  apiToken?: string;
+  runtimeRunners?: Partial<Record<AgentRuntimeName, AgentRuntimeRunner>>;
 }
 
 interface TrackerListenerStatus {
@@ -108,6 +118,7 @@ interface UpdateV1TaskBody {
   assignee?: string | null;
   createdBy?: string | null;
   sourceUrl?: string | null;
+  workspaceBinding?: TaskWorkspaceBinding;
 }
 
 interface WorkbenchTaskBriefBody {
@@ -123,8 +134,50 @@ interface WorkflowFileBody {
   content?: string;
 }
 
-type AgentLoopReviewRoundBody = Omit<AgentLoopPayload, 'kind'>;
-interface AgentLoopWorktreeReviewRoundBody {
+interface CreateArtifactBody {
+  taskId?: string;
+  workspaceId?: string;
+  projectId?: string;
+  sessionId?: string;
+  attemptId?: string;
+  title?: string;
+  description?: string;
+  kind?: ArtifactKind;
+  status?: ArtifactStatus;
+  content?: string;
+  contentType?: string;
+  extension?: 'html' | 'md' | 'svg' | 'json' | 'txt' | 'diff';
+  sourceEventIds?: string[];
+  sourceEvidenceIds?: string[];
+  changedFiles?: string[];
+  validationRefs?: string[];
+  decisionIds?: string[];
+  producedBy?: Record<string, string>;
+  summary?: string;
+  risks?: string[];
+  tags?: string[];
+}
+
+interface AppendArtifactVersionBody {
+  content?: string;
+  contentType?: string;
+  extension?: 'html' | 'md' | 'svg' | 'json' | 'txt' | 'diff';
+  sourceEventIds?: string[];
+  sourceEvidenceIds?: string[];
+  changedFiles?: string[];
+  validationRefs?: string[];
+  decisionIds?: string[];
+  summary?: string;
+}
+
+interface GenerateTaskArtifactBody {
+  template?: ArtifactTemplateName;
+}
+
+type AgentLoopReviewRoundBody = Omit<AgentLoopPayload, 'kind'> & WorkbenchTaskConfigurationBody;
+
+const MAX_LEGACY_PREVIEW_BYTES = 16 * 1024 * 1024;
+interface AgentLoopWorktreeReviewRoundBody extends WorkbenchTaskConfigurationBody {
   rootTaskId?: string;
   round?: number;
   maxRounds?: number;
@@ -151,6 +204,7 @@ export async function createServer(
   const { default: Fastify } = await import('fastify');
   const fastify = Fastify({ logger: false });
   const skillRegistry = new SkillManifestRegistry(options?.workspaceRoot || kernel.projectPath || process.cwd());
+  const apiToken = options?.apiToken || process.env.TIK_API_TOKEN;
 
   function resolveWorkspaceRoot(rootPath?: string): string {
     const resolved = rootPath || options?.workspaceRoot;
@@ -227,6 +281,16 @@ export async function createServer(
       worktreeKind: requested?.worktreeKind || baseBinding.worktreeKind,
       worktreePath: requested?.worktreePath || baseBinding.worktreePath,
     };
+  }
+
+  async function resolveSafeWorkbenchWorkspaceBinding(
+    rootPath: string,
+    executionProjectPath: string,
+    requested: TaskWorkspaceBinding,
+  ): Promise<TaskWorkspaceBinding> {
+    const binding = await resolveWorkbenchWorkspaceBinding(rootPath, executionProjectPath, requested);
+    await assertWorkspaceBindingInsideRoot(rootPath, binding);
+    return binding;
   }
 
   function buildWorkbenchTaskDescription(
@@ -358,8 +422,15 @@ export async function createServer(
   fastify.addHook('onRequest', async (req, reply) => {
     reply.header('Access-Control-Allow-Origin', '*');
     reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    reply.header('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') { reply.send(); }
+    reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') { return reply.send(); }
+    if (apiToken && req.method !== 'GET' && req.method !== 'OPTIONS') {
+      const authorization = req.headers.authorization;
+      if (authorization !== `Bearer ${apiToken}`) {
+        reply.code(401);
+        return reply.send({ error: 'Unauthorized' });
+      }
+    }
   });
 
   // Create task (async — runs in background, returns task immediately)
@@ -555,7 +626,23 @@ export async function createServer(
     }
 
     try {
-      const task = await workbench.updateTaskTrackerMetadata(req.params.id, req.body);
+      const existingTask = await workbench.readTask(req.params.id);
+      if (!existingTask) {
+        return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
+      }
+      const body = { ...req.body };
+      if (body.workspaceBinding) {
+        if (hasOpenWorkbenchAttempt(existingTask)) {
+          return sendV1Error(reply, 409, 'task_running', 'Cannot update workspace binding while a task attempt is running.');
+        }
+        const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
+        body.workspaceBinding = await resolveSafeWorkbenchWorkspaceBinding(
+          workspaceRoot,
+          body.workspaceBinding.effectiveProjectPath || kernel.projectPath || process.cwd(),
+          body.workspaceBinding,
+        );
+      }
+      const task = await workbench.updateTaskTrackerMetadata(req.params.id, body);
       if (!task) {
         return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
       }
@@ -653,6 +740,76 @@ export async function createServer(
     },
   );
 
+  fastify.get<{ Params: { id: string } }>('/api/v1/tasks/:id/routing-preview', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+    }
+
+    try {
+      const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
+      const workflow = await loadWorkspaceTrackerWorkflow(workspaceRoot);
+      const task = await workbench.readTask(req.params.id);
+      if (!task) {
+        return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
+      }
+      const tracked = workbenchTaskToTrackedTaskForWorkflow(task, kernel.projectPath);
+      if (tracked.stateKind !== 'active') {
+        return {
+          runnable: false,
+          reason: tracked.stateKind,
+          workflow: workflowSummary(workflow),
+        };
+      }
+      const selectorReason = workflowV2SelectorSkipReason(workflow, tracked);
+      if (selectorReason) {
+        return {
+          runnable: false,
+          reason: selectorReason,
+          workflow: workflowSummary(workflow),
+        };
+      }
+      return {
+        runnable: true,
+        workflow: workflowSummary(workflow),
+        routing: workflow.version === 2 ? workflow.resolveRouting?.(tracked) : undefined,
+      };
+    } catch (error) {
+      return sendV1CaughtError(reply, error);
+    }
+  });
+
+  fastify.post<{ Params: { id: string } }>('/api/v1/tasks/:id/run', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+    }
+
+    try {
+      const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
+      const workflow = await loadWorkspaceTrackerWorkflow(workspaceRoot);
+      const task = await workbench.readTask(req.params.id);
+      if (!task) {
+        return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
+      }
+      const daemon = buildWorkbenchTrackerDaemon({
+        kernel,
+        workbench,
+        workspaceRoot,
+        importer: new SingleTrackedTaskImporter(workbenchTaskToTrackedTaskForWorkflow(task, kernel.projectPath)),
+        workflow,
+        runtimeRunners: options?.runtimeRunners,
+      });
+      const result = await daemon.tick();
+      return {
+        queued: false,
+        result,
+      };
+    } catch (error) {
+      return sendV1CaughtError(reply, error);
+    }
+  });
+
   fastify.post<{ Body: AgentLoopReviewRoundBody }>(
     '/api/v1/agent-loop/review-rounds',
     async (req, reply) => {
@@ -662,7 +819,12 @@ export async function createServer(
       }
 
       try {
-        const task = await workbench.createReviewRound(req.body);
+        const environmentBinding = await resolveWorkbenchEnvironmentPackBinding(req.body);
+        const task = await workbench.createReviewRound({
+          ...req.body,
+          environmentPackSnapshot: environmentBinding.environmentPackSnapshot,
+          environmentPackSelection: environmentBinding.environmentPackSelection,
+        } as AgentLoopReviewRoundBody);
         return { task };
       } catch (error) {
         return sendV1CaughtError(reply, error);
@@ -679,6 +841,7 @@ export async function createServer(
       }
 
       try {
+        const environmentBinding = await resolveWorkbenchEnvironmentPackBinding(req.body);
         const workspaceBinding = req.body.workspaceBinding
           || buildDefaultWorkspaceBinding(options?.workspaceRoot || kernel.projectPath || process.cwd(), kernel.projectPath || process.cwd());
         const projectPath = workspaceBinding.effectiveProjectPath || kernel.projectPath || process.cwd();
@@ -716,6 +879,8 @@ export async function createServer(
             headSha,
           },
           workspaceBinding,
+          environmentPackSnapshot: environmentBinding.environmentPackSnapshot,
+          environmentPackSelection: environmentBinding.environmentPackSelection,
           allowedScope: req.body.allowedScope,
           acceptanceCriteria: req.body.acceptanceCriteria,
           reviewFocus: req.body.reviewFocus,
@@ -853,44 +1018,13 @@ export async function createServer(
 
     try {
       const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
-      const worktreeManager = new WorkspaceWorktreeManager();
-      const daemon = new TrackerDaemon({
-        importer: new WorkbenchTaskImporter(workbench),
-        stateStore: FileTrackerDaemonStateStore.forWorkspace(workspaceRoot),
-        launcher: new WorkbenchTrackerLauncher(workbench, {
-          workspaceRoot,
-          defaultProjectPath: kernel.projectPath,
-          workspaceName: path.basename(workspaceRoot),
-          resolveExecutionTarget: async (input) => {
-            const target = await worktreeManager.getExecutionTarget({
-              workspaceName: input.workspaceName,
-              workspaceRoot: input.workspaceRoot,
-              projectName: input.projectName,
-              sourceProjectPath: input.sourceProjectPath,
-              laneId: input.laneId,
-            });
-            return {
-              sourceProjectPath: target.sourceProjectPath,
-              effectiveProjectPath: target.effectiveProjectPath,
-              worktreeKind: target.worktree?.kind,
-              worktreePath: target.worktree?.worktreePath,
-            };
-          },
-          createKernelTask: (input) => kernel.taskManager.create(input),
-          runTask: (task, input) => runWorkbenchKernelTaskInBackground(task, {
-            taskId: input.workbenchTaskId,
-            workbench,
-            runTask: (kernelTask) => kernel.runTask(kernelTask as any, 'single'),
-          }),
-          isRunActive: (taskId) => Boolean(kernel.getSession(taskId)),
-          stopTask: (taskId, reason) => {
-            try {
-              kernel.control(taskId, { type: 'stop', reason } as any);
-            } catch {}
-          },
-        }),
+      const workflow = await loadWorkspaceTrackerWorkflow(workspaceRoot).catch(() => undefined);
+      const daemon = buildWorkbenchTrackerDaemon({
+        kernel,
+        workbench,
         workspaceRoot,
-        defaultProjectPath: kernel.projectPath,
+        workflow,
+        runtimeRunners: options?.runtimeRunners,
       });
       const result = await daemon.tick();
       return {
@@ -1150,6 +1284,112 @@ export async function createServer(
     }
   });
 
+  fastify.get<{
+    Querystring: {
+      taskId?: string;
+      workspaceId?: string;
+      projectId?: string;
+      status?: ArtifactStatus;
+      kind?: ArtifactKind;
+      tag?: string;
+      limit?: string;
+      offset?: string;
+      sort?: 'updatedAt.desc' | 'updatedAt.asc';
+    };
+  }>('/api/workbench/artifacts', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      reply.code(500);
+      return { error: 'Workbench service is unavailable' };
+    }
+
+    return {
+      artifacts: await workbench.listArtifacts({
+        taskId: req.query.taskId,
+        workspaceId: req.query.workspaceId,
+        projectId: req.query.projectId,
+        status: req.query.status,
+        kind: req.query.kind,
+        tag: req.query.tag,
+        limit: req.query.limit ? Number(req.query.limit) : undefined,
+        offset: req.query.offset ? Number(req.query.offset) : undefined,
+        sort: req.query.sort,
+      }),
+    };
+  });
+
+  fastify.post<{ Body: CreateArtifactBody }>('/api/workbench/artifacts', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      reply.code(500);
+      return { error: 'Workbench service is unavailable' };
+    }
+    if (!req.body?.taskId || !req.body.title || !req.body.kind || typeof req.body.content !== 'string') {
+      reply.code(400);
+      return { error: 'taskId, title, kind, and content are required' };
+    }
+
+    try {
+      const artifact = await workbench.createArtifact({
+        taskId: req.body.taskId,
+        workspaceId: req.body.workspaceId,
+        projectId: req.body.projectId,
+        sessionId: req.body.sessionId,
+        attemptId: req.body.attemptId,
+        title: req.body.title,
+        description: req.body.description,
+        kind: req.body.kind,
+        status: req.body.status,
+        content: req.body.content,
+        contentType: req.body.contentType || 'text/plain',
+        extension: req.body.extension || 'txt',
+        sourceEventIds: req.body.sourceEventIds,
+        sourceEvidenceIds: req.body.sourceEvidenceIds,
+        changedFiles: req.body.changedFiles,
+        validationRefs: req.body.validationRefs,
+        decisionIds: req.body.decisionIds,
+        producedBy: req.body.producedBy,
+        summary: req.body.summary,
+        risks: req.body.risks,
+        tags: req.body.tags,
+      });
+      return { artifact };
+    } catch (error) {
+      reply.code(400);
+      return { error: (error as Error).message };
+    }
+  });
+
+  fastify.get<{ Params: { id: string } }>('/api/workbench/tasks/:id/artifacts', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      reply.code(500);
+      return { error: 'Workbench service is unavailable' };
+    }
+
+    return { artifacts: await workbench.listArtifacts({ taskId: req.params.id }) };
+  });
+
+  fastify.post<{ Params: { id: string }; Body: GenerateTaskArtifactBody }>(
+    '/api/workbench/tasks/:id/artifacts/generate',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        reply.code(500);
+        return { error: 'Workbench service is unavailable' };
+      }
+
+      try {
+        const artifact = await workbench.generateArtifactForTask(req.params.id, req.body?.template || 'task-review');
+        return { artifact };
+      } catch (error) {
+        const status = error instanceof WorkbenchTaskError && error.code === 'task_not_found' ? 404 : 400;
+        reply.code(status);
+        return { error: (error as Error).message };
+      }
+    },
+  );
+
   fastify.get<{ Querystring: { path?: string } }>('/api/workbench/artifacts/preview', async (req, reply) => {
     const filePath = req.query.path;
     if (!filePath) {
@@ -1166,7 +1406,26 @@ export async function createServer(
     }
 
     try {
+      assertPreviewExtensionAllowed(resolvedFilePath);
+      const [rootRealPath, fileRealPath] = await Promise.all([
+        fs.realpath(resolvedProjectRoot),
+        fs.realpath(resolvedFilePath),
+      ]);
+      if (!isPathInside(rootRealPath, fileRealPath)) {
+        reply.code(403);
+        return { error: 'Artifact path must not escape the project root' };
+      }
+      const stat = await fs.stat(fileRealPath);
+      if (!stat.isFile()) {
+        reply.code(400);
+        return { error: 'Artifact preview path must be a file' };
+      }
+      if (stat.size > MAX_LEGACY_PREVIEW_BYTES) {
+        reply.code(413);
+        return { error: 'Artifact preview file is too large' };
+      }
       const content = await fs.readFile(resolvedFilePath);
+      reply.header('Deprecation', 'true');
       reply.header('Content-Type', getPreviewContentType(resolvedFilePath));
       reply.header('Content-Disposition', `inline; filename="${path.basename(resolvedFilePath)}"`);
       return reply.send(content);
@@ -1175,10 +1434,160 @@ export async function createServer(
         reply.code(404);
         return { error: 'Artifact not found' };
       }
+      if ((error as Error).message.startsWith('Unsupported artifact extension')) {
+        reply.code(415);
+        return { error: (error as Error).message };
+      }
+      if ((error as Error).message.includes('must stay within the project root')) {
+        reply.code(403);
+        return { error: (error as Error).message };
+      }
       reply.code(500);
       return { error: (error as Error).message };
     }
   });
+
+  fastify.get<{ Params: { artifactId: string } }>('/api/workbench/artifacts/:artifactId', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      reply.code(500);
+      return { error: 'Workbench service is unavailable' };
+    }
+
+    const artifact = await workbench.readArtifact(req.params.artifactId);
+    if (!artifact) {
+      reply.code(404);
+      return { error: 'Artifact not found' };
+    }
+    return { artifact };
+  });
+
+  fastify.get<{ Params: { artifactId: string } }>('/api/workbench/artifacts/:artifactId/versions', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      reply.code(500);
+      return { error: 'Workbench service is unavailable' };
+    }
+
+    const artifact = await workbench.readArtifact(req.params.artifactId);
+    if (!artifact) {
+      reply.code(404);
+      return { error: 'Artifact not found' };
+    }
+    return { versions: await workbench.listArtifactVersions(req.params.artifactId) };
+  });
+
+  fastify.post<{ Params: { artifactId: string }; Body: AppendArtifactVersionBody }>(
+    '/api/workbench/artifacts/:artifactId/versions',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        reply.code(500);
+        return { error: 'Workbench service is unavailable' };
+      }
+      if (typeof req.body?.content !== 'string') {
+        reply.code(400);
+        return { error: 'content is required' };
+      }
+
+      try {
+        const artifact = await workbench.appendArtifactVersion({
+          artifactId: req.params.artifactId,
+          content: req.body.content,
+          contentType: req.body.contentType || 'text/plain',
+          extension: req.body.extension || 'txt',
+          sourceEventIds: req.body.sourceEventIds,
+          sourceEvidenceIds: req.body.sourceEvidenceIds,
+          changedFiles: req.body.changedFiles,
+          validationRefs: req.body.validationRefs,
+          decisionIds: req.body.decisionIds,
+          summary: req.body.summary,
+        });
+        return { artifact };
+      } catch (error) {
+        reply.code(404);
+        return { error: (error as Error).message };
+      }
+    },
+  );
+
+  fastify.get<{ Params: { artifactId: string; versionId: string } }>(
+    '/api/workbench/artifacts/:artifactId/versions/:versionId/preview',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        reply.code(500);
+        return { error: 'Artifact registry is unavailable' };
+      }
+
+      const payload = await workbench.readArtifactPreview(req.params.artifactId, req.params.versionId);
+      if (!payload) {
+        reply.code(404);
+        return { error: 'Artifact preview not found' };
+      }
+
+      if (isMarkdownContentType(payload.version.contentType)) {
+        reply.header('Content-Type', 'text/html; charset=utf-8');
+        reply.header('Content-Disposition', `inline; filename="v${payload.version.version}.html"`);
+        return reply.send(renderMarkdownArtifactPreview(payload.content.toString('utf-8'), payload.artifact.title));
+      }
+
+      reply.header('Content-Type', payload.version.contentType);
+      reply.header('Content-Disposition', `inline; filename="v${payload.version.version}${path.extname(payload.version.safeRelativePath)}"`);
+      return reply.send(payload.content);
+    },
+  );
+
+  fastify.post<{ Params: { artifactId: string }; Body: { actor?: string } }>(
+    '/api/workbench/artifacts/:artifactId/accept',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        reply.code(500);
+        return { error: 'Workbench service is unavailable' };
+      }
+      try {
+        return { artifact: await workbench.acceptArtifact(req.params.artifactId, req.body?.actor) };
+      } catch (error) {
+        reply.code(404);
+        return { error: (error as Error).message };
+      }
+    },
+  );
+
+  fastify.post<{ Params: { artifactId: string }; Body: { reason?: string; actor?: string } }>(
+    '/api/workbench/artifacts/:artifactId/reject',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        reply.code(500);
+        return { error: 'Workbench service is unavailable' };
+      }
+      try {
+        return { artifact: await workbench.rejectArtifact(req.params.artifactId, req.body?.reason || '', req.body?.actor) };
+      } catch (error) {
+        reply.code(400);
+        return { error: (error as Error).message };
+      }
+    },
+  );
+
+  fastify.post<{ Params: { artifactId: string }; Body: { actor?: string } }>(
+    '/api/workbench/artifacts/:artifactId/archive',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        reply.code(500);
+        return { error: 'Workbench service is unavailable' };
+      }
+      try {
+        return { artifact: await workbench.archiveArtifact(req.params.artifactId, req.body?.actor) };
+      } catch (error) {
+        reply.code(404);
+        return { error: (error as Error).message };
+      }
+    },
+  );
 
   fastify.get('/api/environment-packs', async (_req, reply) => {
     const registry = (kernel as Partial<ExecutionKernel>).environmentPacks;
@@ -1529,6 +1938,37 @@ function injectHumanCommentIntoActiveTask(
   } catch {}
 }
 
+function hasOpenWorkbenchAttempt(task: WorkbenchTaskRecord): boolean {
+  return Boolean(task.attempts?.some((attempt) => attempt.kernelTaskId && !attempt.finishedAt));
+}
+
+async function assertWorkspaceBindingInsideRoot(
+  workspaceRoot: string,
+  binding: TaskWorkspaceBinding,
+): Promise<void> {
+  const rootRealPath = await fs.realpath(workspaceRoot);
+  const paths = [
+    binding.effectiveProjectPath,
+    binding.sourceProjectPath,
+    binding.worktreePath,
+  ].filter((item): item is string => Boolean(item));
+  for (const candidate of paths) {
+    const resolved = path.resolve(candidate);
+    if (!isPathInside(path.resolve(workspaceRoot), resolved)) {
+      throw new WorkbenchTaskError('invalid_workspace_binding', `Workspace binding path must stay within workspace root: ${candidate}`);
+    }
+    const realCandidate = await fs.realpath(resolved).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new WorkbenchTaskError('invalid_workspace_binding', `Workspace binding path does not exist: ${candidate}`);
+      }
+      throw error;
+    });
+    if (!isPathInside(rootRealPath, realCandidate)) {
+      throw new WorkbenchTaskError('invalid_workspace_binding', `Workspace binding path must not escape workspace root: ${candidate}`);
+    }
+  }
+}
+
 function buildTrackerStateSummary(tasks: WorkbenchTaskRecord[]) {
   const summary = {
     activeCandidates: 0,
@@ -1569,6 +2009,7 @@ function buildTrackerListeners(input: {
 }): TrackerListenerStatus[] {
   const processLines = readProcessLines();
   const tmuxSessions = readTmuxSessions();
+  const dashboardPort = Number(process.env.TIK_DASHBOARD_PORT || 5173);
   const trackerProcess = findProcessLine(processLines, [
     'tracker watch',
     input.workspaceRoot,
@@ -1579,10 +2020,10 @@ function buildTrackerListeners(input: {
   ]);
   const dashboardProcess = findProcessLine(processLines, [
     '@tik/dashboard',
-    '--port 5174',
+    `--port ${dashboardPort}`,
   ]) || findProcessLine(processLines, [
     'vite',
-    '--port 5174',
+    `--port ${dashboardPort}`,
   ]);
 
   return [
@@ -1609,10 +2050,10 @@ function buildTrackerListeners(input: {
       id: 'dashboard',
       label: 'Dashboard dev server',
       expected: false,
-      processLine: dashboardProcess || findProcessByPort(5174),
-      port: 5174,
-      session: tmuxSessions.find((session) => session.includes('tik-dashboard-5174')),
-      fallbackDetail: 'Dashboard dev server was not detected on port 5174.',
+      processLine: dashboardProcess || findProcessByPort(dashboardPort),
+      port: dashboardPort,
+      session: tmuxSessions.find((session) => session.includes(`tik-dashboard-${dashboardPort}`)),
+      fallbackDetail: `Dashboard dev server was not detected on port ${dashboardPort}.`,
     }),
   ];
 }
@@ -1712,6 +2153,139 @@ function getPreviewContentType(filePath: string): string {
   }
 }
 
+function assertPreviewExtensionAllowed(filePath: string): void {
+  const extension = path.extname(filePath).replace(/^\./, '').toLowerCase();
+  if (extension === 'log') {
+    return;
+  }
+  normalizeArtifactExtension(extension);
+}
+
+function isPathInside(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function isMarkdownContentType(contentType: string): boolean {
+  return /^text\/markdown\b/i.test(contentType) || /\bmarkdown\b/i.test(contentType);
+}
+
+function renderMarkdownArtifactPreview(markdown: string, title: string): string {
+  return [
+    '<!doctype html>',
+    '<html>',
+    '<head>',
+    '<meta charset="utf-8">',
+    `<title>${escapeHtml(title)}</title>`,
+    '<style>',
+    'body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.55;margin:0;padding:28px;color:#0f172a;background:#f8fafc;}',
+    'main{max-width:860px;margin:0 auto;background:white;border:1px solid #e2e8f0;border-radius:12px;padding:28px;box-shadow:0 18px 45px rgba(15,23,42,.08);}',
+    'h1,h2,h3{line-height:1.2;margin:1.2em 0 .5em;}h1{font-size:28px;margin-top:0;}h2{font-size:20px;border-top:1px solid #e2e8f0;padding-top:18px;}',
+    'p,ul,ol,pre{margin:.7em 0;}li{margin:.25em 0;}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}pre{white-space:pre-wrap;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:14px;overflow:auto;}',
+    'input[type=checkbox]{margin-right:8px;}',
+    '</style>',
+    '</head>',
+    '<body>',
+    `<main>${renderMarkdownSubset(markdown)}</main>`,
+    '</body>',
+    '</html>',
+  ].join('');
+}
+
+function renderMarkdownSubset(markdown: string): string {
+  const html: string[] = [];
+  const lines = markdown.split(/\r?\n/);
+  let paragraph: string[] = [];
+  let listOpen = false;
+  let inCode = false;
+  let codeLines: string[] = [];
+
+  const flushParagraph = () => {
+    if (paragraph.length > 0) {
+      html.push(`<p>${escapeHtml(paragraph.join(' '))}</p>`);
+      paragraph = [];
+    }
+  };
+  const closeList = () => {
+    if (listOpen) {
+      html.push('</ul>');
+      listOpen = false;
+    }
+  };
+
+  for (const line of lines) {
+    if (line.trim().startsWith('```')) {
+      if (inCode) {
+        html.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+        codeLines = [];
+        inCode = false;
+      } else {
+        flushParagraph();
+        closeList();
+        inCode = true;
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      closeList();
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      closeList();
+      html.push(`<h${heading[1].length}>${escapeHtml(heading[2])}</h${heading[1].length}>`);
+      continue;
+    }
+
+    const listItem = line.match(/^\s*-\s+(.+)$/);
+    if (listItem) {
+      flushParagraph();
+      if (!listOpen) {
+        html.push('<ul>');
+        listOpen = true;
+      }
+      html.push(`<li>${renderInlineMarkdown(listItem[1])}</li>`);
+      continue;
+    }
+
+    paragraph.push(line.trim());
+  }
+
+  if (inCode) {
+    html.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+  }
+  flushParagraph();
+  closeList();
+  return html.join('\n');
+}
+
+function renderInlineMarkdown(value: string): string {
+  const checkbox = value.match(/^\[( |x|X)\]\s+(.+)$/);
+  if (!checkbox) {
+    return escapeHtml(value);
+  }
+  const checked = checkbox[1].toLowerCase() === 'x' ? ' checked' : '';
+  return `<input type="checkbox" disabled${checked}>${escapeHtml(checkbox[2])}`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function buildDefaultWorkspaceBinding(workspaceRoot: string, projectPath: string): TaskWorkspaceBinding {
   return {
     workspaceRoot,
@@ -1733,6 +2307,151 @@ function readGitOutput(cwd: string, args: string[]): string {
     throw new WorkbenchTaskError('git_unavailable', message);
   }
   return result.stdout.trim();
+}
+
+function buildWorkbenchTrackerDaemon(input: {
+  kernel: ExecutionKernel;
+  workbench: NonNullable<Partial<ExecutionKernel>['workbench']>;
+  workspaceRoot: string;
+  importer?: { listCandidateTasks(): Promise<TrackedTask[]> };
+  workflow?: Awaited<ReturnType<typeof loadTrackerWorkflow>>;
+  runtimeRunners?: Partial<Record<AgentRuntimeName, AgentRuntimeRunner>>;
+}): TrackerDaemon {
+  const worktreeManager = new WorkspaceWorktreeManager();
+  const importer = input.importer
+    || (input.workflow?.version === 2
+      ? new WorkflowV2WorkbenchTaskImporter(input.workbench, input.kernel.projectPath)
+      : new WorkbenchTaskImporter(input.workbench));
+  return new TrackerDaemon({
+    importer,
+    stateStore: FileTrackerDaemonStateStore.forWorkspace(input.workspaceRoot),
+    agentRunStore: new FileAgentRunStore(input.workspaceRoot),
+    launcher: new WorkbenchTrackerLauncher(input.workbench, {
+      workspaceRoot: input.workspaceRoot,
+      defaultProjectPath: input.kernel.projectPath,
+      workspaceName: path.basename(input.workspaceRoot),
+      resolveExecutionTarget: async (targetInput) => {
+        const target = await worktreeManager.getExecutionTarget({
+          workspaceName: targetInput.workspaceName,
+          workspaceRoot: targetInput.workspaceRoot,
+          projectName: targetInput.projectName,
+          sourceProjectPath: targetInput.sourceProjectPath,
+          laneId: targetInput.laneId,
+        });
+        return {
+          sourceProjectPath: target.sourceProjectPath,
+          effectiveProjectPath: target.effectiveProjectPath,
+          worktreeKind: target.worktree?.kind,
+          worktreePath: target.worktree?.worktreePath,
+        };
+      },
+      createKernelTask: (taskInput) => input.kernel.taskManager.create(taskInput),
+      runTask: (task, runInput) => runWorkbenchKernelTaskInBackground(task, {
+        taskId: runInput.workbenchTaskId,
+        workbench: input.workbench,
+        runTask: (kernelTask) => input.kernel.runTask(kernelTask as any, 'single'),
+      }),
+      isRunActive: (taskId) => Boolean(input.kernel.getSession(taskId)),
+      stopTask: (taskId, reason) => {
+        try {
+          input.kernel.control(taskId, { type: 'stop', reason } as any);
+        } catch {}
+      },
+    }),
+    workspaceRoot: input.workspaceRoot,
+    defaultProjectPath: input.kernel.projectPath,
+    runtimeRunners: input.runtimeRunners || createDefaultRuntimeRunners(),
+    workflow: input.workflow,
+    maxConcurrentAgents: input.workflow?.config.polling.maxConcurrentAgents,
+    pollIntervalMs: input.workflow?.config.polling.intervalMs,
+    terminalStates: input.workflow?.config.tracker.terminalStates,
+    workspaceHooks: input.workflow?.config.workspace.hooks,
+    cleanupTerminalWorkspaces: input.workflow?.config.workspace.cleanupTerminal,
+  });
+}
+
+async function loadWorkspaceTrackerWorkflow(workspaceRoot: string) {
+  const workflowPath = await resolveTrackerWorkflowPath(workspaceRoot);
+  return loadTrackerWorkflow(path.dirname(workflowPath), path.basename(workflowPath));
+}
+
+class SingleTrackedTaskImporter {
+  constructor(private readonly task: TrackedTask) {}
+
+  async listCandidateTasks(): Promise<TrackedTask[]> {
+    return [this.task];
+  }
+}
+
+function workbenchTaskToTrackedTaskForWorkflow(task: WorkbenchTaskRecord, defaultProjectPath: string): TrackedTask {
+  const identifier = task.identifier || task.shortIdentifier || task.id.slice(0, 8).toUpperCase();
+  const latestOpenAttempt = (task.attempts || [])
+    .filter((attempt) => attempt.kernelTaskId && !attempt.finishedAt)
+    .sort((left, right) => left.attemptNumber - right.attemptNumber)
+    .at(-1);
+  return {
+    id: task.id,
+    shortIdentifier: identifier,
+    title: task.title,
+    description: task.description ?? task.goal,
+    priority: task.priority ?? null,
+    state: task.status,
+    stateKind: isWorkflowV2CandidateStatus(task.status) ? 'active' : 'blocked',
+    sourceUrl: task.sourceUrl,
+    labels: task.labels || [],
+    blockedBy: task.blockedBy || [],
+    repository: {
+      name: task.workspaceBinding?.projectName || path.basename(defaultProjectPath),
+      path: task.workspaceBinding?.effectiveProjectPath || task.workspaceBinding?.sourceProjectPath || defaultProjectPath,
+      executionPath: task.workspaceBinding?.effectiveProjectPath || task.workspaceBinding?.sourceProjectPath || defaultProjectPath,
+      sourcePath: task.workspaceBinding?.sourceProjectPath || task.workspaceBinding?.effectiveProjectPath || defaultProjectPath,
+      workspaceFile: task.workspaceBinding?.workspaceFile,
+    },
+    assignee: task.humanAssignee ?? task.assignee ?? null,
+    createdBy: task.createdBy,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    activeKernelTaskId: latestOpenAttempt?.kernelTaskId || null,
+    activeAttemptStartedAt: latestOpenAttempt?.startedAt || null,
+    sourceKind: 'workbench',
+  };
+}
+
+function isWorkflowV2CandidateStatus(status: WorkbenchTaskStatus): boolean {
+  return status === 'todo'
+    || status === 'in_progress'
+    || status === 'running'
+    || status === 'failed';
+}
+
+function workflowV2SelectorSkipReason(
+  workflow: Awaited<ReturnType<typeof loadTrackerWorkflow>>,
+  task: TrackedTask,
+): string | undefined {
+  if (workflow.version !== 2) return undefined;
+  const selector = workflow.config.selector;
+  if (!selector) return undefined;
+  const labels = new Set(task.labels.map((label) => label.trim().toLowerCase()));
+  for (const required of selector.includeLabels) {
+    if (!labels.has(required.trim().toLowerCase())) {
+      return `skipped, missing label ${required}`;
+    }
+  }
+  for (const excluded of selector.excludeLabels) {
+    if (labels.has(excluded.trim().toLowerCase())) {
+      return `skipped, excluded label ${excluded}`;
+    }
+  }
+  return undefined;
+}
+
+function workflowSummary(workflow: Awaited<ReturnType<typeof loadTrackerWorkflow>>) {
+  return {
+    version: workflow.version,
+    path: workflow.path,
+    workflowConfigHash: workflow.workflowConfigHash,
+    workflowPromptHash: workflow.workflowPromptHash,
+  };
 }
 
 function sendV1Error(reply: any, statusCode: number, code: string, message: string) {

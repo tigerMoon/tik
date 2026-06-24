@@ -30,6 +30,7 @@ import {
   WorkspaceWorkflowEngine,
   WorkflowSubtaskRuntime,
   FileTrackerDaemonStateStore,
+  FileAgentRunStore,
   JsonTaskImporter,
   loadTrackerWorkflow,
   resolveTrackerWorkflowPath,
@@ -37,6 +38,7 @@ import {
   WorkbenchTaskImporter,
   WorkbenchTrackerLauncher,
   runWorkbenchKernelTaskInBackground,
+  createDefaultRuntimeRunners,
 } from '@tik/kernel';
 import { SIGHTRuntime, ContextRenderer, ToolResultStore } from '@tik/sight';
 import { ACEEngine } from '@tik/ace';
@@ -52,6 +54,7 @@ import type {
   WorkflowSkillName,
   WorkflowSubtaskContract,
   WorkflowSubtaskSpec,
+  WorkbenchArtifactRecord,
 } from '@tik/shared';
 import type { TrackedTaskImporter, TrackerWorkflowDefinition } from '@tik/kernel';
 import { generateTaskId } from '@tik/shared';
@@ -71,8 +74,16 @@ import {
   resolveWorkspaceSpecArtifact,
   workspaceFeatureDirForArtifact,
 } from './workspace-artifacts.js';
+import {
+  buildArtifactDetailUrl,
+  buildArtifactPreviewApiUrl,
+  formatArtifactList,
+  formatArtifactShow,
+  readArtifactResponse,
+} from './artifacts-command.js';
 import { cleanupManagedTrackerWorkspace } from './tracker-workspace-cleanup.js';
 import { buildTaskImporterFromCli } from './tracker-importer.js';
+import { runTrackerHook } from './tracker-hooks.js';
 import { MockLLMProvider } from './commands/mock-llm.js';
 import { ClaudeLLMProvider, hasClaudeCredentials } from './commands/claude-llm.js';
 import { OpenAILLMProvider, hasOpenAICredentials } from './commands/openai-llm.js';
@@ -1484,6 +1495,154 @@ program
     }
   });
 
+// ── tik artifacts ────────────────────────────────────────────
+
+program
+  .command('artifacts [subcommand] [artifactId]')
+  .description('List, inspect, create, and review workbench artifacts')
+  .option('--api <url>', 'API server URL', 'http://localhost:3000')
+  .option('--task <taskId>', 'Filter by task or create from task')
+  .option('--status <status>', 'Filter by artifact status')
+  .option('--workspace <workspaceId>', 'Filter by workspace id')
+  .option('--project <projectId>', 'Filter by project id')
+  .option('--kind <kind>', 'Filter by artifact kind')
+  .option('--tag <tag>', 'Filter by tag')
+  .option('--template <template>', 'Template for create/generate', 'task-review')
+  .option('--version <version>', 'Version id or number for open/export')
+  .option('--reason <reason>', 'Rejection reason')
+  .option('--message <message>', 'Review message')
+  .option('--out <path>', 'Output path for export')
+  .action(async (subcommand: string | undefined, artifactId: string | undefined, opts: {
+    api: string;
+    task?: string;
+    status?: string;
+    workspace?: string;
+    project?: string;
+    kind?: string;
+    tag?: string;
+    template?: string;
+    version?: string;
+    reason?: string;
+    message?: string;
+    out?: string;
+  }) => {
+    const command = subcommand || 'list';
+    const apiBase = opts.api.replace(/\/+$/, '');
+
+    try {
+      if (command === 'list') {
+        const query = new URLSearchParams();
+        if (opts.task) query.set('taskId', opts.task);
+        if (opts.status) query.set('status', opts.status);
+        if (opts.workspace) query.set('workspaceId', opts.workspace);
+        if (opts.project) query.set('projectId', opts.project);
+        if (opts.kind) query.set('kind', opts.kind);
+        if (opts.tag) query.set('tag', opts.tag);
+        const response = await fetch(`${apiBase}/api/workbench/artifacts${query.size ? `?${query}` : ''}`);
+        const payload = await readArtifactResponse<{ artifacts: WorkbenchArtifactRecord[] }>(response);
+        console.log(formatArtifactList(payload.artifacts));
+        return;
+      }
+
+      if (command === 'show') {
+        if (!artifactId) {
+          console.log(chalk.red('\n  Missing artifact id.\n'));
+          return;
+        }
+        const response = await fetch(`${apiBase}/api/workbench/artifacts/${encodeURIComponent(artifactId)}`);
+        const payload = await readArtifactResponse<{ artifact: WorkbenchArtifactRecord }>(response);
+        console.log(formatArtifactShow(payload.artifact, apiBase));
+        return;
+      }
+
+      if (command === 'create') {
+        if (!opts.task) {
+          console.log(chalk.red('\n  Missing --task for artifact creation.\n'));
+          return;
+        }
+        const response = await fetch(`${apiBase}/api/workbench/tasks/${encodeURIComponent(opts.task)}/artifacts/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ template: opts.template || 'task-review' }),
+        });
+        const payload = await readArtifactResponse<{ artifact: WorkbenchArtifactRecord }>(response);
+        console.log(formatArtifactShow(payload.artifact, apiBase));
+        return;
+      }
+
+      if (command === 'accept' || command === 'archive') {
+        if (!artifactId) {
+          console.log(chalk.red('\n  Missing artifact id.\n'));
+          return;
+        }
+        const response = await fetch(`${apiBase}/api/workbench/artifacts/${encodeURIComponent(artifactId)}/${command}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ actor: 'cli', message: opts.message }),
+        });
+        const payload = await readArtifactResponse<{ artifact: WorkbenchArtifactRecord }>(response);
+        console.log(formatArtifactShow(payload.artifact, apiBase));
+        return;
+      }
+
+      if (command === 'reject') {
+        if (!artifactId) {
+          console.log(chalk.red('\n  Missing artifact id.\n'));
+          return;
+        }
+        const reason = opts.reason || opts.message;
+        if (!reason) {
+          console.log(chalk.red('\n  Missing --reason for rejection.\n'));
+          return;
+        }
+        const response = await fetch(`${apiBase}/api/workbench/artifacts/${encodeURIComponent(artifactId)}/reject`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ actor: 'cli', reason }),
+        });
+        const payload = await readArtifactResponse<{ artifact: WorkbenchArtifactRecord }>(response);
+        console.log(formatArtifactShow(payload.artifact, apiBase));
+        return;
+      }
+
+      if (command === 'open') {
+        if (!artifactId) {
+          console.log(chalk.red('\n  Missing artifact id.\n'));
+          return;
+        }
+        console.log(buildArtifactDetailUrl(apiBase, artifactId));
+        return;
+      }
+
+      if (command === 'export') {
+        if (!artifactId || !opts.out) {
+          console.log(chalk.red('\n  Missing artifact id or --out for export.\n'));
+          return;
+        }
+        const artifactResponse = await fetch(`${apiBase}/api/workbench/artifacts/${encodeURIComponent(artifactId)}`);
+        const artifactPayload = await readArtifactResponse<{ artifact: WorkbenchArtifactRecord }>(artifactResponse);
+        const previewUrl = buildArtifactPreviewApiUrl(
+          apiBase,
+          artifactId,
+          opts.version || artifactPayload.artifact.latestVersionId,
+        );
+        const previewResponse = await fetch(previewUrl);
+        if (!previewResponse.ok) {
+          throw new Error(`Preview export failed: ${previewResponse.statusText}`);
+        }
+        const buffer = Buffer.from(await previewResponse.arrayBuffer());
+        await fs.mkdir(path.dirname(path.resolve(opts.out)), { recursive: true });
+        await fs.writeFile(path.resolve(opts.out), buffer);
+        console.log(chalk.green(`Exported ${artifactId} to ${path.resolve(opts.out)}`));
+        return;
+      }
+
+      console.log(chalk.red(`\n  Unknown artifacts subcommand: ${command}\n`));
+    } catch (error) {
+      console.log(chalk.red(`\n  Artifact command failed: ${(error as Error).message}\n`));
+    }
+  });
+
 // ── tik update ───────────────────────────────────────────────
 
 program
@@ -1558,6 +1717,7 @@ Examples:
     const daemon = new TrackerDaemon({
       importer,
       stateStore: FileTrackerDaemonStateStore.forWorkspace(workspaceRoot),
+      agentRunStore: new FileAgentRunStore(workspaceRoot),
       launcher: new WorkbenchTrackerLauncher(kernel.workbench, {
         workspaceRoot,
         defaultProjectPath: workspaceRoot,
@@ -1594,18 +1754,7 @@ Examples:
           } catch {}
         },
         runHook: async (name, input) => {
-          await execFileAsync('/bin/sh', ['-lc', name], {
-            cwd: input.projectPath,
-            env: {
-              ...process.env,
-              TIK_TRACKER_TASK_ID: input.task.id,
-              TIK_TRACKER_TASK_IDENTIFIER: input.task.shortIdentifier,
-              TIK_TRACKER_ISSUE_ID: input.task.id,
-              TIK_TRACKER_ISSUE_IDENTIFIER: input.task.shortIdentifier,
-              TIK_TRACKER_WORKSPACE_ROOT: input.workspaceRoot,
-              TIK_TRACKER_PROJECT_PATH: input.projectPath,
-            },
-          });
+          await runTrackerHook(name, input);
         },
         cleanupWorkspace: async (input) => {
           await cleanupManagedTrackerWorkspace({
@@ -1616,6 +1765,7 @@ Examples:
       }),
       workspaceRoot,
       defaultProjectPath: workspaceRoot,
+      runtimeRunners: createDefaultRuntimeRunners(),
       workflow,
       maxConcurrentAgents: workflow?.config.polling.maxConcurrentAgents,
       pollIntervalMs: workflow?.config.polling.intervalMs,
@@ -1699,9 +1849,9 @@ Examples:
 const argv = process.argv.slice(2);
 
 if (argv.length === 0) {
-  program.parse([process.argv[0] ?? 'node', process.argv[1] ?? 'tik', 'shell']);
+  await program.parseAsync([process.argv[0] ?? 'node', process.argv[1] ?? 'tik', 'shell']);
 } else {
-  program.parse();
+  await program.parseAsync();
 }
 
 function printWorkspaceStatus(snapshot: WorkspaceStatusSnapshot, rootPath: string, projects?: string): void {

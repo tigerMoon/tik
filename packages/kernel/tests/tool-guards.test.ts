@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { bashTool, globTool, readFileTool } from '../src/tools.js';
-import { grepTool } from '../src/tools-search.js';
+import { bashTool, globTool, readFileTool, writeFileTool } from '../src/tools.js';
+import { editFileTool, grepTool } from '../src/tools-search.js';
 import type { ToolContext } from '@tik/shared';
 
 const tempDirs: string[] = [];
@@ -42,10 +42,38 @@ afterEach(async () => {
 });
 
 describe('tool search guards', () => {
+  it('file tools reject parent traversal, absolute paths, and symlink escapes', async () => {
+    const root = await makeRepo();
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tool-outside-'));
+    tempDirs.push(outside);
+    await fs.writeFile(path.join(outside, 'secret.txt'), 'do not read\n', 'utf-8');
+    await fs.symlink(outside, path.join(root, 'linked-outside'));
+
+    const context = createContext(root);
+    const attempts = await Promise.all([
+      readFileTool.execute({ path: '../outside.txt' }, context),
+      readFileTool.execute({ path: path.join(outside, 'secret.txt') }, context),
+      readFileTool.execute({ path: 'linked-outside/secret.txt' }, context),
+      writeFileTool.execute({ path: '../outside.txt', content: 'escape' }, context),
+      editFileTool.execute({
+        path: 'linked-outside/secret.txt',
+        old_string: 'do not read',
+        new_string: 'escaped',
+      }, context),
+    ]);
+
+    for (const result of attempts) {
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/outside the workspace|absolute paths are not allowed|parent traversal/i);
+    }
+
+    await expect(fs.readFile(path.join(outside, 'secret.txt'), 'utf-8')).resolves.toBe('do not read\n');
+  });
+
   it('read_file refuses to read directories', async () => {
     const root = await makeRepo();
     const result = await readFileTool.execute(
-      { path: path.join(root, 'catalog-suite-one-api') },
+      { path: 'catalog-suite-one-api' },
       createContext(root),
     );
 

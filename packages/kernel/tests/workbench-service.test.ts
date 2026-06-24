@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { EventType } from '@tik/shared';
 import { EventBus } from '../src/event-bus.js';
+import { FileArtifactRegistry } from '../src/artifacts/artifact-registry.js';
 import { TaskManager } from '../src/task-manager.js';
 import { WorkbenchService } from '../src/workbench/workbench-service.js';
 import { WorkbenchStore } from '../src/workbench/workbench-store.js';
@@ -82,9 +83,15 @@ describe('WorkbenchService', () => {
     tempDirs.push(root);
     const store = new WorkbenchStore(root);
     const eventBus = new EventBus();
-    const service = new WorkbenchService({ rootPath: root, eventBus, store });
+    const service = new WorkbenchService({
+      rootPath: root,
+      eventBus,
+      store,
+      artifacts: new FileArtifactRegistry({ rootPath: root }),
+    });
 
     await service.createTask({ title: 'Snake game', goal: 'Build an H5 playable snake game' }, 'task-raw');
+    await fs.writeFile(path.join(root, 'mock-app.html'), '<h1>Snake</h1>', 'utf-8');
 
     eventBus.emit({
       id: 'evt-raw-1',
@@ -95,7 +102,7 @@ describe('WorkbenchService', () => {
         output: 'Written 319 bytes',
         durationMs: 8,
         success: true,
-        filesModified: ['/tmp/mock-app.html'],
+        filesModified: [path.join(root, 'mock-app.html')],
       },
       timestamp: Date.now(),
     });
@@ -103,19 +110,87 @@ describe('WorkbenchService', () => {
     const timeline = await service.readTimeline('task-raw');
     const rawItem = timeline.find((item) => item.kind === 'raw');
     const [task] = await service.listTasks();
+    const artifacts = await service.listArtifacts({ taskId: 'task-raw' });
 
     expect(rawItem?.body).toContain('write_file');
-    expect(rawItem?.body).toContain('/tmp/mock-app.html');
+    expect(rawItem?.body).toContain(path.join(root, 'mock-app.html'));
     expect(rawItem?.body).toContain('Written 319 bytes');
-    expect(task?.evidenceSummary).toEqual({
+    expect(artifacts).toHaveLength(1);
+    expect(artifacts[0]).toMatchObject({
+      taskId: 'task-raw',
+      status: 'previewable',
+      sourceEventIds: ['evt-raw-1'],
+    });
+    expect(task?.evidenceSummary).toMatchObject({
       rawEventCount: 1,
       modifiedFileCount: 1,
       previewableArtifactCount: 1,
-      latestPreviewableArtifactPath: '/tmp/mock-app.html',
+      latestPreviewableArtifactPath: path.join(root, 'mock-app.html'),
       latestPreviewableArtifactCreatedAt: expect.any(String),
+      latestArtifactId: artifacts[0]?.id,
+      latestArtifactVersionId: artifacts[0]?.latestVersionId,
+      artifactCount: 1,
+      needsReviewArtifactCount: 0,
+      acceptedArtifactCount: 0,
       latestToolName: 'write_file',
       hasErrorEvidence: false,
     });
+  });
+
+  it('keeps completed tasks with review artifacts in review until the artifact is accepted', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const store = new WorkbenchStore(root);
+    const eventBus = new EventBus();
+    const service = new WorkbenchService({
+      rootPath: root,
+      eventBus,
+      store,
+      artifacts: new FileArtifactRegistry({ rootPath: root }),
+    });
+
+    await service.createTask({ title: 'Review gate', goal: 'Wait for artifact acceptance' }, 'task-review-gate');
+    const artifact = await service.createArtifact({
+      taskId: 'task-review-gate',
+      title: 'Task Review: Review gate',
+      kind: 'report',
+      content: '# Review gate',
+      contentType: 'text/markdown',
+      extension: 'md',
+      producedBy: { template: 'task-review' },
+    });
+
+    eventBus.emit({
+      id: 'evt-review-gate-complete',
+      type: EventType.TASK_COMPLETED,
+      taskId: 'task-review-gate',
+      payload: { status: 'completed' },
+      timestamp: Date.now(),
+    });
+
+    const inReview = await service.readTask('task-review-gate');
+    expect(inReview?.status).toBe('in_review');
+    expect(inReview?.latestSummary).toContain('awaiting artifact acceptance');
+
+    const accepted = await service.acceptArtifact(artifact.id, 'reviewer');
+    expect(accepted.status).toBe('accepted');
+    const completed = await service.readTask('task-review-gate');
+    expect(completed?.status).toBe('completed');
+    expect(completed?.latestSummary).toContain('accepted');
+
+    await service.appendArtifactVersion({
+      artifactId: artifact.id,
+      content: '# Review gate v2',
+      contentType: 'text/markdown',
+      extension: 'md',
+    });
+    const afterNewVersion = await service.readTask('task-review-gate');
+    expect(afterNewVersion?.status).toBe('in_review');
+
+    await service.rejectArtifact(artifact.id, 'Needs stronger validation', 'reviewer');
+    const rejected = await service.readTask('task-review-gate');
+    expect(rejected?.status).toBe('todo');
+    expect(rejected?.latestSummary).toContain('Needs stronger validation');
   });
 
   it('projects task evidence summaries for completed tasks so the queue can show acceptance signals', async () => {

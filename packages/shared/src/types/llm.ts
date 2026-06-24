@@ -11,7 +11,7 @@ export interface ILLMProvider {
   /** Provider name */
   name: string;
 
-  /** Generate a plan from context */
+  /** Generate a plan from context. Providers must treat this as plan-only and enforce a read-only tool policy. */
   plan(prompt: string, context: string, options?: LLMCallOptions): Promise<LLMPlanResponse>;
 
   /** Generate a completion */
@@ -47,6 +47,8 @@ export interface LLMCallOptions {
   onProviderEvent?: (event: ProviderRuntimeEvent) => void;
   /** Hint that this completion call may need write-capable execution */
   allowWrites?: boolean;
+  /** Explicit provider-native tool policy for the current phase. */
+  toolPolicy?: LLMToolPolicy;
   /** Abort the provider call if the caller decides the run should stop */
   signal?: AbortSignal;
   /**
@@ -60,6 +62,33 @@ export interface LLMCallOptions {
    */
   providerSessionId?: string;
 }
+
+export interface LLMToolPolicy {
+  /** Planning calls are read-only; execution calls may expose write/exec tools when the caller allows them. */
+  phase: 'plan' | 'execute';
+  /** Exact provider-native tools allowed during this call. */
+  allowedTools: readonly string[];
+  /** Whether provider-native file writes/edits are allowed. */
+  allowWrites: boolean;
+  /** Whether provider-native shell/exec tools are allowed. */
+  allowExec: boolean;
+}
+
+export const PLAN_READ_ONLY_TOOL_NAMES = [
+  'read_file',
+  'glob',
+  'grep',
+  'git_status',
+  'git_diff',
+  'git_log',
+] as const;
+
+export const PLAN_READ_ONLY_TOOL_POLICY: LLMToolPolicy = {
+  phase: 'plan',
+  allowedTools: PLAN_READ_ONLY_TOOL_NAMES,
+  allowWrites: false,
+  allowExec: false,
+};
 
 export type ProviderRuntimeEvent =
   | {

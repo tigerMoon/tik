@@ -1,8 +1,17 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { Liquid } from 'liquidjs';
 import { parse as parseYaml } from 'yaml';
-import type { TrackerWorkflowConfig, TrackerWorkflowDefinition, TrackedTask } from './types.js';
+import type {
+  AgentRuntimeMode,
+  AgentRuntimeName,
+  TrackerWorkflowConfig,
+  TrackerWorkflowDefinition,
+  TrackerWorkflowRoutingResolution,
+  TrackerWorkflowRoutingRule,
+  TrackedTask,
+} from './types.js';
 
 const DEFAULT_CONFIG: TrackerWorkflowConfig = {
   tracker: {
@@ -35,15 +44,26 @@ export async function loadTrackerWorkflow(rootPath: string, fileName = 'WORKFLOW
   const { frontMatter, body } = splitFrontMatter(raw);
   const parsed = parseWorkflowYaml(frontMatter);
   const config = normalizeConfig(parsed);
+  const version = parsed.version === 2 ? 2 : undefined;
+  if (version === 2) {
+    await validateWorkflowV2(rootPath, config);
+  }
   const promptTemplate = body.trim();
   const engine = new Liquid({ strictVariables: true, strictFilters: true });
   const parsedTemplate = engine.parse(promptTemplate);
   return {
+    version,
+    path: workflowPath,
+    workflowConfigHash: version === 2 ? sha256(canonicalize(parsed)) : undefined,
+    workflowPromptHash: version === 2 ? sha256(promptTemplate) : undefined,
     config,
     promptTemplate,
     renderPrompt(task: TrackedTask, input?: { attempt?: number }) {
       return renderPrompt(engine, parsedTemplate, task, input);
     },
+    resolveRouting: version === 2
+      ? (task: TrackedTask) => resolveWorkflowRouting(config, task)
+      : undefined,
   };
 }
 
@@ -118,6 +138,27 @@ function normalizeConfig(parsed: Record<string, any>): TrackerWorkflowConfig {
     agent: {
       timeoutMs: toNumber(parsed.agent?.timeout_ms || parsed.agent?.timeoutMs, DEFAULT_CONFIG.agent.timeoutMs),
     },
+    selector: parsed.version === 2 ? {
+      includeLabels: toStringArray(parsed.selector?.include_labels || parsed.selector?.includeLabels, []),
+      excludeLabels: toStringArray(parsed.selector?.exclude_labels || parsed.selector?.excludeLabels, []),
+    } : undefined,
+    routing: parsed.version === 2 ? {
+      defaultRunner: normalizeRunner(parsed.routing?.default_runner || parsed.routing?.defaultRunner),
+      defaultMode: normalizeMode(parsed.routing?.default_mode || parsed.routing?.defaultMode),
+      rules: normalizeRoutingRules(parsed.routing?.rules),
+    } : undefined,
+    concurrency: parsed.version === 2 ? {
+      lock: normalizeLock(parsed.concurrency?.lock),
+      respectLabels: toStringArray(parsed.concurrency?.respect_labels || parsed.concurrency?.respectLabels, []),
+    } : undefined,
+    sandbox: parsed.version === 2 ? {
+      envWhitelist: toStringArray(parsed.sandbox?.env_whitelist || parsed.sandbox?.envWhitelist, []),
+    } : undefined,
+    hooks: parsed.version === 2 ? {
+      root: parsed.hooks?.root || '.tik/hooks',
+      timeoutMs: toNumber(parsed.hooks?.timeout_ms || parsed.hooks?.timeoutMs, 30_000),
+      allowExecutableOnly: toBoolean(parsed.hooks?.allow_executable_only ?? parsed.hooks?.allowExecutableOnly, true),
+    } : undefined,
   };
 }
 
@@ -164,6 +205,171 @@ function parseWorkflowYaml(source: string): Record<string, any> {
     return {};
   }
   return parsed as Record<string, any>;
+}
+
+function resolveWorkflowRouting(
+  config: TrackerWorkflowConfig,
+  task: TrackedTask,
+): TrackerWorkflowRoutingResolution {
+  const routing = config.routing;
+  if (!routing) {
+    throw new Error('Workflow v2 routing is not configured.');
+  }
+
+  const labels = new Set(task.labels.map(normalizeLabel));
+  const explicitRunnerLabels = [
+    labels.has('runner:codex') ? 'runner:codex' : undefined,
+    labels.has('runner:claude') || labels.has('runner:claude-code') ? 'runner:claude' : undefined,
+  ].filter((label): label is string => Boolean(label));
+  if (explicitRunnerLabels.length > 1) {
+    throw new Error(`Conflicting explicit runner labels for ${task.shortIdentifier}: ${explicitRunnerLabels.join(', ')}`);
+  }
+  if (explicitRunnerLabels.length === 1) {
+    const runner = explicitRunnerLabels[0] === 'runner:codex' ? 'codex' : 'claude-code';
+    return {
+      runner,
+      mode: defaultModeForRunner(runner, routing.defaultMode),
+      matchedSource: 'explicit-label',
+      matchedLabels: explicitRunnerLabels,
+    };
+  }
+
+  for (let index = 0; index < routing.rules.length; index += 1) {
+    const rule = routing.rules[index]!;
+    const matchedLabels = rule.labelsAny.filter((label) => labels.has(normalizeLabel(label)));
+    if (matchedLabels.length === 0) continue;
+    return {
+      runner: rule.runner,
+      mode: rule.mode,
+      matchedSource: `rule[${index}]`,
+      matchedLabels,
+    };
+  }
+
+  if (routing.defaultRunner) {
+    return {
+      runner: routing.defaultRunner,
+      mode: defaultModeForRunner(routing.defaultRunner, routing.defaultMode),
+      matchedSource: 'default',
+    };
+  }
+
+  throw new Error(`No workflow routing rule matched ${task.shortIdentifier}, and routing.default_runner is not configured.`);
+}
+
+async function validateWorkflowV2(rootPath: string, config: TrackerWorkflowConfig): Promise<void> {
+  if (!config.routing) {
+    throw new Error('Workflow v2 requires routing configuration.');
+  }
+  const hookRoot = config.hooks?.root || '.tik/hooks';
+  const configuredHooks = Object.values(config.workspace.hooks).flat();
+  for (const hook of configuredHooks) {
+    await validateWorkflowHook(rootPath, hookRoot, hook, config.hooks?.allowExecutableOnly !== false);
+  }
+}
+
+async function validateWorkflowHook(
+  rootPath: string,
+  hookRoot: string,
+  hook: string,
+  executableOnly: boolean,
+): Promise<void> {
+  const normalizedHook = hook.trim();
+  if (!normalizedHook) return;
+  const hookRootNormalized = normalizePathLike(hookRoot);
+  const hookNormalized = normalizePathLike(normalizedHook);
+  if (path.isAbsolute(normalizedHook) || hookNormalized.includes('..') || !hookNormalized.startsWith(`${hookRootNormalized}/`)) {
+    throw new Error(`Workflow v2 hook must be under ${hookRoot}: ${hook}`);
+  }
+  const hookPath = path.join(rootPath, normalizedHook);
+  const stat = await fs.stat(hookPath).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(`Workflow v2 hook does not exist: ${hook}`);
+    }
+    throw error;
+  });
+  if (!stat.isFile()) {
+    throw new Error(`Workflow v2 hook must be a file: ${hook}`);
+  }
+  if (executableOnly && (stat.mode & 0o111) === 0) {
+    throw new Error(`Workflow v2 hook must be executable: ${hook}`);
+  }
+}
+
+function normalizeRoutingRules(value: unknown): TrackerWorkflowRoutingRule[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => {
+    const candidate = item as Record<string, unknown>;
+    const runner = normalizeRunner(candidate.runner);
+    const mode = normalizeMode(candidate.mode);
+    if (!runner) throw new Error('Workflow v2 routing rule requires runner.');
+    return {
+      labelsAny: toStringArray(candidate.labels_any || candidate.labelsAny, []),
+      runner,
+      mode: mode || defaultModeForRunner(runner),
+    };
+  });
+}
+
+function normalizeRunner(value: unknown): AgentRuntimeName | undefined {
+  if (value === 'codex') return 'codex';
+  if (value === 'claude' || value === 'claude-code' || value === 'claude_code') return 'claude-code';
+  return undefined;
+}
+
+function normalizeMode(value: unknown): AgentRuntimeMode | undefined {
+  if (
+    value === 'codex_exec'
+    || value === 'codex_app_server'
+    || value === 'claude_print'
+    || value === 'claude_hooked'
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function defaultModeForRunner(
+  runner: AgentRuntimeName,
+  preferred?: AgentRuntimeMode,
+): AgentRuntimeMode {
+  if (preferred && modeMatchesRunner(runner, preferred)) return preferred;
+  return runner === 'codex' ? 'codex_app_server' : 'claude_print';
+}
+
+function modeMatchesRunner(runner: AgentRuntimeName, mode: AgentRuntimeMode): boolean {
+  return runner === 'codex' ? mode.startsWith('codex_') : mode.startsWith('claude_');
+}
+
+function normalizeLock(value: unknown): 'repository_branch' | 'none' | undefined {
+  if (value === 'repository_branch' || value === 'repo_branch') return 'repository_branch';
+  if (value === 'none') return 'none';
+  return undefined;
+}
+
+function normalizeLabel(label: string): string {
+  return label.trim().toLowerCase();
+}
+
+function normalizePathLike(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function canonicalize(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalize).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalize(entry)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 export function defaultTrackerWorkflowContent(): string {

@@ -1,9 +1,18 @@
 import React from 'react';
-import { buildWorkbenchArtifactPreviewUrl } from '../api/client';
-import type { WorkbenchTimelineResponseItem } from '../api/client';
+import {
+  buildWorkbenchArtifactLinkPreviewUrl,
+  buildWorkbenchArtifactVersionPreviewUrl,
+} from '../api/client';
+import type { WorkbenchArtifactRecord, WorkbenchTimelineResponseItem } from '../api/client';
 import { parseWorkbenchEvidence } from '../view-models/workbench';
 
-export function EvidencePanel({ items }: { items: WorkbenchTimelineResponseItem[] }) {
+export function EvidencePanel({
+  items,
+  artifacts = [],
+}: {
+  items: WorkbenchTimelineResponseItem[];
+  artifacts?: WorkbenchArtifactRecord[];
+}) {
   if (items.length === 0) {
     return null;
   }
@@ -15,14 +24,35 @@ export function EvidencePanel({ items }: { items: WorkbenchTimelineResponseItem[
       </div>
       <div style={{ marginTop: '10px', display: 'grid', gap: '10px' }}>
         {items.map((item) => (
-          <EvidenceCard key={item.id} item={item} />
+          <EvidenceCard key={item.id} item={item} artifacts={artifacts} />
         ))}
+        {artifacts.length > 0 ? (
+          <div className="linked-artifacts-block">
+            <strong>Linked Artifacts</strong>
+            {artifacts.map((artifact) => (
+              <a
+                key={artifact.id}
+                href={buildWorkbenchArtifactVersionPreviewUrl(artifact.id, artifact.latestVersionId)}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {artifact.title} · v{artifact.version} · {artifact.status.replace(/_/g, ' ')}
+              </a>
+            ))}
+          </div>
+        ) : null}
       </div>
     </div>
   );
 }
 
-function EvidenceCard({ item }: { item: WorkbenchTimelineResponseItem }) {
+function EvidenceCard({
+  item,
+  artifacts,
+}: {
+  item: WorkbenchTimelineResponseItem;
+  artifacts: WorkbenchArtifactRecord[];
+}) {
   const parsed = parseWorkbenchEvidence(item);
 
   return (
@@ -39,23 +69,7 @@ function EvidenceCard({ item }: { item: WorkbenchTimelineResponseItem }) {
           {item.actor}{parsed.toolName ? ` · ${parsed.toolName}` : ''}
         </div>
         {parsed.previewableArtifacts.map((filePath) => (
-          <a
-            key={filePath}
-            href={buildWorkbenchArtifactPreviewUrl(filePath)}
-            target="_blank"
-            rel="noreferrer"
-            style={{
-              borderRadius: '999px',
-              padding: '6px 10px',
-              background: 'rgba(34, 211, 238, 0.12)',
-              color: '#67e8f9',
-              fontSize: '11px',
-              textDecoration: 'none',
-              fontWeight: 700,
-            }}
-          >
-            Preview artifact
-          </a>
+          <PreviewArtifactLink key={filePath} filePath={filePath} artifacts={artifacts} />
         ))}
       </div>
       {parsed.filesModified.length > 0 ? (
@@ -92,5 +106,42 @@ function EvidenceCard({ item }: { item: WorkbenchTimelineResponseItem }) {
         {parsed.output || parsed.error || item.body}
       </pre>
     </div>
+  );
+}
+
+function PreviewArtifactLink({
+  filePath,
+  artifacts,
+}: {
+  filePath: string;
+  artifacts: WorkbenchArtifactRecord[];
+}) {
+  const linkedArtifact = artifacts.find((artifact) => artifact.changedFiles?.includes(filePath));
+  const href = buildWorkbenchArtifactLinkPreviewUrl({
+    artifactId: linkedArtifact?.id,
+    versionId: linkedArtifact?.latestVersionId,
+    filePath,
+  });
+  if (!href) {
+    return null;
+  }
+
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      style={{
+        borderRadius: '999px',
+        padding: '6px 10px',
+        background: 'rgba(34, 211, 238, 0.12)',
+        color: '#67e8f9',
+        fontSize: '11px',
+        textDecoration: 'none',
+        fontWeight: 700,
+      }}
+    >
+      Preview artifact
+    </a>
   );
 }

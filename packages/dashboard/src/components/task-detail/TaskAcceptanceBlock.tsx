@@ -1,7 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import {
-  buildWorkbenchArtifactPreviewUrl,
+  buildWorkbenchArtifactLinkPreviewUrl,
   type WorkbenchDecisionResponse,
+  type WorkbenchArtifactRecord,
   type WorkbenchTaskResponse,
   type WorkbenchTimelineResponseItem,
 } from '../../api/client';
@@ -14,9 +15,10 @@ interface TaskAcceptanceBlockProps {
   task: WorkbenchTaskResponse;
   timeline: WorkbenchTimelineResponseItem[];
   decisions: WorkbenchDecisionResponse[];
+  artifacts?: WorkbenchArtifactRecord[];
 }
 
-export function TaskAcceptanceBlock({ task, timeline, decisions }: TaskAcceptanceBlockProps) {
+export function TaskAcceptanceBlock({ task, timeline, decisions, artifacts = [] }: TaskAcceptanceBlockProps) {
   const rawItems = useMemo(() => timeline.filter((item) => item.kind === 'raw'), [timeline]);
   const evidenceDigest = useMemo(() => buildWorkbenchEvidenceDigest(rawItems), [rawItems]);
   const acceptanceSummary = useMemo(
@@ -36,9 +38,29 @@ export function TaskAcceptanceBlock({ task, timeline, decisions }: TaskAcceptanc
   }
 
   const primaryArtifact = evidenceDigest.previewableArtifacts[0] || null;
-  const primaryArtifactPreviewUrl = primaryArtifact
-    ? buildWorkbenchArtifactPreviewUrl(primaryArtifact.path)
-    : null;
+  const primaryRegistryArtifact = artifacts[0] || null;
+  const primaryPreviewUrl = buildWorkbenchArtifactLinkPreviewUrl({
+    artifactId: primaryRegistryArtifact?.id || task.evidenceSummary?.latestArtifactId,
+    versionId: primaryRegistryArtifact?.latestVersionId || task.evidenceSummary?.latestArtifactVersionId,
+    filePath: primaryArtifact?.path,
+  });
+  const primaryPreviewLabel = primaryRegistryArtifact?.title || (primaryArtifact ? formatArtifactLabel(primaryArtifact.path) : '');
+  const previewRows = artifacts.length > 0
+    ? artifacts.slice(1, 4).map((artifact) => ({
+        key: artifact.id,
+        href: buildWorkbenchArtifactLinkPreviewUrl({
+          artifactId: artifact.id,
+          versionId: artifact.latestVersionId,
+        }),
+        title: artifact.title,
+        detail: `${artifact.kind} · v${artifact.version} · ${artifact.status.replace(/_/g, ' ')}`,
+      }))
+    : evidenceDigest.previewableArtifacts.slice(1, 4).map((artifact) => ({
+        key: artifact.path,
+        href: buildWorkbenchArtifactLinkPreviewUrl({ filePath: artifact.path }),
+        title: formatArtifactLabel(artifact.path),
+        detail: artifact.path,
+      }));
 
   return (
     <section className="task-detail-acceptance">
@@ -60,15 +82,15 @@ export function TaskAcceptanceBlock({ task, timeline, decisions }: TaskAcceptanc
 
       {expanded ? (
         <>
-          {primaryArtifact && primaryArtifactPreviewUrl ? (
+          {primaryPreviewUrl ? (
             <div className="task-detail-acceptance-preview">
               <div className="task-detail-acceptance-preview-head">
                 <div>
                   <div className="task-detail-block-meta">Interactive preview</div>
-                  <strong>{formatArtifactLabel(primaryArtifact.path)}</strong>
+                  <strong>{primaryPreviewLabel}</strong>
                 </div>
                 <a
-                  href={primaryArtifactPreviewUrl}
+                  href={primaryPreviewUrl}
                   target="_blank"
                   rel="noreferrer"
                   className="task-detail-link-button"
@@ -77,11 +99,12 @@ export function TaskAcceptanceBlock({ task, timeline, decisions }: TaskAcceptanc
                 </a>
               </div>
               <iframe
-                key={primaryArtifact.path}
+                key={primaryPreviewUrl}
                 className="task-detail-acceptance-frame"
-                src={primaryArtifactPreviewUrl}
-                title={`Artifact preview: ${formatArtifactLabel(primaryArtifact.path)}`}
+                src={primaryPreviewUrl}
+                title={`Artifact preview: ${primaryPreviewLabel}`}
                 loading="lazy"
+                sandbox="allow-scripts"
               />
             </div>
           ) : null}
@@ -101,20 +124,20 @@ export function TaskAcceptanceBlock({ task, timeline, decisions }: TaskAcceptanc
             </div>
           </div>
 
-          {evidenceDigest.previewableArtifacts.length > 1 ? (
+          {previewRows.length > 0 ? (
             <div className="task-detail-acceptance-list">
-              {evidenceDigest.previewableArtifacts.slice(1, 4).map((artifact) => (
+              {previewRows.map((artifact) => artifact.href ? (
                 <a
-                  key={artifact.path}
-                  href={buildWorkbenchArtifactPreviewUrl(artifact.path)}
+                  key={artifact.key}
+                  href={artifact.href}
                   target="_blank"
                   rel="noreferrer"
                   className="task-detail-acceptance-list-row"
                 >
-                  <strong>{formatArtifactLabel(artifact.path)}</strong>
-                  <span>{artifact.path}</span>
+                  <strong>{artifact.title}</strong>
+                  <span>{artifact.detail}</span>
                 </a>
-              ))}
+              ) : null)}
             </div>
           ) : null}
 
