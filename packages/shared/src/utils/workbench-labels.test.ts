@@ -99,4 +99,16 @@ describe('workbench label routing', () => {
     expect(isWorkbenchTaskCodexDispatchable(task)).toBe(true);
     expect(isWorkbenchTaskWorkflowDispatchable(task)).toBe(true);
   });
+
+  it('allows retry tasks with workflow labels back into the dispatch lane', () => {
+    const task: WorkbenchDispatchEnvironmentTask = {
+      status: 'retry',
+      labels: ['needs-codex-fix'],
+      agentLoop: undefined,
+      environmentPackSnapshot: engineeringSnapshot,
+    };
+
+    expect(isWorkbenchTaskCodexDispatchable(task)).toBe(true);
+    expect(isWorkbenchTaskWorkflowDispatchable(task)).toBe(true);
+  });
 });

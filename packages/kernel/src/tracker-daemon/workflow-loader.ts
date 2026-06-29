@@ -154,6 +154,9 @@ function normalizeConfig(parsed: Record<string, any>): TrackerWorkflowConfig {
     sandbox: parsed.version === 2 ? {
       envWhitelist: toStringArray(parsed.sandbox?.env_whitelist || parsed.sandbox?.envWhitelist, []),
     } : undefined,
+    validation: parsed.version === 2 ? {
+      commands: toStringArray(parsed.validation?.commands || parsed.validation_commands || parsed.validationCommands, []),
+    } : undefined,
     hooks: parsed.version === 2 ? {
       root: parsed.hooks?.root || '.tik/hooks',
       timeoutMs: toNumber(parsed.hooks?.timeout_ms || parsed.hooks?.timeoutMs, 30_000),
@@ -166,7 +169,7 @@ function renderPrompt(
   engine: Liquid,
   parsedTemplate: ReturnType<Liquid['parse']>,
   task: TrackedTask,
-  input?: { attempt?: number },
+  input?: { attempt?: number; previousReview?: string },
 ): string {
   const view = {
     task: {
@@ -188,6 +191,7 @@ function renderPrompt(
       labels: task.labels,
     },
     attempt: input?.attempt || 0,
+    previousReview: input?.previousReview || '',
   };
   try {
     return engine.renderSync(parsedTemplate, view);

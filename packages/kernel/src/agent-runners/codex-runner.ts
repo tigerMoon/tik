@@ -19,6 +19,7 @@ import {
   promiseCompletion,
   type RuntimeChildProcess,
 } from './runtime-process.js';
+import { collectGitDiffSummary, collectTranscriptFromRunLogs } from './runtime-collection.js';
 
 export interface CodexHarnessLike {
   runTurn(options: CodexHarnessTurnOptions): Promise<unknown>;
@@ -39,6 +40,7 @@ export class CodexRunner implements AgentRuntimeRunner {
   private readonly adapterFactory: (cwd: string) => CodexHarnessLike;
   private readonly adapters = new Map<string, CodexHarnessLike>();
   private readonly children = new Map<string, RuntimeChildProcess>();
+  private readonly preparedRuns = new Map<string, PreparedRun>();
   private readonly statuses = new Map<string, AgentRunStatusSnapshot>();
   private readonly spawnProcess: (command: string, args: string[], options: SpawnOptions) => RuntimeChildProcess;
 
@@ -69,6 +71,7 @@ export class CodexRunner implements AgentRuntimeRunner {
 
   async start(input: PreparedRun): Promise<AgentRunHandle> {
     this.statuses.set(input.runId, 'running');
+    this.preparedRuns.set(input.runId, input);
     await assertRuntimeCwd(input.cwd);
     if (input.mode === 'codex_app_server') {
       const adapter = this.adapterFactory(input.cwd);
@@ -140,11 +143,13 @@ export class CodexRunner implements AgentRuntimeRunner {
   }
 
   async collectTranscript(_runId: string) {
-    return [];
+    const prepared = this.preparedRuns.get(_runId);
+    return prepared ? collectTranscriptFromRunLogs(prepared) : [];
   }
 
   async collectDiff(_runId: string) {
-    return { changedFiles: [] };
+    const prepared = this.preparedRuns.get(_runId);
+    return prepared ? collectGitDiffSummary(prepared) : { changedFiles: [] };
   }
 
   async collectArtifacts(_runId: string): Promise<ArtifactCandidate[]> {

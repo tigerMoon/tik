@@ -172,11 +172,13 @@ function stateKindFromTask(
 function stateKindFromStatus(status: WorkbenchTaskStatus): TrackedTaskStateKind {
   switch (status) {
     case 'todo':
+    case 'retry':
     case 'in_progress':
     case 'running':
     case 'failed':
       return 'active';
     case 'completed':
+    case 'accepted':
     case 'cancelled':
     case 'archived':
       return 'terminal';

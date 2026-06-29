@@ -16,6 +16,9 @@ export {
   runWorkbenchKernelTaskInBackground,
 } from './tracker-daemon/workbench-runner.js';
 export { FileAgentRunStore } from './agent-runners/agent-run-store.js';
+export { FileRunProofStore } from './agent-runners/run-proof-store.js';
+export { RunProofService, toRunDiffSummary } from './agent-runners/run-proof-service.js';
+export { renderRunReviewArtifact } from './agent-runners/run-proof-renderer.js';
 export { CodexRunner } from './agent-runners/codex-runner.js';
 export { ClaudeCodeRunner } from './agent-runners/claude-code-runner.js';
 export { createDefaultRuntimeRunners } from './agent-runners/default-runtime-runners.js';
@@ -49,3 +52,8 @@ export type {
   ArtifactCandidate,
   PreparedRun,
 } from './agent-runners/agent-runtime-runner.js';
+export type {
+  RunProofCreateInput,
+  RunProofServiceOptions,
+} from './agent-runners/run-proof-service.js';
+export type { RunProofRenderTask } from './agent-runners/run-proof-renderer.js';

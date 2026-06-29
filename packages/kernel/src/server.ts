@@ -43,6 +43,8 @@ import { runWorkbenchKernelTaskInBackground } from './tracker-daemon/workbench-r
 import { WorkbenchTaskImporter, WorkflowV2WorkbenchTaskImporter } from './tracker-daemon/workbench-tracker-client.js';
 import { loadTrackerWorkflow, readTrackerWorkflowFile, resolveTrackerWorkflowPath, writeTrackerWorkflowFile } from './tracker-daemon/workflow-loader.js';
 import { FileAgentRunStore } from './agent-runners/agent-run-store.js';
+import { FileRunProofStore } from './agent-runners/run-proof-store.js';
+import { RunProofService } from './agent-runners/run-proof-service.js';
 import { createDefaultRuntimeRunners } from './agent-runners/default-runtime-runners.js';
 import type { AgentRuntimeName, TrackedTask } from './tracker-daemon/types.js';
 import type { AgentRuntimeRunner } from './agent-runners/agent-runtime-runner.js';
@@ -50,6 +52,7 @@ import { parseSlashCommand } from './workbench/comment-commands.js';
 import { WorkbenchTaskError } from './workbench/workbench-service.js';
 import type { ArtifactTemplateName } from './artifacts/artifact-templates.js';
 import { normalizeArtifactExtension } from './artifacts/artifact-security.js';
+import { FileArtifactRegistry } from './artifacts/artifact-registry.js';
 
 export interface ServerConfig {
   port: number;
@@ -59,6 +62,9 @@ export interface ServerConfig {
 export interface WorkspaceServerOptions {
   workspaceRoot?: string;
   apiToken?: string;
+  dashboardOrigin?: string;
+  allowUnauthenticatedRemote?: boolean;
+  enableLegacyPathArtifactPreview?: boolean;
   runtimeRunners?: Partial<Record<AgentRuntimeName, AgentRuntimeRunner>>;
 }
 
@@ -176,6 +182,19 @@ interface GenerateTaskArtifactBody {
 
 type AgentLoopReviewRoundBody = Omit<AgentLoopPayload, 'kind'> & WorkbenchTaskConfigurationBody;
 
+interface AcceptTaskReviewBody {
+  runId?: string;
+  artifactId?: string;
+  versionId?: string;
+  message?: string;
+  reviewer?: string;
+}
+
+interface RejectTaskReviewBody extends AcceptTaskReviewBody {
+  reason?: string;
+  retry?: boolean;
+}
+
 const MAX_LEGACY_PREVIEW_BYTES = 16 * 1024 * 1024;
 interface AgentLoopWorktreeReviewRoundBody extends WorkbenchTaskConfigurationBody {
   rootTaskId?: string;
@@ -202,9 +221,13 @@ export async function createServer(
   options?: WorkspaceServerOptions,
 ) {
   const { default: Fastify } = await import('fastify');
+  const apiToken = options?.apiToken || process.env.TIK_API_TOKEN;
+  if (!apiToken && !options?.allowUnauthenticatedRemote && isRemoteBindHost(config.host)) {
+    throw new Error('API token is required when binding Tik server to a non-localhost host.');
+  }
   const fastify = Fastify({ logger: false });
   const skillRegistry = new SkillManifestRegistry(options?.workspaceRoot || kernel.projectPath || process.cwd());
-  const apiToken = options?.apiToken || process.env.TIK_API_TOKEN;
+  const corsOrigin = options?.dashboardOrigin || process.env.TIK_DASHBOARD_ORIGIN || 'http://localhost:5173';
 
   function resolveWorkspaceRoot(rootPath?: string): string {
     const resolved = rootPath || options?.workspaceRoot;
@@ -420,11 +443,11 @@ export async function createServer(
 
   // CORS
   fastify.addHook('onRequest', async (req, reply) => {
-    reply.header('Access-Control-Allow-Origin', '*');
+    reply.header('Access-Control-Allow-Origin', corsOrigin);
     reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     if (req.method === 'OPTIONS') { return reply.send(); }
-    if (apiToken && req.method !== 'GET' && req.method !== 'OPTIONS') {
+    if (apiToken && !isPublicApiRoute(req.method, req.url)) {
       const authorization = req.headers.authorization;
       if (authorization !== `Bearer ${apiToken}`) {
         reply.code(401);
@@ -1370,6 +1393,45 @@ export async function createServer(
     return { artifacts: await workbench.listArtifacts({ taskId: req.params.id }) };
   });
 
+  fastify.get<{ Params: { id: string } }>('/api/workbench/tasks/:id/runs', async (req, reply) => {
+    try {
+      const runStore = new FileAgentRunStore(resolveServerWorkspaceRoot(options, kernel));
+      const runs = (await runStore.listRuns()).filter((run) => run.taskId === req.params.id);
+      return { runs };
+    } catch (error) {
+      reply.code(500);
+      return { error: (error as Error).message };
+    }
+  });
+
+  fastify.get<{ Params: { id: string; runId: string } }>('/api/workbench/tasks/:id/runs/:runId', async (req, reply) => {
+    const runStore = new FileAgentRunStore(resolveServerWorkspaceRoot(options, kernel));
+    const run = await runStore.readRun(req.params.runId).catch(() => null);
+    if (!run || run.taskId !== req.params.id) {
+      reply.code(404);
+      return { error: 'Run not found' };
+    }
+    return { run };
+  });
+
+  fastify.get<{ Params: { id: string; runId: string } }>('/api/workbench/tasks/:id/runs/:runId/proof', async (req, reply) => {
+    const proofStore = new FileRunProofStore(resolveServerWorkspaceRoot(options, kernel));
+    const proof = await proofStore.readProof(req.params.runId).catch(() => null);
+    if (!proof || proof.taskId !== req.params.id) {
+      reply.code(404);
+      return { error: 'Run proof not found' };
+    }
+    return { proof };
+  });
+
+  fastify.post<{ Params: { id: string; runId: string } }>(
+    '/api/workbench/tasks/:id/runs/:runId/proof/regenerate',
+    async (_req, reply) => {
+      reply.code(501);
+      return { error: 'Run proof regeneration is not implemented yet.' };
+    },
+  );
+
   fastify.post<{ Params: { id: string }; Body: GenerateTaskArtifactBody }>(
     '/api/workbench/tasks/:id/artifacts/generate',
     async (req, reply) => {
@@ -1391,6 +1453,10 @@ export async function createServer(
   );
 
   fastify.get<{ Querystring: { path?: string } }>('/api/workbench/artifacts/preview', async (req, reply) => {
+    if (!options?.enableLegacyPathArtifactPreview) {
+      reply.code(410);
+      return { error: 'Legacy path-based artifact preview is disabled. Use artifact-id preview routes instead.' };
+    }
     const filePath = req.query.path;
     if (!filePath) {
       reply.code(400);
@@ -1565,6 +1631,66 @@ export async function createServer(
       }
       try {
         return { artifact: await workbench.rejectArtifact(req.params.artifactId, req.body?.reason || '', req.body?.actor) };
+      } catch (error) {
+        reply.code(400);
+        return { error: (error as Error).message };
+      }
+    },
+  );
+
+  fastify.post<{ Params: { id: string }; Body: AcceptTaskReviewBody }>(
+    '/api/workbench/tasks/:id/review/accept',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        reply.code(500);
+        return { error: 'Workbench service is unavailable' };
+      }
+      if (!req.body?.artifactId) {
+        reply.code(400);
+        return { error: 'artifactId is required' };
+      }
+      const artifact = await workbench.readArtifact(req.body.artifactId);
+      if (!artifact || artifact.taskId !== req.params.id) {
+        reply.code(404);
+        return { error: 'Review artifact not found for task' };
+      }
+      try {
+        const accepted = await workbench.acceptArtifact(req.body.artifactId, req.body.reviewer || 'api');
+        const task = await workbench.readTask(req.params.id);
+        return { artifact: accepted, task };
+      } catch (error) {
+        reply.code(400);
+        return { error: (error as Error).message };
+      }
+    },
+  );
+
+  fastify.post<{ Params: { id: string }; Body: RejectTaskReviewBody }>(
+    '/api/workbench/tasks/:id/review/reject',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        reply.code(500);
+        return { error: 'Workbench service is unavailable' };
+      }
+      if (!req.body?.artifactId) {
+        reply.code(400);
+        return { error: 'artifactId is required' };
+      }
+      if (!req.body.reason?.trim()) {
+        reply.code(400);
+        return { error: 'reason is required' };
+      }
+      const artifact = await workbench.readArtifact(req.body.artifactId);
+      if (!artifact || artifact.taskId !== req.params.id) {
+        reply.code(404);
+        return { error: 'Review artifact not found for task' };
+      }
+      try {
+        const rejected = await workbench.rejectArtifact(req.body.artifactId, req.body.reason, req.body.reviewer || 'api');
+        const task = await workbench.readTask(req.params.id);
+        return { artifact: rejected, task };
       } catch (error) {
         reply.code(400);
         return { error: (error as Error).message };
@@ -2322,10 +2448,15 @@ function buildWorkbenchTrackerDaemon(input: {
     || (input.workflow?.version === 2
       ? new WorkflowV2WorkbenchTaskImporter(input.workbench, input.kernel.projectPath)
       : new WorkbenchTaskImporter(input.workbench));
+  const agentRunStore = new FileAgentRunStore(input.workspaceRoot);
   return new TrackerDaemon({
     importer,
     stateStore: FileTrackerDaemonStateStore.forWorkspace(input.workspaceRoot),
-    agentRunStore: new FileAgentRunStore(input.workspaceRoot),
+    agentRunStore,
+    runProofService: new RunProofService({
+      proofStore: new FileRunProofStore(input.workspaceRoot),
+      artifacts: new FileArtifactRegistry({ rootPath: input.workspaceRoot }),
+    }),
     launcher: new WorkbenchTrackerLauncher(input.workbench, {
       workspaceRoot: input.workspaceRoot,
       defaultProjectPath: input.kernel.projectPath,
@@ -2419,9 +2550,31 @@ function workbenchTaskToTrackedTaskForWorkflow(task: WorkbenchTaskRecord, defaul
 
 function isWorkflowV2CandidateStatus(status: WorkbenchTaskStatus): boolean {
   return status === 'todo'
+    || status === 'retry'
     || status === 'in_progress'
     || status === 'running'
     || status === 'failed';
+}
+
+function resolveServerWorkspaceRoot(
+  options: WorkspaceServerOptions | undefined,
+  kernel: ExecutionKernel,
+): string {
+  return options?.workspaceRoot || kernel.projectPath;
+}
+
+function isRemoteBindHost(host: string | undefined): boolean {
+  const normalized = (host || 'localhost').trim().toLowerCase();
+  return normalized !== 'localhost'
+    && normalized !== '127.0.0.1'
+    && normalized !== '::1'
+    && normalized !== '[::1]';
+}
+
+function isPublicApiRoute(method: string, url: string): boolean {
+  if (method === 'OPTIONS') return true;
+  const pathname = url.split('?')[0] || '/';
+  return method === 'GET' && (pathname === '/api/health' || pathname === '/health');
 }
 
 function workflowV2SelectorSkipReason(

@@ -615,3 +615,13 @@ pnpm --dir packages/cli build
 
 - 当前真实 LLM smoke 可能受外部 provider quota / budget 影响
 - runtime 的剩余主要差距已经从“找不到代码”转向“权限层和更强的 stop / implementation policy”
+
+
+## 最新定位
+
+Local-first engineering control plane for coding agents：
+用 task/workspace/phase/evidence/convergence 管理 Claude Code、Codex、OpenCode、Cline 等 runner 的执行。
+
+换句话说，Tik 应该成为：
+
+Symphony/Sortie 的 local-first 版本 + AoE 的 session/worktree 能力 + SIGHT/ACE 的收敛判断层。

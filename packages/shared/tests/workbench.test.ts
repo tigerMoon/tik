@@ -14,9 +14,12 @@ import {
 describe('workbench shared types', () => {
   it('treats completed, failed, and archived as terminal statuses', () => {
     expect(isWorkbenchTerminalStatus('completed')).toBe(true);
+    expect(isWorkbenchTerminalStatus('accepted')).toBe(true);
     expect(isWorkbenchTerminalStatus('failed')).toBe(true);
     expect(isWorkbenchTerminalStatus('cancelled')).toBe(true);
     expect(isWorkbenchTerminalStatus('archived')).toBe(true);
+    expect(isWorkbenchTerminalStatus('needs_review')).toBe(false);
+    expect(isWorkbenchTerminalStatus('retry')).toBe(false);
     expect(isWorkbenchTerminalStatus('running')).toBe(false);
   });
 
@@ -25,9 +28,13 @@ describe('workbench shared types', () => {
     expect(canRetryWorkbenchTask('failed')).toBe(true);
     expect(canRetryWorkbenchTask('cancelled')).toBe(true);
     expect(canRetryWorkbenchTask('paused')).toBe(true);
+    expect(canRetryWorkbenchTask('retry')).toBe(true);
+    expect(canRetryWorkbenchTask('rejected')).toBe(true);
     expect(canRetryWorkbenchTask('completed')).toBe(true);
+    expect(canRetryWorkbenchTask('accepted')).toBe(true);
     expect(canRetryWorkbenchTask('archived')).toBe(true);
     expect(canRetryWorkbenchTask('running')).toBe(false);
+    expect(canRetryWorkbenchTask('needs_review')).toBe(false);
     expect(canRetryWorkbenchTask('waiting_for_user')).toBe(false);
   });
 
@@ -36,9 +43,12 @@ describe('workbench shared types', () => {
     expect(canArchiveWorkbenchTask('failed')).toBe(true);
     expect(canArchiveWorkbenchTask('cancelled')).toBe(true);
     expect(canArchiveWorkbenchTask('paused')).toBe(true);
+    expect(canArchiveWorkbenchTask('retry')).toBe(true);
+    expect(canArchiveWorkbenchTask('rejected')).toBe(true);
     expect(canArchiveWorkbenchTask('completed')).toBe(true);
     expect(canArchiveWorkbenchTask('archived')).toBe(false);
     expect(canArchiveWorkbenchTask('running')).toBe(false);
+    expect(canArchiveWorkbenchTask('needs_review')).toBe(false);
     expect(canArchiveWorkbenchTask('waiting_for_user')).toBe(false);
   });
 

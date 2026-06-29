@@ -485,6 +485,30 @@ describe('tracker-daemon Symphony spec behavior', () => {
     expect(rendered).toContain('- tracker');
   });
 
+  it('renders previous review rejection context when workflow templates request it', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-loader-'));
+    tempDirs.push(root);
+    await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
+      '---',
+      'tracker:',
+      '  kind: json',
+      '---',
+      '{% if previousReview %}',
+      'Previous review rejection reason:',
+      '{{ previousReview }}',
+      '{% endif %}',
+      'Implement {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workflow = await loadTrackerWorkflow(root);
+    const rendered = workflow.renderPrompt(task('task-1', 'TIK-1'), {
+      previousReview: 'Add regression coverage before touching implementation.',
+    });
+
+    expect(rendered).toContain('Previous review rejection reason:');
+    expect(rendered).toContain('Add regression coverage before touching implementation.');
+  });
+
   it('loads workflow v2 hashes and resolves explicit runner labels before rules', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-v2-'));
     tempDirs.push(root);
@@ -520,6 +544,28 @@ describe('tracker-daemon Symphony spec behavior', () => {
       mode: 'codex_app_server',
       matchedSource: 'explicit-label',
     });
+  });
+
+  it('loads workflow v2 validation commands for run proof collection', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-v2-'));
+    tempDirs.push(root);
+    await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  default_runner: codex',
+      '  default_mode: codex_exec',
+      'validation:',
+      '  commands:',
+      '    - pnpm typecheck',
+      '    - pnpm test',
+      '---',
+      'Implement {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workflow = await loadTrackerWorkflow(root);
+
+    expect(workflow.config.validation?.commands).toEqual(['pnpm typecheck', 'pnpm test']);
   });
 
   it('fails workflow v2 routing for conflicting explicit runner labels', async () => {

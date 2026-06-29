@@ -104,6 +104,7 @@ export interface TrackerDaemonStateStore {
 export interface AgentRunStorePort {
   createRun(record: AgentRunRecord): Promise<AgentRunRecord>;
   appendEvent(event: RunEvent): Promise<void>;
+  readRun?(runId: string): Promise<AgentRunRecord>;
 }
 
 export interface TrackerDaemonLaunchInput {
@@ -200,6 +201,7 @@ export interface TrackerWorkflowConfig {
   routing?: TrackerWorkflowRoutingConfig;
   concurrency?: TrackerWorkflowConcurrencyConfig;
   sandbox?: TrackerWorkflowSandboxConfig;
+  validation?: TrackerWorkflowValidationConfig;
   hooks?: TrackerWorkflowHooksConfig;
 }
 
@@ -239,6 +241,10 @@ export interface TrackerWorkflowSandboxConfig {
   envWhitelist: string[];
 }
 
+export interface TrackerWorkflowValidationConfig {
+  commands: string[];
+}
+
 export interface TrackerWorkflowHooksConfig {
   root: string;
   timeoutMs: number;
@@ -259,7 +265,7 @@ export interface TrackerWorkflowDefinition {
   workflowPromptHash?: string;
   config: TrackerWorkflowConfig;
   promptTemplate: string;
-  renderPrompt(task: TrackedTask, input?: { attempt?: number }): string;
+  renderPrompt(task: TrackedTask, input?: { attempt?: number; previousReview?: string }): string;
   resolveRouting?(task: TrackedTask): TrackerWorkflowRoutingResolution;
 }
 

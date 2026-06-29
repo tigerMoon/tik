@@ -47,6 +47,23 @@ describe('FileAgentRunStore', () => {
       kind: 'run.complete',
       payload: { artifactIds: ['artifact-1'] },
     });
+    await store.appendEvent({
+      runId: 'run-1',
+      ts: '2026-06-23T00:00:02.000Z',
+      source: 'tik',
+      kind: 'artifact.discovered',
+      payload: {
+        status: 'needs_review',
+        artifactIds: ['artifact-2'],
+        transcriptRefs: [{ path: path.join(root, '.tik', 'runs', 'run-1', 'stdout.log'), contentType: 'text/plain' }],
+        diffSummary: {
+          changedFiles: ['src/proof.ts'],
+          insertions: 4,
+          deletions: 1,
+          patchPath: path.join(root, '.tik', 'runs', 'run-1', 'run-diff.patch'),
+        },
+      },
+    });
 
     const recovered = new FileAgentRunStore(root);
     const runs = await recovered.listRuns();
@@ -56,11 +73,18 @@ describe('FileAgentRunStore', () => {
     expect(runs.map((run) => run.id)).toEqual(['run-1']);
     expect(metadata).toMatchObject({
       id: 'run-1',
-      status: 'completed_by_agent',
-      artifactIds: ['artifact-1'],
+      status: 'needs_review',
+      artifactIds: ['artifact-1', 'artifact-2'],
+      transcriptRefs: [{ path: path.join(root, '.tik', 'runs', 'run-1', 'stdout.log'), contentType: 'text/plain' }],
+      diffSummary: {
+        changedFiles: ['src/proof.ts'],
+        insertions: 4,
+        deletions: 1,
+        patchPath: path.join(root, '.tik', 'runs', 'run-1', 'run-diff.patch'),
+      },
       startedAt: '2026-06-23T00:00:00.000Z',
       endedAt: '2026-06-23T00:00:01.000Z',
     });
-    expect(events.map((event) => event.kind)).toEqual(['run.start', 'run.complete']);
+    expect(events.map((event) => event.kind)).toEqual(['run.start', 'run.complete', 'artifact.discovered']);
   });
 });

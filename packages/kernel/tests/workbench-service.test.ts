@@ -189,8 +189,9 @@ describe('WorkbenchService', () => {
 
     await service.rejectArtifact(artifact.id, 'Needs stronger validation', 'reviewer');
     const rejected = await service.readTask('task-review-gate');
-    expect(rejected?.status).toBe('todo');
+    expect(rejected?.status).toBe('retry');
     expect(rejected?.latestSummary).toContain('Needs stronger validation');
+    expect(rejected?.comments?.at(-1)?.body).toContain('Needs stronger validation');
   });
 
   it('projects task evidence summaries for completed tasks so the queue can show acceptance signals', async () => {

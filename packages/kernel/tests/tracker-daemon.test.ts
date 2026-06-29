@@ -18,6 +18,7 @@ import type {
   ArtifactCandidate,
   PreparedRun,
 } from '../src/agent-runners/agent-runtime-runner.js';
+import type { DiffSummary, TranscriptRef } from '@tik/shared';
 import type {
   AgentRuntimeMode,
   AgentRuntimeName,
@@ -29,6 +30,10 @@ import type {
 } from '../src/tracker-daemon/types.js';
 import { WorkbenchService } from '../src/workbench/workbench-service.js';
 import { WorkbenchStore } from '../src/workbench/workbench-store.js';
+import { FileArtifactRegistry } from '../src/artifacts/artifact-registry.js';
+import { FileAgentRunStore } from '../src/agent-runners/agent-run-store.js';
+import { FileRunProofStore } from '../src/agent-runners/run-proof-store.js';
+import { RunProofService } from '../src/agent-runners/run-proof-service.js';
 
 const tempDirs: string[] = [];
 
@@ -182,6 +187,8 @@ class CompletingRuntimeRunner implements AgentRuntimeRunner {
   preparedInputs: AgentRunInput[] = [];
   startedInputs: PreparedRun[] = [];
   stdoutText = '';
+  transcriptRefs: TranscriptRef[] = [];
+  diffSummary: DiffSummary = { changedFiles: [] };
   private statuses = new Map<string, AgentRunStatusSnapshot>();
 
   constructor(name: AgentRuntimeName) {
@@ -233,11 +240,11 @@ class CompletingRuntimeRunner implements AgentRuntimeRunner {
   }
 
   async collectTranscript() {
-    return [];
+    return this.transcriptRefs;
   }
 
   async collectDiff() {
-    return { changedFiles: [] };
+    return this.diffSummary;
   }
 
   async collectArtifacts(): Promise<ArtifactCandidate[]> {
@@ -271,6 +278,7 @@ function workflowV2(input: {
   root: string;
   runner: AgentRuntimeName;
   mode: AgentRuntimeMode;
+  validationCommands?: string[];
   renderPrompt?: (task: TrackedTask, attempt: number) => string;
 }): TrackerWorkflowDefinition {
   return {
@@ -302,6 +310,7 @@ function workflowV2(input: {
       },
       concurrency: { lock: 'repository_branch', respectLabels: [] },
       sandbox: { envWhitelist: [] },
+      validation: input.validationCommands ? { commands: input.validationCommands } : undefined,
       hooks: { root: '.tik/hooks', timeoutMs: 30_000, allowExecutableOnly: true },
     },
     promptTemplate: 'Review {{ task.shortIdentifier }}',
@@ -324,14 +333,15 @@ function workflowV2(input: {
 async function waitForWorkbenchTask(
   workbench: WorkbenchService,
   taskId: string,
-  predicate: (task: Awaited<ReturnType<WorkbenchService['readTask']>>) => boolean,
+  predicate: (task: Awaited<ReturnType<WorkbenchService['readTask']>>) => boolean | Promise<boolean>,
 ) {
   for (let attempt = 0; attempt < 20; attempt++) {
     const task = await workbench.readTask(taskId);
-    if (predicate(task)) return task;
+    if (await predicate(task)) return task;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  return workbench.readTask(taskId);
+  const latest = await workbench.readTask(taskId);
+  throw new Error(`Timed out waiting for workbench task ${taskId}. Latest status: ${latest?.status || 'missing'}`);
 }
 
 async function makeHarness() {
@@ -1269,6 +1279,126 @@ describe('TrackerDaemon', () => {
     });
   });
 
+  it('generates a run proof and review artifact when a workflow v2 runtime completes', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(path.join(repo, 'src'), { recursive: true });
+    const artifacts = new FileArtifactRegistry({ rootPath: root });
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+      artifacts,
+    });
+    await workbench.createTask({
+      id: 'task-proof',
+      shortIdentifier: 'TIK-PROOF',
+      title: 'Generate proof',
+      goal: 'Runtime completion should produce review evidence.',
+      status: 'todo',
+      labels: ['backend'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    }, 'task-proof');
+    const stdoutPath = path.join(root, '.tik', 'runs', 'tik-proof-attempt-0-1000', 'stdout.log');
+    const patchPath = path.join(root, '.tik', 'runs', 'tik-proof-attempt-0-1000', 'run-diff.patch');
+    await fs.mkdir(path.dirname(stdoutPath), { recursive: true });
+    await fs.writeFile(stdoutPath, 'implemented proof\n', 'utf-8');
+    await fs.writeFile(patchPath, 'diff --git a/src/proof.ts b/src/proof.ts\n', 'utf-8');
+    const runtimeRunner = new CompletingRuntimeRunner('codex');
+    runtimeRunner.transcriptRefs = [{ path: stdoutPath, contentType: 'text/plain' }];
+    runtimeRunner.diffSummary = {
+      changedFiles: ['src/proof.ts'],
+      insertions: 4,
+      deletions: 1,
+      patchPath,
+    };
+    const agentRunStore = new FileAgentRunStore(root);
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      agentRunStore,
+      runProofService: new RunProofService({
+        proofStore: new FileRunProofStore(root),
+        artifacts,
+        runCommand: async ({ command, cwd }) => ({
+          exitCode: 0,
+          stdout: `${command} passed in ${cwd}\n`,
+          stderr: '',
+          durationMs: 12,
+        }),
+      }),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { codex: runtimeRunner },
+      workflow: {
+        ...workflowV2({
+          root,
+          runner: 'codex',
+          mode: 'codex_app_server',
+          validationCommands: ['pnpm typecheck'],
+        }),
+        resolveRouting: () => ({
+          runner: 'codex',
+          mode: 'codex_app_server',
+          matchedSource: 'default',
+        }),
+      },
+    });
+
+    await daemon.tick();
+
+    const proofPath = path.join(root, '.tik', 'runs', 'tik-proof-attempt-0-1000', 'proof.json');
+    const updated = await waitForWorkbenchTask(workbench, 'task-proof', async (candidate) => (
+      candidate?.status === 'needs_review'
+      && Boolean(await fs.stat(proofPath).catch(() => null))
+    ));
+    const proof = JSON.parse(await fs.readFile(proofPath, 'utf-8'));
+    const reviewArtifacts = await artifacts.list({ taskId: 'task-proof', tag: 'run-review' });
+
+    expect(updated?.status).toBe('needs_review');
+    expect(proof).toMatchObject({
+      runId: 'tik-proof-attempt-0-1000',
+      status: 'ready_for_review',
+      diff: {
+        filesChanged: 1,
+        changedFiles: ['src/proof.ts'],
+      },
+      validationRefs: [
+        {
+          command: 'pnpm typecheck',
+          cwd: repo,
+          exitCode: 0,
+          stdoutArtifactId: expect.any(String),
+        },
+      ],
+      producedArtifactIds: [expect.any(String)],
+    });
+    expect(reviewArtifacts).toHaveLength(1);
+    expect(reviewArtifacts[0]).toMatchObject({
+      title: 'Run Review: TIK-PROOF attempt 1',
+      status: 'needs_review',
+      changedFiles: ['src/proof.ts'],
+      producedBy: {
+        provider: 'codex',
+        template: 'run-review',
+      },
+    });
+  });
+
   it('renders a Tik-generated fix prompt for Codex agent-loop phases', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
     tempDirs.push(root);
@@ -1375,6 +1505,74 @@ describe('TrackerDaemon', () => {
       && candidate.labels?.includes('needs-claude-review')
       && candidate.agentLoop?.kind === 'claude_review'
     ));
+  });
+
+  it('injects the previous review rejection reason into workflow retry prompts', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      id: 'task-retry-prompt',
+      shortIdentifier: 'TIK-RETRY',
+      title: 'Retry rejected run',
+      goal: 'Retry with review feedback.',
+      status: 'retry',
+      labels: ['backend'],
+      comments: [{
+        id: 'comment-rejected-run',
+        authorKind: 'human',
+        authorId: 'reviewer',
+        body: [
+          'Run review rejected.',
+          '',
+          'Artifact: Run Review: TIK-RETRY attempt 1',
+          'Reason: Add regression coverage before touching implementation.',
+        ].join('\n'),
+        createdAt: '2026-06-24T00:00:00.000Z',
+      }],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    }, 'task-retry-prompt');
+
+    const runtimeRunner = new CompletingRuntimeRunner('codex');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { codex: runtimeRunner },
+      workflow: workflowV2({
+        root,
+        runner: 'codex',
+        mode: 'codex_exec',
+        renderPrompt: (trackedTask) => `Implement ${trackedTask.shortIdentifier}.`,
+      }),
+    });
+
+    await daemon.tick();
+
+    const renderedPrompt = runtimeRunner.preparedInputs[0]?.renderedPrompt || '';
+    expect(renderedPrompt).toContain('Previous review rejection reason');
+    expect(renderedPrompt).toContain('Add regression coverage before touching implementation.');
+    await waitForWorkbenchTask(workbench, 'task-retry-prompt', (candidate) => candidate?.status === 'needs_review');
   });
 
   it('stops open workspace maintenance attempts instead of keeping them in the Codex lane', async () => {

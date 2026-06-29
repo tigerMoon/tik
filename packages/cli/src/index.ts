@@ -31,6 +31,7 @@ import {
   WorkflowSubtaskRuntime,
   FileTrackerDaemonStateStore,
   FileAgentRunStore,
+  FileRunProofStore,
   JsonTaskImporter,
   loadTrackerWorkflow,
   resolveTrackerWorkflowPath,
@@ -84,6 +85,11 @@ import {
 import { cleanupManagedTrackerWorkspace } from './tracker-workspace-cleanup.js';
 import { buildTaskImporterFromCli } from './tracker-importer.js';
 import { runTrackerHook } from './tracker-hooks.js';
+import {
+  explainWorkflowTask,
+  initWorkflowV2,
+  validateWorkflow,
+} from './workflow-command.js';
 import { MockLLMProvider } from './commands/mock-llm.js';
 import { ClaudeLLMProvider, hasClaudeCredentials } from './commands/claude-llm.js';
 import { OpenAILLMProvider, hasOpenAICredentials } from './commands/openai-llm.js';
@@ -1643,6 +1649,60 @@ program
     }
   });
 
+// ── tik runs ─────────────────────────────────────────────────
+
+program
+  .command('runs [subcommand] [runId]')
+  .description('Inspect agent run evidence and proof records')
+  .option('-p, --project <path>', 'Workspace/project root', process.cwd())
+  .option('--task <taskId>', 'List proofs for a workbench task')
+  .action(async (subcommand: string | undefined, runId: string | undefined, opts: { project: string; task?: string }) => {
+    const command = subcommand || 'proof';
+    const workspaceRoot = path.resolve(opts.project);
+    const proofStore = new FileRunProofStore(workspaceRoot);
+
+    try {
+      if (command === 'proof') {
+        if (opts.task) {
+          const proofs = await proofStore.listProofsByTask(opts.task);
+          if (!proofs.length) {
+            console.log(chalk.gray(`No run proofs found for task ${opts.task}.`));
+            return;
+          }
+          for (const proof of proofs) {
+            console.log(`${proof.runId}  attempt=${proof.attempt}  status=${proof.status}  risk=${proof.risk}  files=${proof.diff.filesChanged}`);
+          }
+          return;
+        }
+        if (!runId) {
+          console.log(chalk.red('\n  Missing run id. Use `tik runs proof <runId>` or `tik runs proof --task <taskId>`.\n'));
+          return;
+        }
+        const proof = await proofStore.readProof(runId).catch(() => null);
+        if (!proof) {
+          console.log(chalk.yellow(`No run proof found for ${runId}.`));
+          return;
+        }
+        console.log([
+          `Run: ${proof.runId}`,
+          `Task: ${proof.taskId}`,
+          `Attempt: ${proof.attempt}`,
+          `Status: ${proof.status}`,
+          `Risk: ${proof.risk}`,
+          `Summary: ${proof.summary}`,
+          `Files changed: ${proof.diff.filesChanged}`,
+          `Changed files: ${proof.diff.changedFiles.length ? proof.diff.changedFiles.join(', ') : 'none'}`,
+          `Artifacts: ${proof.producedArtifactIds.length ? proof.producedArtifactIds.join(', ') : 'none'}`,
+        ].join('\n'));
+        return;
+      }
+
+      console.log(chalk.red(`\n  Unknown runs subcommand: ${command}\n`));
+    } catch (error) {
+      console.log(chalk.red(`\n  Runs command failed: ${(error as Error).message}\n`));
+    }
+  });
+
 // ── tik update ───────────────────────────────────────────────
 
 program
@@ -1814,10 +1874,71 @@ async function loadTrackerWorkflowFromCli(
   return loadTrackerWorkflow(path.dirname(resolved), path.basename(resolved));
 }
 
+// ── tik workflow ─────────────────────────────────────────────
+
+program
+  .command('workflow [command] [taskId]')
+  .description('Initialize, validate, and explain tracker workflow v2 files')
+  .option('-p, --project <path>', 'Workspace/project root', process.cwd())
+  .option('--file <path>', 'Workflow file name/path relative to project root')
+  .option('--v2', 'Initialize a workflow v2 file')
+  .option('--force', 'Overwrite an existing workflow when initializing')
+  .action(async (
+    command: string | undefined,
+    taskId: string | undefined,
+    opts: { project: string; file?: string; v2?: boolean; force?: boolean },
+  ) => {
+    const workspaceRoot = path.resolve(opts.project);
+    const subcommand = command || 'validate';
+    try {
+      if (subcommand === 'init') {
+        if (!opts.v2) {
+          console.log(chalk.red('\n  Use `tik workflow init --v2` to initialize a workflow v2 file.\n'));
+          return;
+        }
+        const result = await initWorkflowV2({
+          workspaceRoot,
+          file: opts.file,
+          force: opts.force,
+        });
+        console.log(result.created
+          ? chalk.green(`Created workflow v2: ${result.path}`)
+          : chalk.yellow(`Workflow already exists: ${result.path}`));
+        return;
+      }
+
+      if (subcommand === 'validate') {
+        console.log(await validateWorkflow({
+          workspaceRoot,
+          file: opts.file,
+        }));
+        return;
+      }
+
+      if (subcommand === 'explain') {
+        if (!taskId) {
+          console.log(chalk.red('\n  Missing task id. Use `tik workflow explain <task-id>`.\n'));
+          return;
+        }
+        console.log(await explainWorkflowTask({
+          workspaceRoot,
+          file: opts.file,
+          taskId,
+        }));
+        return;
+      }
+
+      console.log(chalk.red(`\n  Unknown workflow command: ${subcommand}\n`));
+    } catch (error) {
+      console.log(chalk.red(`\n  Workflow command failed: ${(error as Error).message}\n`));
+    }
+  });
+
 program
   .command('serve')
   .description('Start the API server')
   .option('-p, --port <port>', 'Port', '3000')
+  .option('--host <host>', 'Host interface to bind', 'localhost')
   .option('--project <path>', 'Default project/workspace root', process.cwd())
   .option('--provider <provider>', serverProviderHelp, 'codex')
   .option('--model <model>', 'Override model name')
@@ -1828,7 +1949,7 @@ Examples:
   tik serve --provider claude
   tik serve --provider codex
 `)
-  .action(async (opts: { port: string; project: string; provider: ProviderOption; model?: string; mock?: boolean }) => {
+  .action(async (opts: { port: string; host: string; project: string; provider: ProviderOption; model?: string; mock?: boolean }) => {
     const provider = opts.mock ? 'mock' : opts.provider;
     const { kernel, llmName } = createKernel(opts.project, { provider, model: opts.model });
     const { createServer } = await import('@tik/kernel');
@@ -1837,9 +1958,9 @@ Examples:
     console.log(chalk.dim(`  LLM: ${llmName}`));
     console.log(chalk.dim(`  Workspace root: ${opts.project}`));
 
-    await createServer(kernel, { port: parseInt(opts.port), host: '0.0.0.0' }, { workspaceRoot: opts.project });
+    await createServer(kernel, { port: parseInt(opts.port), host: opts.host }, { workspaceRoot: opts.project });
 
-    console.log(chalk.green(`  API: http://localhost:${opts.port}`));
+    console.log(chalk.green(`  API: http://${opts.host}:${opts.port}`));
     console.log(chalk.dim('  Workbench UI expects the dashboard dev server on http://localhost:5173'));
     console.log(chalk.dim('  Press Ctrl+C to stop\n'));
   });

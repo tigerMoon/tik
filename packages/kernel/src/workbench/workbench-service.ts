@@ -71,19 +71,26 @@ type WorkbenchTaskTransitionActor = 'human' | 'agent' | 'daemon' | 'system';
 const TRANSITION_ALIASES: Partial<Record<WorkbenchTaskStatus, WorkbenchTaskStatus>> = {
   running: 'in_progress',
   waiting_for_user: 'in_review',
+  needs_review: 'in_review',
+  retry: 'todo',
+  accepted: 'completed',
 };
 
 const ALLOWED_TASK_TRANSITIONS: Record<WorkbenchTaskStatus, WorkbenchTaskStatus[]> = {
   new: ['todo', 'running', 'in_progress', 'cancelled', 'archived'],
   backlog: ['todo', 'cancelled', 'archived'],
   todo: ['in_progress', 'running', 'cancelled', 'blocked', 'archived'],
-  in_progress: ['failed', 'in_review', 'waiting_for_user', 'completed', 'blocked', 'cancelled'],
-  in_review: ['todo', 'in_progress', 'running', 'completed', 'cancelled', 'blocked'],
-  running: ['failed', 'waiting_for_user', 'in_review', 'completed', 'blocked', 'cancelled', 'paused'],
+  in_progress: ['failed', 'in_review', 'needs_review', 'waiting_for_user', 'completed', 'accepted', 'blocked', 'cancelled'],
+  in_review: ['todo', 'retry', 'in_progress', 'running', 'completed', 'accepted', 'rejected', 'cancelled', 'blocked'],
+  needs_review: ['todo', 'retry', 'in_progress', 'running', 'completed', 'accepted', 'rejected', 'cancelled', 'blocked'],
+  running: ['failed', 'waiting_for_user', 'in_review', 'needs_review', 'completed', 'accepted', 'blocked', 'cancelled', 'paused'],
   waiting_for_user: ['running', 'in_progress', 'cancelled', 'blocked'],
   blocked: ['todo', 'cancelled', 'archived'],
   verifying: ['completed', 'failed', 'cancelled'],
   completed: ['archived', 'todo'],
+  accepted: ['archived', 'todo'],
+  rejected: ['retry', 'todo', 'archived'],
+  retry: ['running', 'in_progress', 'todo', 'cancelled', 'archived'],
   failed: ['todo', 'in_progress', 'running', 'archived'],
   cancelled: ['archived', 'todo'],
   paused: ['running', 'in_progress', 'cancelled', 'archived'],
@@ -216,10 +223,10 @@ export class WorkbenchService {
       status: to,
       updatedAt,
       lastProgressAt: updatedAt,
-      waitingReason: to === 'in_review' || to === 'waiting_for_user'
+      waitingReason: to === 'in_review' || to === 'needs_review' || to === 'waiting_for_user'
         ? bundle.task.waitingReason
         : undefined,
-      waitingDecisionId: to === 'in_review' || to === 'waiting_for_user'
+      waitingDecisionId: to === 'in_review' || to === 'needs_review' || to === 'waiting_for_user'
         ? bundle.task.waitingDecisionId
         : undefined,
       latestSummary: reason
@@ -2610,9 +2617,24 @@ export class WorkbenchService {
     }
 
     const updatedAt = new Date().toISOString();
+    await this.addComment(artifact.taskId, {
+      authorKind: 'human',
+      authorId: artifact.rejectedBy,
+      body: [
+        'Run review rejected.',
+        '',
+        `Artifact: ${artifact.title}`,
+        `Reason: ${reason.trim()}`,
+      ].join('\n'),
+      createdAt: updatedAt,
+    });
+    const latestBundle = await this.store.readTaskBundle(artifact.taskId);
+    if (!latestBundle.task) {
+      return;
+    }
     await this.store.upsertTask({
-      ...bundle.task,
-      status: 'todo',
+      ...latestBundle.task,
+      status: 'retry',
       updatedAt,
       lastProgressAt: updatedAt,
       waitingReason: undefined,

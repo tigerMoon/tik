@@ -10,6 +10,7 @@ import {
   buildWorkbenchAgentLoopSummary,
   buildWorkbenchQueueSignal,
   buildWorkbenchTaskVisibleSummary,
+  buildWorkbenchTaskProgressColumns,
   filterWorkbenchTasksByLens,
 } from '../view-models/workbench';
 import {
@@ -119,6 +120,7 @@ export function WorkbenchTaskList({
   const packInputId = useId();
   const bindingInputId = useId();
   const lensTasks = useMemo(() => filterWorkbenchTasksByLens(tasks, selectedLens), [tasks, selectedLens]);
+  const taskColumns = useMemo(() => buildWorkbenchTaskProgressColumns(lensTasks), [lensTasks]);
   const selectedPack = packs.find((pack) => pack.id === selectedPackId) || null;
   const selectedPackLabelOptions = useMemo(
     () => buildWorkbenchLabelSelectOptions(selectedPack),
@@ -146,7 +148,7 @@ export function WorkbenchTaskList({
       <section className="queue-card">
       <div className="queue-card-header">
         <div>
-          <div className="queue-card-kicker">Tasks</div>
+          <div className="queue-card-kicker">Tasks by progress</div>
           <div className="queue-card-title">{lensTasks.length} task{lensTasks.length === 1 ? '' : 's'}</div>
         </div>
       </div>
@@ -173,14 +175,36 @@ export function WorkbenchTaskList({
             )}
           </div>
         ) : (
-          <div className="task-rail-list queue-task-list">
-            {lensTasks.map((task) => (
-              <TaskRailRow
-                key={task.id}
-                task={task}
-                active={task.id === activeTaskId}
-                onSelect={() => onSelectTask(task.id)}
-              />
+          <div className="task-board" aria-label="Tasks grouped by progress">
+            {taskColumns.map((column) => (
+              <section
+                key={column.id}
+                className={`task-board-column task-board-column-${column.id}`}
+                aria-labelledby={`task-board-column-${column.id}`}
+              >
+                <div className="task-board-column-header">
+                  <div className={`task-board-column-dot task-board-column-dot-${column.tone}`} />
+                  <h2 id={`task-board-column-${column.id}`} className="task-board-column-title">
+                    {column.label}
+                  </h2>
+                  <span className="task-board-column-count">{column.tasks.length}</span>
+                </div>
+
+                {column.tasks.length === 0 ? (
+                  <div className="task-board-column-empty">No tasks</div>
+                ) : (
+                  <div className="task-rail-list queue-task-list">
+                    {column.tasks.map((task) => (
+                      <TaskRailRow
+                        key={task.id}
+                        task={task}
+                        active={task.id === activeTaskId}
+                        onSelect={() => onSelectTask(task.id)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </section>
             ))}
           </div>
         )}

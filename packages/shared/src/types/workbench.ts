@@ -7,10 +7,14 @@ export type WorkbenchTaskStatus =
   | 'todo'
   | 'in_progress'
   | 'in_review'
+  | 'needs_review'
   | 'running'
   | 'waiting_for_user'
   | 'blocked'
   | 'verifying'
+  | 'accepted'
+  | 'rejected'
+  | 'retry'
   | 'completed'
   | 'failed'
   | 'cancelled'
@@ -205,12 +209,18 @@ export interface WorkbenchTaskEvidenceSummary {
 }
 
 export type ArtifactKind =
+  | 'run_review'
+  | 'transcript'
   | 'html'
   | 'markdown'
   | 'svg'
   | 'json'
   | 'text'
   | 'diff'
+  | 'validation_log'
+  | 'agent_output'
+  | 'user_deliverable'
+  | 'diagnostic'
   | 'report'
   | 'dashboard'
   | 'checklist'
@@ -380,7 +390,11 @@ export interface CreateWorkbenchTaskInput {
 export function isWorkbenchTerminalStatus(
   status: WorkbenchTaskStatus,
 ): boolean {
-  return status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'archived';
+  return status === 'completed'
+    || status === 'accepted'
+    || status === 'failed'
+    || status === 'cancelled'
+    || status === 'archived';
 }
 
 export function canRetryWorkbenchTask(
@@ -392,7 +406,10 @@ export function canRetryWorkbenchTask(
     || status === 'failed'
     || status === 'cancelled'
     || status === 'paused'
+    || status === 'retry'
+    || status === 'rejected'
     || status === 'completed'
+    || status === 'accepted'
     || status === 'archived';
 }
 
@@ -405,5 +422,7 @@ export function canArchiveWorkbenchTask(
     || status === 'failed'
     || status === 'cancelled'
     || status === 'paused'
+    || status === 'retry'
+    || status === 'rejected'
     || status === 'completed';
 }

@@ -5007,6 +5007,7 @@ body {
 .task-detail-brief,
 .task-detail-activity,
 .task-detail-acceptance,
+.task-run-proof-panel,
 .task-detail-setup {
   padding: 14px 16px;
   background: var(--wb-panel);
@@ -5048,6 +5049,42 @@ body {
   font-size: 11px;
   color: var(--wb-muted);
   margin-top: 2px;
+}
+
+.task-run-proof-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.task-run-proof-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--wb-muted);
+}
+
+.task-run-proof-summary strong {
+  font-size: 14px;
+  color: var(--wb-text);
+}
+
+.task-run-proof-links,
+.task-run-proof-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.task-run-proof-links a {
+  color: var(--wb-accent);
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.task-run-proof-links a:hover {
+  text-decoration: underline;
 }
 
 .task-detail-activity-stream {
@@ -5856,4 +5893,173 @@ body {
   color: var(--wb-muted);
   font-size: 11px;
   line-height: 1.45;
+}
+
+.inbox-content.is-list-view {
+  justify-content: stretch;
+}
+
+.inbox-content.is-list-view > .queue-card {
+  max-width: none;
+}
+
+.task-board {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(260px, 1fr));
+  gap: 12px;
+  min-width: max(100%, 1120px);
+  padding: 12px;
+}
+
+.task-board-column {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--wb-line);
+  border-radius: 8px;
+  background: #fbfbfa;
+}
+
+.task-board-column-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 42px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--wb-line);
+  background: #fbfbfa;
+}
+
+.task-board-column-dot {
+  width: 10px;
+  height: 10px;
+  border: 2px solid #9aa0a6;
+  border-radius: 999px;
+  background: #ffffff;
+}
+
+.task-board-column-dot-blue {
+  border-color: var(--wb-blue);
+}
+
+.task-board-column-dot-yellow {
+  border-color: var(--wb-yellow);
+}
+
+.task-board-column-dot-purple {
+  border-color: #8b5cf6;
+}
+
+.task-board-column-title {
+  margin: 0;
+  overflow: hidden;
+  color: #4b5563;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.task-board-column-count {
+  color: #8a8f98;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-board-column-empty {
+  margin: 10px;
+  padding: 14px;
+  border: 1px dashed #d8d8d2;
+  border-radius: 8px;
+  color: #8a8f98;
+  font-size: 12px;
+  text-align: center;
+}
+
+.task-board .queue-task-list {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+}
+
+.task-board .queue-task-card {
+  border: 1px solid var(--wb-line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.task-board .queue-task-card:hover {
+  border-color: #d8d8d2;
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(31, 35, 40, 0.08);
+}
+
+.task-board .queue-task-card.is-active {
+  background: #f4f4f1;
+  border-color: #c8c8c1;
+  box-shadow: inset 3px 0 0 #24292f;
+}
+
+.task-board .queue-task-body {
+  padding: 10px;
+}
+
+.task-board .queue-task-card {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.task-board .queue-task-side {
+  padding: 0 10px 10px 29px;
+}
+
+.task-board .queue-task-actions {
+  opacity: 1;
+}
+
+.task-board .queue-task-top,
+.task-board .queue-task-title-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 3px;
+}
+
+.task-board .queue-task-title {
+  display: -webkit-box;
+  overflow: hidden;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.task-board .queue-task-meta {
+  max-height: 54px;
+  overflow: hidden;
+}
+
+.task-board .queue-label-row {
+  max-height: 43px;
+  overflow: hidden;
+}
+
+.task-board .queue-task-summary {
+  -webkit-line-clamp: 3;
+}
+
+.task-board .queue-task-evidence {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+@media (max-width: 1100px) {
+  .task-board {
+    grid-template-columns: 1fr;
+    min-width: 0;
+  }
 }

@@ -5,10 +5,12 @@ import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createServer } from '../src/server.js';
 import { FileArtifactRegistry } from '../src/artifacts/artifact-registry.js';
+import { FileAgentRunStore } from '../src/agent-runners/agent-run-store.js';
+import { FileRunProofStore } from '../src/agent-runners/run-proof-store.js';
 import { EventBus } from '../src/event-bus.js';
 import { WorkbenchStore } from '../src/workbench/workbench-store.js';
 import { WorkbenchService } from '../src/workbench/workbench-service.js';
-import { EventType, type EnvironmentPackSnapshot } from '@tik/shared';
+import { EventType, type EnvironmentPackSnapshot, type RunProof } from '@tik/shared';
 import type {
   AgentRunHandle,
   AgentRunInput,
@@ -157,6 +159,124 @@ describe('workbench API routes', () => {
     expect(invalid.statusCode).toBe(401);
     expect(authenticated.statusCode).toBe(200);
     expect(authenticated.json().task.title).toBe('Auth check');
+  });
+
+  it('refuses non-localhost binds without an API token', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+
+    await expect(createServer(
+      mockKernel as any,
+      { port: 0, host: '0.0.0.0' },
+      { workspaceRoot: root },
+    )).rejects.toThrow('API token is required');
+  });
+
+  it('requires bearer auth for artifact previews when an API token is configured', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+      artifacts: new FileArtifactRegistry({ rootPath: root }),
+    });
+    await workbench.createTask({
+      title: 'Secure preview',
+      goal: 'Require token for preview',
+    }, 'task-preview-auth');
+    const artifact = await workbench.createArtifact({
+      taskId: 'task-preview-auth',
+      title: 'Preview me',
+      kind: 'markdown',
+      content: '# Preview',
+      contentType: 'text/markdown',
+      extension: 'md',
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root, apiToken: 'test-token' },
+    );
+    servers.push(server);
+
+    const unauthenticated = await server.inject({
+      method: 'GET',
+      url: `/api/workbench/artifacts/${artifact.id}/versions/${artifact.latestVersionId}/preview`,
+    });
+    const authenticated = await server.inject({
+      method: 'GET',
+      url: `/api/workbench/artifacts/${artifact.id}/versions/${artifact.latestVersionId}/preview`,
+      headers: { authorization: 'Bearer test-token' },
+    });
+
+    expect(unauthenticated.statusCode).toBe(401);
+    expect(authenticated.statusCode).toBe(200);
+    expect(authenticated.body).toContain('Preview');
+  });
+
+  it('defaults CORS to the dashboard origin instead of wildcard', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({ method: 'OPTIONS', url: '/api/health' });
+
+    expect(response.headers['access-control-allow-origin']).toBe('http://localhost:5173');
   });
 
   it('publishes a current worktree review round with workspace binding', async () => {
@@ -2486,6 +2606,117 @@ describe('workbench API routes', () => {
     expect(taskListResponse.json().tasks.find((item: { id: string }) => item.id === task.id)?.status).toBe('archived');
   });
 
+  it('serves run proofs and review decision routes for workbench tasks', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const eventBus = new EventBus();
+    const store = new WorkbenchStore(root);
+    const artifactRegistry = new FileArtifactRegistry({ rootPath: root });
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus,
+      store,
+      artifacts: artifactRegistry,
+    });
+    const runStore = new FileAgentRunStore(root);
+    const proofStore = new FileRunProofStore(root);
+
+    await workbench.createTask({
+      title: 'Review proof',
+      goal: 'Expose run proof review routes',
+      status: 'needs_review',
+    }, 'task-proof');
+    const reviewArtifact = await artifactRegistry.create({
+      taskId: 'task-proof',
+      title: 'Run Review: TIK-1 attempt 1',
+      kind: 'run_review',
+      content: '# Run Review',
+      contentType: 'text/markdown',
+      extension: 'md',
+      tags: ['run-review', 'run-1'],
+    });
+    await runStore.createRun({
+      id: 'run-1',
+      taskId: 'task-proof',
+      shortIdentifier: 'TIK-1',
+      attempt: 1,
+      runner: 'codex',
+      runnerMode: 'codex_exec',
+      workflowPath: path.join(root, '.tik', 'WORKFLOW.md'),
+      workflowConfigHash: 'config-hash',
+      workflowPromptHash: 'prompt-hash',
+      status: 'needs_review',
+      workspaceRoot: root,
+      projectPath: root,
+      transcriptRefs: [],
+      eventRefs: [],
+      artifactIds: [reviewArtifact.id],
+    });
+    const proof: RunProof = {
+      id: 'proof-1',
+      taskId: 'task-proof',
+      runId: 'run-1',
+      attempt: 1,
+      status: 'ready_for_review',
+      risk: 'low',
+      summary: 'Runner completed with review evidence.',
+      transcriptArtifactIds: [],
+      diff: { filesChanged: 1, changedFiles: ['README.md'] },
+      validationRefs: [],
+      producedArtifactIds: [reviewArtifact.id],
+      createdAt: '2026-06-24T00:00:00.000Z',
+      updatedAt: '2026-06-24T00:00:00.000Z',
+    };
+    await proofStore.saveProof(proof);
+
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null },
+      taskManager: { create: () => ({ id: 'legacy-task-1' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(mockKernel as any, { port: 0, host: '127.0.0.1' }, { workspaceRoot: root });
+    servers.push(server);
+
+    const runsResponse = await server.inject({
+      method: 'GET',
+      url: '/api/workbench/tasks/task-proof/runs',
+    });
+    const proofResponse = await server.inject({
+      method: 'GET',
+      url: '/api/workbench/tasks/task-proof/runs/run-1/proof',
+    });
+    const rejectResponse = await server.inject({
+      method: 'POST',
+      url: '/api/workbench/tasks/task-proof/review/reject',
+      payload: {
+        runId: 'run-1',
+        artifactId: reviewArtifact.id,
+        reason: 'Needs stronger validation',
+        reviewer: 'api-test',
+      },
+    });
+
+    expect(runsResponse.statusCode).toBe(200);
+    expect(runsResponse.json().runs).toHaveLength(1);
+    expect(proofResponse.statusCode).toBe(200);
+    expect(proofResponse.json().proof).toMatchObject({
+      id: 'proof-1',
+      runId: 'run-1',
+      status: 'ready_for_review',
+    });
+    expect(rejectResponse.statusCode).toBe(200);
+    expect(rejectResponse.json().artifact.status).toBe('rejected');
+    expect(rejectResponse.json().task.status).toBe('retry');
+  });
+
   it('archives stale running tasks when the workbench record exists but the kernel task is gone', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
@@ -2578,7 +2809,41 @@ describe('workbench API routes', () => {
     expect(response.json().task.latestSummary).toContain('rejected');
   });
 
-  it('serves previewable artifact files from the project root and blocks paths outside it', async () => {
+  it('disables legacy path-based artifact preview by default', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+    const previewPath = path.join(root, 'src', 'mock-app.html');
+    await fs.mkdir(path.dirname(previewPath), { recursive: true });
+    await fs.writeFile(previewPath, '<!doctype html><title>Preview</title><h1>Snake</h1>', 'utf-8');
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null },
+      taskManager: { create: () => ({ id: 'legacy-task-1' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(mockKernel as any, { port: 0, host: '127.0.0.1' }, { workspaceRoot: root });
+    servers.push(server);
+
+    const previewResponse = await server.inject({
+      method: 'GET',
+      url: `/api/workbench/artifacts/preview?path=${encodeURIComponent(previewPath)}`,
+    });
+
+    expect(previewResponse.statusCode).toBe(410);
+  });
+
+  it('serves legacy previewable artifact files only when explicitly enabled', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
 
@@ -2607,7 +2872,10 @@ describe('workbench API routes', () => {
       workbench,
     };
 
-    const server = await createServer(mockKernel as any, { port: 0, host: '127.0.0.1' }, { workspaceRoot: root });
+    const server = await createServer(mockKernel as any, { port: 0, host: '127.0.0.1' }, {
+      workspaceRoot: root,
+      enableLegacyPathArtifactPreview: true,
+    });
     servers.push(server);
 
     const previewResponse = await server.inject({

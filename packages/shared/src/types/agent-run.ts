@@ -14,6 +14,8 @@ export type AgentRunStatus =
   | 'completed_by_agent'
   | 'needs_review'
   | 'accepted'
+  | 'rejected'
+  | 'retry'
   | 'failed'
   | 'cancelled'
   | 'timed_out';
@@ -28,6 +30,7 @@ export interface DiffSummary {
   insertions?: number;
   deletions?: number;
   patchPath?: string;
+  statPath?: string;
 }
 
 export interface AgentRunRecord {
@@ -87,4 +90,54 @@ export interface RunEvent {
     | 'stdout'
     | 'stderr';
   payload: Record<string, unknown>;
+}
+
+export type RunProofStatus =
+  | 'ready_for_review'
+  | 'no_change'
+  | 'validation_failed'
+  | 'runner_failed'
+  | 'proof_incomplete';
+
+export type RunRiskLevel = 'low' | 'medium' | 'high' | 'unknown';
+
+export interface RunDiffSummary {
+  filesChanged: number;
+  insertions?: number;
+  deletions?: number;
+  changedFiles: string[];
+  patchArtifactId?: string;
+  statArtifactId?: string;
+}
+
+export interface RunValidationRef {
+  id: string;
+  command: string;
+  cwd: string;
+  exitCode: number | null;
+  durationMs?: number;
+  stdoutArtifactId?: string;
+  stderrArtifactId?: string;
+  summary?: string;
+}
+
+export interface RunProof {
+  id: string;
+  taskId: string;
+  runId: string;
+  attempt: number;
+  status: RunProofStatus;
+  risk: RunRiskLevel;
+  summary: string;
+  transcriptArtifactIds: string[];
+  diff: RunDiffSummary;
+  validationRefs: RunValidationRef[];
+  producedArtifactIds: string[];
+  failure?: {
+    kind: 'runner_error' | 'timeout' | 'validation_error' | 'collection_error' | 'unknown';
+    message: string;
+    retryable: boolean;
+  };
+  createdAt: string;
+  updatedAt: string;
 }

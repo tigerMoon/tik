@@ -27,7 +27,7 @@ export class WorkbenchTrackerLauncher implements TrackerDaemonWorkLauncher {
       task.timeline = existingTimeline;
     }
     const taskContextSnapshot = buildTaskContextSnapshot(existingTask, existingTimeline);
-    if (existingTask && (existingTask.status === 'todo' || existingTask.status === 'failed' || existingTask.status === 'backlog')) {
+    if (existingTask && (existingTask.status === 'todo' || existingTask.status === 'retry' || existingTask.status === 'failed' || existingTask.status === 'backlog')) {
       await this.workbench.transitionTask?.(task.id, 'in_progress', {
         actor: 'daemon',
         reason: `Dispatching tracker task ${task.shortIdentifier}.`,
@@ -266,8 +266,8 @@ export class WorkbenchTrackerLauncher implements TrackerDaemonWorkLauncher {
     if (advanced) {
       return;
     }
-    if (input.completion.status === 'completed' && latestTask.status !== 'in_review') {
-      await this.workbench.transitionTask?.(taskId, 'in_review', {
+    if (input.completion.status === 'completed' && latestTask.status !== 'in_review' && latestTask.status !== 'needs_review') {
+      await this.workbench.transitionTask?.(taskId, 'needs_review', {
         actor: 'daemon',
         reason: 'Runtime runner completed and is ready for review.',
       });

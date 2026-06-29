@@ -17,6 +17,7 @@ import type {
 import { emptyState } from './file-state-store.js';
 import type { AgentRuntimeRunner } from '../agent-runners/agent-runtime-runner.js';
 import type { AgentRunCompletion } from '../agent-runners/agent-runtime-runner.js';
+import type { RunProofService } from '../agent-runners/run-proof-service.js';
 import { buildTikGeneratedReviewContext } from './review-context.js';
 
 export interface TrackerDaemonOptions {
@@ -41,6 +42,7 @@ export interface TrackerDaemonOptions {
     beforeRemove?: string[];
   };
   runtimeRunners?: Partial<Record<AgentRuntimeName, AgentRuntimeRunner>>;
+  runProofService?: RunProofService;
 }
 
 const DEFAULT_RETRY: TrackerDaemonRetryConfig = {
@@ -443,7 +445,11 @@ export class TrackerDaemon {
     if (isCodexFixRouting(input.routing, task)) {
       return buildTikGeneratedCodexFixPrompt(task);
     }
-    const basePrompt = input.workflow.renderPrompt(task, { attempt: input.attempt });
+    const previousReview = previousReviewReason(task);
+    const basePrompt = withPreviousReviewContext(
+      input.workflow.renderPrompt(task, { attempt: input.attempt, previousReview }),
+      previousReview,
+    );
     if (!isClaudeReviewRouting(input.routing, task)) {
       return basePrompt;
     }
@@ -521,6 +527,8 @@ export class TrackerDaemon {
           runId: input.runId,
           attemptNumber,
           runner: input.routing.runner,
+          workflow: input.workflow,
+          projectPath: input.projectPath,
           completion: handle.completion,
         });
       }
@@ -543,6 +551,8 @@ export class TrackerDaemon {
       runId: string;
       attemptNumber: number;
       runner: AgentRuntimeName;
+      workflow: TrackerWorkflowDefinition;
+      projectPath: string;
       completion: Promise<AgentRunCompletion>;
     },
   ): void {
@@ -551,12 +561,16 @@ export class TrackerDaemon {
         runId: input.runId,
         attemptNumber: input.attemptNumber,
         runner: input.runner,
+        workflow: input.workflow,
+        projectPath: input.projectPath,
         completion,
       }),
       (err) => this.recordRuntimeCompletion(task, {
         runId: input.runId,
         attemptNumber: input.attemptNumber,
         runner: input.runner,
+        workflow: input.workflow,
+        projectPath: input.projectPath,
         completion: {
           status: 'failed',
           error: err instanceof Error ? err.message : String(err),
@@ -571,6 +585,8 @@ export class TrackerDaemon {
       runId: string;
       attemptNumber: number;
       runner: AgentRuntimeName;
+      workflow?: TrackerWorkflowDefinition;
+      projectPath?: string;
       completion: AgentRunCompletion;
     },
   ): Promise<void> {
@@ -582,6 +598,7 @@ export class TrackerDaemon {
     } else {
       await this.appendAgentRunFailure(task, input.runId, input.completion.error || 'Runtime runner failed.', false, endedAt);
     }
+    await this.createRunProof(task, input);
     await this.options.launcher.markRuntimeRunFinished?.(task.id, {
       runId: input.runId,
       attemptNumber: input.attemptNumber,
@@ -589,6 +606,41 @@ export class TrackerDaemon {
       completion: input.completion,
       endedAt,
     });
+  }
+
+  private async createRunProof(
+    task: TrackedTask,
+    input: {
+      runId: string;
+      runner: AgentRuntimeName;
+      workflow?: TrackerWorkflowDefinition;
+      projectPath?: string;
+      completion: AgentRunCompletion;
+    },
+  ): Promise<void> {
+    const proofService = this.options.runProofService;
+    const runner = this.options.runtimeRunners?.[input.runner];
+    const store = this.options.agentRunStore;
+    if (!proofService || !runner || !store?.readRun) return;
+    try {
+      const run = await store.readRun(input.runId);
+      await proofService.createProof({
+        task: {
+          id: task.id,
+          shortIdentifier: task.shortIdentifier,
+          title: task.title,
+          goal: task.description || task.title,
+        },
+        run,
+        runner,
+        completion: input.completion,
+        validationCommands: input.workflow?.config.validation?.commands,
+        validationCwd: input.projectPath || run.projectPath,
+        now: new Date(this.now()).toISOString(),
+      });
+    } catch {
+      // Proof collection is best-effort relative to daemon completion bookkeeping.
+    }
   }
 
   private async isRuntimeRunActive(runId: string): Promise<boolean> {
@@ -940,6 +992,32 @@ function isCodexFixRouting(
     || phase === 'needs_codex_fix'
     || phase === 'codex_fixing'
     || task.agentLoop?.kind === 'codex_fix';
+}
+
+function previousReviewReason(task: TrackedTask): string | undefined {
+  const comments = [...(task.comments || [])].sort((left, right) => (
+    right.createdAt.localeCompare(left.createdAt)
+  ));
+  for (const comment of comments) {
+    if (!/run review rejected/i.test(comment.body)) continue;
+    const reason = comment.body.match(/(?:^|\n)Reason:\s*([\s\S]+)/i)?.[1]?.trim();
+    if (reason) return reason;
+    const trimmed = comment.body.trim();
+    if (trimmed) return trimmed;
+  }
+  const summaryReason = task.latestSummary?.match(/changes requested[^:]*:\s*([\s\S]+)/i)?.[1]?.trim();
+  return summaryReason || undefined;
+}
+
+function withPreviousReviewContext(prompt: string, previousReview: string | undefined): string {
+  if (!previousReview) return prompt;
+  if (prompt.includes(previousReview)) return prompt;
+  return [
+    prompt.trimEnd(),
+    '',
+    'Previous review rejection reason:',
+    previousReview,
+  ].join('\n');
 }
 
 function buildTikGeneratedCodexFixPrompt(task: TrackedTask): string {

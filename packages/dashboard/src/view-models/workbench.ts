@@ -1,6 +1,7 @@
 import { extractModifiedFilesFromEvidenceBody, isWorkbenchTerminalStatus } from '@tik/shared';
 import type {
   AgentLoopMetadata,
+  WorkbenchArtifactRecord as SharedWorkbenchArtifactRecord,
   TaskWorkspaceBinding,
   WorkbenchTaskAdjustmentRecord,
   WorkbenchTaskCommentRecord,
@@ -88,6 +89,28 @@ export interface WorkbenchAcceptanceSummary {
   detail: string;
 }
 
+export interface RunProofArtifactLink {
+  artifactId: string;
+  versionId: string;
+  title: string;
+}
+
+export interface RunProofPanelModel {
+  reviewArtifactId: string;
+  title: string;
+  summary: string;
+  statusLabel: string;
+  canDecide: boolean;
+  changedFiles: string[];
+  validationRefs: string[];
+  links: {
+    review?: RunProofArtifactLink;
+    diff?: RunProofArtifactLink;
+    transcript?: RunProofArtifactLink;
+    validation?: RunProofArtifactLink;
+  };
+}
+
 export interface WorkbenchQueueSignal {
   tone: 'green' | 'blue' | 'yellow' | 'red' | 'neutral';
   label: string;
@@ -129,6 +152,15 @@ export interface GroupedWorkbenchTasks<T extends WorkbenchTaskSummary = Workbenc
 }
 
 export type WorkbenchLens = 'inbox' | 'today' | 'active' | 'review-loop' | 'all' | 'completed' | 'archived' | 'backlog';
+
+export type WorkbenchProgressColumnId = 'backlog' | 'todo' | 'in_progress' | 'in_review';
+
+export interface WorkbenchProgressColumn<T extends WorkbenchTaskSummary = WorkbenchTaskSummary> {
+  id: WorkbenchProgressColumnId;
+  label: string;
+  tone: 'neutral' | 'blue' | 'yellow' | 'purple';
+  tasks: T[];
+}
 
 export interface WorkbenchFocusSummary {
   lens: WorkbenchLens;
@@ -353,6 +385,51 @@ export function groupWorkbenchTasks<T extends WorkbenchTaskSummary>(tasks: T[]):
     completed: sorted.filter((task) => task.status === 'completed'),
     archived: sorted.filter((task) => task.status === 'archived'),
   };
+}
+
+export function resolveWorkbenchTaskProgressColumn(status: WorkbenchTaskStatus): WorkbenchProgressColumnId {
+  switch (status) {
+    case 'new':
+    case 'backlog':
+    case 'paused':
+    case 'retry':
+      return 'backlog';
+    case 'todo':
+    case 'blocked':
+    case 'failed':
+    case 'cancelled':
+    case 'rejected':
+      return 'todo';
+    case 'in_progress':
+    case 'running':
+    case 'verifying':
+      return 'in_progress';
+    case 'in_review':
+    case 'needs_review':
+    case 'waiting_for_user':
+    case 'accepted':
+    case 'completed':
+    case 'archived':
+      return 'in_review';
+  }
+}
+
+export function buildWorkbenchTaskProgressColumns<T extends WorkbenchTaskSummary>(
+  tasks: T[],
+): WorkbenchProgressColumn<T>[] {
+  const columns: WorkbenchProgressColumn<T>[] = [
+    { id: 'backlog', label: 'Backlog', tone: 'neutral', tasks: [] },
+    { id: 'todo', label: 'Todo', tone: 'blue', tasks: [] },
+    { id: 'in_progress', label: 'In progress', tone: 'yellow', tasks: [] },
+    { id: 'in_review', label: 'In review', tone: 'purple', tasks: [] },
+  ];
+  const byColumnId = new Map(columns.map((column) => [column.id, column]));
+
+  for (const task of sortWorkbenchTasks(tasks)) {
+    byColumnId.get(resolveWorkbenchTaskProgressColumn(task.status))?.tasks.push(task);
+  }
+
+  return columns;
 }
 
 export function applyTaskAdjustmentPreset(
@@ -882,6 +959,49 @@ export function buildWorkbenchAcceptanceSummary(
     headline: 'No acceptance evidence yet',
     detail: 'The workbench has not recorded artifacts or raw execution evidence for this task yet.',
   };
+}
+
+export function buildRunProofPanelModel(
+  taskStatus: WorkbenchTaskStatus,
+  artifacts: SharedWorkbenchArtifactRecord[],
+): RunProofPanelModel | null {
+  const sorted = [...artifacts].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const review = sorted.find((artifact) => artifact.kind === 'run_review' || artifact.tags?.includes('run-review'));
+  if (!review) return null;
+
+  const diff = sorted.find((artifact) => artifact.kind === 'diff');
+  const transcript = sorted.find((artifact) => artifact.kind === 'transcript');
+  const validation = sorted.find((artifact) => artifact.kind === 'validation_log');
+  const canDecide = taskStatus === 'needs_review' && review.status === 'needs_review';
+
+  return {
+    reviewArtifactId: review.id,
+    title: review.title,
+    summary: review.summary || 'Run proof evidence is ready for review.',
+    statusLabel: formatArtifactStatusLabel(review.status),
+    canDecide,
+    changedFiles: review.changedFiles || [],
+    validationRefs: review.validationRefs || [],
+    links: {
+      review: toRunProofArtifactLink(review),
+      diff: diff ? toRunProofArtifactLink(diff) : undefined,
+      transcript: transcript ? toRunProofArtifactLink(transcript) : undefined,
+      validation: validation ? toRunProofArtifactLink(validation) : undefined,
+    },
+  };
+}
+
+function toRunProofArtifactLink(artifact: SharedWorkbenchArtifactRecord): RunProofArtifactLink {
+  return {
+    artifactId: artifact.id,
+    versionId: artifact.latestVersionId,
+    title: artifact.title,
+  };
+}
+
+function formatArtifactStatusLabel(status: SharedWorkbenchArtifactRecord['status']): string {
+  const label = status.replace(/_/g, ' ');
+  return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
 export function buildWorkbenchQueueSignal(

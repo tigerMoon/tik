@@ -19,6 +19,7 @@ import { TaskDecisionBlock } from './TaskDecisionBlock';
 import { TaskBriefBlock } from './TaskBriefBlock';
 import { TaskActivityBlock } from './TaskActivityBlock';
 import { TaskAcceptanceBlock } from './TaskAcceptanceBlock';
+import { TaskRunProofPanel } from './TaskRunProofPanel';
 import { TaskExecutionSetupBlock } from './TaskExecutionSetupBlock';
 import { TaskCommentsBlock } from './TaskCommentsBlock';
 import { TaskArtifactRail } from './TaskArtifactRail';
@@ -186,6 +187,15 @@ export function TaskDetailPanel(props: TaskDetailPanelProps) {
         />
 
         <TaskActivityBlock task={task} timeline={timeline} />
+
+        <TaskRunProofPanel
+          task={task}
+          artifacts={artifacts}
+          busyArtifactId={busyArtifactId}
+          onAcceptArtifact={onAcceptArtifact}
+          onRejectArtifact={onRejectArtifact}
+          onOpenArtifact={onOpenArtifact}
+        />
 
         <TaskAcceptanceBlock task={task} timeline={timeline} decisions={decisions} artifacts={artifacts} />
 

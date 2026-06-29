@@ -192,7 +192,6 @@ export function App() {
   const waitingCount = filteredTasks.filter((task) => task.status === 'waiting_for_user' || task.status === 'failed' || task.status === 'blocked' || task.status === 'cancelled').length;
   const highRiskCount = filteredTasks.filter((task) => (task.waitingReason || '').toLowerCase().includes('high-risk')).length;
   const groupedTasks = groupWorkbenchTasks(filteredTasks);
-  const todayCount = filterWorkbenchTasksByLens(filteredTasks, 'today').length;
   const trackerSidebarCandidateCount = trackerState?.summary?.activeCandidates
     ?? tasks.filter(isTrackerDispatchCandidate).length;
   const trackerSidebarCount = trackerSidebarCandidateCount
@@ -930,12 +929,8 @@ export function App() {
           <div className="sidebar-section-label">Views</div>
           {[
             { label: 'Inbox', count: groupedTasks.attention.length, active: activeSurface === 'workbench' && selectedLens === 'inbox', onClick: () => { setActiveSurface('workbench'); setWorkbenchView('list'); setAutoFocusLane(false); setSelectedLens('inbox'); } },
-            { label: 'Today', count: todayCount, active: activeSurface === 'workbench' && selectedLens === 'today', onClick: () => { setActiveSurface('workbench'); setWorkbenchView('list'); setAutoFocusLane(false); setSelectedLens('today'); } },
-            { label: 'Active', count: groupedTasks.active.length, active: activeSurface === 'workbench' && selectedLens === 'active', onClick: () => { setActiveSurface('workbench'); setWorkbenchView('list'); setAutoFocusLane(false); setSelectedLens('active'); } },
             { label: 'Review loop', count: filterWorkbenchTasksByLens(filteredTasks, 'review-loop').length, active: activeSurface === 'workbench' && selectedLens === 'review-loop', onClick: () => { setActiveSurface('workbench'); setWorkbenchView('list'); setAutoFocusLane(false); setSelectedLens('review-loop'); } },
             { label: 'All tasks', count: visibleTaskCount, active: activeSurface === 'workbench' && selectedLens === 'all', onClick: () => { setActiveSurface('workbench'); setWorkbenchView('list'); setAutoFocusLane(false); setSelectedLens('all'); } },
-            { label: 'Completed', count: groupedTasks.completed.length, active: activeSurface === 'workbench' && selectedLens === 'completed', onClick: () => { setActiveSurface('workbench'); setWorkbenchView('list'); setAutoFocusLane(false); setSelectedLens('completed'); } },
-            { label: 'Backlog', count: groupedTasks.backlog.length, active: activeSurface === 'workbench' && selectedLens === 'backlog', onClick: () => { setActiveSurface('workbench'); setWorkbenchView('list'); setAutoFocusLane(false); setSelectedLens('backlog'); } },
             { label: 'Archive', count: archivedCount, active: activeSurface === 'workbench' && selectedLens === 'archived', onClick: () => { setActiveSurface('workbench'); setWorkbenchView('list'); setAutoFocusLane(false); setSelectedLens('archived'); } },
           ].map((item) => (
             <button

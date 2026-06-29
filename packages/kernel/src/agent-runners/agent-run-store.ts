@@ -126,7 +126,10 @@ function applyRunEvent(record: AgentRunRecord, event: RunEvent): AgentRunRecord 
     case 'artifact.discovered':
       return {
         ...next,
+        status: event.payload.status === 'needs_review' ? 'needs_review' : next.status,
         artifactIds: mergeStrings(next.artifactIds, event.payload.artifactIds || event.payload.artifactId),
+        transcriptRefs: mergeTranscriptRefs(next.transcriptRefs, event.payload.transcriptRefs),
+        diffSummary: normalizeDiffSummary(event.payload.diffSummary) || next.diffSummary,
       };
     default:
       return next;
@@ -149,6 +152,46 @@ function mergeStrings(current: string[], value: unknown): string[] {
     if (typeof item === 'string' && item) next.add(item);
   }
   return Array.from(next);
+}
+
+function mergeTranscriptRefs(current: AgentRunRecord['transcriptRefs'], value: unknown): AgentRunRecord['transcriptRefs'] {
+  if (!Array.isArray(value)) {
+    return current;
+  }
+  const byPath = new Map(current.map((ref) => [ref.path, ref]));
+  for (const item of value) {
+    if (item && typeof item === 'object' && typeof (item as { path?: unknown }).path === 'string') {
+      const ref = item as { path: string; contentType?: unknown };
+      byPath.set(ref.path, {
+        path: ref.path,
+        contentType: typeof ref.contentType === 'string' ? ref.contentType : undefined,
+      });
+    }
+  }
+  return Array.from(byPath.values());
+}
+
+function normalizeDiffSummary(value: unknown): AgentRunRecord['diffSummary'] | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+  const candidate = value as {
+    changedFiles?: unknown;
+    insertions?: unknown;
+    deletions?: unknown;
+    patchPath?: unknown;
+    statPath?: unknown;
+  };
+  if (!Array.isArray(candidate.changedFiles)) {
+    return undefined;
+  }
+  return {
+    changedFiles: candidate.changedFiles.filter((item): item is string => typeof item === 'string'),
+    insertions: typeof candidate.insertions === 'number' ? candidate.insertions : undefined,
+    deletions: typeof candidate.deletions === 'number' ? candidate.deletions : undefined,
+    patchPath: typeof candidate.patchPath === 'string' ? candidate.patchPath : undefined,
+    statPath: typeof candidate.statPath === 'string' ? candidate.statPath : undefined,
+  };
 }
 
 function normalizeFailureKind(value: unknown): NonNullable<AgentRunRecord['failure']>['kind'] {

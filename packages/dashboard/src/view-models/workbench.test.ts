@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   applyTaskAdjustmentPreset,
   allowedMetadataStatuses,
+  buildRunProofPanelModel,
   buildTaskStatusBannerSpec,
   buildWorkbenchAcceptanceSummary,
   buildWorkbenchEvidenceDigest,
@@ -12,6 +13,7 @@ import {
   buildWorkbenchQueueSignal,
   buildWorkbenchRuntimeControlActions,
   buildWorkbenchSteeringUpdateInput,
+  buildWorkbenchTaskProgressColumns,
   buildWorkbenchTaskVisibleSummary,
   buildTimelineFeedMetrics,
   buildWorkbenchOverview,
@@ -159,6 +161,26 @@ describe('workbench view models', () => {
     expect(grouped.active.map((task) => task.id)).toEqual(['urgent', 'review', 'progress', 'todo']);
     expect(grouped.attention.map((task) => task.id)).toEqual(['urgent', 'review']);
     expect(filterWorkbenchTasksByLens(tasks, 'backlog').map((task) => task.id)).toEqual(['backlog']);
+  });
+
+  it('groups visible tasks into progress board columns', () => {
+    const tasks: WorkbenchTaskSummary[] = [
+      { id: 'backlog', title: 'backlog', status: 'backlog', updatedAt: '2026-04-09T00:00:00.000Z' },
+      { id: 'recover', title: 'recover', status: 'failed', updatedAt: '2026-04-09T00:00:01.000Z' },
+      { id: 'running', title: 'running', status: 'running', updatedAt: '2026-04-09T00:00:02.000Z' },
+      { id: 'review', title: 'review', status: 'waiting_for_user', updatedAt: '2026-04-09T00:00:03.000Z' },
+      { id: 'done', title: 'done', status: 'completed', updatedAt: '2026-04-09T00:00:04.000Z' },
+    ];
+
+    expect(buildWorkbenchTaskProgressColumns(tasks).map((column) => ({
+      id: column.id,
+      taskIds: column.tasks.map((task) => task.id),
+    }))).toEqual([
+      { id: 'backlog', taskIds: ['backlog'] },
+      { id: 'todo', taskIds: ['recover'] },
+      { id: 'in_progress', taskIds: ['running'] },
+      { id: 'in_review', taskIds: ['done', 'review'] },
+    ]);
   });
 
   it('surfaces agent-loop tasks in review loop lane and search metadata', () => {
@@ -403,6 +425,104 @@ describe('workbench view models', () => {
       tone: 'yellow',
       headline: 'Operator review required',
       detail: 'The task is paused for a decision, but no previewable artifact is attached yet. Inspect the latest evidence before approving.',
+    });
+  });
+
+  it('builds a run proof decision panel model from review evidence artifacts', () => {
+    const model = buildRunProofPanelModel('needs_review', [
+      {
+        id: 'art-review',
+        taskId: 'task-1',
+        title: 'Run Review: TIK-1 attempt 1',
+        kind: 'run_review',
+        status: 'needs_review',
+        visibility: 'local',
+        latestVersionId: 'ver-review',
+        version: 1,
+        safeRelativePath: 'review.md',
+        contentType: 'text/markdown',
+        sizeBytes: 10,
+        contentHash: 'hash',
+        sourceEventIds: [],
+        sourceEvidenceIds: [],
+        changedFiles: ['src/app.ts'],
+        validationRefs: ['validation-1'],
+        producedBy: { provider: 'codex', template: 'run-review' },
+        summary: 'Ready for review',
+        createdAt: '2026-06-24T00:00:00.000Z',
+        updatedAt: '2026-06-24T00:00:00.000Z',
+      },
+      {
+        id: 'art-diff',
+        taskId: 'task-1',
+        title: 'Run Diff: TIK-1 attempt 1',
+        kind: 'diff',
+        status: 'needs_review',
+        visibility: 'local',
+        latestVersionId: 'ver-diff',
+        version: 1,
+        safeRelativePath: 'diff.patch',
+        contentType: 'text/x-diff',
+        sizeBytes: 10,
+        contentHash: 'hash',
+        sourceEventIds: [],
+        sourceEvidenceIds: [],
+        producedBy: {},
+        createdAt: '2026-06-24T00:00:01.000Z',
+        updatedAt: '2026-06-24T00:00:01.000Z',
+      },
+      {
+        id: 'art-transcript',
+        taskId: 'task-1',
+        title: 'Run Transcript: TIK-1 attempt 1',
+        kind: 'transcript',
+        status: 'needs_review',
+        visibility: 'local',
+        latestVersionId: 'ver-transcript',
+        version: 1,
+        safeRelativePath: 'transcript.txt',
+        contentType: 'text/plain',
+        sizeBytes: 10,
+        contentHash: 'hash',
+        sourceEventIds: [],
+        sourceEvidenceIds: [],
+        producedBy: {},
+        createdAt: '2026-06-24T00:00:02.000Z',
+        updatedAt: '2026-06-24T00:00:02.000Z',
+      },
+      {
+        id: 'art-validation',
+        taskId: 'task-1',
+        title: 'Run Validation STDOUT: TIK-1 attempt 1',
+        kind: 'validation_log',
+        status: 'needs_review',
+        visibility: 'local',
+        latestVersionId: 'ver-validation',
+        version: 1,
+        safeRelativePath: 'validation.txt',
+        contentType: 'text/plain',
+        sizeBytes: 10,
+        contentHash: 'hash',
+        sourceEventIds: [],
+        sourceEvidenceIds: [],
+        producedBy: {},
+        createdAt: '2026-06-24T00:00:03.000Z',
+        updatedAt: '2026-06-24T00:00:03.000Z',
+      },
+    ]);
+
+    expect(model).toMatchObject({
+      reviewArtifactId: 'art-review',
+      statusLabel: 'Needs review',
+      canDecide: true,
+      changedFiles: ['src/app.ts'],
+      validationRefs: ['validation-1'],
+      links: {
+        review: { artifactId: 'art-review', versionId: 'ver-review' },
+        diff: { artifactId: 'art-diff', versionId: 'ver-diff' },
+        transcript: { artifactId: 'art-transcript', versionId: 'ver-transcript' },
+        validation: { artifactId: 'art-validation', versionId: 'ver-validation' },
+      },
     });
   });
 

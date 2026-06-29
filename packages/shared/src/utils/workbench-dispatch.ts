@@ -83,5 +83,6 @@ function isWorkbenchDispatchCandidateStatus(status: WorkbenchTaskStatus): boolea
   return status === 'todo'
     || status === 'in_progress'
     || status === 'running'
+    || status === 'retry'
     || status === 'failed';
 }
