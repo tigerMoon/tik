@@ -116,6 +116,7 @@ export interface AgentLoopPayload {
   reviewFocus?: string[];
   blockingIssues?: BlockingIssue[];
   createdBy?: AgentLoopMetadata['createdBy'];
+  labels?: string[];
   workspaceBinding?: TaskWorkspaceBinding;
   environmentPackSnapshot?: EnvironmentPackSnapshot;
   environmentPackSelection?: EnvironmentPackSelection;

@@ -88,6 +88,35 @@ describe('workbench label routing', () => {
     expect(isWorkbenchTaskWorkflowDispatchable(task)).toBe(true);
   });
 
+  it('keeps externally-owned Claude review tasks out of workflow dispatch', () => {
+    const task: WorkbenchDispatchEnvironmentTask = {
+      status: 'todo',
+      labels: ['needs-claude-review', 'external-claude-review'],
+      agentLoop: {
+        kind: 'claude_review',
+        phase: 'needs_claude_review',
+        rootTaskId: 'TASK-123',
+        round: 1,
+        maxRounds: 3,
+        headSha: 'abc123',
+        idempotencyKey: 'external-review',
+        changeRequest: {
+          scm: 'internal',
+          repo: 'tik',
+          id: 'TASK-123:abc123',
+          type: 'internal_review',
+          baseRef: 'main',
+          headRef: 'feature',
+          headSha: 'abc123',
+        },
+      },
+      environmentPackSnapshot: engineeringSnapshot,
+    };
+
+    expect(isWorkbenchTaskCodexDispatchable(task)).toBe(false);
+    expect(isWorkbenchTaskWorkflowDispatchable(task)).toBe(false);
+  });
+
   it('allows environment-declared codex fix labels through the Codex dispatch lane', () => {
     const task: WorkbenchDispatchEnvironmentTask = {
       status: 'todo',

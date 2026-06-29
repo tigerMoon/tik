@@ -25,6 +25,7 @@ import {
   canRetryWorkbenchTask,
   createEnvironmentPackSelection,
   isWorkbenchTaskCodexDispatchable,
+  isWorkbenchTaskExternallyOwnedClaudeReview,
   isWorkbenchTaskMaintenance,
   isWorkbenchTerminalStatus,
   toEnvironmentPackSnapshot,
@@ -211,6 +212,7 @@ interface AgentLoopWorktreeReviewRoundBody extends WorkbenchTaskConfigurationBod
   acceptanceCriteria?: string[];
   reviewFocus?: string[];
   createdBy?: AgentLoopPayload['createdBy'];
+  labels?: string[];
 }
 type AgentLoopFixWorkItemBody = Omit<AgentLoopPayload, 'kind'>;
 type AgentLoopHumanReviewWorkItemBody = Omit<AgentLoopPayload, 'kind'>;
@@ -952,6 +954,7 @@ export async function createServer(
           acceptanceCriteria: req.body.acceptanceCriteria,
           reviewFocus: req.body.reviewFocus,
           createdBy: req.body.createdBy || 'human',
+          labels: req.body.labels,
         });
         return { task };
       } catch (error) {
@@ -2580,7 +2583,7 @@ function workbenchTaskToTrackedTaskForWorkflow(task: WorkbenchTaskRecord, defaul
     description: task.description ?? task.goal,
     priority: task.priority ?? null,
     state: task.status,
-    stateKind: isWorkflowV2CandidateStatus(task.status) ? 'active' : 'blocked',
+    stateKind: isWorkflowV2CandidateStatus(task.status) && !isWorkbenchTaskExternallyOwnedClaudeReview(task) ? 'active' : 'blocked',
     sourceUrl: task.sourceUrl,
     labels: task.labels || [],
     blockedBy: task.blockedBy || [],
@@ -2598,6 +2601,9 @@ function workbenchTaskToTrackedTaskForWorkflow(task: WorkbenchTaskRecord, defaul
     activeKernelTaskId: latestOpenAttempt?.kernelTaskId || null,
     activeAttemptStartedAt: latestOpenAttempt?.startedAt || null,
     sourceKind: 'workbench',
+    agentLoop: task.agentLoop,
+    comments: task.comments,
+    latestSummary: task.latestSummary,
   };
 }
 

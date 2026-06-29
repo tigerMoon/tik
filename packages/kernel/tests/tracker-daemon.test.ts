@@ -1014,6 +1014,79 @@ describe('TrackerDaemon', () => {
     ]);
   });
 
+  it('keeps externally-owned Claude review tasks out of workflow v2 dispatch', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      id: 'task-external-claude-review',
+      shortIdentifier: 'TIK-EXT-REVIEW',
+      title: 'Review workspace changes externally',
+      goal: 'Review the current worktree in a separately managed Claude Code session.',
+      status: 'todo',
+      labels: ['needs-claude-review', 'external-claude-review'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+      agentLoop: {
+        kind: 'claude_review',
+        phase: 'needs_claude_review',
+        rootTaskId: 'task-root',
+        round: 1,
+        maxRounds: 3,
+        headSha: 'abc123',
+        idempotencyKey: 'external-review',
+        changeRequest: {
+          scm: 'internal',
+          repo: 'repo',
+          id: 'task-root:abc123',
+          type: 'internal_review',
+          baseRef: 'HEAD~1',
+          headRef: 'feature',
+          headSha: 'abc123',
+        },
+      },
+    }, 'task-external-claude-review');
+
+    const legacyImporter = new WorkbenchTaskImporter(workbench);
+    const workflowImporter = new WorkflowV2WorkbenchTaskImporter(workbench, root);
+
+    await expect(legacyImporter.listCandidateTasks()).resolves.toEqual([]);
+    await expect(workflowImporter.listCandidateTasks()).resolves.toEqual([]);
+    await expect(workflowImporter.fetchTaskStatesByIds?.(['task-external-claude-review'])).resolves.toEqual([
+      expect.objectContaining({
+        id: 'task-external-claude-review',
+        stateKind: 'blocked',
+      }),
+    ]);
+
+    await workbench.completeAgentLoopReview('task-external-claude-review', {
+      verdict: 'request_changes',
+      headShaReviewed: 'abc123',
+      blockingIssues: [{
+        title: 'Missing regression test',
+        file: 'packages/kernel/tests/tracker-daemon.test.ts',
+        reason: 'The external review loop should remain owned by the invoking Codex skill.',
+      }],
+      markdown: 'Blocking issue found.',
+    });
+
+    await expect(workflowImporter.listCandidateTasks()).resolves.toEqual([]);
+    await expect(workflowImporter.fetchTaskStatesByIds?.(['task-external-claude-review'])).resolves.toEqual([
+      expect.objectContaining({
+        id: 'task-external-claude-review',
+        labels: ['agent-loop', 'codex-fix', 'external-claude-review', 'needs-codex-fix'],
+        stateKind: 'blocked',
+        agentLoop: expect.objectContaining({
+          kind: 'codex_fix',
+          phase: 'needs_codex_fix',
+        }),
+      }),
+    ]);
+  });
+
   it('injects a Tik-generated diff summary into Claude review prompts', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
     tempDirs.push(root);

@@ -20,9 +20,17 @@ const WORKFLOW_DISPATCH_LABEL_ACTIONS = new Set<WorkbenchLabelAction>([
   'codex_fix',
   'claude_code_review',
 ]);
+const EXTERNAL_CLAUDE_REVIEW_LABEL = 'external-claude-review';
 
 export type WorkbenchDispatchTask = Pick<WorkbenchTaskRecord, 'agentLoop' | 'labels' | 'status'>;
 export type WorkbenchDispatchEnvironmentTask = Pick<WorkbenchTaskRecord, 'agentLoop' | 'environmentPackSnapshot' | 'labels' | 'status'>;
+
+export function isWorkbenchTaskExternallyOwnedClaudeReview(
+  task: Pick<WorkbenchTaskRecord, 'agentLoop' | 'labels'>,
+): boolean {
+  const labels = new Set((task.labels || []).map((label) => label.trim().toLowerCase()));
+  return labels.has(EXTERNAL_CLAUDE_REVIEW_LABEL) && Boolean(task.agentLoop);
+}
 
 export function isWorkbenchTaskMaintenance(
   task: Pick<WorkbenchTaskRecord, 'agentLoop' | 'environmentPackSnapshot' | 'labels'>,
@@ -64,6 +72,10 @@ export function isWorkbenchTaskCodexDispatchable(task: WorkbenchDispatchEnvironm
 
 export function isWorkbenchTaskWorkflowDispatchable(task: WorkbenchDispatchEnvironmentTask): boolean {
   if (!isWorkbenchDispatchCandidateStatus(task.status)) {
+    return false;
+  }
+
+  if (isWorkbenchTaskExternallyOwnedClaudeReview(task)) {
     return false;
   }
 

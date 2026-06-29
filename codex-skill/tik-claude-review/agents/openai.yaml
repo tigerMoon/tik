@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tik Claude Review"
+  short_description: "Create and await Tik Claude reviews"
+  default_prompt: "Use $tik-claude-review to request a Claude Code review for the current Tik worktree."

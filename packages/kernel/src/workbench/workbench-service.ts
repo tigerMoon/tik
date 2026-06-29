@@ -533,7 +533,10 @@ export class WorkbenchService {
       const updatedTask: WorkbenchTaskRecord = {
         ...rootTask,
         status: phase === 'needs_human_review' ? 'in_review' : 'todo',
-        labels: this.applyAgentLoopLabels(rootTask.labels, phase),
+        labels: this.applyAgentLoopLabels([
+          ...(rootTask.labels || []),
+          ...(effectiveInput.labels || []),
+        ], phase),
         updatedAt,
         lastProgressAt: updatedAt,
         latestSummary: this.summaryForAgentLoopPhase(phase, metadata),
@@ -568,7 +571,7 @@ export class WorkbenchService {
       description: this.buildAgentLoopDescription(metadata),
       goal: this.buildAgentLoopGoal(metadata),
       status: metadata.kind === 'human_review' ? 'in_review' : 'todo',
-      labels: this.labelsForAgentLoopPhase(this.phaseForAgentLoopKind(metadata.kind)),
+      labels: this.applyAgentLoopLabels(effectiveInput.labels, this.phaseForAgentLoopKind(metadata.kind)),
       parentTaskId: undefined,
       createdBy: metadata.createdBy || 'system',
       workspaceBinding: input.workspaceBinding,

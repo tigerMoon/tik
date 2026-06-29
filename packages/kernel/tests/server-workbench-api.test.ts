@@ -353,6 +353,108 @@ describe('workbench API routes', () => {
     });
   });
 
+  it('publishes externally-owned worktree review rounds outside tracker dispatch', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+    spawnSync('git', ['init'], { cwd: root });
+    spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: root });
+    spawnSync('git', ['config', 'user.name', 'Tik Test'], { cwd: root });
+    await fs.writeFile(path.join(root, 'README.md'), '# Tik\n', 'utf-8');
+    spawnSync('git', ['add', 'README.md'], { cwd: root });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: root });
+    await fs.mkdir(path.join(root, '.tik'), { recursive: true });
+    await fs.writeFile(path.join(root, '.tik', 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  rules:',
+      '    - labels_any: [needs-claude-review]',
+      '      runner: claude-code',
+      '      mode: claude_print',
+      '---',
+      'Review {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+    const headSha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf-8' }).stdout.trim();
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: {
+        getActivePack: async () => ({
+          kind: 'EnvironmentPack',
+          id: 'review-loop',
+          name: 'Review Loop',
+          version: '1.0.0',
+          description: 'Agent review loop pack',
+          tools: [],
+          skills: [],
+          knowledge: [],
+          policies: [],
+          workflowBindings: [],
+          taskLabels: [
+            {
+              value: 'needs-claude-review',
+              label: 'Claude review',
+              action: 'claude_code_review',
+              description: 'Ask Claude Code to review the task.',
+              aliases: ['claude-review'],
+            },
+          ],
+          evaluators: [],
+        }),
+        listPacks: async () => [],
+      },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const createResponse = await server.inject({
+      method: 'POST',
+      url: '/api/v1/agent-loop/worktree-review-rounds',
+      payload: {
+        rootTaskId: 'local-review',
+        labels: ['external-claude-review'],
+      },
+    });
+
+    expect(createResponse.statusCode).toBe(200);
+    const task = createResponse.json().task;
+    expect(task).toMatchObject({
+      status: 'todo',
+      labels: ['agent-loop', 'claude-review', 'external-claude-review', 'needs-claude-review'],
+      agentLoop: {
+        kind: 'claude_review',
+        headSha,
+      },
+    });
+
+    const preview = await server.inject({
+      method: 'GET',
+      url: `/api/v1/tasks/${task.id}/routing-preview`,
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json()).toMatchObject({
+      runnable: false,
+      reason: 'blocked',
+    });
+  });
+
   it('binds the active environment pack to worktree review rounds so tracker can route them', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
@@ -453,7 +555,7 @@ describe('workbench API routes', () => {
       routing: {
         runner: 'claude-code',
         mode: 'claude_print',
-        matchedLabels: ['needs-claude-review'],
+        matchedLabels: ['needs_claude_review'],
       },
     });
   });

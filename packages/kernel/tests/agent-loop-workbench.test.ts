@@ -146,6 +146,43 @@ describe('WorkbenchService agent loop work items', () => {
     expect(completed.task.workspaceBinding).toEqual(workspaceBinding);
   });
 
+  it('preserves caller labels across external review and fix phases', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-external-owner',
+      labels: ['external-claude-review'],
+    });
+
+    expect(reviewTask.labels).toEqual([
+      'agent-loop',
+      'claude-review',
+      'external-claude-review',
+      'needs-claude-review',
+    ]);
+
+    const completed = await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'request_changes',
+      headShaReviewed: 'abc123',
+      blockingIssues: [{
+        title: 'Missing regression coverage',
+        file: 'packages/kernel/src/workbench/workbench-service.ts',
+        reason: 'The caller-owned loop must not lose its owner label.',
+      }],
+      markdown: 'External review loop should stay externally owned.',
+    });
+
+    expect(completed.task.labels).toEqual([
+      'agent-loop',
+      'codex-fix',
+      'external-claude-review',
+      'needs-codex-fix',
+    ]);
+  });
+
   it('marks stale review tasks blocked and records expected and actual head shas', async () => {
     const { service } = await makeService();
     const reviewTask = await service.createReviewRound({

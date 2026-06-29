@@ -89,6 +89,7 @@ export {
 } from './workbench-labels.js';
 export {
   isWorkbenchTaskCodexDispatchable,
+  isWorkbenchTaskExternallyOwnedClaudeReview,
   isWorkbenchTaskWorkflowDispatchable,
   isWorkbenchTaskMaintenance,
 } from './workbench-dispatch.js';
