@@ -75,6 +75,13 @@ export async function buildTikGeneratedReviewContext(
   ].join('\n');
 }
 
+export function hasTikReviewableChanges(projectPath: string): boolean {
+  if (!isGitWorkTree(projectPath)) {
+    return true;
+  }
+  return Boolean(gitOutput(projectPath, ['status', '--short']).trim());
+}
+
 function isGitWorkTree(projectPath: string): boolean {
   return gitOutput(projectPath, ['rev-parse', '--is-inside-work-tree']) === 'true';
 }

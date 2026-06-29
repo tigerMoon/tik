@@ -7,6 +7,7 @@ import {
   enoughEvidenceToConclude,
   getToolCallSignature,
   hasMeaningfulPendingWork,
+  hasSuccessfulValidationAction,
   isVerificationProbeBatch,
   isRedundantReadBatch,
   normalizeToolCall,
@@ -179,6 +180,46 @@ describe('tool-call policy', () => {
     ).toBe(false);
   });
 
+  it('distinguishes successful validation commands from verification probes', () => {
+    expect(hasSuccessfulValidationAction([
+      {
+        tool: 'bash',
+        input: { command: 'corepack pnpm --filter @tik/kernel test -- tool-call-policy.test.ts' },
+        output: 'passed',
+        success: true,
+      },
+    ])).toBe(true);
+
+    expect(hasSuccessfulValidationAction([
+      {
+        tool: 'frontend_run_script',
+        input: { script: 'build' },
+        output: 'built',
+        success: true,
+      },
+    ])).toBe(true);
+
+    expect(hasSuccessfulValidationAction([
+      {
+        tool: 'bash',
+        input: { command: 'rg "test" packages/kernel/src' },
+        output: 'matches',
+        success: true,
+      },
+    ])).toBe(false);
+  });
+
+  it('does not count failed validation commands as successful validation', () => {
+    expect(hasSuccessfulValidationAction([
+      {
+        tool: 'bash',
+        input: { command: 'pnpm test -- CatalogQueryServiceImpl.test.ts' },
+        output: '1 failed',
+        success: false,
+      },
+    ])).toBe(false);
+  });
+
   it('detects enough evidence to conclude when memory, assistant, and probes line up', () => {
     const summary = [
       'Conversation summary:',
@@ -244,6 +285,87 @@ describe('tool-call policy', () => {
         },
       ],
     )).toBe(false);
+  });
+
+  it('does not mark implementation tasks completed after writing code without verification', () => {
+    expect(shouldMarkTaskCompleted(
+      '实现票务查询接口缓存',
+      {
+        goal: 'add cache',
+        keyFiles: ['/repo/AccountCacheManager.java', '/repo/CatalogQueryServiceImpl.java'],
+        pendingWork: ['Verify the implemented change and summarize the affected flow'],
+        currentWork: 'Summarize the implemented changes and note any follow-up verification',
+        implementationReady: true,
+        currentFocus: 'implementation',
+      },
+      '我已经修改了查询服务以接入缓存。',
+      [
+        {
+          tool: 'edit_file',
+          input: { path: '/repo/CatalogQueryServiceImpl.java' },
+          output: 'patched',
+          success: true,
+        },
+      ],
+    )).toBe(false);
+  });
+
+  it('does not mark implementation tasks completed when validation fails after code changes', () => {
+    expect(shouldMarkTaskCompleted(
+      '实现票务查询接口缓存',
+      {
+        goal: 'add cache',
+        keyFiles: ['/repo/AccountCacheManager.java', '/repo/CatalogQueryServiceImpl.java'],
+        pendingWork: ['Fix failing validation before completion'],
+        currentWork: 'Fix failing validation before completion',
+        implementationReady: true,
+        currentFocus: 'implementation',
+      },
+      '我已经修改了查询服务并运行了测试，但测试失败。',
+      [
+        {
+          tool: 'edit_file',
+          input: { path: '/repo/CatalogQueryServiceImpl.java' },
+          output: 'patched',
+          success: true,
+        },
+        {
+          tool: 'bash',
+          input: { command: 'pnpm test -- CatalogQueryServiceImpl.test.ts' },
+          output: '1 failed',
+          success: false,
+        },
+      ],
+    )).toBe(false);
+  });
+
+  it('marks implementation tasks completed after code changes and successful validation', () => {
+    expect(shouldMarkTaskCompleted(
+      '实现票务查询接口缓存',
+      {
+        goal: 'add cache',
+        keyFiles: ['/repo/AccountCacheManager.java', '/repo/CatalogQueryServiceImpl.java'],
+        pendingWork: ['Verify the implemented change and summarize the affected flow'],
+        currentWork: 'Summarize the implemented changes and note any follow-up verification',
+        implementationReady: true,
+        currentFocus: 'implementation',
+      },
+      '我已经修改了查询服务并运行 pnpm test，验证通过。',
+      [
+        {
+          tool: 'edit_file',
+          input: { path: '/repo/CatalogQueryServiceImpl.java' },
+          output: 'patched',
+          success: true,
+        },
+        {
+          tool: 'bash',
+          input: { command: 'pnpm test -- CatalogQueryServiceImpl.test.ts' },
+          output: 'passed',
+          success: true,
+        },
+      ],
+    )).toBe(true);
   });
 
   it('allows implementation tasks to complete when assistant explicitly concludes no code change is needed', () => {

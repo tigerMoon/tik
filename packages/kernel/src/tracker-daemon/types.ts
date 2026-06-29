@@ -254,7 +254,7 @@ export interface TrackerWorkflowHooksConfig {
 export interface TrackerWorkflowRoutingResolution {
   runner: AgentRuntimeName;
   mode: AgentRuntimeMode;
-  matchedSource: 'explicit-label' | `rule[${number}]` | 'default';
+  matchedSource: 'phase' | 'explicit-label' | `rule[${number}]` | 'default';
   matchedLabels?: string[];
 }
 

@@ -698,6 +698,50 @@ export async function createServer(
     },
   );
 
+  fastify.post<{ Params: { id: string }; Body: Pick<ControlCommand, 'type'> & { reason?: string } }>(
+    '/api/workbench/tasks/:id/control',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        reply.code(500);
+        return { error: 'Workbench service is unavailable' };
+      }
+
+      const nextStatusByCommand: Partial<Record<ControlCommand['type'], WorkbenchTaskStatus>> = {
+        pause: 'paused',
+        resume: 'running',
+        stop: 'cancelled',
+      };
+      const nextStatus = nextStatusByCommand[req.body?.type];
+      if (!nextStatus) {
+        reply.code(400);
+        return { error: `Unsupported workbench control command: ${req.body?.type || 'unknown'}` };
+      }
+
+      try {
+        const existingTask = await workbench.readTask(req.params.id);
+        if (!existingTask) {
+          reply.code(404);
+          return { error: 'Workbench task not found' };
+        }
+        if (req.body?.type === 'resume' && existingTask.status === 'in_review') {
+          throw new WorkbenchTaskError(
+            'human_review_resume_not_allowed',
+            'Cannot resume a task that is in human review. Open the review artifact and accept or request changes instead.',
+          );
+        }
+        const task = await workbench.transitionTask(req.params.id, nextStatus, {
+          reason: req.body?.reason,
+          actor: 'human',
+        });
+        return { task };
+      } catch (error) {
+        reply.code(error instanceof WorkbenchTaskError ? 409 : 400);
+        return { error: (error as Error).message };
+      }
+    },
+  );
+
   fastify.post<{ Params: { id: string }; Body: { body: string; authorKind?: 'human' | 'agent' | 'system'; authorId?: string } }>(
     '/api/v1/tasks/:id/comments',
     async (req, reply) => {
@@ -991,15 +1035,17 @@ export async function createServer(
       const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
       const state = await FileTrackerDaemonStateStore.forWorkspace(workspaceRoot).load();
       const tasks = await (kernel as Partial<ExecutionKernel>).workbench?.listTasks?.();
-      return {
+      const listeners = buildTrackerListeners({
+        workspaceRoot,
+        apiPort: config.port,
         watching: state.watching ?? false,
+      });
+      const trackerWatchVisible = listeners.find((listener) => listener.id === 'tracker-watch')?.status === 'running';
+      return {
+        watching: Boolean((state.watching ?? false) && trackerWatchVisible),
         retries: state.retries,
         summary: buildTrackerStateSummary(tasks || []),
-        listeners: buildTrackerListeners({
-          workspaceRoot,
-          apiPort: config.port,
-          watching: state.watching ?? false,
-        }),
+        listeners,
         recent: state.recent || [],
       };
     } catch (error) {
@@ -2159,6 +2205,7 @@ function buildTrackerListeners(input: {
       expected: input.watching,
       processLine: trackerProcess,
       session: tmuxSessions.find((session) => session.includes('tik-tracker-watch')),
+      requireProcessForRunning: true,
       fallbackDetail: input.watching
         ? 'Watch mode is marked active, but the local process was not visible.'
         : 'Watch mode is not marked active.',
@@ -2192,9 +2239,10 @@ function buildListenerStatus(input: {
   processLine?: string | null;
   port?: number;
   session?: string;
+  requireProcessForRunning?: boolean;
 }): TrackerListenerStatus {
   const pid = input.processLine ? parseProcessPid(input.processLine) : undefined;
-  const isRunning = Boolean(pid || input.session);
+  const isRunning = input.requireProcessForRunning ? Boolean(pid) : Boolean(pid || input.session);
   const sessionName = input.session?.split(':')[0];
   const detailParts = [
     pid ? `pid ${pid}` : null,
@@ -2230,7 +2278,12 @@ function readTmuxSessions(): string[] {
 }
 
 function findProcessLine(lines: string[], requiredParts: string[]): string | null {
-  return lines.find((line) => requiredParts.every((part) => line.includes(part))) || null;
+  const matches = lines.filter((line) => requiredParts.every((part) => line.includes(part)));
+  return matches.find((line) => /^\d+\s+node\s+dist\/index\.js\b/.test(line))
+    || matches.find((line) => /^\d+\s+node\b/.test(line) && line.includes('dist/index.js'))
+    || matches.find((line) => /^\d+\s+node\b/.test(line))
+    || matches[0]
+    || null;
 }
 
 function findProcessByPort(port: number): string | null {

@@ -387,7 +387,7 @@ export function groupWorkbenchTasks<T extends WorkbenchTaskSummary>(tasks: T[]):
   };
 }
 
-export function resolveWorkbenchTaskProgressColumn(status: WorkbenchTaskStatus): WorkbenchProgressColumnId {
+export function resolveWorkbenchTaskProgressColumn(status: WorkbenchTaskStatus): WorkbenchProgressColumnId | null {
   switch (status) {
     case 'new':
     case 'backlog':
@@ -397,7 +397,6 @@ export function resolveWorkbenchTaskProgressColumn(status: WorkbenchTaskStatus):
     case 'todo':
     case 'blocked':
     case 'failed':
-    case 'cancelled':
     case 'rejected':
       return 'todo';
     case 'in_progress':
@@ -411,6 +410,8 @@ export function resolveWorkbenchTaskProgressColumn(status: WorkbenchTaskStatus):
     case 'completed':
     case 'archived':
       return 'in_review';
+    case 'cancelled':
+      return null;
   }
 }
 
@@ -426,7 +427,10 @@ export function buildWorkbenchTaskProgressColumns<T extends WorkbenchTaskSummary
   const byColumnId = new Map(columns.map((column) => [column.id, column]));
 
   for (const task of sortWorkbenchTasks(tasks)) {
-    byColumnId.get(resolveWorkbenchTaskProgressColumn(task.status))?.tasks.push(task);
+    const columnId = resolveWorkbenchTaskProgressColumn(task.status);
+    if (columnId) {
+      byColumnId.get(columnId)?.tasks.push(task);
+    }
   }
 
   return columns;
@@ -597,7 +601,7 @@ export function filterWorkbenchTasksByLens<T extends WorkbenchTaskSummary>(
     case 'active':
       return grouped.active;
     case 'review-loop':
-      return sortWorkbenchTasks(tasks.filter((task) => task.status !== 'archived' && Boolean(task.agentLoop)));
+      return sortWorkbenchTasks(tasks.filter((task) => !isWorkbenchTerminalStatus(task.status) && Boolean(task.agentLoop)));
     case 'completed':
       return grouped.completed;
     case 'archived':
@@ -891,6 +895,54 @@ export function buildWorkbenchEvidenceDigest<T extends Pick<WorkbenchTimelineNod
   };
 }
 
+export function buildWorkbenchAcceptanceDigest<T extends Pick<WorkbenchTimelineNode, 'body' | 'createdAt'>>(
+  items: T[],
+  artifacts: SharedWorkbenchArtifactRecord[] = [],
+): WorkbenchEvidenceDigest {
+  const rawDigest = buildWorkbenchEvidenceDigest(items);
+  if (artifacts.length === 0) {
+    return rawDigest;
+  }
+
+  const previewableArtifacts = [...rawDigest.previewableArtifacts];
+  const previewableArtifactPaths = new Set(previewableArtifacts.map((artifact) => artifact.path));
+  const modifiedFiles = [...rawDigest.modifiedFiles];
+  const toolNames = [...rawDigest.toolNames];
+
+  for (const artifact of artifacts) {
+    if (!previewableArtifactPaths.has(artifact.safeRelativePath)) {
+      previewableArtifactPaths.add(artifact.safeRelativePath);
+      previewableArtifacts.push({
+        path: artifact.safeRelativePath,
+        createdAt: artifact.updatedAt || artifact.createdAt,
+        toolName: artifact.producedBy?.tool || artifact.producedBy?.agent || artifact.producedBy?.provider,
+        outputExcerpt: truncateWorkbenchEvidenceText(artifact.summary || artifact.description || artifact.title),
+      });
+    }
+
+    artifact.changedFiles?.forEach((filePath) => {
+      if (!modifiedFiles.includes(filePath)) {
+        modifiedFiles.push(filePath);
+      }
+    });
+
+    const producedBy = artifact.producedBy?.tool || artifact.producedBy?.agent || artifact.producedBy?.provider;
+    if (producedBy && !toolNames.includes(producedBy)) {
+      toolNames.push(producedBy);
+    }
+  }
+
+  return {
+    ...rawDigest,
+    artifactCount: previewableArtifacts.length,
+    modifiedFileCount: modifiedFiles.length,
+    toolNames,
+    previewableArtifacts,
+    modifiedFiles,
+    latestCreatedAt: rawDigest.latestCreatedAt || artifacts[0]?.updatedAt || artifacts[0]?.createdAt,
+  };
+}
+
 export function buildWorkbenchAcceptanceSummary(
   taskStatus: WorkbenchTaskStatus | null | undefined,
   digest: WorkbenchEvidenceDigest,
@@ -918,6 +970,14 @@ export function buildWorkbenchAcceptanceSummary(
         headline: 'Completed without previewable artifact',
         detail: 'The task finished, but acceptance still depends on reviewing changed files and the latest execution evidence.',
       };
+  }
+
+  if ((taskStatus === 'in_review' || taskStatus === 'needs_review' || taskStatus === 'verifying') && digest.artifactCount > 0) {
+    return {
+      tone: 'blue',
+      headline: 'Review artifacts ready',
+      detail: 'The task is in review with artifacts attached. Inspect the preview, changed files, and run evidence before accepting it.',
+    };
   }
 
   if (taskStatus === 'failed' || taskStatus === 'blocked' || taskStatus === 'cancelled') {
@@ -1468,6 +1528,7 @@ export type TaskStatusBannerAction =
   | { id: 'archive'; label: string; kind: TaskStatusBannerActionKind }
   | { id: 'cancel'; label: string; kind: TaskStatusBannerActionKind }
   | { id: 'resume'; label: string; kind: TaskStatusBannerActionKind }
+  | { id: 'open-review'; label: string; kind: TaskStatusBannerActionKind }
   | { id: 'stop'; label: string; kind: TaskStatusBannerActionKind }
   | { id: 'reopen'; label: string; kind: TaskStatusBannerActionKind }
   | { id: 'unblock'; label: string; kind: TaskStatusBannerActionKind }
@@ -1544,7 +1605,7 @@ export function buildTaskStatusBannerSpec(
         headline: 'In review',
         detail: task.waitingReason?.trim() || 'Awaiting human review before the task can move forward.',
         actions: [
-          { id: 'resume', label: 'Resume', kind: 'primary' },
+          { id: 'open-review', label: 'Open review', kind: 'primary' },
           { id: 'stop', label: 'Stop', kind: 'danger' },
         ],
         decisionDriven: false,
@@ -1626,8 +1687,11 @@ export function buildTaskStatusBannerSpec(
         tone: 'neutral',
         icon: '○',
         headline: 'Cancelled',
-        detail: 'Task was cancelled. Reopen to bring it back into the queue.',
-        actions: [{ id: 'reopen', label: 'Reopen', kind: 'primary' }],
+        detail: 'Task was cancelled. Archive it to hide it from active work, or reopen it to bring it back.',
+        actions: [
+          { id: 'archive', label: 'Archive', kind: 'primary' },
+          { id: 'reopen', label: 'Reopen', kind: 'secondary' },
+        ],
         decisionDriven: false,
       };
 
@@ -1679,7 +1743,7 @@ export function canPauseTask(status: WorkbenchTaskStatus): boolean {
 }
 
 export function canResumeTask(status: WorkbenchTaskStatus): boolean {
-  return status === 'paused' || status === 'in_review' || status === 'waiting_for_user';
+  return status === 'paused' || status === 'waiting_for_user';
 }
 
 export function canStopTask(status: WorkbenchTaskStatus): boolean {
@@ -1707,4 +1771,23 @@ export function buildWorkbenchRuntimeControlActions(status: WorkbenchTaskStatus)
   }
 
   return actions;
+}
+
+export function getPreferredReviewArtifactId(
+  artifacts: SharedWorkbenchArtifactRecord[],
+): string | null {
+  const sorted = [...artifacts].sort(compareArtifactsByUpdatedAtDesc);
+  const review = sorted.find((artifact) => artifact.kind === 'run_review' || artifact.tags?.includes('run-review'));
+  return (review || sorted[0])?.id || null;
+}
+
+function compareArtifactsByUpdatedAtDesc(
+  left: Pick<SharedWorkbenchArtifactRecord, 'updatedAt' | 'createdAt' | 'id'>,
+  right: Pick<SharedWorkbenchArtifactRecord, 'updatedAt' | 'createdAt' | 'id'>,
+): number {
+  const byUpdatedAt = right.updatedAt.localeCompare(left.updatedAt);
+  if (byUpdatedAt !== 0) return byUpdatedAt;
+  const byCreatedAt = right.createdAt.localeCompare(left.createdAt);
+  if (byCreatedAt !== 0) return byCreatedAt;
+  return left.id.localeCompare(right.id);
 }

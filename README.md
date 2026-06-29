@@ -435,9 +435,11 @@ Dashboard 当前支持：
 
 - Linear-like 左侧导航：`Workspace -> Projects -> Views`
 - workspace/project 作用域切换：Workspace 显示全部 task，Project 只显示绑定到该项目的 task
-- task 列表、事件流、execution timeline、artifact preview
+- task 列表、事件流、execution timeline、artifact review gallery / detail preview
 - task 创建时绑定 execution context：`Workspace · <name>` 或 `Project · <name>`
 - Universal composer：无当前 task 时按当前 workspace/project scope 创建新 task；从已有 task 分支时继承该 task 的环境与 workspace binding
+- artifact gallery 会按 task、kind、producer template 和标题折叠同一逻辑 artifact 的多次运行，侧边栏 badge 与 gallery filter 使用同一组 review counts；`cancelled` / `archived` task 的 artifact 不再进入可操作 review 列表
+- artifact detail 支持按 artifact-id/version 预览、accept / reject / archive，并展示 source events、evidence refs、changed files、validation refs 和 risks
 - environment pack / skill manifest 视图
 - workspace 决策面板、pending decisions 的结构化展示与 resolve
 - workspace worktree lane 面板，可直接 create / use / remove lane
@@ -475,6 +477,9 @@ Dashboard 复用现有 kernel / workbench / worktree 能力，不引入独立任
 
 - workspace 元数据来自 `GET /api/workspace/status`
 - task 列表来自 `GET /api/workbench/tasks`
+- artifact review 数据来自 `GET /api/workbench/artifacts`、`GET /api/workbench/tasks/:id/artifacts` 和 `GET /api/workbench/artifacts/:artifactId/versions`
+- artifact 预览使用 artifact-id 路由 `GET /api/workbench/artifacts/:artifactId/versions/:versionId/preview`；legacy path preview 仅保留兼容入口
+- artifact 操作通过 `POST /api/workbench/artifacts/:artifactId/accept|reject|archive` 写回 workbench timeline，并驱动 task review / completion 状态
 - task 执行上下文写入 `workspaceBinding`
 - project 列表优先来自 `.code-workspace` settings、workspace memory、worktree entries；单仓库模式下会用 workspace root 生成 fallback project
 - scope key 语义为 `workspace` 或 `project:<name>:<path>`

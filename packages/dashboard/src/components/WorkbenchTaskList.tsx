@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useMemo, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { EnvironmentPackManifest, EnvironmentPackSelection } from '@tik/shared';
 import {
   buildWorkbenchArtifactLinkPreviewUrl,
@@ -19,11 +19,27 @@ import {
   type WorkspaceBindingOption,
   type WorkspaceScopeKey,
 } from '../view-models/workspace-hierarchy';
+import {
+  appendWorkbenchTaskGoalAttachments,
+  buildWorkbenchTaskGoalImageMarkdown,
+  buildWorkbenchTaskGoalMarkdownFileSection,
+  isSupportedWorkbenchTaskGoalFile,
+  isWorkbenchTaskGoalImage,
+  isWorkbenchTaskGoalMarkdown,
+  type WorkbenchTaskGoalAttachment,
+} from '../view-models/task-goal-attachments';
 import { ChipMultiSelect } from './task-detail/ChipMultiSelect';
 import {
   buildWorkbenchLabelSelectOptions,
   WorkbenchLabelGuide,
 } from './task-detail/WorkbenchLabelGuide';
+import {
+  buildWorkbenchTaskLaunchInput,
+  emptyLaunchValidation,
+  shouldInitializeWorkbenchTaskLaunchDraft,
+  validateWorkbenchTaskLaunchDraft,
+  type WorkbenchTaskLaunchValidation,
+} from './workbench-task-launch';
 
 interface WorkbenchTaskListProps {
   packs: EnvironmentPackManifest[];
@@ -46,32 +62,6 @@ interface WorkbenchTaskListProps {
     input?: CreateWorkbenchTaskInput,
   ) => Promise<void>;
   onToggleLauncher: (open: boolean) => void;
-}
-
-interface WorkbenchTaskLaunchValidation {
-  valid: boolean;
-  titleError: string | null;
-  goalError: string | null;
-}
-
-const emptyLaunchValidation: WorkbenchTaskLaunchValidation = {
-  valid: true,
-  titleError: null,
-  goalError: null,
-};
-
-export function validateWorkbenchTaskLaunchDraft(input: {
-  title: string;
-  goal: string;
-}): WorkbenchTaskLaunchValidation {
-  const titleError = input.title.trim() ? null : 'Task title is required.';
-  const goalError = input.goal.trim() ? null : 'Task goal is required.';
-
-  return {
-    valid: !titleError && !goalError,
-    titleError,
-    goalError,
-  };
 }
 
 export function WorkbenchTaskList({
@@ -102,6 +92,8 @@ export function WorkbenchTaskList({
     : launcherSeedSelection;
   const [title, setTitle] = useState('');
   const [goal, setGoal] = useState('');
+  const [goalAttachments, setGoalAttachments] = useState<WorkbenchTaskGoalAttachment[]>([]);
+  const [goalAttachmentError, setGoalAttachmentError] = useState<string | null>(null);
   const [status, setStatus] = useState<'backlog' | 'todo'>('backlog');
   const [priority, setPriority] = useState('');
   const [labels, setLabels] = useState<string[]>([]);
@@ -111,14 +103,17 @@ export function WorkbenchTaskList({
   const [submitting, setSubmitting] = useState(false);
   const [validation, setValidation] = useState<WorkbenchTaskLaunchValidation>(emptyLaunchValidation);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  const wasLauncherOpenRef = useRef(false);
   const launchDialogTitleId = useId();
   const titleInputId = useId();
   const goalInputId = useId();
+  const attachmentInputId = useId();
   const titleErrorId = useId();
   const goalErrorId = useId();
   const launchErrorId = useId();
   const packInputId = useId();
   const bindingInputId = useId();
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const lensTasks = useMemo(() => filterWorkbenchTasksByLens(tasks, selectedLens), [tasks, selectedLens]);
   const taskColumns = useMemo(() => buildWorkbenchTaskProgressColumns(lensTasks), [lensTasks]);
   const selectedPack = packs.find((pack) => pack.id === selectedPackId) || null;
@@ -132,16 +127,44 @@ export function WorkbenchTaskList({
     && selectedPackId === activeTask.environmentPackSnapshot?.id;
 
   useEffect(() => {
-    if (!launcherOpen) {
-      return;
-    }
+    const shouldInitialize = shouldInitializeWorkbenchTaskLaunchDraft({
+      launcherOpen,
+      wasLauncherOpen: wasLauncherOpenRef.current,
+    });
+    wasLauncherOpenRef.current = launcherOpen;
 
+    if (!shouldInitialize) return;
     setSelectedPackId(resolvedLauncherSeedPackId);
     setSelectedTaskBindingKey(selectedBindingKey);
     setStatus('backlog');
     setValidation(emptyLaunchValidation);
     setLaunchError(null);
+    setGoalAttachmentError(null);
   }, [launcherOpen, resolvedLauncherSeedPackId, selectedBindingKey]);
+
+  const handleGoalFiles = async (files: Iterable<File>) => {
+    const candidates = Array.from(files).filter(isSupportedWorkbenchTaskGoalFile);
+    if (candidates.length === 0) {
+      setGoalAttachmentError('Only image and Markdown files can be attached to the task goal.');
+      return;
+    }
+
+    try {
+      const nextAttachments = await Promise.all(candidates.map(readWorkbenchTaskGoalAttachment));
+      setGoalAttachments((current) => [...current, ...nextAttachments]);
+      setGoalAttachmentError(null);
+      setLaunchError(null);
+      if (validation.goalError) {
+        setValidation(validateWorkbenchTaskLaunchDraft({
+          title,
+          goal,
+          attachmentCount: goalAttachments.length + nextAttachments.length,
+        }));
+      }
+    } catch (error) {
+      setGoalAttachmentError(error instanceof Error ? error.message : 'Unable to attach that file.');
+    }
+  };
 
   return (
     <>
@@ -239,11 +262,15 @@ export function WorkbenchTaskList({
               onSubmit={async (event) => {
                 event.preventDefault();
                 const nextTitle = title.trim();
-                const nextGoal = goal.trim();
+                const nextGoal = appendWorkbenchTaskGoalAttachments(goal, goalAttachments);
                 if (submitting) {
                   return;
                 }
-                const nextValidation = validateWorkbenchTaskLaunchDraft({ title, goal });
+                const nextValidation = validateWorkbenchTaskLaunchDraft({
+                  title,
+                  goal,
+                  attachmentCount: goalAttachments.length,
+                });
                 setValidation(nextValidation);
                 setLaunchError(null);
                 if (!nextValidation.valid) {
@@ -251,18 +278,26 @@ export function WorkbenchTaskList({
                 }
                 setSubmitting(true);
                 try {
+                  const launchInput = buildWorkbenchTaskLaunchInput({
+                    title: nextTitle,
+                    status,
+                    labels,
+                    selectedPack,
+                  });
                   await onCreateTask(nextTitle, nextGoal, {
                     environmentPackId: selectedPackId || undefined,
                     selectedSkills: inheritsFocusedSetup ? resolvedLauncherSeedSelection?.selectedSkills : undefined,
                     selectedKnowledgeIds: inheritsFocusedSetup ? resolvedLauncherSeedSelection?.selectedKnowledgeIds : undefined,
-                    status,
+                    status: launchInput.status,
                     priority: priority ? Number(priority) : null,
-                    labels,
+                    labels: launchInput.labels,
                     humanAssignee: assignee.trim() || null,
                     workspaceBinding: selectedBindingOption.binding,
                   });
                   setTitle('');
                   setGoal('');
+                  setGoalAttachments([]);
+                  setGoalAttachmentError(null);
                   setPriority('');
                   setLabels([]);
                   setAssignee('');
@@ -285,7 +320,11 @@ export function WorkbenchTaskList({
                   setTitle(nextTitle);
                   setLaunchError(null);
                   if (validation.titleError) {
-                    setValidation(validateWorkbenchTaskLaunchDraft({ title: nextTitle, goal }));
+                    setValidation(validateWorkbenchTaskLaunchDraft({
+                      title: nextTitle,
+                      goal,
+                      attachmentCount: goalAttachments.length,
+                    }));
                   }
                 }}
                 placeholder="What should the agents work on?"
@@ -308,7 +347,32 @@ export function WorkbenchTaskList({
                   setGoal(nextGoal);
                   setLaunchError(null);
                   if (validation.goalError) {
-                    setValidation(validateWorkbenchTaskLaunchDraft({ title, goal: nextGoal }));
+                    setValidation(validateWorkbenchTaskLaunchDraft({
+                      title,
+                      goal: nextGoal,
+                      attachmentCount: goalAttachments.length,
+                    }));
+                  }
+                }}
+                onPaste={(event) => {
+                  const files = Array.from(event.clipboardData.files);
+                  if (files.length === 0) {
+                    return;
+                  }
+                  event.preventDefault();
+                  void handleGoalFiles(files);
+                }}
+                onDrop={(event) => {
+                  const files = Array.from(event.dataTransfer.files);
+                  if (files.length === 0) {
+                    return;
+                  }
+                  event.preventDefault();
+                  void handleGoalFiles(files);
+                }}
+                onDragOver={(event) => {
+                  if (event.dataTransfer.types.includes('Files')) {
+                    event.preventDefault();
                   }
                 }}
                 rows={3}
@@ -317,6 +381,53 @@ export function WorkbenchTaskList({
                 aria-invalid={!!validation.goalError}
                 aria-describedby={validation.goalError ? goalErrorId : undefined}
               />
+              <div className="task-goal-attachment-actions">
+                <button
+                  type="button"
+                  className="console-secondary-button task-goal-attachment-button"
+                  onClick={() => attachmentInputRef.current?.click()}
+                >
+                  Attach image or Markdown
+                </button>
+                <span>Paste or drop images and .md files into the goal.</span>
+                <input
+                  ref={attachmentInputRef}
+                  id={attachmentInputId}
+                  type="file"
+                  accept="image/*,.md,.markdown,text/markdown"
+                  multiple
+                  className="task-goal-attachment-input"
+                  onChange={(event) => {
+                    const files = event.currentTarget.files;
+                    if (files) {
+                      void handleGoalFiles(files);
+                    }
+                    event.currentTarget.value = '';
+                  }}
+                />
+              </div>
+              {goalAttachments.length > 0 ? (
+                <div className="task-goal-attachment-list" aria-label="Attached task goal context">
+                  {goalAttachments.map((attachment) => (
+                    <div key={attachment.id} className="task-goal-attachment-item">
+                      <span>{attachment.kind === 'image' ? 'Image' : 'Markdown'} · {attachment.name}</span>
+                      <button
+                        type="button"
+                        className="task-goal-attachment-remove"
+                        onClick={() => {
+                          setGoalAttachments((current) => current.filter((item) => item.id !== attachment.id));
+                          setGoalAttachmentError(null);
+                        }}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {goalAttachmentError ? (
+                <div className="task-launch-error">{goalAttachmentError}</div>
+              ) : null}
               {validation.goalError ? (
                 <div id={goalErrorId} className="task-launch-error">
                   {validation.goalError}
@@ -423,6 +534,56 @@ export function WorkbenchTaskList({
       ) : null}
     </>
   );
+}
+
+async function readWorkbenchTaskGoalAttachment(file: File): Promise<WorkbenchTaskGoalAttachment> {
+  if (isWorkbenchTaskGoalImage(file)) {
+    const dataUrl = await readFileAsDataUrl(file);
+    return {
+      id: buildGoalAttachmentId(file),
+      kind: 'image',
+      name: file.name || 'pasted-image',
+      markdown: buildWorkbenchTaskGoalImageMarkdown({
+        name: file.name || 'pasted-image',
+        type: file.type || 'image/*',
+        dataUrl,
+      }),
+    };
+  }
+
+  if (isWorkbenchTaskGoalMarkdown(file)) {
+    const text = await file.text();
+    return {
+      id: buildGoalAttachmentId(file),
+      kind: 'markdown',
+      name: file.name || 'pasted-markdown.md',
+      markdown: buildWorkbenchTaskGoalMarkdownFileSection({
+        name: file.name || 'pasted-markdown.md',
+        text,
+      }),
+    };
+  }
+
+  throw new Error('Only image and Markdown files can be attached to the task goal.');
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener('load', () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result);
+        return;
+      }
+      reject(new Error('Unable to read image attachment.'));
+    });
+    reader.addEventListener('error', () => reject(new Error('Unable to read image attachment.')));
+    reader.readAsDataURL(file);
+  });
+}
+
+function buildGoalAttachmentId(file: File): string {
+  return `${file.name || 'clipboard'}-${file.size}-${file.lastModified}-${Math.random().toString(36).slice(2)}`;
 }
 
 function TaskRailRow({

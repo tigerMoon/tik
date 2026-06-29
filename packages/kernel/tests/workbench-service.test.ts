@@ -696,6 +696,81 @@ describe('WorkbenchService', () => {
     expect(cancelled?.attempts?.[0]?.finishedAt).toBeTruthy();
   });
 
+  it('dismisses pending decisions and archives pending review artifacts when a task is cancelled manually', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const service = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+      artifacts: new FileArtifactRegistry({ rootPath: root }),
+    });
+
+    await service.createTask({ title: 'Cancel cleanup', goal: 'Leave no actionable review residue' }, 'task-cancel-cleanup');
+    const decision = await service.requestToolApproval('task-cancel-cleanup', 'bash');
+    const artifact = await service.createArtifact({
+      taskId: 'task-cancel-cleanup',
+      title: 'Run Review: cancel cleanup',
+      kind: 'run_review',
+      content: '# Review',
+      contentType: 'text/markdown',
+      extension: 'md',
+      tags: ['run-review'],
+    });
+
+    const cancelled = await service.transitionTask('task-cancel-cleanup', 'cancelled', {
+      actor: 'human',
+      reason: 'No longer needed',
+    });
+
+    expect(cancelled?.status).toBe('cancelled');
+    expect(cancelled?.waitingReason).toBeUndefined();
+    expect(cancelled?.waitingDecisionId).toBeUndefined();
+    expect(await service.readPendingDecisions('task-cancel-cleanup')).toHaveLength(0);
+    expect(await readDecisionStatuses(root, 'task-cancel-cleanup')).toContain('dismissed');
+    expect(await service.readDecision(decision!.id)).toMatchObject({ status: 'dismissed' });
+    expect(await service.readArtifact(artifact.id)).toMatchObject({ status: 'archived' });
+  });
+
+  it('does not reactivate cancelled tasks when stale review artifacts are accepted or rejected', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
+    tempDirs.push(root);
+    const service = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+      artifacts: new FileArtifactRegistry({ rootPath: root }),
+    });
+
+    await service.createTask({ title: 'Accept after cancel', goal: 'Stay cancelled', status: 'needs_review' }, 'task-cancel-accept');
+    const acceptArtifact = await service.createArtifact({
+      taskId: 'task-cancel-accept',
+      title: 'Run Review: accept after cancel',
+      kind: 'run_review',
+      content: '# Review',
+      contentType: 'text/markdown',
+      extension: 'md',
+      tags: ['run-review'],
+    });
+    await service.transitionTask('task-cancel-accept', 'cancelled', { actor: 'human' });
+    await service.acceptArtifact(acceptArtifact.id, 'reviewer');
+    expect((await service.readTask('task-cancel-accept'))?.status).toBe('cancelled');
+
+    await service.createTask({ title: 'Reject after cancel', goal: 'Stay cancelled', status: 'needs_review' }, 'task-cancel-reject');
+    const rejectArtifact = await service.createArtifact({
+      taskId: 'task-cancel-reject',
+      title: 'Run Review: reject after cancel',
+      kind: 'run_review',
+      content: '# Review',
+      contentType: 'text/markdown',
+      extension: 'md',
+      tags: ['run-review'],
+    });
+    await service.transitionTask('task-cancel-reject', 'cancelled', { actor: 'human' });
+    await service.rejectArtifact(rejectArtifact.id, 'No longer relevant', 'reviewer');
+    expect((await service.readTask('task-cancel-reject'))?.status).toBe('cancelled');
+  });
+
   it('prevents dependency cycles between task blockers', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-service-'));
     tempDirs.push(root);

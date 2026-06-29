@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   getWorkbenchLabelAction,
   getWorkbenchLabelActionDefinition,
@@ -13,7 +13,7 @@ import {
   acceptWorkbenchArtifact,
   archiveWorkbenchArtifact,
   archiveWorkbenchTask,
-  controlTask,
+  controlWorkbenchTask,
   createWorkbenchTask,
   createWorktreeReviewRound,
   fetchWorkbenchArtifact,
@@ -56,6 +56,10 @@ import {
 } from './api/client';
 import { ArtifactDetail } from './components/ArtifactDetail';
 import { ArtifactGallery } from './components/ArtifactGallery';
+import {
+  countWorkbenchArtifactGroupsByStatus,
+  groupWorkbenchArtifactsForReview,
+} from './view-models/artifacts';
 import { WorkbenchConsoleHeader } from './components/WorkbenchConsoleHeader';
 import { WorkbenchEnvironmentView } from './components/WorkbenchEnvironmentView';
 import { WorkbenchSkillsView } from './components/WorkbenchSkillsView';
@@ -201,7 +205,17 @@ export function App() {
     + Object.keys(trackerState?.retries || {}).length;
   const visibleTaskCount = filteredTasks.filter((task) => task.status !== 'archived').length;
   const archivedCount = groupedTasks.archived.length;
-  const artifactNeedsReviewCount = artifacts.filter((artifact) => artifact.status === 'needs_review').length;
+  const inactiveTaskIds = useMemo(
+    () => tasks
+      .filter((task) => task.status === 'cancelled' || task.status === 'archived')
+      .map((task) => task.id),
+    [tasks],
+  );
+  const artifactGroupCounts = useMemo(
+    () => countWorkbenchArtifactGroupsByStatus(groupWorkbenchArtifactsForReview(artifacts, { inactiveTaskIds })),
+    [artifacts, inactiveTaskIds],
+  );
+  const artifactNeedsReviewCount = artifactGroupCounts.needs_review;
   const liveStatusLabel = liveStatus === 'live'
     ? 'Live'
     : liveStatus === 'connecting'
@@ -948,7 +962,7 @@ export function App() {
         <nav className="inbox-nav sidebar-lower-nav">
           <div className="sidebar-section-label">Capabilities</div>
           {[
-            { label: 'Artifacts', count: artifactNeedsReviewCount || artifacts.length, active: activeSurface === 'artifacts', onClick: () => { setActiveSurface('artifacts'); setLauncherOpen(false); } },
+            { label: 'Artifacts', count: artifactNeedsReviewCount || artifactGroupCounts.all, active: activeSurface === 'artifacts', onClick: () => { setActiveSurface('artifacts'); setLauncherOpen(false); } },
             { label: 'Skills', count: skillRegistry.length, active: activeSurface === 'skills', onClick: () => { setActiveSurface('skills'); setLauncherOpen(false); } },
             { label: 'Environments', count: packs.length, active: activeSurface === 'environments', onClick: () => { setActiveSurface('environments'); setLauncherOpen(false); } },
             { label: 'Tracker', count: trackerSidebarCount, active: activeSurface === 'tracker', onClick: () => { setActiveSurface('tracker'); setLauncherOpen(false); } },
@@ -1283,7 +1297,7 @@ export function App() {
                   onControlTask={async (taskId, action) => {
                     setControllingTask({ taskId, action });
                     try {
-                      await controlTask(taskId, { type: action });
+                      await controlWorkbenchTask(taskId, { type: action });
                       await reloadTaskDetails(taskId);
                     } catch (error) {
                       setTimelineError((error as Error).message);
@@ -1708,6 +1722,9 @@ function isTrackerStaleTask(task: WorkbenchTaskResponse): boolean {
 }
 
 function isWaitingForClaudeReview(task: WorkbenchTaskResponse): boolean {
+  if (isWorkbenchTerminalStatus(task.status)) {
+    return false;
+  }
   return task.agentLoop?.kind === 'claude_review'
     || task.agentLoop?.phase === 'needs_claude_review'
     || task.agentLoop?.phase === 'claude_reviewing'
@@ -1715,6 +1732,9 @@ function isWaitingForClaudeReview(task: WorkbenchTaskResponse): boolean {
 }
 
 function isWaitingForHumanReview(task: WorkbenchTaskResponse): boolean {
+  if (isWorkbenchTerminalStatus(task.status)) {
+    return false;
+  }
   return task.agentLoop?.kind === 'human_review'
     || task.agentLoop?.phase === 'needs_human_review'
     || hasTrackerLabelAction(task, 'human_review')

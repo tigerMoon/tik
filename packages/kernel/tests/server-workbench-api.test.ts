@@ -1421,7 +1421,7 @@ describe('workbench API routes', () => {
     expect(response.json().result.dispatched).toEqual([task.shortIdentifier]);
   });
 
-  it('returns persisted tracker watching and recent state from /api/v1/tracker/state', async () => {
+  it('reports tracker watching only when persisted watch state has a visible local process', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
 
@@ -1502,7 +1502,7 @@ describe('workbench API routes', () => {
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body).toMatchObject({
-      watching: true,
+      watching: false,
       retries: {},
       summary: {
         activeCandidates: 1,
@@ -1535,7 +1535,7 @@ describe('workbench API routes', () => {
       }),
     ]));
     expect(body.listeners.find((listener: { id: string }) => listener.id === 'tracker-watch')?.status)
-      .toMatch(/^(running|expected)$/);
+      .toBe('expected');
     const dashboard = body.listeners.find((listener: { id: string }) => listener.id === 'dashboard');
     expect(dashboard).toMatchObject({
       id: 'dashboard',
@@ -2328,6 +2328,61 @@ describe('workbench API routes', () => {
     });
     expect(decisionsResponse.statusCode).toBe(200);
     expect(decisionsResponse.json().decisions).toEqual([]);
+  });
+
+  it('rejects resume control for human-review workbench tasks without routing through legacy kernel control', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const eventBus = new EventBus();
+    const store = new WorkbenchStore(root);
+    const workbench = new WorkbenchService({ rootPath: root, eventBus, store });
+    const controlCalls: Array<Record<string, unknown>> = [];
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: {
+        getActivePack: async () => null,
+      },
+      taskManager: {
+        create: () => ({ id: 'unused' }),
+        get: () => null,
+        updateDescription: () => undefined,
+      },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: (taskId: string, command: Record<string, unknown>) => {
+        controlCalls.push({ taskId, ...command });
+        throw new Error(`Task ${taskId} not found`);
+      },
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+
+    const task = await workbench.createTask({
+      title: 'Review README update',
+      goal: 'Review generated run proof before continuing',
+      status: 'in_review',
+    });
+
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/workbench/tasks/${task.id}/control`,
+      payload: { type: 'resume' },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toContain('Cannot resume a task that is in human review');
+    expect((await workbench.readTask(task.id))?.status).toBe('in_review');
+    expect(controlCalls).toEqual([]);
   });
 
   it('launches a follow-up pass when a brief update requests the next run', async () => {

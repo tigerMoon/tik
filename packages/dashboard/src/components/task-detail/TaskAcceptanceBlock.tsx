@@ -7,8 +7,8 @@ import {
   type WorkbenchTimelineResponseItem,
 } from '../../api/client';
 import {
+  buildWorkbenchAcceptanceDigest,
   buildWorkbenchAcceptanceSummary,
-  buildWorkbenchEvidenceDigest,
 } from '../../view-models/workbench';
 
 interface TaskAcceptanceBlockProps {
@@ -20,7 +20,7 @@ interface TaskAcceptanceBlockProps {
 
 export function TaskAcceptanceBlock({ task, timeline, decisions, artifacts = [] }: TaskAcceptanceBlockProps) {
   const rawItems = useMemo(() => timeline.filter((item) => item.kind === 'raw'), [timeline]);
-  const evidenceDigest = useMemo(() => buildWorkbenchEvidenceDigest(rawItems), [rawItems]);
+  const evidenceDigest = useMemo(() => buildWorkbenchAcceptanceDigest(rawItems, artifacts), [artifacts, rawItems]);
   const acceptanceSummary = useMemo(
     () => buildWorkbenchAcceptanceSummary(task.status, evidenceDigest, decisions.length),
     [decisions.length, evidenceDigest, task.status],

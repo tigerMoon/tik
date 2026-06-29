@@ -46,6 +46,8 @@ import type {
   ToolResultRef,
   SessionCompactMemory,
 } from '@tik/shared';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 import {
   EventType,
   PLAN_READ_ONLY_TOOL_POLICY,
@@ -59,6 +61,7 @@ import {
   assistantSuggestsNoCodeChangeNeeded,
   classifyTaskIntent,
   hasWriteLikeAction,
+  hasSuccessfulValidationAction,
   dedupeToolCalls,
   enoughEvidenceToConclude,
   getToolCallSignature,
@@ -483,7 +486,7 @@ export class AgentLoop {
         // evaluation so that explicit no-change conclusions can clear pending
         // work and participate in completion semantics immediately.
         this.updateContextSummary(session, actingAgent, response.content, iterationActions);
-        const summary = session.compactMemory || session.contextSummary;
+        let summary = session.compactMemory || session.contextSummary;
 
         if (
           classifyTaskIntent(task.description) === 'implementation'
@@ -499,11 +502,19 @@ export class AgentLoop {
           });
         }
 
+        const harnessActions = await this.runProjectHarnessIfNeeded(task, session, iterationActions, likelyTargetPaths, toolDefs);
+        if (harnessActions.length > 0) {
+          iterationActions.push(...harnessActions);
+          this.updateContextSummary(session, actingAgent, response.content, iterationActions);
+          summary = session.compactMemory || session.contextSummary;
+        }
+
         const completionEligible = shouldMarkTaskCompleted(
           task.description,
           summary,
           response.content,
           iterationActions,
+          { validationAvailable: this.hasValidationTool(toolDefs) },
         );
 
         if (!completionEligible) {
@@ -594,6 +605,7 @@ export class AgentLoop {
           }
 
           if (this.isDelegateProvider()) {
+            completed = true;
             session.loopState = 'stopped';
             break;
           }
@@ -920,6 +932,108 @@ export class AgentLoop {
     }
 
     return executedActions;
+  }
+
+  private async runProjectHarnessIfNeeded(
+    task: Task,
+    session: AgentSession,
+    actions: Array<{ tool: string; input: unknown; output?: unknown; success: boolean; error?: string; durationMs?: number }>,
+    likelyTargetPaths: string[],
+    toolDefs: LLMToolDef[],
+  ): Promise<Array<{ tool: string; input: unknown; output: unknown; success: boolean; error?: string; durationMs: number }>> {
+    if (classifyTaskIntent(task.description) !== 'implementation') return [];
+    if (!hasWriteLikeAction(actions)) return [];
+    if (!this.hasValidationTool(toolDefs)) return [];
+
+    const projectPath = task.projectPath || process.cwd();
+    const configured = await this.readConfiguredHarnessCommands(projectPath);
+    const commands = configured.length > 0
+      ? configured
+      : await this.resolveInferredProjectHarnessCommands(projectPath, actions);
+    if (commands.length === 0) return [];
+
+    const executedActions: Array<{ tool: string; input: unknown; output: unknown; success: boolean; error?: string; durationMs: number }> = [];
+    for (const command of commands) {
+      const call = {
+        id: generateId(),
+        name: 'bash',
+        arguments: {
+          command,
+          timeout: 120_000,
+        },
+      };
+      const toolContext = {
+        cwd: projectPath,
+        taskId: task.id,
+        likelyTargetPaths,
+        implementationReady: true,
+      };
+      const start = now();
+      const result = await this.toolScheduler.execute(call.name, call.arguments, toolContext);
+      const durationMs = now() - start;
+      await this.recordToolResult(task, session, call, result, durationMs);
+      executedActions.push({
+        tool: call.name,
+        input: call.arguments,
+        output: result.output,
+        success: result.success,
+        error: result.error,
+        durationMs,
+      });
+      if (!result.success) break;
+    }
+    return executedActions;
+  }
+
+  private hasValidationTool(toolDefs: LLMToolDef[]): boolean {
+    return toolDefs.some((tool) => tool.name === 'bash' || tool.name === 'frontend_run_script');
+  }
+
+  private async resolveInferredProjectHarnessCommands(
+    projectPath: string,
+    actions: Array<{ tool: string; input: unknown; output?: unknown; success: boolean; error?: string; durationMs?: number }>,
+  ): Promise<string[]> {
+    if (hasSuccessfulValidationAction(actions)) return [];
+    const inferred = await this.inferDefaultHarnessCommand(projectPath);
+    return inferred ? [inferred] : [];
+  }
+
+  private async readConfiguredHarnessCommands(projectPath: string): Promise<string[]> {
+    const candidates = [
+      path.join(projectPath, '.tik', 'harness.json'),
+      path.join(projectPath, '.tik', 'harness'),
+    ];
+
+    for (const candidate of candidates) {
+      const raw = await fs.readFile(candidate, 'utf-8').catch(() => undefined);
+      if (!raw) continue;
+      const commands = candidate.endsWith('.json')
+        ? parseHarnessJson(raw)
+        : raw.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+      if (commands.length > 0) return commands;
+    }
+
+    return [];
+  }
+
+  private async inferDefaultHarnessCommand(projectPath: string): Promise<string | undefined> {
+    const packageJson = await fs.readFile(path.join(projectPath, 'package.json'), 'utf-8').catch(() => undefined);
+    if (packageJson) {
+      try {
+        const parsed = JSON.parse(packageJson) as { scripts?: Record<string, string>; packageManager?: unknown };
+        const scripts = parsed.scripts || {};
+        for (const script of ['test', 'typecheck', 'type-check', 'lint', 'build']) {
+          if (scripts[script]) return packageScriptCommand(parsed.packageManager, script);
+        }
+      } catch {
+        // Ignore malformed package metadata and keep looking for other harnesses.
+      }
+    }
+
+    if (await fileExists(path.join(projectPath, 'pom.xml'))) return 'mvn test';
+    if (await fileExists(path.join(projectPath, 'gradlew'))) return './gradlew test';
+    if (await fileExists(path.join(projectPath, 'build.gradle')) || await fileExists(path.join(projectPath, 'build.gradle.kts'))) return 'gradle test';
+    return undefined;
   }
 
   /** Record a single tool result to session messages and events */
@@ -1353,9 +1467,12 @@ export class AgentLoop {
     if (agent === 'reviewer') {
       pendingWork.push('Verify correctness and regressions in the changed flow');
     }
+    const carryPending = wroteCode
+      ? prevPending.filter((item) => isValidationPendingWork(item))
+      : prevPending;
     const mergedPending = explicitNoChange
       ? []
-      : [...new Set([...prevPending, ...pendingWork])].slice(-3);
+      : [...new Set([...carryPending, ...pendingWork])].slice(-3);
     const mergedBlockers = [...new Set([...prevBlockers, ...failures])].slice(-3);
     const currentWork = explicitNoChange
       ? 'Explain why no code changes are required and cite the supporting implementation files'
@@ -1756,4 +1873,62 @@ export class AgentLoop {
   private emitEvent(type: EventType, taskId: string, payload: unknown): void {
     this.eventBus.emit({ id: generateId(), type, taskId, payload, timestamp: now() });
   }
+}
+
+function parseHarnessJson(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw) as { commands?: unknown; command?: unknown };
+    if (Array.isArray(parsed.commands)) {
+      return parsed.commands.map((command) => String(command).trim()).filter(Boolean);
+    }
+    if (typeof parsed.command === 'string' && parsed.command.trim()) {
+      return [parsed.command.trim()];
+    }
+  } catch {
+    return [];
+  }
+  return [];
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function packageScriptCommand(packageManager: unknown, script: string): string {
+  if (typeof packageManager !== 'string') return `pnpm ${script}`;
+  const [name] = packageManager.split('@');
+  if (name === 'pnpm' || name === 'yarn') return `corepack ${name} ${script}`;
+  if (name === 'npm') return `npm run ${script}`;
+  if (name === 'bun') return `bun ${script}`;
+  return `pnpm ${script}`;
+}
+
+function isValidationPendingWork(item: string): boolean {
+  const lowered = item.toLowerCase();
+  const hasValidationSignal = (
+    lowered.includes('verify')
+    || lowered.includes('validation')
+    || lowered.includes('test')
+    || lowered.includes('验证')
+    || lowered.includes('测试')
+  );
+  const hasImplementationSignal = (
+    /\bimplement\b/.test(lowered)
+    || lowered.includes('modify')
+    || lowered.includes('edit')
+    || lowered.includes('read ')
+    || lowered.includes('resume')
+    || lowered.includes('continue')
+    || lowered.includes('新增')
+    || lowered.includes('修复')
+    || lowered.includes('修改')
+    || lowered.includes('阅读')
+    || lowered.includes('继续')
+  );
+  return hasValidationSignal && !hasImplementationSignal;
 }

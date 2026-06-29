@@ -1,5 +1,9 @@
 import React, { useMemo, useState } from 'react';
 import type { WorkbenchArtifactRecord, WorkbenchTaskResponse } from '../api/client';
+import {
+  type ArtifactGalleryFilter,
+  buildArtifactGalleryViewModel,
+} from '../view-models/artifacts';
 
 interface ArtifactGalleryProps {
   artifacts: WorkbenchArtifactRecord[];
@@ -10,8 +14,6 @@ interface ArtifactGalleryProps {
   onOpenTask: (taskId: string) => void;
   onRefresh: () => Promise<void>;
 }
-
-type ArtifactGalleryFilter = 'all' | 'needs_review' | 'accepted' | 'rejected';
 
 export function ArtifactGallery({
   artifacts,
@@ -24,13 +26,10 @@ export function ArtifactGallery({
 }: ArtifactGalleryProps) {
   const [filter, setFilter] = useState<ArtifactGalleryFilter>('all');
   const tasksById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks]);
-  const visibleArtifacts = artifacts.filter((artifact) => filter === 'all' || artifact.status === filter);
-  const counts = {
-    all: artifacts.length,
-    needs_review: artifacts.filter((artifact) => artifact.status === 'needs_review').length,
-    accepted: artifacts.filter((artifact) => artifact.status === 'accepted').length,
-    rejected: artifacts.filter((artifact) => artifact.status === 'rejected').length,
-  };
+  const { rows: visibleArtifacts, counts } = useMemo(
+    () => buildArtifactGalleryViewModel({ artifacts, tasks, filter }),
+    [artifacts, tasks, filter],
+  );
 
   return (
     <section className="artifact-gallery panel">
@@ -73,7 +72,7 @@ export function ArtifactGallery({
               key={artifact.id}
               role="button"
               tabIndex={0}
-              className={`artifact-row ${artifact.id === selectedArtifactId ? 'is-active' : ''}`}
+              className={`artifact-row ${artifact.groupedArtifactIds.includes(selectedArtifactId || '') ? 'is-active' : ''}`}
               onClick={() => onSelectArtifact(artifact.id)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' || event.key === ' ') {
@@ -85,11 +84,20 @@ export function ArtifactGallery({
               <span className={`artifact-status is-${artifact.status}`}>{artifact.status.replace(/_/g, ' ')}</span>
               <span className="artifact-row-main">
                 <strong>{artifact.title}</strong>
-                <span>{task?.shortIdentifier || task?.identifier || artifact.taskId} · {artifact.kind} · v{artifact.version}</span>
+                <span>
+                  {task?.shortIdentifier || task?.identifier || artifact.taskId} · {artifact.kind} · v{artifact.version}
+                  {artifact.groupedArtifactCount > 1 ? ` · ${artifact.groupedArtifactCount} runs folded` : ''}
+                </span>
               </span>
               <span className="artifact-row-meta">
                 <span>{artifact.producedBy.template || artifact.producedBy.tool || artifact.producedBy.provider || 'manual'}</span>
                 <span>{formatShortDate(artifact.updatedAt)}</span>
+              </span>
+              <span
+                className={`artifact-version-badge ${artifact.groupedVersionCount > 1 ? '' : 'is-empty'}`}
+                aria-hidden={artifact.groupedVersionCount > 1 ? undefined : 'true'}
+              >
+                {artifact.groupedVersionCount > 1 ? `x${artifact.groupedVersionCount}` : ''}
               </span>
               <span
                 role="button"

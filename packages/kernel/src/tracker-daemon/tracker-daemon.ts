@@ -18,7 +18,7 @@ import { emptyState } from './file-state-store.js';
 import type { AgentRuntimeRunner } from '../agent-runners/agent-runtime-runner.js';
 import type { AgentRunCompletion } from '../agent-runners/agent-runtime-runner.js';
 import type { RunProofService } from '../agent-runners/run-proof-service.js';
-import { buildTikGeneratedReviewContext } from './review-context.js';
+import { buildTikGeneratedReviewContext, hasTikReviewableChanges } from './review-context.js';
 
 export interface TrackerDaemonOptions {
   importer: TrackedTaskImporter;
@@ -152,9 +152,14 @@ export class TrackerDaemon {
         result.skipped.push({ shortIdentifier: task.shortIdentifier, reason: selectorReason });
         continue;
       }
+      const projectPath = task.repository?.executionPath || task.repository?.path || this.options.defaultProjectPath;
       if (workflow?.version === 2) {
         try {
-          workflow.resolveRouting?.(task);
+          const routing = workflow.resolveRouting?.(task);
+          if (shouldRunClaudeReview(routing, task) && !hasTikReviewableChanges(projectPath)) {
+            result.skipped.push({ shortIdentifier: task.shortIdentifier, reason: 'no-reviewable-changes' });
+            continue;
+          }
         } catch (err) {
           const error = err instanceof Error ? err.message : String(err);
           result.failed.push({ shortIdentifier: task.shortIdentifier, error });
@@ -978,6 +983,18 @@ function isClaudeReviewRouting(
   if (routing?.runner !== 'claude-code') return false;
   const labels = new Set(task.labels.map(normalizeLabel));
   return labels.has('needs-claude-review') || labels.has('claude-review');
+}
+
+function shouldRunClaudeReview(
+  routing: TrackerWorkflowRoutingResolution | undefined,
+  task: TrackedTask,
+): boolean {
+  if (routing?.runner !== 'claude-code') return false;
+  const phase = task.agentLoop?.phase;
+  return phase === 'needs_claude_review'
+    || phase === 'claude_reviewing'
+    || task.agentLoop?.kind === 'claude_review'
+    || isClaudeReviewRouting(routing, task);
 }
 
 function isCodexFixRouting(

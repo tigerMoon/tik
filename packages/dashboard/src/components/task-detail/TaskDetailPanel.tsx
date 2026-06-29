@@ -11,6 +11,7 @@ import type {
 } from '../../api/client';
 import {
   buildTaskStatusBannerSpec,
+  getPreferredReviewArtifactId,
   type TaskStatusBannerAction,
 } from '../../view-models/workbench';
 import { TaskDetailHeader } from './TaskDetailHeader';
@@ -142,6 +143,13 @@ export function TaskDetailPanel(props: TaskDetailPanelProps) {
         case 'resume':
           await onControlTask(task.id, 'resume');
           break;
+        case 'open-review': {
+          const artifactId = getPreferredReviewArtifactId(artifacts);
+          if (artifactId) {
+            onOpenArtifact?.(artifactId);
+          }
+          break;
+        }
         case 'reopen':
           await onUpdateTaskMetadata(task, { status: 'todo' });
           break;
@@ -203,10 +211,7 @@ export function TaskDetailPanel(props: TaskDetailPanelProps) {
           task={task}
           artifacts={artifacts}
           loading={generatingArtifact}
-          busyArtifactId={busyArtifactId}
           onGenerate={onGenerateArtifact || (async () => {})}
-          onAccept={onAcceptArtifact || (async () => {})}
-          onReject={onRejectArtifact || (async () => {})}
           onOpenArtifact={onOpenArtifact || (() => {})}
         />
 

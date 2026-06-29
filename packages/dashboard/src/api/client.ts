@@ -497,6 +497,18 @@ export async function controlTask(id: string, command: unknown): Promise<void> {
   await readJsonOrThrow(res);
 }
 
+export async function controlWorkbenchTask(
+  taskId: string,
+  command: { type: 'pause' | 'resume' | 'stop'; reason?: string },
+): Promise<WorkbenchTaskResponse> {
+  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/control`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(command),
+  });
+  return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
+}
+
 export async function fetchWorkbenchTasks(): Promise<WorkbenchTaskResponse[]> {
   const res = await fetch(`${BASE_URL}/v1/tasks`);
   return (await readJsonOrThrow<{ tasks: WorkbenchTaskResponse[] }>(res)).tasks;

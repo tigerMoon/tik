@@ -1082,6 +1082,86 @@ describe('TrackerDaemon', () => {
     await waitForWorkbenchTask(workbench, 'task-review-context', (candidate) => candidate?.status === 'in_review');
   });
 
+  it('does not dispatch Claude review when there are no reviewable git changes', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    await fs.writeFile(path.join(repo, 'README.md'), '# demo\n', 'utf-8');
+    await runGit(repo, ['init']);
+    await runGit(repo, ['config', 'user.email', 'test@example.com']);
+    await runGit(repo, ['config', 'user.name', 'Tik Test']);
+    await runGit(repo, ['add', 'README.md']);
+    await runGit(repo, ['commit', '-m', 'init']);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    await workbench.createTask({
+      id: 'task-clean-review',
+      shortIdentifier: 'TIK-CLEAN',
+      title: 'Review clean tree',
+      goal: 'Review should wait for changes.',
+      status: 'todo',
+      labels: ['needs-claude-review'],
+      environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
+      agentLoop: {
+        kind: 'claude_review',
+        phase: 'needs_claude_review',
+        round: 1,
+        maxRounds: 3,
+        rootTaskId: 'task-clean-review',
+        changeRequest: {
+          scm: 'local',
+          repo: 'tik',
+          id: 'task-clean-review',
+          baseRef: 'main',
+          headRef: 'docs',
+          headSha: 'abc123',
+        },
+      },
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    }, 'task-clean-review');
+
+    const runtimeRunner = new CompletingRuntimeRunner('claude-code');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({
+        root,
+        runner: 'claude-code',
+        mode: 'claude_print',
+        renderPrompt: (trackedTask) => `Review ${trackedTask.shortIdentifier}.`,
+      }),
+    });
+
+    const result = await daemon.tick();
+
+    expect(result.dispatched).toEqual([]);
+    expect(result.skipped).toContainEqual({
+      shortIdentifier: 'TIK-CLEAN',
+      reason: 'no-reviewable-changes',
+    });
+    expect(runtimeRunner.preparedInputs).toHaveLength(0);
+  });
+
   it('records Claude review output as a task comment and routes blocking reviews to Codex fix', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
     tempDirs.push(root);

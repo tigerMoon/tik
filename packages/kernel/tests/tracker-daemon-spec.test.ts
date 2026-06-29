@@ -546,6 +546,86 @@ describe('tracker-daemon Symphony spec behavior', () => {
     });
   });
 
+  it('routes implementation labels before review labels until the task reaches the review phase', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-v2-'));
+    tempDirs.push(root);
+    await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  rules:',
+      '    - labels_any: [needs-claude-review, claude-review]',
+      '      runner: claude-code',
+      '      mode: claude_print',
+      '    - labels_any: [docs, implementation]',
+      '      runner: codex',
+      '      mode: codex_exec',
+      '---',
+      'Run {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+
+    const workflow = await loadTrackerWorkflow(root);
+    const implementationFirst = workflow.resolveRouting?.({
+      ...task('task-1', 'TIK-1'),
+      labels: ['docs', 'needs-claude-review'],
+    });
+    const reviewPhase = workflow.resolveRouting?.({
+      ...task('task-2', 'TIK-2'),
+      labels: ['docs', 'needs-claude-review'],
+      agentLoop: {
+        kind: 'claude_review',
+        phase: 'needs_claude_review',
+        round: 1,
+        maxRounds: 3,
+        rootTaskId: 'task-2',
+        changeRequest: {
+          scm: 'local',
+          repo: 'tik',
+          id: 'task-2',
+          baseRef: 'main',
+          headRef: 'docs',
+          headSha: 'abc123',
+        },
+      },
+    });
+    const codexFixPhase = workflow.resolveRouting?.({
+      ...task('task-3', 'TIK-3'),
+      labels: ['needs-codex-fix', 'needs-claude-review'],
+      agentLoop: {
+        kind: 'codex_fix',
+        phase: 'needs_codex_fix',
+        round: 1,
+        maxRounds: 3,
+        rootTaskId: 'task-3',
+        changeRequest: {
+          scm: 'local',
+          repo: 'tik',
+          id: 'task-3',
+          baseRef: 'main',
+          headRef: 'fix',
+          headSha: 'def456',
+        },
+      },
+    });
+
+    expect(implementationFirst).toMatchObject({
+      runner: 'codex',
+      mode: 'codex_exec',
+      matchedSource: 'rule[1]',
+      matchedLabels: ['docs'],
+    });
+    expect(reviewPhase).toMatchObject({
+      runner: 'claude-code',
+      mode: 'claude_print',
+      matchedSource: 'phase',
+    });
+    expect(codexFixPhase).toMatchObject({
+      runner: 'codex',
+      mode: 'codex_exec',
+      matchedSource: 'phase',
+    });
+  });
+
   it('loads workflow v2 validation commands for run proof collection', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-v2-'));
     tempDirs.push(root);

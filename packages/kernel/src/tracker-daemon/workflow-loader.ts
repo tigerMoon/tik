@@ -8,6 +8,7 @@ import type {
   AgentRuntimeName,
   TrackerWorkflowConfig,
   TrackerWorkflowDefinition,
+  TrackerWorkflowRoutingConfig,
   TrackerWorkflowRoutingResolution,
   TrackerWorkflowRoutingRule,
   TrackedTask,
@@ -221,6 +222,11 @@ function resolveWorkflowRouting(
   }
 
   const labels = new Set(task.labels.map(normalizeLabel));
+  const phaseRouting = resolveWorkflowPhaseRouting(routing, task);
+  if (phaseRouting) {
+    return phaseRouting;
+  }
+
   const explicitRunnerLabels = [
     labels.has('runner:codex') ? 'runner:codex' : undefined,
     labels.has('runner:claude') || labels.has('runner:claude-code') ? 'runner:claude' : undefined,
@@ -236,6 +242,11 @@ function resolveWorkflowRouting(
       matchedSource: 'explicit-label',
       matchedLabels: explicitRunnerLabels,
     };
+  }
+
+  const implementationRule = resolveImplementationRuleRouting(routing, labels);
+  if (implementationRule) {
+    return implementationRule;
   }
 
   for (let index = 0; index < routing.rules.length; index += 1) {
@@ -259,6 +270,64 @@ function resolveWorkflowRouting(
   }
 
   throw new Error(`No workflow routing rule matched ${task.shortIdentifier}, and routing.default_runner is not configured.`);
+}
+
+function resolveWorkflowPhaseRouting(
+  routing: TrackerWorkflowRoutingConfig,
+  task: TrackedTask,
+): TrackerWorkflowRoutingResolution | undefined {
+  const phase = task.agentLoop?.phase;
+  const kind = task.agentLoop?.kind;
+  if (!phase && !kind) {
+    return undefined;
+  }
+
+  if (phase === 'needs_claude_review' || phase === 'claude_reviewing' || kind === 'claude_review') {
+    return {
+      runner: 'claude-code',
+      mode: configuredModeForRunner(routing, 'claude-code'),
+      matchedSource: 'phase',
+      matchedLabels: phase ? [phase] : kind ? [kind] : undefined,
+    };
+  }
+
+  if (phase === 'needs_codex_fix' || phase === 'codex_fixing' || kind === 'codex_fix' || kind === 'codex_implement') {
+    return {
+      runner: 'codex',
+      mode: configuredModeForRunner(routing, 'codex'),
+      matchedSource: 'phase',
+      matchedLabels: phase ? [phase] : kind ? [kind] : undefined,
+    };
+  }
+
+  return undefined;
+}
+
+function configuredModeForRunner(
+  routing: TrackerWorkflowRoutingConfig,
+  runner: AgentRuntimeName,
+): AgentRuntimeMode {
+  const matchingRule = routing.rules.find((rule) => rule.runner === runner);
+  return matchingRule?.mode || defaultModeForRunner(runner, routing.defaultMode);
+}
+
+function resolveImplementationRuleRouting(
+  routing: TrackerWorkflowRoutingConfig,
+  labels: Set<string>,
+): TrackerWorkflowRoutingResolution | undefined {
+  for (let index = 0; index < routing.rules.length; index += 1) {
+    const rule = routing.rules[index]!;
+    if (rule.runner !== 'codex') continue;
+    const matchedLabels = rule.labelsAny.filter((label) => labels.has(normalizeLabel(label)));
+    if (matchedLabels.length === 0) continue;
+    return {
+      runner: rule.runner,
+      mode: rule.mode,
+      matchedSource: `rule[${index}]`,
+      matchedLabels,
+    };
+  }
+  return undefined;
 }
 
 async function validateWorkflowV2(rootPath: string, config: TrackerWorkflowConfig): Promise<void> {

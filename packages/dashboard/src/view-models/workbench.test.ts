@@ -4,6 +4,7 @@ import {
   allowedMetadataStatuses,
   buildRunProofPanelModel,
   buildTaskStatusBannerSpec,
+  buildWorkbenchAcceptanceDigest,
   buildWorkbenchAcceptanceSummary,
   buildWorkbenchEvidenceDigest,
   buildWorkbenchLiveRunEntries,
@@ -29,6 +30,7 @@ import {
   getDefaultWorkbenchFeedLens,
   getLatestPreviewableArtifact,
   getNextActiveWorkbenchTaskId,
+  getPreferredReviewArtifactId,
   groupWorkbenchTasks,
   normalizeWorkbenchSummaryText,
   parseWorkbenchEvidence,
@@ -167,6 +169,7 @@ describe('workbench view models', () => {
     const tasks: WorkbenchTaskSummary[] = [
       { id: 'backlog', title: 'backlog', status: 'backlog', updatedAt: '2026-04-09T00:00:00.000Z' },
       { id: 'recover', title: 'recover', status: 'failed', updatedAt: '2026-04-09T00:00:01.000Z' },
+      { id: 'cancelled', title: 'cancelled', status: 'cancelled', updatedAt: '2026-04-09T00:00:01.500Z' },
       { id: 'running', title: 'running', status: 'running', updatedAt: '2026-04-09T00:00:02.000Z' },
       { id: 'review', title: 'review', status: 'waiting_for_user', updatedAt: '2026-04-09T00:00:03.000Z' },
       { id: 'done', title: 'done', status: 'completed', updatedAt: '2026-04-09T00:00:04.000Z' },
@@ -209,11 +212,34 @@ describe('workbench view models', () => {
           reviewFocus: ['dashboard visibility'],
         },
       },
+      {
+        id: 'cancelled-review-task',
+        title: 'Cancelled review local changes',
+        status: 'cancelled',
+        updatedAt: '2026-04-09T00:00:02.000Z',
+        agentLoop: {
+          kind: 'claude_review',
+          rootTaskId: 'local-review',
+          round: 1,
+          maxRounds: 3,
+          headSha: 'abcdef1234567890',
+          idempotencyKey: 'claude_review:internal:tik:cancelled:abcdef:r1',
+          changeRequest: {
+            scm: 'internal',
+            repo: 'tik',
+            id: 'cancelled:abcdef',
+            type: 'internal_review',
+            baseRef: 'HEAD~1',
+            headRef: 'codex/tik-agent-loop-mvp',
+            headSha: 'abcdef1234567890',
+          },
+        },
+      },
       { id: 'normal-task', title: 'Normal task', status: 'todo', updatedAt: '2026-04-09T00:00:00.000Z' },
     ];
 
     expect(filterWorkbenchTasksByLens(tasks, 'review-loop').map((task) => task.id)).toEqual(['review-task']);
-    expect(filterWorkbenchTasksByQuery(tasks, 'claude_review').map((task) => task.id)).toEqual(['review-task']);
+    expect(filterWorkbenchTasksByQuery(tasks, 'claude_review').map((task) => task.id)).toEqual(['review-task', 'cancelled-review-task']);
     expect(filterWorkbenchTasksByQuery(tasks, 'dashboard visibility').map((task) => task.id)).toEqual(['review-task']);
     expect(buildWorkbenchAgentLoopSummary(tasks[0]?.agentLoop)).toEqual({
       label: 'Claude review · R1/3',
@@ -425,6 +451,100 @@ describe('workbench view models', () => {
       tone: 'yellow',
       headline: 'Operator review required',
       detail: 'The task is paused for a decision, but no previewable artifact is attached yet. Inspect the latest evidence before approving.',
+    });
+  });
+
+  it('counts registry artifacts as acceptance evidence when raw timeline evidence is missing', () => {
+    const digest = buildWorkbenchAcceptanceDigest([], [
+      {
+        id: 'art-review',
+        taskId: 'task-1',
+        title: 'Run Review: TIK-105 attempt 1',
+        kind: 'run_review',
+        status: 'needs_review',
+        visibility: 'local',
+        latestVersionId: 'ver-review',
+        version: 1,
+        safeRelativePath: 'review.md',
+        contentType: 'text/markdown',
+        sizeBytes: 10,
+        contentHash: 'hash-review',
+        sourceEventIds: [],
+        sourceEvidenceIds: [],
+        changedFiles: ['README.md', 'packages/dashboard/src/App.tsx'],
+        producedBy: { provider: 'codex', template: 'run-review' },
+        createdAt: '2026-06-24T00:00:00.000Z',
+        updatedAt: '2026-06-24T00:00:00.000Z',
+      },
+      {
+        id: 'art-diff',
+        taskId: 'task-1',
+        title: 'Run Diff: TIK-105 attempt 1',
+        kind: 'diff',
+        status: 'needs_review',
+        visibility: 'local',
+        latestVersionId: 'ver-diff',
+        version: 1,
+        safeRelativePath: 'diff.patch',
+        contentType: 'text/x-diff',
+        sizeBytes: 10,
+        contentHash: 'hash-diff',
+        sourceEventIds: [],
+        sourceEvidenceIds: [],
+        changedFiles: ['README.md'],
+        producedBy: { provider: 'codex' },
+        createdAt: '2026-06-24T00:00:01.000Z',
+        updatedAt: '2026-06-24T00:00:01.000Z',
+      },
+      {
+        id: 'art-transcript',
+        taskId: 'task-1',
+        title: 'Run Transcript: TIK-105 attempt 1',
+        kind: 'transcript',
+        status: 'needs_review',
+        visibility: 'local',
+        latestVersionId: 'ver-transcript',
+        version: 1,
+        safeRelativePath: 'transcript.txt',
+        contentType: 'text/plain',
+        sizeBytes: 10,
+        contentHash: 'hash-transcript',
+        sourceEventIds: [],
+        sourceEvidenceIds: [],
+        producedBy: { provider: 'codex' },
+        createdAt: '2026-06-24T00:00:02.000Z',
+        updatedAt: '2026-06-24T00:00:02.000Z',
+      },
+      {
+        id: 'art-diff-stat',
+        taskId: 'task-1',
+        title: 'Run Diff Stat: TIK-105 attempt 1',
+        kind: 'diff',
+        status: 'needs_review',
+        visibility: 'local',
+        latestVersionId: 'ver-diff-stat',
+        version: 1,
+        safeRelativePath: 'diff-stat.txt',
+        contentType: 'text/plain',
+        sizeBytes: 10,
+        contentHash: 'hash-diff-stat',
+        sourceEventIds: [],
+        sourceEvidenceIds: [],
+        changedFiles: ['packages/dashboard/src/App.tsx'],
+        producedBy: { provider: 'codex' },
+        createdAt: '2026-06-24T00:00:03.000Z',
+        updatedAt: '2026-06-24T00:00:03.000Z',
+      },
+    ]);
+
+    expect(digest.rawEventCount).toBe(0);
+    expect(digest.artifactCount).toBe(4);
+    expect(digest.modifiedFileCount).toBe(2);
+    expect(digest.modifiedFiles).toEqual(['README.md', 'packages/dashboard/src/App.tsx']);
+    expect(buildWorkbenchAcceptanceSummary('in_review', digest)).toEqual({
+      tone: 'blue',
+      headline: 'Review artifacts ready',
+      detail: 'The task is in review with artifacts attached. Inspect the preview, changed files, and run evidence before accepting it.',
     });
   });
 
@@ -1001,6 +1121,19 @@ describe('task status banner spec', () => {
     expect(spec!.decisionDriven).toBe(false);
   });
 
+  it('renders in_review banner as a review entrypoint instead of a resume control', () => {
+    const spec = buildTaskStatusBannerSpec(baseTask({
+      status: 'in_review',
+      waitingReason: 'Latest review artifact needs acceptance.',
+    }));
+
+    expect(spec).not.toBeNull();
+    expect(spec!.headline).toBe('In review');
+    expect(spec!.detail).toBe('Latest review artifact needs acceptance.');
+    expect(spec!.actions.map((action) => action.id)).toEqual(['open-review', 'stop']);
+    expect(spec!.actions.find((action) => action.id === 'open-review')?.label).toBe('Open review');
+  });
+
   it('renders failed banner with retry + cancel and surfaces last attempt error', () => {
     const spec = buildTaskStatusBannerSpec(baseTask({
       status: 'failed',
@@ -1055,13 +1188,17 @@ describe('task status banner spec', () => {
     expect(spec!.actions.map((action) => action.id)).toEqual(['resume', 'stop']);
   });
 
-  it('renders cancelled and archived banners with reopen action', () => {
+  it('renders cancelled banner with archive + reopen actions', () => {
     const cancelled = buildTaskStatusBannerSpec(baseTask({ status: 'cancelled' }));
     expect(cancelled!.tone).toBe('neutral');
-    expect(cancelled!.actions.map((action) => action.id)).toEqual(['reopen']);
+    expect(cancelled!.headline).toBe('Cancelled');
+    expect(cancelled!.actions.map((action) => action.id)).toEqual(['archive', 'reopen']);
+  });
 
+  it('renders archived banner with reopen action', () => {
     const archived = buildTaskStatusBannerSpec(baseTask({ status: 'archived' }));
     expect(archived!.tone).toBe('neutral');
+    expect(archived!.headline).toBe('Archived');
     expect(archived!.actions.map((action) => action.id)).toEqual(['reopen']);
   });
 });
@@ -1088,5 +1225,72 @@ describe('buildWorkbenchRuntimeControlActions', () => {
     expect(buildWorkbenchRuntimeControlActions('running').map((action) => action.id)).toEqual(['pause', 'stop']);
     expect(buildWorkbenchRuntimeControlActions('paused').map((action) => action.id)).toEqual(['resume', 'stop']);
     expect(buildWorkbenchRuntimeControlActions('waiting_for_user').map((action) => action.id)).toEqual(['resume', 'stop']);
+    expect(buildWorkbenchRuntimeControlActions('in_review').map((action) => action.id)).toEqual(['stop']);
+  });
+});
+
+describe('getPreferredReviewArtifactId', () => {
+  const artifact = (input: {
+    id: string;
+    kind: import('@tik/shared').ArtifactKind;
+    title: string;
+    createdAt: string;
+    updatedAt: string;
+    tags?: string[];
+  }): import('@tik/shared').WorkbenchArtifactRecord => ({
+    id: input.id,
+    taskId: 'task-1',
+    kind: input.kind,
+    title: input.title,
+    status: 'needs_review',
+    visibility: 'local',
+    latestVersionId: `ver-${input.id}`,
+    version: 1,
+    safeRelativePath: `${input.id}.md`,
+    contentType: 'text/markdown',
+    sizeBytes: 1,
+    contentHash: `hash-${input.id}`,
+    sourceEventIds: [],
+    sourceEvidenceIds: [],
+    createdAt: input.createdAt,
+    updatedAt: input.updatedAt,
+    tags: input.tags || [],
+    producedBy: {},
+  });
+
+  it('prefers the newest run review artifact, then falls back to the newest artifact', () => {
+    expect(getPreferredReviewArtifactId([
+      artifact({
+        id: 'art-diff-newer',
+        kind: 'diff',
+        title: 'Patch',
+        createdAt: '2026-04-09T00:00:03.000Z',
+        updatedAt: '2026-04-09T00:00:03.000Z',
+      }),
+      artifact({
+        id: 'art-review',
+        kind: 'run_review',
+        title: 'Review',
+        createdAt: '2026-04-09T00:00:01.000Z',
+        updatedAt: '2026-04-09T00:00:01.000Z',
+      }),
+    ])).toBe('art-review');
+
+    expect(getPreferredReviewArtifactId([
+      artifact({
+        id: 'art-diff',
+        kind: 'diff',
+        title: 'Patch',
+        createdAt: '2026-04-09T00:00:01.000Z',
+        updatedAt: '2026-04-09T00:00:01.000Z',
+      }),
+      artifact({
+        id: 'art-validation',
+        kind: 'validation_log',
+        title: 'Validation',
+        createdAt: '2026-04-09T00:00:02.000Z',
+        updatedAt: '2026-04-09T00:00:02.000Z',
+      }),
+    ])).toBe('art-validation');
   });
 });

@@ -235,6 +235,7 @@ export class WorkbenchService {
     };
 
     await this.stopActiveAttemptIfNeeded(bundle.task, updatedTask, reason);
+    await this.cleanupInactiveTaskStateIfNeeded(updatedTask, actor);
 
     await this.store.appendTimelineItem({
       id: generateId(),
@@ -906,6 +907,11 @@ export class WorkbenchService {
     return this.store.readPendingDecisions(taskId);
   }
 
+  async readDecision(decisionId: string): Promise<WorkbenchDecisionRecord | null> {
+    await this.drainEventQueue();
+    return this.store.readDecision(decisionId);
+  }
+
   async requestToolApproval(
     taskId: string,
     toolName: string,
@@ -1227,6 +1233,7 @@ export class WorkbenchService {
       waitingDecisionId: undefined,
     };
 
+    await this.cleanupInactiveTaskStateIfNeeded(archivedTask, 'human');
     await this.store.appendTimelineItem({
       id: generateId(),
       taskId,
@@ -1615,6 +1622,28 @@ export class WorkbenchService {
           error: reason || attempt.error,
         }
       : attempt);
+  }
+
+  private async cleanupInactiveTaskStateIfNeeded(
+    task: WorkbenchTaskRecord,
+    actor: WorkbenchTaskTransitionActor,
+  ): Promise<void> {
+    if (task.status !== 'cancelled' && task.status !== 'archived') {
+      return;
+    }
+
+    const updatedAt = task.updatedAt || new Date().toISOString();
+    const pendingDecisions = await this.store.readPendingDecisions(task.id);
+    await Promise.all(pendingDecisions.map((decision) => this.store.appendDecision({
+      ...decision,
+      status: 'dismissed',
+      updatedAt,
+    })));
+
+    const reviewArtifacts = await this.artifacts?.list({ taskId: task.id }) || [];
+    await Promise.all(reviewArtifacts
+      .filter((artifact) => artifact.status === 'needs_review' || artifact.status === 'rejected' || artifact.status === 'draft')
+      .map((artifact) => this.archiveArtifact(artifact.id, actor)));
   }
 
   private buildAgentLoopMetadata(input: AgentLoopPayload): AgentLoopMetadata {
@@ -2568,7 +2597,7 @@ export class WorkbenchService {
 
   private async moveTaskToArtifactReview(artifact: WorkbenchArtifactRecord): Promise<void> {
     const bundle = await this.store.readTaskBundle(artifact.taskId);
-    if (!bundle.task || bundle.task.status === 'archived') {
+    if (!bundle.task || bundle.task.status === 'cancelled' || bundle.task.status === 'archived') {
       return;
     }
 
@@ -2586,7 +2615,7 @@ export class WorkbenchService {
 
   private async completeTaskAfterArtifactAcceptance(artifact: WorkbenchArtifactRecord): Promise<void> {
     const bundle = await this.store.readTaskBundle(artifact.taskId);
-    if (!bundle.task || bundle.task.status === 'archived') {
+    if (!bundle.task || bundle.task.status === 'cancelled' || bundle.task.status === 'archived') {
       return;
     }
 
@@ -2612,7 +2641,7 @@ export class WorkbenchService {
     reason: string,
   ): Promise<void> {
     const bundle = await this.store.readTaskBundle(artifact.taskId);
-    if (!bundle.task || bundle.task.status === 'archived') {
+    if (!bundle.task || bundle.task.status === 'cancelled' || bundle.task.status === 'archived') {
       return;
     }
 

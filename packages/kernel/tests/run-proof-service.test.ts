@@ -86,6 +86,67 @@ describe('RunProofService', () => {
     });
   });
 
+  it('updates existing run proof artifacts instead of creating duplicate review rows for the same attempt', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-run-proof-service-'));
+    tempDirs.push(root);
+    await fs.mkdir(path.join(root, '.tik', 'runs', 'run-1'), { recursive: true });
+    const transcriptPath = path.join(root, '.tik', 'runs', 'run-1', 'stdout.log');
+    const patchPath = path.join(root, '.tik', 'runs', 'run-1', 'run-diff.patch');
+    await fs.writeFile(transcriptPath, 'first pass\n', 'utf-8');
+    await fs.writeFile(patchPath, 'diff --git a/src/app.ts b/src/app.ts\n+first\n', 'utf-8');
+    const runner = makeRunner({
+      transcript: [{ path: transcriptPath, contentType: 'text/plain' }],
+      diff: {
+        changedFiles: ['src/app.ts'],
+        insertions: 1,
+        deletions: 0,
+        patchPath,
+      },
+    });
+    const registry = new FileArtifactRegistry({ rootPath: root });
+    const service = new RunProofService({
+      proofStore: new FileRunProofStore(root),
+      artifacts: registry,
+    });
+    const task = {
+      id: 'task-1',
+      shortIdentifier: 'TIK-1',
+      title: 'Add review loop',
+      goal: 'Generate a reviewable run proof',
+    };
+
+    const firstProof = await service.createProof({
+      task,
+      run: makeRun(root),
+      runner,
+      completion: { status: 'completed' },
+    });
+    await fs.writeFile(transcriptPath, 'second pass\n', 'utf-8');
+    await fs.writeFile(patchPath, 'diff --git a/src/app.ts b/src/app.ts\n+second\n', 'utf-8');
+    const secondProof = await service.createProof({
+      task,
+      run: makeRun(root),
+      runner,
+      completion: { status: 'completed' },
+    });
+
+    const artifacts = await registry.list({ taskId: 'task-1' });
+    expect(artifacts.map((artifact) => artifact.title).sort()).toEqual([
+      'Run Diff: TIK-1 attempt 1',
+      'Run Diff Stat: TIK-1 attempt 1',
+      'Run Review: TIK-1 attempt 1',
+      'Run Transcript: TIK-1 attempt 1',
+    ].sort());
+    expect(secondProof.producedArtifactIds).toEqual(firstProof.producedArtifactIds);
+    expect(secondProof.diff.patchArtifactId).toBe(firstProof.diff.patchArtifactId);
+    expect(secondProof.diff.statArtifactId).toBe(firstProof.diff.statArtifactId);
+    expect(secondProof.transcriptArtifactIds).toEqual(firstProof.transcriptArtifactIds);
+    await Promise.all(artifacts.map(async (artifact) => {
+      expect(artifact.version).toBe(2);
+      expect(await registry.listVersions(artifact.id)).toHaveLength(2);
+    }));
+  });
+
   it('records validation command output and marks the proof failed when validation fails', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-run-proof-service-'));
     tempDirs.push(root);

@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { AgentLoop } from '../src/agent-loop.js';
 import { EventBus } from '../src/event-bus.js';
 import { ToolRegistry, ToolScheduler } from '../src/tool-scheduler.js';
@@ -335,6 +338,366 @@ describe('AgentLoop completion semantics', () => {
     expect(result.status).toBe('completed');
   });
 
+  it('runs the project harness before completing implementation changes', async () => {
+    const projectPath = await makeProjectWithHarness(['pnpm test -- changed.spec.ts']);
+    const eventBus = new EventBus();
+    const toolRegistry = new ToolRegistry();
+    const harnessCommands: string[] = [];
+
+    toolRegistry.register({
+      name: 'bash',
+      description: 'Execute a shell command',
+      type: 'exec',
+      inputSchema: { type: 'object', properties: { command: { type: 'string' } } },
+      async execute(input: { command: string }) {
+        harnessCommands.push(input.command);
+        return { success: true, output: { stdout: 'ok', stderr: '' }, durationMs: 1 };
+      },
+    } as any);
+
+    const toolScheduler = new ToolScheduler(toolRegistry, eventBus);
+    const llm = buildSingleTurnLlm({
+      content: '我已经完成代码修改。',
+      executedActions: [
+        {
+          tool: 'edit_file',
+          input: { path: 'src/service.ts' },
+          output: 'patched',
+          success: true,
+        },
+        {
+          tool: 'bash',
+          input: { command: 'rg "cache" src/service.ts' },
+          output: 'matches',
+          success: true,
+        },
+      ],
+    });
+    const task = buildTask(projectPath, '实现服务缓存');
+    const session = buildSession(task, llm);
+    const loop = new AgentLoop(
+      eventBus,
+      toolScheduler,
+      buildEmptyContextBuilder(projectPath),
+      llm,
+      buildNoopAceEngine() as any,
+    );
+
+    const result = await loop.run(task, session);
+
+    expect(harnessCommands).toEqual(['pnpm test -- changed.spec.ts']);
+    expect(result.status).toBe('completed');
+  });
+
+  it('runs configured project harness even after agent-supplied validation passes', async () => {
+    const projectPath = await makeProjectWithHarness(['pnpm test -- full-suite']);
+    const eventBus = new EventBus();
+    const toolRegistry = new ToolRegistry();
+    const harnessCommands: string[] = [];
+
+    toolRegistry.register({
+      name: 'bash',
+      description: 'Execute a shell command',
+      type: 'exec',
+      inputSchema: { type: 'object', properties: { command: { type: 'string' } } },
+      async execute(input: { command: string }) {
+        harnessCommands.push(input.command);
+        return { success: true, output: { stdout: 'ok', stderr: '' }, durationMs: 1 };
+      },
+    } as any);
+
+    const toolScheduler = new ToolScheduler(toolRegistry, eventBus);
+    const llm = buildSingleTurnLlm({
+      content: '我已经完成代码修改，并运行了相关测试。',
+      executedActions: [
+        {
+          tool: 'edit_file',
+          input: { path: 'src/service.ts' },
+          output: 'patched',
+          success: true,
+        },
+        {
+          tool: 'bash',
+          input: { command: 'pnpm test -- changed.spec.ts' },
+          output: 'passed',
+          success: true,
+        },
+      ],
+    });
+    const task = buildTask(projectPath, '实现服务缓存');
+    const session = buildSession(task, llm);
+    const loop = new AgentLoop(
+      eventBus,
+      toolScheduler,
+      buildEmptyContextBuilder(projectPath),
+      llm,
+      buildNoopAceEngine() as any,
+    );
+
+    const result = await loop.run(task, session);
+
+    expect(harnessCommands).toEqual(['pnpm test -- full-suite']);
+    expect(result.status).toBe('completed');
+  });
+
+  it('runs every configured project harness command before completing implementation changes', async () => {
+    const projectPath = await makeProjectWithHarness(['pnpm typecheck', 'pnpm test -- changed.spec.ts']);
+    const eventBus = new EventBus();
+    const toolRegistry = new ToolRegistry();
+    const harnessCommands: string[] = [];
+
+    toolRegistry.register({
+      name: 'bash',
+      description: 'Execute a shell command',
+      type: 'exec',
+      inputSchema: { type: 'object', properties: { command: { type: 'string' } } },
+      async execute(input: { command: string }) {
+        harnessCommands.push(input.command);
+        return { success: true, output: { stdout: 'ok', stderr: '' }, durationMs: 1 };
+      },
+    } as any);
+
+    const toolScheduler = new ToolScheduler(toolRegistry, eventBus);
+    const llm = buildSingleTurnLlm({
+      content: '我已经完成代码修改。',
+      executedActions: [
+        {
+          tool: 'edit_file',
+          input: { path: 'src/service.ts' },
+          output: 'patched',
+          success: true,
+        },
+      ],
+    });
+    const task = buildTask(projectPath, '实现服务缓存');
+    const session = buildSession(task, llm);
+    const loop = new AgentLoop(
+      eventBus,
+      toolScheduler,
+      buildEmptyContextBuilder(projectPath),
+      llm,
+      buildNoopAceEngine() as any,
+    );
+
+    const result = await loop.run(task, session);
+
+    expect(harnessCommands).toEqual(['pnpm typecheck', 'pnpm test -- changed.spec.ts']);
+    expect(result.status).toBe('completed');
+  });
+
+  it('uses the package manager declared by the project for default harness commands', async () => {
+    const projectPath = await makeProjectWithPackageJson({
+      packageManager: 'pnpm@8.15.0',
+      scripts: { test: 'vitest run' },
+    });
+    const eventBus = new EventBus();
+    const toolRegistry = new ToolRegistry();
+    const harnessCommands: string[] = [];
+
+    toolRegistry.register({
+      name: 'bash',
+      description: 'Execute a shell command',
+      type: 'exec',
+      inputSchema: { type: 'object', properties: { command: { type: 'string' } } },
+      async execute(input: { command: string }) {
+        harnessCommands.push(input.command);
+        return { success: true, output: { stdout: 'ok', stderr: '' }, durationMs: 1 };
+      },
+    } as any);
+
+    const toolScheduler = new ToolScheduler(toolRegistry, eventBus);
+    const llm = buildSingleTurnLlm({
+      content: '我已经完成代码修改。',
+      executedActions: [
+        {
+          tool: 'edit_file',
+          input: { path: 'src/service.ts' },
+          output: 'patched',
+          success: true,
+        },
+      ],
+    });
+    const task = buildTask(projectPath, '实现服务缓存');
+    const session = buildSession(task, llm);
+    const loop = new AgentLoop(
+      eventBus,
+      toolScheduler,
+      buildEmptyContextBuilder(projectPath),
+      llm,
+      buildNoopAceEngine() as any,
+    );
+
+    const result = await loop.run(task, session);
+
+    expect(harnessCommands).toEqual(['corepack pnpm test']);
+    expect(result.status).toBe('completed');
+  });
+
+  it('runs default npm package scripts through npm run', async () => {
+    const projectPath = await makeProjectWithPackageJson({
+      packageManager: 'npm@10.5.0',
+      scripts: { typecheck: 'tsc --noEmit' },
+    });
+    const eventBus = new EventBus();
+    const toolRegistry = new ToolRegistry();
+    const harnessCommands: string[] = [];
+
+    toolRegistry.register({
+      name: 'bash',
+      description: 'Execute a shell command',
+      type: 'exec',
+      inputSchema: { type: 'object', properties: { command: { type: 'string' } } },
+      async execute(input: { command: string }) {
+        harnessCommands.push(input.command);
+        return { success: true, output: { stdout: 'ok', stderr: '' }, durationMs: 1 };
+      },
+    } as any);
+
+    const toolScheduler = new ToolScheduler(toolRegistry, eventBus);
+    const llm = buildSingleTurnLlm({
+      content: '我已经完成代码修改。',
+      executedActions: [
+        {
+          tool: 'edit_file',
+          input: { path: 'src/service.ts' },
+          output: 'patched',
+          success: true,
+        },
+      ],
+    });
+    const task = buildTask(projectPath, '实现服务缓存');
+    const session = buildSession(task, llm);
+    const loop = new AgentLoop(
+      eventBus,
+      toolScheduler,
+      buildEmptyContextBuilder(projectPath),
+      llm,
+      buildNoopAceEngine() as any,
+    );
+
+    const result = await loop.run(task, session);
+
+    expect(harnessCommands).toEqual(['npm run typecheck']);
+    expect(result.status).toBe('completed');
+  });
+
+  it('does not complete implementation changes when the project harness fails', async () => {
+    const projectPath = await makeProjectWithHarness(['pnpm test -- changed.spec.ts']);
+    const eventBus = new EventBus();
+    const toolRegistry = new ToolRegistry();
+    const harnessCommands: string[] = [];
+
+    toolRegistry.register({
+      name: 'bash',
+      description: 'Execute a shell command',
+      type: 'exec',
+      inputSchema: { type: 'object', properties: { command: { type: 'string' } } },
+      async execute(input: { command: string }) {
+        harnessCommands.push(input.command);
+        return { success: false, output: { stdout: '', stderr: 'failed' }, error: 'failed', durationMs: 1 };
+      },
+    } as any);
+
+    const toolScheduler = new ToolScheduler(toolRegistry, eventBus);
+    const llm = buildSingleTurnLlm({
+      content: '我已经完成代码修改。',
+      executedActions: [
+        {
+          tool: 'edit_file',
+          input: { path: 'src/service.ts' },
+          output: 'patched',
+          success: true,
+        },
+      ],
+    });
+    const task = buildTask(projectPath, '实现服务缓存');
+    const session = buildSession(task, llm);
+    const loop = new AgentLoop(
+      eventBus,
+      toolScheduler,
+      buildEmptyContextBuilder(projectPath),
+      llm,
+      buildNoopAceEngine() as any,
+    );
+
+    const result = await loop.run(task, session);
+
+    expect(harnessCommands).toEqual(['pnpm test -- changed.spec.ts']);
+    expect(result.status).not.toBe('completed');
+  });
+
+  it('does not require inferred harness validation when the runtime has no exec tool', async () => {
+    const projectPath = await makeProjectWithPackageJson({
+      packageManager: 'pnpm@8.15.0',
+      scripts: { test: 'vitest run' },
+    });
+    const eventBus = new EventBus();
+    const toolRegistry = new ToolRegistry();
+
+    toolRegistry.register({
+      name: 'write_file',
+      description: 'Write a file',
+      type: 'write',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } } },
+      async execute(input: { path: string; content: string }) {
+        return {
+          success: true,
+          output: { path: input.path, bytes: input.content.length },
+          durationMs: 1,
+        };
+      },
+    } as any);
+
+    const toolScheduler = new ToolScheduler(toolRegistry, eventBus);
+    let calls = 0;
+    const llm: ILLMProvider = {
+      name: 'mock',
+      async chatWithContext(): Promise<ChatResponse> {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            content: '我会先写入代码修改。',
+            toolCalls: [
+              {
+                id: 'write-1',
+                name: 'write_file',
+                arguments: { path: 'src/service.ts', content: 'patched' },
+              },
+            ],
+            usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          };
+        }
+        return {
+          content: '我已经完成代码修改。',
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        };
+      },
+      async chat(): Promise<ChatResponse> {
+        throw new Error('not used');
+      },
+      async plan() {
+        throw new Error('not used');
+      },
+      async complete() {
+        throw new Error('not used');
+      },
+    };
+    const task = buildTask(projectPath, '实现服务缓存');
+    const session = buildSession(task, llm);
+    const loop = new AgentLoop(
+      eventBus,
+      toolScheduler,
+      buildEmptyContextBuilder(projectPath),
+      llm,
+      buildNoopAceEngine() as any,
+    );
+
+    const result = await loop.run(task, session);
+
+    expect(result.status).toBe('completed');
+    expect(task.iterations[0]?.executedActions.map((action) => action.tool)).toEqual(['write_file']);
+  });
+
   it('forces implementation tasks out of repeated read-only exploration before completing', async () => {
     const eventBus = new EventBus();
     const toolRegistry = new ToolRegistry();
@@ -627,6 +990,48 @@ function buildNoopAceEngine() {
     },
     checkConvergence() {
       return false;
+    },
+  };
+}
+
+async function makeProjectWithHarness(commands: string[]): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-harness-'));
+  await fs.mkdir(path.join(root, '.tik'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.tik', 'harness.json'),
+    JSON.stringify({ commands }, null, 2),
+    'utf-8',
+  );
+  return root;
+}
+
+async function makeProjectWithPackageJson(packageJson: Record<string, unknown>): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-package-harness-'));
+  await fs.writeFile(
+    path.join(root, 'package.json'),
+    JSON.stringify(packageJson, null, 2),
+    'utf-8',
+  );
+  return root;
+}
+
+function buildSingleTurnLlm(response: Omit<ChatResponse, 'usage'> & { usage?: ChatResponse['usage'] }): ILLMProvider {
+  return {
+    name: 'mock',
+    async chatWithContext(): Promise<ChatResponse> {
+      return {
+        ...response,
+        usage: response.usage || { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      };
+    },
+    async chat(): Promise<ChatResponse> {
+      throw new Error('not used');
+    },
+    async plan() {
+      throw new Error('not used');
+    },
+    async complete() {
+      throw new Error('not used');
     },
   };
 }

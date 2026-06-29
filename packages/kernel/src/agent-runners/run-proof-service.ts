@@ -13,7 +13,7 @@ import type {
   TranscriptRef,
   WorkbenchArtifactRecord,
 } from '@tik/shared';
-import type { ArtifactRegistry } from '../artifacts/artifact-registry.js';
+import type { AppendArtifactVersionInput, ArtifactRegistry, CreateArtifactInput } from '../artifacts/artifact-registry.js';
 import type { AgentRunCompletion, AgentRuntimeRunner } from './agent-runtime-runner.js';
 import { renderRunReviewArtifact, type RunProofRenderTask } from './run-proof-renderer.js';
 import { FileRunProofStore } from './run-proof-store.js';
@@ -88,7 +88,7 @@ export class RunProofService {
       updatedAt: timestamp,
     };
 
-    const reviewArtifact = await this.options.artifacts.create({
+    const reviewArtifact = await this.createOrAppendRunArtifact({
       taskId: input.task.id,
       title: `Run Review: ${input.run.shortIdentifier} attempt ${input.run.attempt + 1}`,
       kind: 'run_review',
@@ -149,7 +149,7 @@ export class RunProofService {
     }
     if (contentParts.length === 0) return [];
     return [
-      await this.options.artifacts.create({
+      await this.createOrAppendRunArtifact({
         taskId: input.task.id,
         title: `Run Transcript: ${input.run.shortIdentifier} attempt ${input.run.attempt + 1}`,
         kind: 'transcript',
@@ -175,7 +175,7 @@ export class RunProofService {
       ? await fs.readFile(diff.patchPath, 'utf-8').catch(() => '')
       : '';
     const statContent = renderDiffStat(diff);
-    const patch = await this.options.artifacts.create({
+    const patch = await this.createOrAppendRunArtifact({
       taskId: input.task.id,
       title: `Run Diff: ${input.run.shortIdentifier} attempt ${input.run.attempt + 1}`,
       kind: 'diff',
@@ -190,7 +190,7 @@ export class RunProofService {
       },
       tags: ['run-diff'],
     });
-    const stat = await this.options.artifacts.create({
+    const stat = await this.createOrAppendRunArtifact({
       taskId: input.task.id,
       title: `Run Diff Stat: ${input.run.shortIdentifier} attempt ${input.run.attempt + 1}`,
       kind: 'diff',
@@ -277,7 +277,7 @@ export class RunProofService {
       exitCode: number | null;
     },
   ): Promise<WorkbenchArtifactRecord> {
-    return this.options.artifacts.create({
+    return this.createOrAppendRunArtifact({
       taskId: input.task.id,
       title: `Run Validation ${validation.stream.toUpperCase()}: ${input.run.shortIdentifier} attempt ${input.run.attempt + 1}`,
       kind: 'validation_log',
@@ -293,6 +293,40 @@ export class RunProofService {
       summary: `${validation.command} exited with ${validation.exitCode ?? 'unknown'}`,
       tags: ['run-validation', validation.stream],
     });
+  }
+
+  private async createOrAppendRunArtifact(input: CreateArtifactInput): Promise<WorkbenchArtifactRecord> {
+    const existing = await this.findExistingRunArtifact(input);
+    if (!existing) {
+      return this.options.artifacts.create(input);
+    }
+
+    const appendInput: AppendArtifactVersionInput = {
+      artifactId: existing.id,
+      content: input.content,
+      contentType: input.contentType,
+      extension: input.extension,
+      sourceEventIds: input.sourceEventIds,
+      sourceEvidenceIds: input.sourceEvidenceIds,
+      changedFiles: input.changedFiles,
+      validationRefs: input.validationRefs,
+      decisionIds: input.decisionIds,
+      summary: input.summary,
+    };
+    return this.options.artifacts.appendVersion(appendInput);
+  }
+
+  private async findExistingRunArtifact(input: CreateArtifactInput): Promise<WorkbenchArtifactRecord | undefined> {
+    const template = input.producedBy?.template;
+    if (!template) return undefined;
+    const artifacts = await this.options.artifacts.list({ taskId: input.taskId });
+    return artifacts
+      .filter((artifact) => (
+        artifact.title === input.title
+        && artifact.kind === input.kind
+        && artifact.producedBy.template === template
+      ))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
   }
 
   private classifyStatus(

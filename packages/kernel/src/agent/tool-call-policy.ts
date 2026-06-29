@@ -218,6 +218,8 @@ export function assistantSuggestsNoCodeChangeNeeded(content: string): boolean {
   return (
     lowered.includes('no code changes are needed')
     || lowered.includes('no code change is needed')
+    || lowered.includes('no further code changes are needed')
+    || lowered.includes('no further code change is needed')
     || lowered.includes('no changes are required')
     || lowered.includes('no code changes required')
     || lowered.includes('does not need code changes')
@@ -342,30 +344,69 @@ export function shouldForceImplementationAction(
 }
 
 export function hasMeaningfulPendingWork(summary?: string | SessionCompactMemory): boolean {
-  if (!summary) return false;
+  return extractPendingWork(summary).some(isMeaningfulPendingItem);
+}
 
-  const pendingItems = typeof summary === 'string'
+function hasBlockingPendingWork(
+  summary: string | SessionCompactMemory | undefined,
+  options: { validationSatisfied: boolean },
+): boolean {
+  return extractPendingWork(summary).some((item) => {
+    if (options.validationSatisfied && isValidationPendingItem(item)) return false;
+    return isMeaningfulPendingItem(item);
+  });
+}
+
+function extractPendingWork(summary?: string | SessionCompactMemory): string[] {
+  if (!summary) return [];
+
+  return typeof summary === 'string'
     ? extractPendingItemsFromSummary(summary)
     : (summary.pendingWork || []);
+}
 
-  return pendingItems.some((item) => {
-    const lowered = item.toLowerCase();
-    return (
-      lowered.includes('implement')
-      || lowered.includes('verify')
-      || lowered.includes('read ')
-      || lowered.includes('modify')
-      || lowered.includes('change')
-      || lowered.includes('resume')
-      || lowered.includes('continue')
-      || lowered.includes('补')
-      || lowered.includes('实现')
-      || lowered.includes('修改')
-      || lowered.includes('验证')
-      || lowered.includes('阅读')
-      || lowered.includes('继续')
-    );
-  });
+function isMeaningfulPendingItem(item: string): boolean {
+  const lowered = item.toLowerCase();
+  return (
+    lowered.includes('implement')
+    || lowered.includes('verify')
+    || lowered.includes('read ')
+    || lowered.includes('modify')
+    || lowered.includes('change')
+    || lowered.includes('resume')
+    || lowered.includes('continue')
+    || lowered.includes('补')
+    || lowered.includes('实现')
+    || lowered.includes('修改')
+    || lowered.includes('验证')
+    || lowered.includes('阅读')
+    || lowered.includes('继续')
+  );
+}
+
+function isValidationPendingItem(item: string): boolean {
+  const lowered = item.toLowerCase();
+  const hasValidationSignal = (
+    lowered.includes('verify')
+    || lowered.includes('validation')
+    || lowered.includes('test')
+    || lowered.includes('验证')
+    || lowered.includes('测试')
+  );
+  const hasImplementationSignal = (
+    /\bimplement\b/.test(lowered)
+    || lowered.includes('modify')
+    || lowered.includes('edit')
+    || lowered.includes('read ')
+    || lowered.includes('resume')
+    || lowered.includes('continue')
+    || lowered.includes('新增')
+    || lowered.includes('修复')
+    || lowered.includes('修改')
+    || lowered.includes('阅读')
+    || lowered.includes('继续')
+  );
+  return hasValidationSignal && !hasImplementationSignal;
 }
 
 export function hasWriteLikeAction(actions: ExecutedActionLike[]): boolean {
@@ -374,19 +415,33 @@ export function hasWriteLikeAction(actions: ExecutedActionLike[]): boolean {
   );
 }
 
+export function hasSuccessfulValidationAction(actions: ExecutedActionLike[]): boolean {
+  return actions.some((action) => action.success && isValidationAction(action));
+}
+
+export function hasFailedAction(actions: ExecutedActionLike[]): boolean {
+  return actions.some((action) => !action.success);
+}
+
 export function shouldMarkTaskCompleted(
   taskDescription: string,
   summary: string | SessionCompactMemory | undefined,
   assistantContent: string,
   actions: ExecutedActionLike[],
+  options: { validationAvailable?: boolean } = {},
 ): boolean {
   const intent = classifyTaskIntent(taskDescription);
   const explicitNoChange = assistantSuggestsNoCodeChangeNeeded(assistantContent);
   const wroteCode = hasWriteLikeAction(actions);
-  const hasPending = hasMeaningfulPendingWork(summary);
+  const validationPassed = hasSuccessfulValidationAction(actions);
+  const hasFailure = hasFailedAction(actions);
+  const validationSatisfied = validationPassed || options.validationAvailable === false;
+  const hasPending = hasBlockingPendingWork(summary, { validationSatisfied });
 
   if (intent === 'implementation') {
-    if (wroteCode) return true;
+    if (wroteCode) {
+      return validationSatisfied && !hasPending && !hasFailure;
+    }
     if (explicitNoChange && !hasPending) return true;
     return false;
   }
@@ -396,6 +451,36 @@ export function shouldMarkTaskCompleted(
   }
 
   return wroteCode || explicitNoChange || !hasPending;
+}
+
+function isValidationAction(action: ExecutedActionLike): boolean {
+  if (action.tool === 'frontend_run_script') {
+    const script = String((action.input as { script?: unknown })?.script || '');
+    return isValidationScriptName(script);
+  }
+
+  if (action.tool !== 'bash') return false;
+  const command = String((action.input as { command?: unknown })?.command || '');
+  return isValidationCommand(command);
+}
+
+function isValidationCommand(command: string): boolean {
+  const normalized = command.toLowerCase();
+  const packageScriptMatch = normalized.match(/\b(?:pnpm|npm|yarn|bun)(?:\s+--[^\s]+(?:\s+[^\s]+)?)*\s+(?:run\s+)?([a-z0-9:_-]+)/);
+  if (packageScriptMatch && isValidationScriptName(packageScriptMatch[1] || '')) {
+    return true;
+  }
+
+  return (
+    /(?:^|&&|\|\||;)\s*(?:npx\s+)?(?:vitest|jest|mocha|playwright|cypress|eslint|tsc|pytest)\b/.test(normalized)
+    || /\b(mvn|gradle|gradlew)\b.*\b(test|verify|check|build)\b/.test(normalized)
+    || /\bgo\s+test\b/.test(normalized)
+    || /\bcargo\s+(test|check|build)\b/.test(normalized)
+  );
+}
+
+function isValidationScriptName(script: string): boolean {
+  return /^(test|test:.+|lint|lint:.+|typecheck|type-check|check|check:.+|build|build:.+)$/i.test(script);
 }
 
 function extractPendingItemsFromSummary(summary: string): string[] {
