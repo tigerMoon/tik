@@ -1,39 +1,85 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
-export async function safeResolve(contextCwd: string, requestedPath: string): Promise<string> {
+export interface SafeResolveOptions {
+  allowAbsolute?: boolean;
+  allowDirectory?: boolean;
+}
+
+export interface SafeResolveWorkspacePathOptions {
+  allowDirectory?: boolean;
+}
+
+export async function safeResolveWorkspacePath(
+  root: string,
+  requestedPath: string,
+  options: SafeResolveWorkspacePathOptions = {},
+): Promise<string> {
   if (!requestedPath || !requestedPath.trim()) {
     throw new Error('Path is required.');
   }
 
   if (path.isAbsolute(requestedPath)) {
-    throw new Error(`Refusing absolute paths outside the workspace: ${requestedPath}`);
+    throw new Error(`Absolute paths are not allowed: ${requestedPath}`);
   }
 
-  const cwd = path.resolve(contextCwd);
+  const workspaceRoot = path.resolve(root);
+  const realRoot = await fs.realpath(workspaceRoot);
   const normalized = requestedPath.replace(/\\/g, '/');
   if (normalized.split('/').includes('..')) {
     throw new Error(`Refusing parent traversal outside the workspace: ${requestedPath}`);
   }
 
-  const resolved = path.resolve(cwd, requestedPath);
-  if (!isWithin(cwd, resolved)) {
+  const resolved = path.resolve(workspaceRoot, requestedPath);
+  if (!isWithin(workspaceRoot, resolved)) {
     throw new Error(`Refusing path outside the workspace: ${requestedPath}`);
   }
 
-  const realParent = await fs.realpath(path.dirname(resolved)).catch(async (error) => {
+  const realTarget = await fs.realpath(resolved).catch((error) => {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw error;
     }
-    return nearestExistingRealpath(cwd, path.dirname(resolved));
+    return null;
   });
-  const realCwd = await fs.realpath(cwd);
-  if (!isWithin(realCwd, realParent)) {
+  if (realTarget) {
+    if (!isWithin(realRoot, realTarget)) {
+      throw new Error(`Refusing symlink escape outside the workspace: ${requestedPath}`);
+    }
+    const stat = await fs.stat(realTarget);
+    if (stat.isDirectory() && !options.allowDirectory) {
+      throw new Error(`Directory paths are not allowed for this tool path: ${requestedPath}`);
+    }
+    return realTarget;
+  }
+
+  const nearestExisting = await nearestExistingPath(workspaceRoot, path.dirname(resolved));
+  if (!isWithin(realRoot, nearestExisting.realPath)) {
     throw new Error(`Refusing symlink escape outside the workspace: ${requestedPath}`);
   }
 
-  const basename = path.basename(resolved);
-  return path.join(realParent, basename);
+  const missingSuffix = path.relative(nearestExisting.path, resolved);
+  if (missingSuffix.startsWith('..') || path.isAbsolute(missingSuffix)) {
+    throw new Error(`Refusing path outside the workspace: ${requestedPath}`);
+  }
+  return resolved;
+}
+
+export async function safeResolve(
+  contextCwd: string,
+  requestedPath: string,
+  options: SafeResolveOptions = {},
+): Promise<string> {
+  if (!options.allowAbsolute || !path.isAbsolute(requestedPath)) {
+    return safeResolveWorkspacePath(contextCwd, requestedPath, {
+      allowDirectory: options.allowDirectory,
+    });
+  }
+
+  const workspaceRoot = path.resolve(contextCwd);
+  const relativePath = path.relative(workspaceRoot, path.resolve(requestedPath)) || '.';
+  return safeResolveWorkspacePath(contextCwd, relativePath, {
+    allowDirectory: options.allowDirectory,
+  });
 }
 
 function isWithin(root: string, target: string): boolean {
@@ -41,13 +87,16 @@ function isWithin(root: string, target: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-async function nearestExistingRealpath(root: string, targetDir: string): Promise<string> {
+async function nearestExistingPath(root: string, targetDir: string): Promise<{ path: string; realPath: string }> {
   let current = path.resolve(targetDir);
   const resolvedRoot = path.resolve(root);
 
   while (isWithin(resolvedRoot, current)) {
     try {
-      return await fs.realpath(current);
+      return {
+        path: current,
+        realPath: await fs.realpath(current),
+      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw error;

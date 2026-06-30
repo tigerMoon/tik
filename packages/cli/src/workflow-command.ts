@@ -47,12 +47,12 @@ export async function validateWorkflow(options: WorkflowValidateOptions): Promis
 export async function explainWorkflowTask(options: WorkflowExplainOptions): Promise<string> {
   const workflow = await loadWorkflowForCli(options.workspaceRoot, options.file);
   const task = makeExplainTask(options.taskId, options.task);
-  const routing = workflow.version === 2 ? workflow.resolveRouting?.(task) : undefined;
+  const routing = workflow.resolveRouting(task);
   const projectPath = task.repository?.executionPath || task.repository?.path || options.workspaceRoot;
   return formatWorkflowExplain(workflow, task, {
-    runner: routing?.runner || 'codex',
-    mode: routing?.mode || 'codex_app_server',
-    matchedSource: routing?.matchedSource || 'default',
+    runner: routing.runner,
+    mode: routing.mode,
+    matchedSource: routing.matchedSource,
     projectPath,
   });
 }
@@ -106,11 +106,11 @@ export function defaultTrackerWorkflowV2Content(): string {
 export function formatWorkflowValidation(workflow: TrackerWorkflowDefinition): string {
   return [
     `Workflow: ${workflow.path || '(inline)'}`,
-    `Version: ${workflow.version || 1}`,
-    `Routing: ${workflow.config.routing?.defaultRunner || 'legacy'} ${workflow.config.routing?.defaultMode || ''}`.trimEnd(),
+    `Version: ${workflow.version}`,
+    `Routing: ${workflow.config.routing?.defaultRunner || 'none'} ${workflow.config.routing?.defaultMode || ''}`.trimEnd(),
     `Validation: ${workflow.config.validation?.commands.length ? workflow.config.validation.commands.join(', ') : 'none'}`,
-    `Config hash: ${workflow.workflowConfigHash || 'n/a'}`,
-    `Prompt hash: ${workflow.workflowPromptHash || 'n/a'}`,
+    `Config hash: ${workflow.workflowConfigHash}`,
+    `Prompt hash: ${workflow.workflowPromptHash}`,
   ].join('\n');
 }
 

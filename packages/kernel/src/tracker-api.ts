@@ -2,7 +2,7 @@ export { TrackerDaemon } from './tracker-daemon/tracker-daemon.js';
 export { FileTrackerDaemonStateStore } from './tracker-daemon/file-state-store.js';
 export { JsonTaskImporter } from './tracker-daemon/json-tracker-client.js';
 export { LinearTaskImporter } from './tracker-daemon/linear-tracker-client.js';
-export { WorkbenchTaskImporter, WorkflowV2WorkbenchTaskImporter } from './tracker-daemon/workbench-tracker-client.js';
+export { WorkflowV2WorkbenchTaskImporter } from './tracker-daemon/workbench-tracker-client.js';
 export {
   defaultTrackerWorkflowContent,
   loadTrackerWorkflow,

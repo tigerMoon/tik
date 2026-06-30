@@ -341,7 +341,7 @@ function workflowV2(input: {
 }
 
 describe('tracker-daemon Symphony spec behavior', () => {
-  it('loads WORKFLOW.md front matter and renders task prompts from the prompt body', async () => {
+  it('rejects workflow files that do not declare version 2', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-loader-'));
     tempDirs.push(root);
     await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
@@ -362,8 +362,33 @@ describe('tracker-daemon Symphony spec behavior', () => {
       '{{task.description}}',
     ].join('\n'), 'utf-8');
 
+    await expect(loadTrackerWorkflow(root)).rejects.toThrow('Workflow files must declare version: 2.');
+  });
+
+  it('loads workflow v2 front matter and renders task prompts from the prompt body', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-loader-'));
+    tempDirs.push(root);
+    await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'polling:',
+      '  interval_ms: 2500',
+      '  max_concurrent_agents: 2',
+      'workspace:',
+      '  root: .tik/workspaces',
+      '  cleanup_terminal: true',
+      'routing:',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
+      '---',
+      'Please work on {{task.shortIdentifier}}: {{task.title}}.',
+      '',
+      '{{task.description}}',
+    ].join('\n'), 'utf-8');
+
     const workflow = await loadTrackerWorkflow(root);
 
+    expect(workflow.version).toBe(2);
     expect(workflow.config.polling.intervalMs).toBe(2500);
     expect(workflow.config.polling.maxConcurrentAgents).toBe(2);
     expect(workflow.config.workspace.cleanupTerminal).toBe(true);
@@ -371,52 +396,15 @@ describe('tracker-daemon Symphony spec behavior', () => {
     expect(workflow.renderPrompt(task('task-1', 'TIK-1'))).toContain('Description TIK-1');
   });
 
-  it('loads SPEC-style top-level hooks and agent concurrency settings', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-loader-'));
-    tempDirs.push(root);
-    await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
-      '---',
-      'tracker:',
-      '  kind: linear',
-      '  api_key: $LINEAR_API_KEY',
-      '  endpoint: https://linear.example/graphql',
-      '  project_slug: tik',
-      'agent:',
-      '  max_concurrent_agents: 4',
-      '  timeout_ms: 12345',
-      'hooks:',
-      '  after_create: |',
-      '    echo created',
-      '    echo done',
-      '  before_run: echo before',
-      '  after_run: echo after',
-      '  before_remove: echo remove',
-      '---',
-      'Implement {{task.shortIdentifier}}.',
-    ].join('\n'), 'utf-8');
-
-    const workflow = await loadTrackerWorkflow(root);
-
-    expect(workflow.config.tracker.kind).toBe('linear');
-    expect(workflow.config.tracker.apiKeyEnv).toBe('LINEAR_API_KEY');
-    expect(workflow.config.tracker.endpoint).toBe('https://linear.example/graphql');
-    expect(workflow.config.tracker.projectSlug).toBe('tik');
-    expect(workflow.config.polling.maxConcurrentAgents).toBe(4);
-    expect(workflow.config.workspace.hooks).toEqual({
-      afterCreate: ['echo created\necho done'],
-      beforeRun: ['echo before'],
-      afterRun: ['echo after'],
-      beforeRemove: ['echo remove'],
-    });
-  });
-
   it('fails prompt rendering on unknown workflow variables', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-loader-'));
     tempDirs.push(root);
     await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
       '---',
-      'tracker:',
-      '  kind: json',
+      'version: 2',
+      'routing:',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
       '---',
       'Implement {{issue.missing_field}}.',
     ].join('\n'), 'utf-8');
@@ -428,13 +416,15 @@ describe('tracker-daemon Symphony spec behavior', () => {
     );
   });
 
-  it('keeps backward-compatible issue template variables for existing WORKFLOW.md files', async () => {
+  it('keeps issue template aliases for workflow v2 files', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workflow-loader-'));
     tempDirs.push(root);
     await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
       '---',
-      'tracker:',
-      '  kind: json',
+      'version: 2',
+      'routing:',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
       '---',
       'Implement {{issue.identifier}} from {{issue.url}}.',
     ].join('\n'), 'utf-8');
@@ -451,6 +441,7 @@ describe('tracker-daemon Symphony spec behavior', () => {
     tempDirs.push(root);
     await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
       '---',
+      'version: 2',
       'tracker:',
       '  kind: json',
       '  active_states:',
@@ -460,15 +451,24 @@ describe('tracker-daemon Symphony spec behavior', () => {
       'workspace:',
       '  hooks:',
       '    before_run:',
-      '      - echo first',
-      '      - echo second',
+      '      - .tik/hooks/first.sh',
+      '      - .tik/hooks/second.sh',
       'polling:',
       '  interval_ms: 2500',
+      'routing:',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
       '---',
       '{% if attempt > 0 %}Retry {{attempt}} for {% endif %}{{ task.shortIdentifier }}',
       'Labels: {{ task.labels | join: ", " }}',
       '{% for label in task.labels %}- {{ label }}{% endfor %}',
     ].join('\n'), 'utf-8');
+    await fs.mkdir(path.join(root, '.tik', 'hooks'), { recursive: true });
+    await Promise.all(['first.sh', 'second.sh'].map(async (name) => {
+      const hookPath = path.join(root, '.tik', 'hooks', name);
+      await fs.writeFile(hookPath, '#!/bin/sh\nexit 0\n', 'utf-8');
+      await fs.chmod(hookPath, 0o755);
+    }));
 
     const workflow = await loadTrackerWorkflow(root);
     const rendered = workflow.renderPrompt({
@@ -478,7 +478,7 @@ describe('tracker-daemon Symphony spec behavior', () => {
 
     expect(workflow.config.tracker.activeStates).toEqual(['Todo', 'Ready']);
     expect(workflow.config.tracker.terminalStates).toEqual(['Done', 'Closed']);
-    expect(workflow.config.workspace.hooks.beforeRun).toEqual(['echo first', 'echo second']);
+    expect(workflow.config.workspace.hooks.beforeRun).toEqual(['.tik/hooks/first.sh', '.tik/hooks/second.sh']);
     expect(rendered).toContain('Retry 2 for TIK-1');
     expect(rendered).toContain('Labels: backend, tracker');
     expect(rendered).toContain('- backend');
@@ -490,8 +490,10 @@ describe('tracker-daemon Symphony spec behavior', () => {
     tempDirs.push(root);
     await fs.writeFile(path.join(root, 'WORKFLOW.md'), [
       '---',
-      'tracker:',
-      '  kind: json',
+      'version: 2',
+      'routing:',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
       '---',
       '{% if previousReview %}',
       'Previous review rejection reason:',
@@ -1476,6 +1478,9 @@ describe('tracker-daemon Symphony spec behavior', () => {
       workspaceRoot: '/workspace',
       defaultProjectPath: '/repo/default',
       workflowProvider: async () => ({
+        version: 2,
+        workflowConfigHash: 'config-hash',
+        workflowPromptHash: 'prompt-hash',
         config: {
           tracker: { kind: 'json', activeStates: ['Todo'], terminalStates: ['Done'] },
           polling: { intervalMs: workflowPollMs, maxConcurrentAgents: 3 },
@@ -1485,10 +1490,14 @@ describe('tracker-daemon Symphony spec behavior', () => {
             hooks: { afterCreate: [], beforeRun: [], afterRun: [], beforeRemove: [] },
           },
           agent: { timeoutMs: 1000 },
+          routing: { defaultRunner: 'codex', defaultMode: 'codex_app_server', rules: [] },
         },
         promptTemplate: 'Implement {{ task.shortIdentifier }}',
         renderPrompt(taskInput) {
           return `Implement ${taskInput.shortIdentifier}`;
+        },
+        resolveRouting() {
+          return { runner: 'codex', mode: 'codex_app_server', matchedSource: 'default' };
         },
       }),
     });

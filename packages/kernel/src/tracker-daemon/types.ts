@@ -135,7 +135,6 @@ export interface TrackerDaemonWorkLauncher {
     workspaceRoot: string;
     projectPath: string;
     run?: TrackerRunRecord;
-    workflowVersion?: TrackerWorkflowVersion;
     envWhitelist?: string[];
   }): Promise<void>;
   cleanupWorkspace?(input: { task: TrackedTask; workspaceRoot: string; projectPath: string; run?: TrackerRunRecord }): Promise<void>;
@@ -206,7 +205,7 @@ export interface TrackerWorkflowConfig {
   hooks?: TrackerWorkflowHooksConfig;
 }
 
-export type TrackerWorkflowVersion = 1 | 2;
+export type TrackerWorkflowVersion = 2;
 
 export type AgentRuntimeName = 'codex' | 'claude-code';
 
@@ -260,14 +259,14 @@ export interface TrackerWorkflowRoutingResolution {
 }
 
 export interface TrackerWorkflowDefinition {
-  version?: TrackerWorkflowVersion;
+  version: TrackerWorkflowVersion;
   path?: string;
-  workflowConfigHash?: string;
-  workflowPromptHash?: string;
+  workflowConfigHash: string;
+  workflowPromptHash: string;
   config: TrackerWorkflowConfig;
   promptTemplate: string;
   renderPrompt(task: TrackedTask, input?: { attempt?: number; previousReview?: string }): string;
-  resolveRouting?(task: TrackedTask): TrackerWorkflowRoutingResolution;
+  resolveRouting(task: TrackedTask): TrackerWorkflowRoutingResolution;
 }
 
 export interface TrackerDaemonWatchHandle {
@@ -299,7 +298,6 @@ export interface WorkbenchLaunchTaskOptions {
     workspaceRoot: string;
     projectPath: string;
     run?: TrackerRunRecord;
-    workflowVersion?: TrackerWorkflowVersion;
     envWhitelist?: string[];
   }) => Promise<unknown> | unknown;
   cleanupWorkspace?: (input: { task: TrackedTask; workspaceRoot: string; projectPath: string; run?: TrackerRunRecord }) => Promise<unknown> | unknown;

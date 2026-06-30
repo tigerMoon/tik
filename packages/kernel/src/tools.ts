@@ -10,7 +10,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '@tik/shared';
-import { safeResolve } from './path-safety.js';
+import { safeResolve, safeResolveWorkspacePath } from './path-safety.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -29,12 +29,12 @@ function isImplementationReady(context: ToolContext): boolean {
   return Boolean((context as ToolContextWithHints).implementationReady);
 }
 
-function isBroadSearchRoot(target: string | undefined, context: ToolContext): boolean {
+async function isBroadSearchRoot(target: string | undefined, context: ToolContext): Promise<boolean> {
   if (!target) return true;
   const normalized = target.trim();
   if (!normalized || normalized === '.' || normalized === './') return true;
-  const resolved = path.resolve(context.cwd, normalized);
-  return resolved === context.cwd;
+  const resolved = await safeResolveWorkspacePath(context.cwd, normalized, { allowDirectory: true });
+  return resolved === await fs.realpath(context.cwd);
 }
 
 function normalizeGlobPattern(pattern: string): string {
@@ -53,17 +53,29 @@ function patternAlreadyTargetsScope(pattern: string, scopedTarget: string | null
   return normalizedPattern.startsWith(`${basename}/`) || normalizedPattern === basename || normalizedPattern.startsWith(`${basename}**`);
 }
 
-function resolveGlobBaseDir(pattern: string, cwd: string | undefined, context: ToolContext): string {
+async function resolveGlobBaseDir(pattern: string, cwd: string | undefined, context: ToolContext): Promise<string> {
   const scopedTarget = getPrimaryTargetScope(context);
-  if (!isBroadSearchRoot(cwd, context)) {
-    return cwd ? path.resolve(context.cwd, cwd) : context.cwd;
+  if (!(await isBroadSearchRoot(cwd, context))) {
+    return cwd
+      ? safeResolveWorkspacePath(context.cwd, cwd, { allowDirectory: true })
+      : context.cwd;
   }
 
   if (patternAlreadyTargetsScope(pattern, scopedTarget)) {
     return context.cwd;
   }
 
-  return scopedTarget ? path.resolve(context.cwd, scopedTarget) : context.cwd;
+  return scopedTarget
+    ? safeResolve(context.cwd, scopedTarget, { allowAbsolute: true, allowDirectory: true })
+    : context.cwd;
+}
+
+function isBroadShellSearchRoot(target: string | undefined, context: ToolContext): boolean {
+  if (!target) return true;
+  const normalized = target.trim();
+  if (!normalized || normalized === '.' || normalized === './') return true;
+  const resolved = path.resolve(context.cwd, normalized);
+  return resolved === context.cwd;
 }
 
 function guardBashCommand(command: string, context: ToolContext): { command?: string; error?: string } {
@@ -98,7 +110,7 @@ function guardBashCommand(command: string, context: ToolContext): { command?: st
   if (!match) return { command };
 
   const searchRoot = match[1];
-  if (!isBroadSearchRoot(searchRoot, context)) {
+  if (!isBroadShellSearchRoot(searchRoot, context)) {
     return { command };
   }
 
@@ -129,7 +141,7 @@ export const readFileTool: Tool = {
     const { path: filePath } = input as { path: string };
 
     try {
-      const resolved = await safeResolve(context.cwd, filePath);
+      const resolved = await safeResolve(context.cwd, filePath, { allowDirectory: true });
       const stat = await fs.stat(resolved);
       if (stat.isDirectory()) {
         return {
@@ -201,10 +213,10 @@ export const globTool: Tool = {
   async execute(input: unknown, context: ToolContext): Promise<ToolResult> {
     const start = Date.now();
     const { pattern, cwd } = input as { pattern: string; cwd?: string };
-    const dir = resolveGlobBaseDir(pattern, cwd, context);
     const normalizedPattern = normalizeGlobPattern(pattern);
 
     try {
+      const dir = await resolveGlobBaseDir(pattern, cwd, context);
       const files = await findFiles(dir, normalizedPattern);
       return { success: true, output: files, durationMs: Date.now() - start };
     } catch (err) {

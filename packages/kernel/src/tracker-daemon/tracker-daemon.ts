@@ -153,9 +153,9 @@ export class TrackerDaemon {
         continue;
       }
       const projectPath = task.repository?.executionPath || task.repository?.path || this.options.defaultProjectPath;
-      if (workflow?.version === 2) {
+      if (workflow) {
         try {
-          const routing = workflow.resolveRouting?.(task);
+          const routing = workflow.resolveRouting(task);
           if (shouldRunClaudeReview(routing, task) && !hasTikReviewableChanges(projectPath, {
             baseRef: task.agentLoop?.changeRequest.baseRef,
             headSha: task.agentLoop?.headSha || task.agentLoop?.changeRequest.headSha,
@@ -193,15 +193,15 @@ export class TrackerDaemon {
         const projectPath = task.repository?.executionPath || task.repository?.path || this.options.defaultProjectPath;
         await this.runHooks('afterCreate', task, projectPath, undefined, workflow);
         await this.runHooks('beforeRun', task, projectPath, undefined, workflow);
-        const routing = workflow?.version === 2 ? workflow.resolveRouting?.(task) : undefined;
-        runId = workflow?.version === 2 ? buildAgentRunId(task, attempt, this.now()) : undefined;
+        const routing = workflow?.resolveRouting(task);
+        runId = workflow ? buildAgentRunId(task, attempt, this.now()) : undefined;
         const prompt = await this.renderWorkflowPrompt(task, {
           attempt,
           workflow,
           routing,
           projectPath,
         });
-        if (workflow?.version === 2 && runId && routing) {
+        if (workflow && runId && routing) {
           await this.createAgentRun(task, {
             runId,
             attempt,
@@ -210,7 +210,7 @@ export class TrackerDaemon {
             routing,
           });
         }
-        if (workflow?.version === 2 && runId && routing && this.options.runtimeRunners?.[routing.runner]) {
+        if (workflow && runId && routing && this.options.runtimeRunners?.[routing.runner]) {
           await this.launchRuntimeRunner(task, {
             runId,
             attempt,
@@ -238,7 +238,7 @@ export class TrackerDaemon {
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err);
         await this.options.launcher.markAttemptFailed?.(task.id, error);
-        if (workflow?.version === 2) {
+        if (workflow) {
           await this.appendAgentRunFailure(task, runId || buildAgentRunId(task, attempt, this.now()), error);
         }
         state.retries[task.id] = this.nextRetry(state, task, error);
@@ -265,17 +265,17 @@ export class TrackerDaemon {
     const workflow = await this.resolveWorkflow();
     const state = await this.options.stateStore.load().catch(() => emptyState());
     const attempt = state.retries[task.id]?.attempt || 0;
-    const runId = workflow?.version === 2 ? buildAgentRunId(task, attempt, this.now()) : undefined;
+    const runId = workflow ? buildAgentRunId(task, attempt, this.now()) : undefined;
     try {
       const projectPath = task.repository?.executionPath || task.repository?.path || this.options.defaultProjectPath;
-      const routing = workflow?.version === 2 ? workflow.resolveRouting?.(task) : undefined;
+      const routing = workflow?.resolveRouting(task);
       const prompt = await this.renderWorkflowPrompt(task, {
         attempt,
         workflow,
         routing,
         projectPath,
       });
-      if (workflow?.version === 2 && runId && routing) {
+      if (workflow && runId && routing) {
         await this.createAgentRun(task, {
           runId,
           attempt,
@@ -284,7 +284,7 @@ export class TrackerDaemon {
           routing,
         });
       }
-      if (workflow?.version === 2 && runId && routing && this.options.runtimeRunners?.[routing.runner]) {
+      if (workflow && runId && routing && this.options.runtimeRunners?.[routing.runner]) {
         await this.launchRuntimeRunner(task, {
           runId,
           attempt,
@@ -314,7 +314,7 @@ export class TrackerDaemon {
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
       await this.options.launcher.markAttemptFailed?.(task.id, error);
-      if (workflow?.version === 2) {
+      if (workflow) {
         await this.appendAgentRunFailure(task, runId || buildAgentRunId(task, attempt, this.now()), error);
       }
       state.retries[task.id] = this.nextRetry(state, task, error);
@@ -829,7 +829,6 @@ export class TrackerDaemon {
         workspaceRoot: this.options.workspaceRoot,
         projectPath,
         run,
-        workflowVersion: workflow?.version,
         envWhitelist: workflow?.config.sandbox?.envWhitelist,
       });
     }
@@ -955,7 +954,7 @@ function appendRecent(
 }
 
 function workflowSelectorSkipReason(workflow: TrackerWorkflowDefinition | undefined, task: TrackedTask): string | undefined {
-  if (workflow?.version !== 2) return undefined;
+  if (!workflow) return undefined;
   const selector = workflow.config.selector;
   if (!selector) return undefined;
   const labels = new Set(task.labels.map(normalizeLabel));
@@ -993,7 +992,7 @@ function workflowLockKey(
   task: TrackedTask,
   defaultProjectPath: string,
 ): string | undefined {
-  if (workflow?.version !== 2) return undefined;
+  if (!workflow) return undefined;
   if (workflow.config.concurrency?.lock !== 'repository_branch') return undefined;
   const repository = task.repository?.sourcePath || task.repository?.path || task.repository?.name || defaultProjectPath;
   const branch = workflowBranchForTask(task);

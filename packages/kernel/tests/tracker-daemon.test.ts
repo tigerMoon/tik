@@ -7,7 +7,7 @@ import { EventType, type EnvironmentPackSnapshot } from '@tik/shared';
 import { EventBus } from '../src/event-bus.js';
 import { FileTrackerDaemonStateStore } from '../src/tracker-daemon/file-state-store.js';
 import { TrackerDaemon } from '../src/tracker-daemon/tracker-daemon.js';
-import { WorkbenchTaskImporter, WorkflowV2WorkbenchTaskImporter } from '../src/tracker-daemon/workbench-tracker-client.js';
+import { WorkflowV2WorkbenchTaskImporter } from '../src/tracker-daemon/workbench-tracker-client.js';
 import { WorkbenchTrackerLauncher } from '../src/tracker-daemon/workbench-launcher.js';
 import { runWorkbenchKernelTaskInBackground } from '../src/tracker-daemon/workbench-runner.js';
 import type {
@@ -561,7 +561,7 @@ describe('TrackerDaemon', () => {
       }],
     }, 'task-stale');
 
-    const importer = new WorkbenchTaskImporter(workbench);
+    const importer = new WorkflowV2WorkbenchTaskImporter(workbench, root);
     const launcher = new WorkbenchTrackerLauncher(workbench, {
       workspaceRoot: root,
       defaultProjectPath: root,
@@ -608,7 +608,7 @@ describe('TrackerDaemon', () => {
       activeSessionId: 'stale-session-id',
     }, 'task-orphan-running');
 
-    const importer = new WorkbenchTaskImporter(workbench);
+    const importer = new WorkflowV2WorkbenchTaskImporter(workbench, root);
     const launcher = new WorkbenchTrackerLauncher(workbench, {
       workspaceRoot: root,
       defaultProjectPath: root,
@@ -823,7 +823,7 @@ describe('TrackerDaemon', () => {
     ]);
     expect(workbenchTask?.attempts?.[0]?.finishedAt).toBeTruthy();
 
-    const importer = new WorkbenchTaskImporter(workbench);
+    const importer = new WorkflowV2WorkbenchTaskImporter(workbench, root);
     const running = await importer.listOpenAttemptTasks();
     expect(running).toEqual([]);
   });
@@ -920,7 +920,7 @@ describe('TrackerDaemon', () => {
       status: 'backlog',
     }, 'task-backlog');
 
-    const importer = new WorkbenchTaskImporter(workbench);
+    const importer = new WorkflowV2WorkbenchTaskImporter(workbench, root);
     const tasks = await importer.listCandidateTasks();
 
     expect(tasks.map((entry) => entry.id)).toEqual(['task-ready']);
@@ -968,7 +968,7 @@ describe('TrackerDaemon', () => {
       environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
     }, 'task-maintenance');
 
-    const importer = new WorkbenchTaskImporter(workbench);
+    const importer = new WorkflowV2WorkbenchTaskImporter(workbench, root);
 
     await expect(importer.listCandidateTasks()).resolves.toEqual([
       expect.objectContaining({ id: 'task-coding' }),
@@ -996,10 +996,8 @@ describe('TrackerDaemon', () => {
       environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
     }, 'task-claude-review');
 
-    const legacyImporter = new WorkbenchTaskImporter(workbench);
     const workflowImporter = new WorkflowV2WorkbenchTaskImporter(workbench, root);
 
-    await expect(legacyImporter.listCandidateTasks()).resolves.toEqual([]);
     await expect(workflowImporter.listCandidateTasks()).resolves.toEqual([
       expect.objectContaining({
         id: 'task-claude-review',
@@ -1050,10 +1048,8 @@ describe('TrackerDaemon', () => {
       },
     }, 'task-external-claude-review');
 
-    const legacyImporter = new WorkbenchTaskImporter(workbench);
     const workflowImporter = new WorkflowV2WorkbenchTaskImporter(workbench, root);
 
-    await expect(legacyImporter.listCandidateTasks()).resolves.toEqual([]);
     await expect(workflowImporter.listCandidateTasks()).resolves.toEqual([]);
     await expect(workflowImporter.fetchTaskStatesByIds?.(['task-external-claude-review'])).resolves.toEqual([
       expect.objectContaining({
@@ -1123,9 +1119,10 @@ describe('TrackerDaemon', () => {
       },
     }, 'task-review-context');
 
+    const trackedTask = (await new WorkflowV2WorkbenchTaskImporter(workbench, repo).fetchTaskStatesByIds?.(['task-review-context']))![0]!;
     const runtimeRunner = new CompletingRuntimeRunner('claude-code');
     const daemon = new TrackerDaemon({
-      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      importer: new MemoryTaskImporter([trackedTask]),
       stateStore: new MemoryTrackerStateStore(),
       launcher: new WorkbenchTrackerLauncher(workbench, {
         workspaceRoot: root,
@@ -2008,7 +2005,7 @@ describe('TrackerDaemon', () => {
       }],
     }, 'task-maintenance-running');
 
-    const importer = new WorkbenchTaskImporter(workbench);
+    const importer = new WorkflowV2WorkbenchTaskImporter(workbench, root);
     const launcher = new WorkbenchTrackerLauncher(workbench, {
       workspaceRoot: root,
       defaultProjectPath: root,
@@ -2028,7 +2025,7 @@ describe('TrackerDaemon', () => {
     expect(result.stopped).toEqual(['TIK-OPS']);
   });
 
-  it('leaves Claude review work items for the Claude Code plugin while importing Codex fix items', async () => {
+  it('leaves Claude review work items for explicit review runs while importing Codex fix items through workflow v2', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
     tempDirs.push(root);
     const workbench = new WorkbenchService({
@@ -2058,7 +2055,7 @@ describe('TrackerDaemon', () => {
       title: 'Claude review',
       goal: 'This should be claimed by Claude Code',
       status: 'todo',
-      labels: ['agent-loop', 'claude-review', 'needs-claude-review'],
+      labels: ['agent-loop', 'claude-review', 'external-claude-review', 'needs-claude-review'],
       environmentPackSnapshot: TEST_ENVIRONMENT_SNAPSHOT,
       agentLoop: {
         kind: 'claude_review',
@@ -2088,7 +2085,7 @@ describe('TrackerDaemon', () => {
       },
     }, 'task-codex-fix');
 
-    const importer = new WorkbenchTaskImporter(workbench);
+    const importer = new WorkflowV2WorkbenchTaskImporter(workbench, root);
 
     await expect(importer.listCandidateTasks()).resolves.toEqual([
       expect.objectContaining({ id: 'task-regular' }),
@@ -2130,7 +2127,7 @@ describe('TrackerDaemon', () => {
       },
     }, 'task-reopened');
 
-    const importer = new WorkbenchTaskImporter(workbench);
+    const importer = new WorkflowV2WorkbenchTaskImporter(workbench, root);
     const tasks = await importer.listCandidateTasks();
 
     expect(tasks[0]?.repository).toMatchObject({

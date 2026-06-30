@@ -17,7 +17,6 @@ export interface TrackerHookInput {
   task: { id: string; shortIdentifier: string };
   workspaceRoot: string;
   projectPath: string;
-  workflowVersion?: 1 | 2;
   envWhitelist?: string[];
 }
 
@@ -31,26 +30,15 @@ export async function runTrackerHook(name: string, input: TrackerHookInput): Pro
     TIK_TRACKER_PROJECT_PATH: input.projectPath,
   };
 
-  if (input.workflowVersion === 2) {
-    const env = buildWhitelistedHookEnv(input.envWhitelist || [], tikEnv);
-    try {
-      await execFileAsync(await resolveWorkflowV2HookPath(input.workspaceRoot, name), [], {
-        cwd: input.projectPath,
-        env,
-      });
-    } catch (error) {
-      throw redactHookError(error, env);
-    }
-    return;
+  const env = buildWhitelistedHookEnv(input.envWhitelist || [], tikEnv);
+  try {
+    await execFileAsync(await resolveWorkflowV2HookPath(input.workspaceRoot, name), [], {
+      cwd: input.projectPath,
+      env,
+    });
+  } catch (error) {
+    throw redactHookError(error, env);
   }
-
-  await execFileAsync('/bin/sh', ['-lc', name], {
-    cwd: input.projectPath,
-    env: {
-      ...process.env,
-      ...tikEnv,
-    },
-  });
 }
 
 export function buildWhitelistedHookEnv(
@@ -97,7 +85,12 @@ async function resolveWorkflowV2HookPath(workspaceRoot: string, hookName: string
     throw new Error(`Workflow v2 hook resolves outside the workspace root: ${hookName}`);
   }
   const realRoot = await fs.realpath(root);
-  const realResolved = await fs.realpath(resolved);
+  const realResolved = await fs.realpath(resolved).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(`Workflow v2 hook does not exist: ${hookName}`);
+    }
+    throw error;
+  });
   if (!isWithin(realRoot, realResolved)) {
     throw new Error(`Workflow v2 hook resolves outside the workspace root: ${hookName}`);
   }

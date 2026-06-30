@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import * as TikKernel from '@tik/kernel';
-import { JsonTaskImporter, WorkbenchTaskImporter, WorkflowV2WorkbenchTaskImporter } from '@tik/kernel';
+import { JsonTaskImporter, WorkflowV2WorkbenchTaskImporter } from '@tik/kernel';
 import type { TrackedTaskImporter, TrackerWorkflowDefinition } from '@tik/kernel';
 
 export function buildTaskImporterFromCli(input: {
@@ -9,6 +9,9 @@ export function buildTaskImporterFromCli(input: {
   workflow?: TrackerWorkflowDefinition;
   workbench: TikKernel.WorkbenchService;
 }): TrackedTaskImporter {
+  if (input.workflow?.version !== 2) {
+    throw new Error('Workflow v2 is required for tracker importing.');
+  }
   const workflowTracker = input.workflow?.config.tracker;
   const taskFile = input.file || workflowTracker?.taskFile;
   if (taskFile) {
@@ -17,8 +20,5 @@ export function buildTaskImporterFromCli(input: {
   if (workflowTracker?.kind === 'linear') {
     throw new Error('Linear runtime import is no longer supported. Import Linear issues into Workbench tasks first, then run tracker against local tasks.');
   }
-  if (input.workflow?.version === 2) {
-    return new WorkflowV2WorkbenchTaskImporter(input.workbench, input.workspaceRoot);
-  }
-  return new WorkbenchTaskImporter(input.workbench);
+  return new WorkflowV2WorkbenchTaskImporter(input.workbench, input.workspaceRoot);
 }

@@ -14,6 +14,21 @@ afterEach(async () => {
 });
 
 describe('buildTaskImporterFromCli', () => {
+  it('requires a workflow v2 definition when importing workbench tasks', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-cli-tracker-'));
+    tempDirs.push(root);
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+
+    expect(() => buildTaskImporterFromCli({
+      workspaceRoot: root,
+      workbench,
+    })).toThrow(/Workflow v2 is required/i);
+  });
+
   it('rejects Linear as a runtime tracker source for daemon commands', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-cli-tracker-'));
     tempDirs.push(root);
@@ -26,6 +41,9 @@ describe('buildTaskImporterFromCli', () => {
     expect(() => buildTaskImporterFromCli({
       workspaceRoot: root,
       workflow: {
+        version: 2,
+        workflowConfigHash: 'config-hash',
+        workflowPromptHash: 'prompt-hash',
         config: {
           tracker: {
             kind: 'linear',
@@ -53,6 +71,9 @@ describe('buildTaskImporterFromCli', () => {
         promptTemplate: 'Implement {{ task.shortIdentifier }}.',
         renderPrompt(task) {
           return `Implement ${task.shortIdentifier}.`;
+        },
+        resolveRouting() {
+          return { runner: 'codex', mode: 'codex_app_server', matchedSource: 'default' };
         },
       },
       workbench,

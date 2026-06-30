@@ -5,6 +5,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import * as path from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '@tik/shared';
@@ -86,19 +87,31 @@ export const gitCommitTool: Tool = {
   description: 'Stage files and create a git commit',
   inputSchema: z.object({
     message: z.string().describe('Commit message'),
-    files: z.array(z.string()).optional().describe('Files to stage (defaults to all)'),
+    files: z.array(z.string()).optional().describe('Explicit files to stage'),
   }),
   async execute(input: unknown, context: ToolContext): Promise<ToolResult> {
     const start = Date.now();
     const { message, files } = input as { message: string; files?: string[] };
     try {
-      // Stage files
-      if (files && files.length > 0) {
-        await runGit(['add', ...files], context.cwd, context.signal);
-      } else {
-        await runGit(['add', '-A'], context.cwd, context.signal);
+      if (!files || files.length === 0) {
+        return {
+          success: false,
+          output: null,
+          error: 'git_commit requires explicit files; refusing implicit git add -A.',
+          durationMs: Date.now() - start,
+        };
       }
-      // Commit
+      const invalidFile = files.find((file) => !isSafeGitFilePath(file));
+      if (invalidFile) {
+        return {
+          success: false,
+          output: null,
+          error: `git_commit files must be relative file paths inside the repository: ${invalidFile}`,
+          durationMs: Date.now() - start,
+        };
+      }
+
+      await runGit(['add', '--', ...files], context.cwd, context.signal);
       const { stdout } = await runGit(['commit', '-m', message], context.cwd, context.signal);
       return { success: true, output: stdout, durationMs: Date.now() - start };
     } catch (err) {
@@ -108,3 +121,13 @@ export const gitCommitTool: Tool = {
 };
 
 export const gitTools: Tool[] = [gitStatusTool, gitDiffTool, gitLogTool, gitCommitTool];
+
+function isSafeGitFilePath(file: string): boolean {
+  if (!file || !file.trim()) {
+    return false;
+  }
+  if (file.startsWith('-') || path.isAbsolute(file)) {
+    return false;
+  }
+  return !file.replace(/\\/g, '/').split('/').includes('..');
+}

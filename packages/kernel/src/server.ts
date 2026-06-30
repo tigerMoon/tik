@@ -41,7 +41,7 @@ import { FileTrackerDaemonStateStore } from './tracker-daemon/file-state-store.j
 import { TrackerDaemon } from './tracker-daemon/tracker-daemon.js';
 import { WorkbenchTrackerLauncher } from './tracker-daemon/workbench-launcher.js';
 import { runWorkbenchKernelTaskInBackground } from './tracker-daemon/workbench-runner.js';
-import { WorkbenchTaskImporter, WorkflowV2WorkbenchTaskImporter } from './tracker-daemon/workbench-tracker-client.js';
+import { WorkflowV2WorkbenchTaskImporter } from './tracker-daemon/workbench-tracker-client.js';
 import { loadTrackerWorkflow, readTrackerWorkflowFile, resolveTrackerWorkflowPath, writeTrackerWorkflowFile } from './tracker-daemon/workflow-loader.js';
 import { FileAgentRunStore } from './agent-runners/agent-run-store.js';
 import { FileRunProofStore } from './agent-runners/run-proof-store.js';
@@ -841,7 +841,7 @@ export async function createServer(
       return {
         runnable: true,
         workflow: workflowSummary(workflow),
-        routing: workflow.version === 2 ? workflow.resolveRouting?.(tracked) : undefined,
+        routing: workflow.resolveRouting(tracked),
       };
     } catch (error) {
       return sendV1CaughtError(reply, error);
@@ -1054,7 +1054,7 @@ export async function createServer(
             });
           }
         }
-        const routing = workflow.version === 2 ? workflow.resolveRouting?.(tracked) : undefined;
+        const routing = workflow.resolveRouting(tracked);
         if (!routing || routing.runner !== 'claude-code') {
           return sendV1ErrorWithBody(reply, 409, 'not_claude_code_routed', 'Claude review task is not routed to the claude-code runtime', {
             workflow: workflowSummary(workflow),
@@ -1155,7 +1155,7 @@ export async function createServer(
 
     try {
       const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
-      const workflow = await loadWorkspaceTrackerWorkflow(workspaceRoot).catch(() => undefined);
+      const workflow = await loadWorkspaceTrackerWorkflow(workspaceRoot);
       const daemon = buildWorkbenchTrackerDaemon({
         kernel,
         workbench,
@@ -2566,9 +2566,7 @@ function buildWorkbenchTrackerDaemon(input: {
 }): TrackerDaemon {
   const worktreeManager = new WorkspaceWorktreeManager();
   const importer = input.importer
-    || (input.workflow?.version === 2
-      ? new WorkflowV2WorkbenchTaskImporter(input.workbench, input.kernel.projectPath)
-      : new WorkbenchTaskImporter(input.workbench));
+    || new WorkflowV2WorkbenchTaskImporter(input.workbench, input.kernel.projectPath);
   const agentRunStore = new FileAgentRunStore(input.workspaceRoot);
   return new TrackerDaemon({
     importer,
@@ -2603,7 +2601,7 @@ function buildWorkbenchTrackerDaemon(input: {
         workbench: input.workbench,
         runTask: (kernelTask) => input.kernel.runTask(kernelTask as any, 'single'),
       }),
-      isRunActive: (taskId) => Boolean(input.kernel.getSession(taskId)),
+      isRunActive: (taskId) => Boolean(input.kernel.getSession?.(taskId)),
       stopTask: (taskId, reason) => {
         try {
           input.kernel.control(taskId, { type: 'stop', reason } as any);
@@ -2712,7 +2710,6 @@ function workflowV2SelectorSkipReason(
   workflow: Awaited<ReturnType<typeof loadTrackerWorkflow>>,
   task: TrackedTask,
 ): string | undefined {
-  if (workflow.version !== 2) return undefined;
   const selector = workflow.config.selector;
   if (!selector) return undefined;
   const labels = new Set(task.labels.map((label) => label.trim().toLowerCase()));

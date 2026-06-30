@@ -84,7 +84,7 @@ describe('tool search guards', () => {
   it('glob auto-scopes broad searches to likely target paths', async () => {
     const root = await makeRepo();
     const result = await globTool.execute(
-      { pattern: '**/*', cwd: root },
+      { pattern: '**/*', cwd: '.' },
       createContext(root, [path.join(root, 'catalog-suite-one-api')]),
     );
 
@@ -106,6 +106,27 @@ describe('tool search guards', () => {
     expect(files.some((file) => file.endsWith('catalog-suite-one-api/src/CatalogQueryService.java'))).toBe(true);
   });
 
+  it('glob rejects cwd traversal, absolute paths, and symlink escapes', async () => {
+    const root = await makeRepo();
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tool-outside-'));
+    tempDirs.push(outside);
+    await fs.writeFile(path.join(outside, 'secret.txt'), 'do not glob\n', 'utf-8');
+    await fs.symlink(outside, path.join(root, 'linked-outside'));
+
+    const context = createContext(root);
+    const attempts = await Promise.all([
+      globTool.execute({ pattern: '**/*', cwd: '..' }, context),
+      globTool.execute({ pattern: '**/*', cwd: path.join(outside) }, context),
+      globTool.execute({ pattern: '**/*', cwd: path.join(root, 'catalog-suite-one-api') }, context),
+      globTool.execute({ pattern: '**/*', cwd: 'linked-outside' }, context),
+    ]);
+
+    for (const result of attempts) {
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/outside the workspace|parent traversal|absolute paths are not allowed/i);
+    }
+  });
+
   it('grep auto-scopes broad searches to likely target paths', async () => {
     const root = await makeRepo();
     const result = await grepTool.execute(
@@ -117,6 +138,27 @@ describe('tool search guards', () => {
     const output = String(result.output);
     expect(output).toContain('CatalogQueryService.java');
     expect(output).not.toContain('OtherService.java');
+  });
+
+  it('grep rejects path traversal, absolute paths, and symlink escapes', async () => {
+    const root = await makeRepo();
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tool-outside-'));
+    tempDirs.push(outside);
+    await fs.writeFile(path.join(outside, 'secret.txt'), 'do not grep\n', 'utf-8');
+    await fs.symlink(outside, path.join(root, 'linked-outside'));
+
+    const context = createContext(root);
+    const attempts = await Promise.all([
+      grepTool.execute({ pattern: 'grep', path: '..' }, context),
+      grepTool.execute({ pattern: 'grep', path: path.join(outside, 'secret.txt') }, context),
+      grepTool.execute({ pattern: 'cacheKey', path: path.join(root, 'catalog-suite-one-api') }, context),
+      grepTool.execute({ pattern: 'grep', path: 'linked-outside/secret.txt' }, context),
+    ]);
+
+    for (const result of attempts) {
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/outside the workspace|parent traversal|absolute paths are not allowed/i);
+    }
   });
 
   it('bash rewrites broad repo-wide find to the likely target path', async () => {

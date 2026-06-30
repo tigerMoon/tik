@@ -108,6 +108,23 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
 });
 
+async function writeWorkflowV2Fixture(root: string): Promise<void> {
+  await fs.mkdir(path.join(root, '.tik'), { recursive: true });
+  await fs.writeFile(path.join(root, '.tik', 'WORKFLOW.md'), [
+    '---',
+    'version: 2',
+    'routing:',
+    '  default_runner: codex',
+    '  default_mode: codex_app_server',
+    '  rules:',
+    '    - labels_any: [backend]',
+    '      runner: codex',
+    '      mode: codex_app_server',
+    '---',
+    'Implement {{ task.shortIdentifier }}.',
+  ].join('\n'), 'utf-8');
+}
+
 describe('workbench API routes', () => {
   it('requires bearer auth for mutating routes when an API token is configured', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
@@ -1229,6 +1246,7 @@ describe('workbench API routes', () => {
   it('runs a workbench-backed tracker tick from /api/v1/tracker/refresh', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
+    await writeWorkflowV2Fixture(root);
 
     const workbench = new WorkbenchService({
       rootPath: root,
@@ -1282,13 +1300,13 @@ describe('workbench API routes', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json().result.dispatched).toEqual([task.identifier]);
-    expect(runTaskCalls).toBe(1);
+    expect(runTaskCalls).toBe(0);
     const updatedTask = await workbench.readTask(task.id);
     expect(updatedTask?.status).toBe('in_progress');
     expect(updatedTask?.attempts).toEqual([
       expect.objectContaining({
         attemptNumber: 1,
-        kernelTaskId: 'kernel-refresh-1',
+        kernelTaskId: expect.stringMatching(/^tik-\d+-attempt-0-/),
       }),
     ]);
   });
@@ -1771,6 +1789,7 @@ describe('workbench API routes', () => {
   it('does not mark tracker watch mode as active after a manual refresh tick', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
+    await writeWorkflowV2Fixture(root);
 
     const workbench = new WorkbenchService({
       rootPath: root,

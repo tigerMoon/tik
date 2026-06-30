@@ -1,4 +1,4 @@
-import { isWorkbenchTaskCodexDispatchable, isWorkbenchTaskWorkflowDispatchable } from '@tik/shared';
+import { isWorkbenchTaskWorkflowDispatchable } from '@tik/shared';
 import type { WorkbenchTaskRecord, WorkbenchTaskStatus } from '@tik/shared';
 import type {
   TrackedTask,
@@ -9,47 +9,6 @@ import type {
 
 const WORKBENCH_SOURCE = 'workbench';
 type WorkbenchTaskDispatchPredicate = (task: WorkbenchTaskRecord) => boolean;
-
-export class WorkbenchTaskImporter implements TrackedTaskImporter {
-  constructor(private readonly workbench: WorkbenchPort) {}
-
-  async listCandidateTasks(): Promise<TrackedTask[]> {
-    const tasks = await this.listWorkbenchTasks();
-    return tasks
-      .filter(isWorkbenchTaskCodexDispatchable)
-      .map((task) => taskToTrackedTask(task));
-  }
-
-  async listOpenAttemptTasks(): Promise<TrackedTask[]> {
-    const tasks = await this.listWorkbenchTasks();
-    return tasks
-      .filter((task) => Boolean(task.attempts?.some((attempt) => attempt.kernelTaskId && !attempt.finishedAt)))
-      .map((task) => taskToTrackedTask(task));
-  }
-
-  async fetchTaskStatesByIds(taskIds: string[]): Promise<TrackedTask[]> {
-    const tasks = await Promise.all(taskIds.map(async (taskId) => this.workbench.readTask?.(taskId)));
-    return tasks
-      .filter((task): task is WorkbenchTaskRecord => Boolean(task))
-      .map((task) => taskToTrackedTask(task));
-  }
-
-  async fetchTasksByStates(stateNames: string[]): Promise<TrackedTask[]> {
-    const stateSet = new Set(stateNames.map((state) => state.toLowerCase()));
-    const tasks = await this.listWorkbenchTasks();
-    return tasks
-      .filter(isWorkbenchTaskCodexDispatchable)
-      .filter((task) => stateSet.has(task.status.toLowerCase()) || (task.state && stateSet.has(task.state.toLowerCase())))
-      .map((task) => taskToTrackedTask(task));
-  }
-
-  private async listWorkbenchTasks(): Promise<WorkbenchTaskRecord[]> {
-    if (!this.workbench.listTasks) {
-      throw new Error('Workbench task importer requires listTasks support.');
-    }
-    return this.workbench.listTasks();
-  }
-}
 
 export class WorkflowV2WorkbenchTaskImporter implements TrackedTaskImporter {
   constructor(
@@ -98,7 +57,7 @@ export class WorkflowV2WorkbenchTaskImporter implements TrackedTaskImporter {
 function taskToTrackedTask(
   task: WorkbenchTaskRecord,
   defaultProjectPath?: string,
-  isDispatchable: WorkbenchTaskDispatchPredicate = isWorkbenchTaskCodexDispatchable,
+  isDispatchable: WorkbenchTaskDispatchPredicate = isWorkbenchTaskWorkflowDispatchable,
 ): TrackedTask {
   const identifier = task.identifier || task.shortIdentifier || task.id.slice(0, 8).toUpperCase();
   const latestOpenAttempt = (task.attempts || [])

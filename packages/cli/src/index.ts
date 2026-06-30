@@ -10,8 +10,6 @@ import chalk from 'chalk';
 import ora from 'ora';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import * as TikKernel from '@tik/kernel';
 import {
   buildWorkspaceEventProjection,
@@ -29,20 +27,8 @@ import {
   WorkspaceWorktreeManager,
   WorkspaceWorkflowEngine,
   WorkflowSubtaskRuntime,
-  FileTrackerDaemonStateStore,
-  FileAgentRunStore,
   FileRunProofStore,
-  JsonTaskImporter,
-  loadTrackerWorkflow,
-  resolveTrackerWorkflowPath,
-  TrackerDaemon,
-  WorkbenchTaskImporter,
-  WorkbenchTrackerLauncher,
-  runWorkbenchKernelTaskInBackground,
-  createDefaultRuntimeRunners,
 } from '@tik/kernel';
-import { SIGHTRuntime, ContextRenderer, ToolResultStore } from '@tik/sight';
-import { ACEEngine } from '@tik/ace';
 import type {
   AgentEvent,
   ConvergenceStrategy,
@@ -57,8 +43,6 @@ import type {
   WorkflowSubtaskSpec,
   WorkbenchArtifactRecord,
 } from '@tik/shared';
-import type { TrackedTaskImporter, TrackerWorkflowDefinition } from '@tik/kernel';
-import { generateTaskId } from '@tik/shared';
 import {
   displayTask,
   displayTaskResult,
@@ -82,36 +66,22 @@ import {
   formatArtifactShow,
   readArtifactResponse,
 } from './artifacts-command.js';
-import { cleanupManagedTrackerWorkspace } from './tracker-workspace-cleanup.js';
-import { buildTaskImporterFromCli } from './tracker-importer.js';
-import { runTrackerHook } from './tracker-hooks.js';
+import { createKernel } from './cli/kernel-factory.js';
+import { registerServeCommand } from './cli/serve-command.js';
+import { registerTrackerCommands } from './cli/tracker-command.js';
+import { registerWorkflowCommands } from './cli/workflow-command-registration.js';
+import { registerWorktreeCommands } from './cli/worktree-command.js';
 import {
-  explainWorkflowTask,
-  initWorkflowV2,
-  validateWorkflow,
-} from './workflow-command.js';
-import { MockLLMProvider } from './commands/mock-llm.js';
-import { ClaudeLLMProvider, hasClaudeCredentials } from './commands/claude-llm.js';
-import { OpenAILLMProvider, hasOpenAICredentials } from './commands/openai-llm.js';
-import { CodexCliProvider, hasCodexCli, hasCodexLogin } from './commands/codex-cli.js';
+  interactiveProviderHelp,
+  planningProviderHelp,
+} from './cli/provider-resolution.js';
 import { captureWorkspaceGitChangedFiles } from './workspace-git.js';
 
-const execFileAsync = promisify(execFile);
-
-const interactiveProviderHelp = 'LLM provider (default: codex): auto, claude, openai, codex (governed implementation), codex-delegate (delegated subtask execution), mock';
-const planningProviderHelp = 'LLM provider (default: codex): auto, claude, openai, codex, mock';
-const serverProviderHelp = 'LLM provider (default: codex): auto, claude, openai, codex, mock';
+const DEFAULT_API_BASE_URL = 'http://localhost:3300';
 
 // ─── Workspace Resolution ────────────────────────────────────
 
-const {
-  ExecutionKernel,
-  builtinTools,
-  frontendTools,
-  gitTools,
-  searchEditTools,
-  WorkspaceResolver,
-} = TikKernel;
+const { WorkspaceResolver } = TikKernel;
 
 const workspaceResolver = new WorkspaceResolver();
 const workspaceWorktreeManager = new WorkspaceWorktreeManager();
@@ -255,84 +225,6 @@ async function resolveProjectPath(opts: { project?: string; target?: string }): 
   return workspaceResolver.resolve(process.cwd(), opts.target);
 }
 
-// ─── Create Kernel ───────────────────────────────────────────
-
-function resolveProvider(provider: ProviderOption = 'codex'): ProviderOption {
-  const envProvider = (process.env.TIK_LLM_PROVIDER as ProviderOption | undefined) || 'codex';
-  const requested = provider === 'auto' ? envProvider : provider;
-
-  if (requested === 'mock') return 'mock';
-  if (requested === 'claude') {
-    if (!hasClaudeCredentials()) throw new Error('Claude credentials not found. Set ANTHROPIC_API_KEY.');
-    return 'claude';
-  }
-  if (requested === 'openai') {
-    if (!hasOpenAICredentials()) throw new Error('OpenAI credentials not found. Set OPENAI_API_KEY.');
-    return 'openai';
-  }
-  if (requested === 'codex') {
-    if (!hasCodexCli()) throw new Error('Codex CLI not found. Install `codex` first.');
-    if (!hasCodexLogin()) throw new Error('Codex CLI is not logged in. Run `codex login` first.');
-    return 'codex';
-  }
-  if (requested === 'codex-delegate') {
-    if (!hasCodexCli()) throw new Error('Codex CLI not found. Install `codex` first.');
-    if (!hasCodexLogin()) throw new Error('Codex CLI is not logged in. Run `codex login` first.');
-    return 'codex-delegate';
-  }
-
-  if (hasCodexCli() && hasCodexLogin()) return 'codex';
-  if (hasClaudeCredentials()) return 'claude';
-  if (hasOpenAICredentials()) return 'openai';
-  return 'mock';
-}
-
-function createKernel(projectPath: string, options?: { provider?: ProviderOption; model?: string; stream?: boolean }) {
-  const sight = new SIGHTRuntime({ projectPath });
-  const renderer = new ContextRenderer();
-  const toolStore = new ToolResultStore(projectPath);
-  const provider = resolveProvider(options?.provider);
-  const llm = provider === 'claude'
-    ? new ClaudeLLMProvider(options?.model)
-    : provider === 'openai'
-      ? new OpenAILLMProvider(options?.model)
-      : provider === 'codex'
-        ? new CodexCliProvider(projectPath, options?.model, 'governed')
-        : provider === 'codex-delegate'
-          ? new CodexCliProvider(projectPath, options?.model, 'delegate')
-      : new MockLLMProvider();
-
-  // Streaming handler: write LLM text chunks directly to stdout
-  const onStreamChunk = options?.stream
-    ? (chunk: string, _meta: { taskId: string; agent: string }) => {
-        process.stdout.write(chunk);
-      }
-    : undefined;
-
-  // Create kernel first (it owns the EventBus)
-  const kernel = new ExecutionKernel({
-    llm,
-    contextBuilder: sight.contextEngine,
-    sight,
-    projectPath,
-    contextRenderer: renderer,
-    toolResultStore: toolStore,
-    onStreamChunk,
-    // Placeholder ACE — replaced below after we have eventBus
-    ace: new ACEEngine('incremental'),
-  });
-
-  // Now create ACE with the kernel's eventBus for real metrics collection
-  const ace = new ACEEngine('incremental', kernel.eventBus);
-  // Replace the placeholder
-  (kernel as any).ace = ace;
-
-  for (const tool of [...builtinTools, ...frontendTools, ...gitTools, ...searchEditTools]) {
-    kernel.toolRegistry.register(tool);
-  }
-
-  return { kernel, sight, ace, llmName: llm.name, provider, llm };
-}
 // ─── CLI Program ─────────────────────────────────────────────
 
 const program = new Command();
@@ -605,212 +497,13 @@ program
     }
   });
 
-// ── tik workspace ────────────────────────────────────────────
-
-program
-  .command('worktree')
-  .description('Manage workspace-managed project worktrees')
-  .argument('[subcommand]', 'Subcommand: list, status, path, create, use, remove')
-  .option('-p, --project <path>', 'Explicit project or workspace path')
-  .option('-t, --target <name>', 'Target project in workspace')
-  .option('--lane <id>', 'Managed worktree lane id (default: primary)')
-  .option('--force', 'Force worktree removal when supported')
-  .action(async (subcommand: string | undefined, opts: { project?: string; target?: string; lane?: string; force?: boolean }) => {
-    const command = subcommand || 'list';
-    const resolution = await resolveProjectPath(opts);
-    if (!resolution.workspace) {
-      console.log(chalk.red('\n  Worktree management requires a .code-workspace root.\n'));
-      return;
-    }
-
-    const snapshot = await workspaceOrchestrator.getStatus(resolution.workspace.rootPath);
-    if (!snapshot.state || !snapshot.settings) {
-      console.log(chalk.yellow('\n  Workspace state not initialized yet. Run `tik workspace run --demand \"...\"` first.\n'));
-      return;
-    }
-
-    const projects = ((snapshot.state.projects || []) as WorkspaceProjectSnapshot[]);
-    if (projects.length === 0) {
-      console.log(chalk.yellow('\n  No active workspace projects found.\n'));
-      return;
-    }
-
-    const selectedProject = selectWorkspaceProjectSnapshot(projects, resolution.projectPath, opts.target);
-    const entries = await workspaceWorktreeManager.listManagedWorktrees({
-      workspaceName: snapshot.settings.workspaceName,
-      workspaceRoot: resolution.workspace.rootPath,
-      projects: projects.map((project) => ({
-        projectName: project.projectName,
-        sourceProjectPath: project.sourceProjectPath || project.projectPath,
-        effectiveProjectPath: project.effectiveProjectPath,
-        worktree: project.worktree,
-        worktreeLanes: project.worktreeLanes,
-      })),
-      policy: snapshot.settings.worktreePolicy,
-    });
-
-    if (command === 'list' || command === 'status') {
-      console.log(chalk.bold(`\n🪵 Workspace Worktrees${command === 'status' ? ' Status' : ''}\n`));
-      console.log(chalk.dim(`  Workspace: ${resolution.workspace.rootPath}`));
-      console.log(chalk.dim(`  Mode: ${snapshot.settings.worktreePolicy?.mode || 'managed'}`));
-      console.log(chalk.dim(`  Root: ${snapshot.settings.worktreePolicy?.worktreeRoot || path.join(resolution.workspace.rootPath, '.workspace', 'worktrees')}`));
-      console.log(chalk.dim(`  Non-git: ${snapshot.settings.worktreePolicy?.nonGitStrategy || 'source'}`));
-      console.log('');
-      for (const entry of entries) {
-        const laneLabel = entry.laneId ? ` [${entry.laneId}]` : '';
-        const activeLabel = entry.active ? ' *' : '';
-        console.log(`  ${chalk.cyan(entry.projectName)}${chalk.dim(laneLabel)}${chalk.dim(activeLabel)}  ${chalk.dim(`${entry.kind} / ${entry.worktree?.status || 'disabled'}`)}`);
-        console.log(`    ${chalk.dim(`source: ${entry.sourceProjectPath}`)}`);
-        console.log(`    ${chalk.dim(`exec:   ${entry.effectiveProjectPath}`)}`);
-        if (entry.worktree?.sourceBranch) console.log(`    ${chalk.dim(`source-branch: ${entry.worktree.sourceBranch}`)}`);
-        if (entry.worktree?.worktreeBranch) console.log(`    ${chalk.dim(`worktree-branch: ${entry.worktree.worktreeBranch}`)}`);
-        if (typeof entry.dirtyFileCount === 'number') console.log(`    ${chalk.dim(`dirty-files: ${entry.dirtyFileCount}`)}`);
-        for (const warning of entry.warnings || []) {
-          console.log(`    ${chalk.yellow(warning)}`);
-        }
-        if (entry.worktree?.lastError) console.log(`    ${chalk.red(entry.worktree.lastError)}`);
-      }
-      console.log('');
-      return;
-    }
-
-    if (!selectedProject) {
-      console.log(chalk.red('\n  Unable to resolve target project for worktree command.\n'));
-      return;
-    }
-
-    const selectedEntry = selectManagedWorktreeEntry(
-      entries,
-      selectedProject.projectName,
-      selectedProject.sourceProjectPath || selectedProject.projectPath,
-      opts.lane,
-    );
-    if (opts.lane && !selectedEntry && (command === 'path' || command === 'use' || command === 'remove')) {
-      console.log(chalk.red(`\n  No managed worktree lane found: ${opts.lane}\n`));
-      return;
-    }
-
-    if (command === 'path') {
-      console.log(chalk.bold('\n🪵 Worktree Path\n'));
-      console.log(chalk.dim(`  Project: ${selectedProject.projectName}`));
-      if (selectedEntry?.laneId) console.log(chalk.dim(`  Lane: ${selectedEntry.laneId}`));
-      console.log(chalk.dim(`  Path: ${selectedEntry?.effectiveProjectPath || selectedProject.effectiveProjectPath || selectedProject.projectPath}\n`));
-      return;
-    }
-
-    if (command === 'create') {
-      const target = await workspaceWorktreeManager.getExecutionTarget({
-        workspaceName: snapshot.settings.workspaceName,
-        workspaceRoot: resolution.workspace.rootPath,
-        projectName: selectedProject.projectName,
-        sourceProjectPath: selectedProject.sourceProjectPath || selectedProject.projectPath,
-        laneId: opts.lane,
-        existingEffectiveProjectPath: selectedProject.effectiveProjectPath,
-        existingWorktree: selectedProject.worktree,
-        existingWorktreeLanes: selectedProject.worktreeLanes,
-        policy: snapshot.settings.worktreePolicy,
-      });
-      if (target.worktree) {
-        await workspaceOrchestrator.markProjectWorktreeReady(resolution.workspace.rootPath, selectedProject.projectName, {
-          effectiveProjectPath: target.effectiveProjectPath,
-          worktree: target.worktree,
-        });
-      }
-      console.log(chalk.bold('\n🪵 Worktree Ready\n'));
-      console.log(chalk.dim(`  Project: ${selectedProject.projectName}`));
-      if (target.worktree?.laneId) console.log(chalk.dim(`  Lane:   ${target.worktree.laneId}`));
-      console.log(chalk.dim(`  Source: ${target.sourceProjectPath}`));
-      console.log(chalk.dim(`  Exec:   ${target.effectiveProjectPath}`));
-      if (target.worktree?.worktreeBranch) console.log(chalk.dim(`  Branch: ${target.worktree.worktreeBranch}`));
-      console.log('');
-      return;
-    }
-
-    if (command === 'use') {
-      if (!selectedEntry?.worktree) {
-        console.log(chalk.red('\n  No managed worktree lane found for this project.\n'));
-        console.log(chalk.dim('  Create one first with `tik worktree create --lane <id>`.\n'));
-        return;
-      }
-      const currentActiveEntry = entries.find((entry) => (
-        entry.projectName === selectedProject.projectName
-        && entry.sourceProjectPath === (selectedProject.sourceProjectPath || selectedProject.projectPath)
-        && entry.active
-      ));
-      if (selectedEntry.worktree.status !== 'ready' && selectedEntry.worktree.status !== 'source') {
-        console.log(chalk.red('\n  The selected worktree lane is not ready for activation.\n'));
-        console.log(chalk.dim(`  Current status: ${selectedEntry.worktree.status}\n`));
-        return;
-      }
-      if (!selectedEntry.active && selectedProject.status === 'in_progress' && !opts.force) {
-        console.log(chalk.red('\n  Refusing to switch lanes while the project is in progress.\n'));
-        console.log(chalk.dim('  Re-run with `--force` to override.\n'));
-        return;
-      }
-      if (!selectedEntry.active && (currentActiveEntry?.dirtyFileCount || 0) > 0 && !opts.force) {
-        console.log(chalk.red('\n  Refusing to switch away from the current active lane because it has uncommitted changes.\n'));
-        console.log(chalk.dim('  Review or clean the active lane first, or re-run with `--force`.\n'));
-        return;
-      }
-      await workspaceOrchestrator.activateProjectWorktreeLane(
-        resolution.workspace.rootPath,
-        selectedProject.projectName,
-        {
-          effectiveProjectPath: selectedEntry.effectiveProjectPath,
-          worktree: selectedEntry.worktree,
-        },
-      );
-      console.log(chalk.bold('\n🪵 Worktree Lane Activated\n'));
-      console.log(chalk.dim(`  Project: ${selectedProject.projectName}`));
-      if (selectedEntry.worktree.laneId) console.log(chalk.dim(`  Lane:   ${selectedEntry.worktree.laneId}`));
-      console.log(chalk.dim(`  Exec:   ${selectedEntry.effectiveProjectPath}`));
-      console.log('');
-      return;
-    }
-
-    if (command === 'remove') {
-      if (selectedProject.status === 'in_progress' && !opts.force) {
-        console.log(chalk.red('\n  Refusing to remove a managed worktree while the project is in progress. Re-run with --force if you really need to.\n'));
-        return;
-      }
-      if (selectedEntry && !selectedEntry.safeToRemove && !opts.force) {
-        console.log(chalk.red('\n  Refusing to remove this managed lane because it is not safe to discard.\n'));
-        if (selectedEntry.warnings.length > 0) {
-          console.log(chalk.dim(`  ${selectedEntry.warnings.join(' | ')}\n`));
-        }
-        console.log(chalk.dim('  Re-run with `--force` if you want to discard the isolated lane anyway.\n'));
-        return;
-      }
-      const removed = await workspaceWorktreeManager.removeManagedWorktree({
-        workspaceName: snapshot.settings.workspaceName,
-        workspaceRoot: resolution.workspace.rootPath,
-        projectName: selectedProject.projectName,
-        sourceProjectPath: selectedProject.sourceProjectPath || selectedProject.projectPath,
-        laneId: opts.lane,
-        existingWorktree: selectedEntry?.worktree || selectedProject.worktree,
-        existingWorktreeLanes: selectedProject.worktreeLanes,
-        policy: snapshot.settings.worktreePolicy,
-        force: Boolean(opts.force),
-      });
-      if (removed.worktree) {
-        await workspaceOrchestrator.markProjectWorktreeRemoved(resolution.workspace.rootPath, selectedProject.projectName, {
-          sourceProjectPath: removed.sourceProjectPath,
-          worktree: removed.worktree,
-        });
-      }
-      console.log(chalk.bold('\n🪵 Worktree Removed\n'));
-      console.log(chalk.dim(`  Project: ${selectedProject.projectName}`));
-      if (removed.worktree?.laneId) console.log(chalk.dim(`  Lane: ${removed.worktree.laneId}`));
-      console.log(chalk.dim(`  Source: ${removed.sourceProjectPath}`));
-      if (removed.worktree?.worktreePath) console.log(chalk.dim(`  Removed path: ${removed.worktree.worktreePath}`));
-      if (removed.worktree?.worktreeBranch) console.log(chalk.dim(`  Branch retained: ${removed.worktree.worktreeBranch}`));
-      console.log('');
-      return;
-    }
-
-    console.log(chalk.red(`\n  Unknown worktree subcommand: ${command}`));
-    console.log(chalk.dim('  Available: list, status, path, create, use, remove\n'));
-  });
+registerWorktreeCommands(program, {
+  resolveProjectPath,
+  workspaceOrchestrator,
+  workspaceWorktreeManager,
+  selectWorkspaceProjectSnapshot,
+  selectManagedWorktreeEntry,
+});
 
 program
   .command('workspace')
@@ -1383,7 +1076,7 @@ program
   .command('status')
   .description('Check task status')
   .argument('[taskId]', 'Task ID')
-  .option('--api <url>', 'API server URL', 'http://localhost:3000')
+  .option('--api <url>', 'API server URL', DEFAULT_API_BASE_URL)
   .action(async (taskId: string | undefined, opts: { api: string }) => {
     console.log(chalk.bold('\n📌 Task Status\n'));
     try {
@@ -1411,7 +1104,7 @@ program
   .command('logs')
   .description('Stream execution events')
   .argument('<taskId>', 'Task ID')
-  .option('--api <url>', 'API server URL', 'http://localhost:3000')
+  .option('--api <url>', 'API server URL', DEFAULT_API_BASE_URL)
   .action(async (taskId: string, opts: { api: string }) => {
     console.log(chalk.bold(`\n📜 Event Stream: ${taskId}\n`));
     try {
@@ -1439,7 +1132,7 @@ program
   .command('eval')
   .description('View evaluation metrics')
   .argument('<taskId>', 'Task ID')
-  .option('--api <url>', 'API server URL', 'http://localhost:3000')
+  .option('--api <url>', 'API server URL', DEFAULT_API_BASE_URL)
   .action(async (taskId: string, opts: { api: string }) => {
     console.log(chalk.bold(`\n📊 Evaluation: ${taskId}\n`));
     try {
@@ -1461,7 +1154,7 @@ program
   .command('stop')
   .description('Stop a running task')
   .argument('<taskId>', 'Task ID')
-  .option('--api <url>', 'API server URL', 'http://localhost:3000')
+  .option('--api <url>', 'API server URL', DEFAULT_API_BASE_URL)
   .action(async (taskId: string, opts: { api: string }) => {
     try {
       const res = await fetch(`${opts.api}/api/tasks/${taskId}/control`, {
@@ -1480,7 +1173,7 @@ program
 program
   .command('list')
   .description('List all tasks')
-  .option('--api <url>', 'API server URL', 'http://localhost:3000')
+  .option('--api <url>', 'API server URL', DEFAULT_API_BASE_URL)
   .action(async (opts: { api: string }) => {
     console.log(chalk.bold('\n📋 Tasks\n'));
     try {
@@ -1506,7 +1199,7 @@ program
 program
   .command('artifacts [subcommand] [artifactId]')
   .description('List, inspect, create, and review workbench artifacts')
-  .option('--api <url>', 'API server URL', 'http://localhost:3000')
+  .option('--api <url>', 'API server URL', DEFAULT_API_BASE_URL)
   .option('--task <taskId>', 'Filter by task or create from task')
   .option('--status <status>', 'Filter by artifact status')
   .option('--workspace <workspaceId>', 'Filter by workspace id')
@@ -1737,233 +1430,9 @@ program
     }
   });
 
-// ── tik serve ────────────────────────────────────────────────
-
-program
-  .command('tracker')
-  .description('Run tracker-daemon operations')
-  .argument('[command]', 'Command: tick or watch', 'tick')
-  .option('--file <path>', 'JSON task snapshot file')
-  .option('--workflow <path>', 'Workflow file name/path relative to project root')
-  .option('-p, --project <path>', 'Workspace/project root', process.cwd())
-  .option('--provider <provider>', serverProviderHelp, 'codex')
-  .option('--model <model>', 'Override model name')
-  .option('--mock', 'Force mock LLM')
-  .addHelpText('after', `
-
-Examples:
-  tik tracker tick --file ./tasks.json --provider mock
-  tik tracker watch --workflow WORKFLOW.md --provider codex
-`)
-  .action(async (
-    command: string,
-    opts: { file?: string; workflow?: string; project: string; provider: ProviderOption; model?: string; mock?: boolean },
-  ) => {
-    if (command !== 'tick' && command !== 'watch') {
-      console.log(chalk.red(`\n  Unknown tracker command: ${command}\n`));
-      return;
-    }
-    const workspaceRoot = path.resolve(opts.project);
-    const provider = opts.mock ? 'mock' : opts.provider;
-    const { kernel, llmName } = createKernel(workspaceRoot, { provider, model: opts.model });
-    const workflowPath = await resolveTrackerWorkflowPath(workspaceRoot, opts.workflow).catch(() => path.join(workspaceRoot, opts.workflow || '.tik/WORKFLOW.md'));
-    const workflow = await loadTrackerWorkflowFromCli(workspaceRoot, opts.workflow).catch(() => undefined);
-    const importer = buildTaskImporterFromCli({
-      workspaceRoot,
-      file: opts.file,
-      workflow,
-      workbench: kernel.workbench,
-    });
-    const daemon = new TrackerDaemon({
-      importer,
-      stateStore: FileTrackerDaemonStateStore.forWorkspace(workspaceRoot),
-      agentRunStore: new FileAgentRunStore(workspaceRoot),
-      launcher: new WorkbenchTrackerLauncher(kernel.workbench, {
-        workspaceRoot,
-        defaultProjectPath: workspaceRoot,
-        workspaceName: path.basename(workspaceRoot),
-        resolveExecutionTarget: async (input) => {
-          const target = await workspaceWorktreeManager.getExecutionTarget({
-            workspaceName: input.workspaceName,
-            workspaceRoot: input.workspaceRoot,
-            projectName: input.projectName,
-            sourceProjectPath: input.sourceProjectPath,
-            laneId: input.laneId,
-          });
-          return {
-            sourceProjectPath: target.sourceProjectPath,
-            effectiveProjectPath: target.effectiveProjectPath,
-            worktreeKind: target.worktree?.kind,
-            worktreePath: target.worktree?.worktreePath,
-          };
-        },
-        createKernelTask: (input) => kernel.taskManager.create(input),
-        runTask: (task, input) => runWorkbenchKernelTaskInBackground(task as any, {
-          taskId: input.workbenchTaskId,
-          workbench: kernel.workbench,
-          runTask: (kernelTask) => kernel.runTask(kernelTask as any),
-          logError: (message, err) => {
-            console.error(message);
-            if (err.stack) console.error('[tracker] Stack:', err.stack);
-          },
-        }),
-        isRunActive: (taskId) => Boolean(kernel.getSession(taskId)),
-        stopTask: (taskId) => {
-          try {
-            kernel.control(taskId, { type: 'stop' });
-          } catch {}
-        },
-        runHook: async (name, input) => {
-          await runTrackerHook(name, input);
-        },
-        cleanupWorkspace: async (input) => {
-          await cleanupManagedTrackerWorkspace({
-            workspaceRoot: input.workspaceRoot,
-            worktreePath: input.run?.projectPath,
-          });
-        },
-      }),
-      workspaceRoot,
-      defaultProjectPath: workspaceRoot,
-      runtimeRunners: createDefaultRuntimeRunners(),
-      workflow,
-      maxConcurrentAgents: workflow?.config.polling.maxConcurrentAgents,
-      pollIntervalMs: workflow?.config.polling.intervalMs,
-      workflowProvider: command === 'watch'
-        ? async () => loadTrackerWorkflow(path.dirname(workflowPath), path.basename(workflowPath)).catch(() => workflow)
-        : undefined,
-      terminalStates: workflow?.config.tracker.terminalStates,
-      workspaceHooks: workflow?.config.workspace.hooks,
-      cleanupTerminalWorkspaces: workflow?.config.workspace.cleanupTerminal,
-    });
-
-    if (command === 'watch') {
-      console.log(chalk.bold('\n🎼 Tracker Daemon Watch\n'));
-      console.log(chalk.dim(`  Provider: ${llmName}`));
-      console.log(chalk.dim(`  Workspace: ${workspaceRoot}`));
-      console.log(chalk.dim(`  Interval: ${workflow?.config.polling.intervalMs || 30_000}ms`));
-      console.log(chalk.dim('  Press Ctrl+C to stop\n'));
-      daemon.watch();
-      return;
-    }
-
-    const result = await daemon.tick();
-    console.log(chalk.bold('\n🎼 Tracker Daemon Tick\n'));
-    console.log(chalk.dim(`  Provider: ${llmName}`));
-    console.log(chalk.dim(`  Workspace: ${workspaceRoot}`));
-    if (opts.file) console.log(chalk.dim(`  Tracker: ${path.resolve(opts.file)}\n`));
-    if (result.dispatched.length) console.log(chalk.green(`  Dispatched: ${result.dispatched.join(', ')}`));
-    if (result.stopped.length) console.log(chalk.yellow(`  Stopped: ${result.stopped.join(', ')}`));
-    if (result.skipped.length) {
-      console.log(chalk.dim(`  Skipped: ${result.skipped.map((item) => `${item.shortIdentifier}:${item.reason}`).join(', ')}`));
-    }
-    if (result.failed.length) {
-      console.log(chalk.red(`  Failed: ${result.failed.map((item) => `${item.shortIdentifier}:${item.error}`).join(', ')}`));
-    }
-    if (!result.dispatched.length && !result.stopped.length && !result.skipped.length && !result.failed.length) {
-      console.log(chalk.gray('  No tracker changes.'));
-    }
-    console.log();
-  });
-
-async function loadTrackerWorkflowFromCli(
-  workspaceRoot: string,
-  workflowPath?: string,
-): Promise<TrackerWorkflowDefinition> {
-  const resolved = await resolveTrackerWorkflowPath(workspaceRoot, workflowPath);
-  return loadTrackerWorkflow(path.dirname(resolved), path.basename(resolved));
-}
-
-// ── tik workflow ─────────────────────────────────────────────
-
-program
-  .command('workflow [command] [taskId]')
-  .description('Initialize, validate, and explain tracker workflow v2 files')
-  .option('-p, --project <path>', 'Workspace/project root', process.cwd())
-  .option('--file <path>', 'Workflow file name/path relative to project root')
-  .option('--v2', 'Initialize a workflow v2 file')
-  .option('--force', 'Overwrite an existing workflow when initializing')
-  .action(async (
-    command: string | undefined,
-    taskId: string | undefined,
-    opts: { project: string; file?: string; v2?: boolean; force?: boolean },
-  ) => {
-    const workspaceRoot = path.resolve(opts.project);
-    const subcommand = command || 'validate';
-    try {
-      if (subcommand === 'init') {
-        if (!opts.v2) {
-          console.log(chalk.red('\n  Use `tik workflow init --v2` to initialize a workflow v2 file.\n'));
-          return;
-        }
-        const result = await initWorkflowV2({
-          workspaceRoot,
-          file: opts.file,
-          force: opts.force,
-        });
-        console.log(result.created
-          ? chalk.green(`Created workflow v2: ${result.path}`)
-          : chalk.yellow(`Workflow already exists: ${result.path}`));
-        return;
-      }
-
-      if (subcommand === 'validate') {
-        console.log(await validateWorkflow({
-          workspaceRoot,
-          file: opts.file,
-        }));
-        return;
-      }
-
-      if (subcommand === 'explain') {
-        if (!taskId) {
-          console.log(chalk.red('\n  Missing task id. Use `tik workflow explain <task-id>`.\n'));
-          return;
-        }
-        console.log(await explainWorkflowTask({
-          workspaceRoot,
-          file: opts.file,
-          taskId,
-        }));
-        return;
-      }
-
-      console.log(chalk.red(`\n  Unknown workflow command: ${subcommand}\n`));
-    } catch (error) {
-      console.log(chalk.red(`\n  Workflow command failed: ${(error as Error).message}\n`));
-    }
-  });
-
-program
-  .command('serve')
-  .description('Start the API server')
-  .option('-p, --port <port>', 'Port', '3000')
-  .option('--host <host>', 'Host interface to bind', 'localhost')
-  .option('--project <path>', 'Default project/workspace root', process.cwd())
-  .option('--provider <provider>', serverProviderHelp, 'codex')
-  .option('--model <model>', 'Override model name')
-  .option('--mock', 'Force mock LLM')
-  .addHelpText('after', `
-
-Examples:
-  tik serve --provider claude
-  tik serve --provider codex
-`)
-  .action(async (opts: { port: string; host: string; project: string; provider: ProviderOption; model?: string; mock?: boolean }) => {
-    const provider = opts.mock ? 'mock' : opts.provider;
-    const { kernel, llmName } = createKernel(opts.project, { provider, model: opts.model });
-    const { createServer } = await import('@tik/kernel');
-
-    console.log(chalk.bold('\n🌐 Tik Workbench Server\n'));
-    console.log(chalk.dim(`  LLM: ${llmName}`));
-    console.log(chalk.dim(`  Workspace root: ${opts.project}`));
-
-    await createServer(kernel, { port: parseInt(opts.port), host: opts.host }, { workspaceRoot: opts.project });
-
-    console.log(chalk.green(`  API: http://${opts.host}:${opts.port}`));
-    console.log(chalk.dim('  Workbench UI expects the dashboard dev server on http://localhost:5173'));
-    console.log(chalk.dim('  Press Ctrl+C to stop\n'));
-  });
+registerTrackerCommands(program, { workspaceWorktreeManager });
+registerWorkflowCommands(program);
+registerServeCommand(program);
 
 // ─── Parse & Run ─────────────────────────────────────────────
 
@@ -2426,19 +1895,7 @@ function selectWorkspaceProjectSnapshot(
 }
 
 function selectManagedWorktreeEntry(
-  entries: Array<{
-    projectName: string;
-    sourceProjectPath: string;
-    laneId?: string;
-    active: boolean;
-    kind: string;
-    dirtyFileCount?: number;
-    warnings: string[];
-    safeToActivate: boolean;
-    safeToRemove: boolean;
-    effectiveProjectPath: string;
-    worktree?: WorkspaceProjectWorktreeState;
-  }>,
+  entries: Array<import('@tik/kernel').WorkspaceManagedWorktreeEntry>,
   projectName: string,
   sourceProjectPath?: string,
   laneId?: string,

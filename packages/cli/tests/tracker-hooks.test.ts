@@ -42,7 +42,6 @@ describe('tracker hooks', () => {
       task: { id: 'task-1', shortIdentifier: 'TIK-1' },
       workspaceRoot: root,
       projectPath: root,
-      workflowVersion: 2,
       envWhitelist: ['SAFE_VALUE'],
     });
 
@@ -60,7 +59,6 @@ describe('tracker hooks', () => {
       task: { id: 'task-1', shortIdentifier: 'TIK-1' },
       workspaceRoot: root,
       projectPath: root,
-      workflowVersion: 2,
       envWhitelist: [],
     })).rejects.toThrow(/outside the workspace root/i);
   });
@@ -79,25 +77,23 @@ describe('tracker hooks', () => {
       task: { id: 'task-1', shortIdentifier: 'TIK-1' },
       workspaceRoot: root,
       projectPath: root,
-      workflowVersion: 2,
       envWhitelist: [],
     })).rejects.toThrow(/outside the workspace root/i);
   });
 
-  it('keeps v1 hook execution on the legacy shell path', async () => {
+  it('treats hook names as workflow v2 file paths instead of shell commands', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-hook-'));
     tempDirs.push(root);
     process.env.SHELL_ONLY_VALUE = 'legacy-env';
 
-    await runTrackerHook('printf "%s:%s" "$TIK_TRACKER_TASK_ID" "$SHELL_ONLY_VALUE" > shell-output.txt', {
+    await expect(runTrackerHook('printf "%s:%s" "$TIK_TRACKER_TASK_ID" "$SHELL_ONLY_VALUE" > shell-output.txt', {
       task: { id: 'task-1', shortIdentifier: 'TIK-1' },
       workspaceRoot: root,
       projectPath: root,
-      workflowVersion: 1,
       envWhitelist: [],
-    });
+    })).rejects.toThrow(/Workflow v2 hook does not exist/i);
 
-    await expect(fs.readFile(path.join(root, 'shell-output.txt'), 'utf-8')).resolves.toBe('task-1:legacy-env');
+    await expect(fs.stat(path.join(root, 'shell-output.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('redacts sensitive env values while preserving useful execFile error fields', () => {

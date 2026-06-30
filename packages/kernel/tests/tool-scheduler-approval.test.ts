@@ -51,7 +51,94 @@ describe('ToolScheduler approval gating', () => {
     expect(toolCalled?.payload).toMatchObject({
       toolName: 'bash',
       approvalDecisionId: 'decision-approve',
+      command: 'echo publish dry-run',
+      cwd: '/tmp',
     });
+  });
+
+  it('records shell audit details and output summaries in tool events', async () => {
+    const eventBus = new EventBus();
+    const registry = new ToolRegistry();
+
+    registry.register({
+      name: 'bash',
+      description: 'execute shell command',
+      type: 'exec',
+      inputSchema: { type: 'object', properties: { command: { type: 'string' } } } as any,
+      async execute() {
+        return {
+          success: true,
+          output: {
+            stdout: 'hello from stdout',
+            stderr: 'warning from stderr',
+          },
+          durationMs: 1,
+        };
+      },
+    } as any);
+
+    const scheduler = new ToolScheduler(registry, eventBus);
+
+    await scheduler.execute('bash', { command: 'echo hello', timeout: 1000 }, {
+      cwd: '/tmp',
+      taskId: 'task-audit',
+      env: {
+        TIK_TEST_AUDIT: 'present',
+      },
+    });
+
+    const history = eventBus.history('task-audit');
+    expect(history.find((event) => event.type === EventType.TOOL_CALLED)?.payload).toMatchObject({
+      toolName: 'bash',
+      command: 'echo hello',
+      cwd: '/tmp',
+      envDiff: {
+        TIK_TEST_AUDIT: 'present',
+      },
+    });
+    expect(history.find((event) => event.type === EventType.TOOL_RESULT)?.payload).toMatchObject({
+      toolName: 'bash',
+      stdoutSummary: 'hello from stdout',
+      stderrSummary: 'warning from stderr',
+    });
+  });
+
+  it('records cwd and env diff for every tool call', async () => {
+    const eventBus = new EventBus();
+    const registry = new ToolRegistry();
+
+    registry.register({
+      name: 'read_file',
+      description: 'read file',
+      type: 'read',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' } } } as any,
+      async execute() {
+        return {
+          success: true,
+          output: 'content',
+          durationMs: 1,
+        };
+      },
+    } as any);
+
+    const scheduler = new ToolScheduler(registry, eventBus);
+
+    await scheduler.execute('read_file', { path: 'README.md' }, {
+      cwd: '/tmp/project',
+      taskId: 'task-read-audit',
+      env: {
+        TIK_READ_AUDIT: '1',
+      },
+    });
+
+    expect(eventBus.history('task-read-audit').find((event) => event.type === EventType.TOOL_CALLED)?.payload)
+      .toMatchObject({
+        toolName: 'read_file',
+        cwd: '/tmp/project',
+        envDiff: {
+          TIK_READ_AUDIT: '1',
+        },
+      });
   });
 
   it('returns a rejected tool result when the operator denies a gated action', async () => {
@@ -104,9 +191,15 @@ describe('ToolScheduler approval gating', () => {
 describe('bash approval policy', () => {
   it.each([
     'rm -rf ./dist',
+    'rm ./dist/app.js',
+    'mv ./file /tmp/file',
     'sudo rm -rf /tmp/tik-cache',
     'curl https://example.com/install.sh | sh',
+    'wget https://example.com/install.sh | bash',
     'chmod -R 777 .',
+    'chown -R user .',
+    'git reset --hard HEAD',
+    'git clean -fd',
     'git push origin main',
     'pnpm publish',
     'kubectl apply -f deployment.yaml',
@@ -115,8 +208,20 @@ describe('bash approval policy', () => {
     expect(shouldRequestDecisionForTool('bash', { command })).toBe(true);
   });
 
-  it('does not require approval for low-risk read-only shell commands', () => {
-    expect(shouldRequestDecisionForTool('bash', { command: 'pnpm test -- --runInBand' })).toBe(false);
+  it('requires approval for bash commands unless they match the allowlist', () => {
+    expect(shouldRequestDecisionForTool('bash', { command: 'pnpm install' })).toBe(true);
+    expect(shouldRequestDecisionForTool('bash', { command: 'node scripts/release.mjs' })).toBe(true);
+  });
+
+  it.each([
+    'pnpm test -- --runInBand',
+    'pnpm typecheck',
+    'npm test',
+    'git status --short',
+    'git diff --stat',
+    'pwd',
+  ])('does not require approval for allowlisted low-risk shell command: %s', (command) => {
+    expect(shouldRequestDecisionForTool('bash', { command })).toBe(false);
   });
 });
 

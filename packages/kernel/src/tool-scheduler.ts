@@ -115,6 +115,7 @@ export class ToolScheduler implements IToolScheduler {
       toolType: tool.type,
       input,
       approvalDecisionId: approval?.decisionId,
+      ...buildToolCallAuditPayload(toolName, input, context),
     });
 
     if (approval && !approval.approved) {
@@ -166,6 +167,7 @@ export class ToolScheduler implements IToolScheduler {
         success: result.success,
         error: result.error,
         filesModified: result.filesModified,
+        ...buildToolResultAuditPayload(toolName, result),
         truncated: outputStr ? outputStr.length > EVENT_OUTPUT_LIMIT : false,
         originalSize: outputStr ? outputStr.length : 0,
       },
@@ -292,4 +294,53 @@ export class ToolScheduler implements IToolScheduler {
       timestamp: now(),
     });
   }
+}
+
+function buildToolCallAuditPayload(
+  toolName: string,
+  input: unknown,
+  context: ToolContext,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    cwd: context.cwd,
+    envDiff: context.env || {},
+  };
+
+  if (toolName !== 'bash') {
+    return payload;
+  }
+
+  const command = input && typeof input === 'object' && 'command' in input
+    ? (input as { command?: unknown }).command
+    : undefined;
+
+  return {
+    ...payload,
+    command: typeof command === 'string' ? command : undefined,
+  };
+}
+
+function buildToolResultAuditPayload(toolName: string, result: ToolResult): Record<string, unknown> {
+  void toolName;
+  if (!result.output || typeof result.output !== 'object') {
+    return {};
+  }
+
+  const output = result.output as { stdout?: unknown; stderr?: unknown };
+  return {
+    stdoutSummary: summarizeStream(output.stdout),
+    stderrSummary: summarizeStream(output.stderr),
+  };
+}
+
+function summarizeStream(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  const LIMIT = 512;
+  return normalized.length > LIMIT
+    ? `${normalized.slice(0, LIMIT)}\n[... truncated, ${normalized.length} bytes total]`
+    : normalized;
 }

@@ -44,27 +44,27 @@ export async function loadTrackerWorkflow(rootPath: string, fileName = 'WORKFLOW
   const raw = await fs.readFile(workflowPath, 'utf-8');
   const { frontMatter, body } = splitFrontMatter(raw);
   const parsed = parseWorkflowYaml(frontMatter);
-  const config = normalizeConfig(parsed);
-  const version = parsed.version === 2 ? 2 : undefined;
-  if (version === 2) {
-    await validateWorkflowV2(rootPath, config);
+  if (parsed.version !== 2) {
+    throw new Error('Workflow files must declare version: 2.');
   }
+  const config = normalizeConfig(parsed);
+  await validateWorkflowV2(rootPath, config);
   const promptTemplate = body.trim();
   const engine = new Liquid({ strictVariables: true, strictFilters: true });
   const parsedTemplate = engine.parse(promptTemplate);
   return {
-    version,
+    version: 2,
     path: workflowPath,
-    workflowConfigHash: version === 2 ? sha256(canonicalize(parsed)) : undefined,
-    workflowPromptHash: version === 2 ? sha256(promptTemplate) : undefined,
+    workflowConfigHash: sha256(canonicalize(parsed)),
+    workflowPromptHash: sha256(promptTemplate),
     config,
     promptTemplate,
-    renderPrompt(task: TrackedTask, input?: { attempt?: number }) {
+    renderPrompt(task: TrackedTask, input?: { attempt?: number; previousReview?: string }) {
       return renderPrompt(engine, parsedTemplate, task, input);
     },
-    resolveRouting: version === 2
-      ? (task: TrackedTask) => resolveWorkflowRouting(config, task)
-      : undefined,
+    resolveRouting(task: TrackedTask) {
+      return resolveWorkflowRouting(config, task);
+    },
   };
 }
 
@@ -139,30 +139,30 @@ function normalizeConfig(parsed: Record<string, any>): TrackerWorkflowConfig {
     agent: {
       timeoutMs: toNumber(parsed.agent?.timeout_ms || parsed.agent?.timeoutMs, DEFAULT_CONFIG.agent.timeoutMs),
     },
-    selector: parsed.version === 2 ? {
+    selector: {
       includeLabels: toStringArray(parsed.selector?.include_labels || parsed.selector?.includeLabels, []),
       excludeLabels: toStringArray(parsed.selector?.exclude_labels || parsed.selector?.excludeLabels, []),
-    } : undefined,
-    routing: parsed.version === 2 ? {
+    },
+    routing: {
       defaultRunner: normalizeRunner(parsed.routing?.default_runner || parsed.routing?.defaultRunner),
       defaultMode: normalizeMode(parsed.routing?.default_mode || parsed.routing?.defaultMode),
       rules: normalizeRoutingRules(parsed.routing?.rules),
-    } : undefined,
-    concurrency: parsed.version === 2 ? {
+    },
+    concurrency: {
       lock: normalizeLock(parsed.concurrency?.lock),
       respectLabels: toStringArray(parsed.concurrency?.respect_labels || parsed.concurrency?.respectLabels, []),
-    } : undefined,
-    sandbox: parsed.version === 2 ? {
+    },
+    sandbox: {
       envWhitelist: toStringArray(parsed.sandbox?.env_whitelist || parsed.sandbox?.envWhitelist, []),
-    } : undefined,
-    validation: parsed.version === 2 ? {
+    },
+    validation: {
       commands: toStringArray(parsed.validation?.commands || parsed.validation_commands || parsed.validationCommands, []),
-    } : undefined,
-    hooks: parsed.version === 2 ? {
+    },
+    hooks: {
       root: parsed.hooks?.root || '.tik/hooks',
       timeoutMs: toNumber(parsed.hooks?.timeout_ms || parsed.hooks?.timeoutMs, 30_000),
       allowExecutableOnly: toBoolean(parsed.hooks?.allow_executable_only ?? parsed.hooks?.allowExecutableOnly, true),
-    } : undefined,
+    },
   };
 }
 
@@ -448,6 +448,7 @@ function canonicalize(value: unknown): string {
 export function defaultTrackerWorkflowContent(): string {
   return [
     '---',
+    'version: 2',
     'tracker:',
     '  kind: json',
     'polling:',
@@ -463,6 +464,13 @@ export function defaultTrackerWorkflowContent(): string {
     '    before_remove: []',
     'agent:',
     '  timeout_ms: 90000',
+    'routing:',
+    '  default_runner: codex',
+    '  default_mode: codex_app_server',
+    'sandbox:',
+    '  env_whitelist: []',
+    'validation:',
+    '  commands: []',
     '---',
     'Implement {{ task.shortIdentifier }}: {{ task.title }}.',
     '',

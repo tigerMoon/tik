@@ -5,12 +5,11 @@
  */
 
 import * as fs from 'node:fs/promises';
-import * as path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { Tool, ToolContext, ToolResult } from '@tik/shared';
-import { safeResolve } from './path-safety.js';
+import { safeResolve, safeResolveWorkspacePath } from './path-safety.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -22,12 +21,27 @@ function getPrimaryTargetScope(context: ToolContext): string | null {
   return (context as ToolContextWithHints).likelyTargetPaths?.[0] || null;
 }
 
-function isBroadSearchRoot(target: string | undefined, context: ToolContext): boolean {
-  if (!target) return true;
+async function resolveGrepTarget(target: string | undefined, context: ToolContext): Promise<string> {
+  if (!target) {
+    const scopedTarget = getPrimaryTargetScope(context);
+    return scopedTarget
+      ? safeResolve(context.cwd, scopedTarget, { allowAbsolute: true, allowDirectory: true })
+      : context.cwd;
+  }
   const normalized = target.trim();
-  if (!normalized || normalized === '.' || normalized === './') return true;
-  const resolved = path.resolve(context.cwd, normalized);
-  return resolved === context.cwd;
+  if (!normalized || normalized === '.' || normalized === './') {
+    const scopedTarget = getPrimaryTargetScope(context);
+    return scopedTarget
+      ? safeResolve(context.cwd, scopedTarget, { allowAbsolute: true, allowDirectory: true })
+      : context.cwd;
+  }
+
+  const resolved = await safeResolveWorkspacePath(context.cwd, normalized, { allowDirectory: true });
+  return resolved === context.cwd
+    ? (getPrimaryTargetScope(context)
+      ? safeResolve(context.cwd, getPrimaryTargetScope(context)!, { allowAbsolute: true, allowDirectory: true })
+      : resolved)
+    : resolved;
 }
 
 export const grepTool: Tool = {
@@ -46,10 +60,9 @@ export const grepTool: Tool = {
       path?: string;
       glob?: string;
     };
-    const scopedPath = isBroadSearchRoot(searchPath, context) ? getPrimaryTargetScope(context) || searchPath : searchPath;
-    const target = scopedPath ? path.resolve(context.cwd, scopedPath) : context.cwd;
 
     try {
+      const target = await resolveGrepTarget(searchPath, context);
       const args = ['--color=never', '-rn', '--max-count=50'];
       if (globFilter) args.push('--include', globFilter);
       args.push(pattern, target);
