@@ -1,21 +1,20 @@
 ---
 name: review-tik-agent-loop
-description: Review Tik-native claude_review work items from Workbench and submit ReviewResult JSON back to Tik.
+description: Use when Claude Code is launched by Tik to review a Tik claude_review work item and submit ReviewResult JSON back to Tik.
 ---
 
 # Review Tik Agent Loop
 
-Use this skill when asked to review a Tik agent-loop task, review the current worktree through Tik, or close a Tik `claude_review` work item.
+Use this skill only as the Claude Code side of a Tik-owned workflow. Tik selects the task, launches Claude Code, provides the prompt/context, and owns state transitions.
 
 ## Contract
 
-You are the reviewer worker for Tik Workbench tasks whose `agentLoop.kind` is `claude_review`.
+You are the reviewer worker for the Tik Workbench task named in the current prompt.
 
 Do:
-- Read the selected Tik task from `GET ${TIK_API_BASE_URL:-http://127.0.0.1:3300/api}/v1/tasks`.
-- Select a task with `status=todo`, `status=in_progress`, or `status=running`, label `needs-claude-review` (or legacy `claude-review`), and `agentLoop.kind=claude_review`.
-- Review exactly `task.agentLoop.headSha`.
-- Use `task.workspaceBinding.effectiveProjectPath` as the repository path.
+- Read the selected Tik task from `GET ${TIK_API_BASE_URL:-http://127.0.0.1:3300/api}/v1/tasks` if the prompt does not include all needed fields.
+- Review exactly the recorded `task.agentLoop.headSha`.
+- Use the repository path provided by Tik's runtime prompt.
 - Compare the recorded head SHA with `git -C <path> rev-parse HEAD`.
 - If HEAD differs, call `POST /v1/agent-loop/tasks/:id/stale` with `{ "expectedHeadSha": "...", "actualHeadSha": "..." }` and stop.
 - Submit only the Tik `ReviewResult` object to `POST /v1/agent-loop/tasks/:id/review-result`.
@@ -24,6 +23,7 @@ Do not:
 - Edit files.
 - Commit, push, merge, or approve externally.
 - Call GitHub/GitLab review APIs.
+- Claim tasks or choose another task from the board.
 - Review a moving target if the current HEAD differs from `agentLoop.headSha`.
 
 ## ReviewResult JSON

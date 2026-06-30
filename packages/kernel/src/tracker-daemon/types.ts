@@ -167,6 +167,7 @@ export interface TrackerDaemonTickResult {
   stopped: string[];
   skipped: Array<{ shortIdentifier: string; reason: string }>;
   failed: Array<{ shortIdentifier: string; error: string }>;
+  runIds?: Record<string, string>;
 }
 
 export interface TrackerWorkflowConfig {

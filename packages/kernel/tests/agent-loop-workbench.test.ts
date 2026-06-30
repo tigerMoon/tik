@@ -183,6 +183,51 @@ describe('WorkbenchService agent loop work items', () => {
     ]);
   });
 
+  it('does not reroute a review task after Claude already submitted ReviewResult JSON', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-result-before-runtime-completion',
+      labels: ['external-claude-review'],
+    });
+
+    await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'request_changes',
+      headShaReviewed: 'abc123',
+      blockingIssues: [{
+        title: 'Missing regression coverage',
+        file: 'packages/kernel/src/workbench/workbench-service.ts',
+        reason: 'The structured ReviewResult must remain authoritative.',
+      }],
+      markdown: 'Structured review result found a blocker.',
+    });
+
+    const afterRuntime = await service.advanceReviewLoopAfterRuntime(reviewTask.id, {
+      runner: 'claude-code',
+      status: 'completed',
+      stdout: 'No blocking findings. Ready for human review.',
+      runId: 'claude-run-1',
+    });
+
+    expect(afterRuntime?.status).toBe('todo');
+    expect(afterRuntime?.labels).toEqual([
+      'agent-loop',
+      'codex-fix',
+      'external-claude-review',
+      'needs-codex-fix',
+    ]);
+    expect(afterRuntime?.agentLoop).toMatchObject({
+      kind: 'codex_fix',
+      phase: 'needs_codex_fix',
+      reviewResult: {
+        verdict: 'request_changes',
+      },
+    });
+  });
+
   it('marks stale review tasks blocked and records expected and actual head shas', async () => {
     const { service } = await makeService();
     const reviewTask = await service.createReviewRound({

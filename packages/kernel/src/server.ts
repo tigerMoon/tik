@@ -1017,6 +1017,71 @@ export async function createServer(
     },
   );
 
+  fastify.post<{ Params: { id: string } }>(
+    '/api/v1/agent-loop/tasks/:id/claude-review-runs',
+    async (req, reply) => {
+      const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+      if (!workbench) {
+        return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+      }
+
+      try {
+        const workspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
+        const workflow = await loadWorkspaceTrackerWorkflow(workspaceRoot);
+        const task = await workbench.readTask(req.params.id);
+        if (!task) {
+          return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
+        }
+        if (task.agentLoop?.kind !== 'claude_review') {
+          return sendV1Error(reply, 400, 'not_claude_review_task', 'Workbench task is not a Claude review task');
+        }
+        const tracked = workbenchTaskToTrackedTaskForWorkflow(task, kernel.projectPath, {
+          allowExternalClaudeReview: true,
+        });
+        const projectPath = tracked.repository?.executionPath || tracked.repository?.path || kernel.projectPath || process.cwd();
+        const expectedHeadSha = task.agentLoop.headSha || task.agentLoop.changeRequest.headSha;
+        if (expectedHeadSha) {
+          const actualHeadSha = readGitOutput(projectPath, ['rev-parse', 'HEAD']);
+          if (actualHeadSha !== expectedHeadSha) {
+            const staleTask = await workbench.markAgentLoopStale(task.id, {
+              expectedHeadSha,
+              actualHeadSha,
+            });
+            return sendV1ErrorWithBody(reply, 409, 'head_sha_mismatch', 'Workbench task head sha no longer matches the worktree HEAD', {
+              task: staleTask,
+              expectedHeadSha,
+              actualHeadSha,
+            });
+          }
+        }
+        const routing = workflow.version === 2 ? workflow.resolveRouting?.(tracked) : undefined;
+        if (!routing || routing.runner !== 'claude-code') {
+          return sendV1ErrorWithBody(reply, 409, 'not_claude_code_routed', 'Claude review task is not routed to the claude-code runtime', {
+            workflow: workflowSummary(workflow),
+            routing,
+          });
+        }
+        const daemon = buildWorkbenchTrackerDaemon({
+          kernel,
+          workbench,
+          workspaceRoot,
+          importer: new SingleTrackedTaskImporter(tracked),
+          workflow,
+          runtimeRunners: options?.runtimeRunners,
+        });
+        const result = await daemon.runExplicitTask(tracked);
+        const runId = result.runIds?.[tracked.shortIdentifier] || null;
+        return {
+          queued: false,
+          runId,
+          result,
+        };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
   fastify.post<{ Params: { id: string }; Body: ReviewResult }>(
     '/api/v1/agent-loop/tasks/:id/review-result',
     async (req, reply) => {
@@ -2570,7 +2635,11 @@ class SingleTrackedTaskImporter {
   }
 }
 
-function workbenchTaskToTrackedTaskForWorkflow(task: WorkbenchTaskRecord, defaultProjectPath: string): TrackedTask {
+function workbenchTaskToTrackedTaskForWorkflow(
+  task: WorkbenchTaskRecord,
+  defaultProjectPath: string,
+  options: { allowExternalClaudeReview?: boolean } = {},
+): TrackedTask {
   const identifier = task.identifier || task.shortIdentifier || task.id.slice(0, 8).toUpperCase();
   const latestOpenAttempt = (task.attempts || [])
     .filter((attempt) => attempt.kernelTaskId && !attempt.finishedAt)
@@ -2583,7 +2652,10 @@ function workbenchTaskToTrackedTaskForWorkflow(task: WorkbenchTaskRecord, defaul
     description: task.description ?? task.goal,
     priority: task.priority ?? null,
     state: task.status,
-    stateKind: isWorkflowV2CandidateStatus(task.status) && !isWorkbenchTaskExternallyOwnedClaudeReview(task) ? 'active' : 'blocked',
+    stateKind: isWorkflowV2CandidateStatus(task.status)
+      && (options.allowExternalClaudeReview || !isWorkbenchTaskExternallyOwnedClaudeReview(task))
+      ? 'active'
+      : 'blocked',
     sourceUrl: task.sourceUrl,
     labels: task.labels || [],
     blockedBy: task.blockedBy || [],
@@ -2673,6 +2745,19 @@ function sendV1Error(reply: any, statusCode: number, code: string, message: stri
       code,
       message,
     },
+  };
+}
+
+function sendV1ErrorWithBody(
+  reply: any,
+  statusCode: number,
+  code: string,
+  message: string,
+  body: Record<string, unknown>,
+) {
+  return {
+    ...sendV1Error(reply, statusCode, code, message),
+    ...body,
   };
 }
 

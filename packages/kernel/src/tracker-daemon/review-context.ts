@@ -3,6 +3,9 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 export interface ReviewContextOptions {
+  baseRef?: string;
+  headSha?: string;
+  allowedScope?: string[];
   maxFiles?: number;
   maxDiffBytes?: number;
 }
@@ -25,18 +28,30 @@ export async function buildTikGeneratedReviewContext(
     ].join('\n');
   }
 
-  const status = gitOutput(projectPath, ['status', '--short']);
-  const changedFiles = uniqueStrings([
-    ...gitOutput(projectPath, ['diff', '--name-only', '--diff-filter=ACMRTUXB', 'HEAD', '--']).split(/\r?\n/),
-    ...gitOutput(projectPath, ['ls-files', '--others', '--exclude-standard']).split(/\r?\n/),
-  ].map((line) => line.trim()).filter(Boolean));
+  const status = filterFilesByScope(
+    gitOutput(projectPath, ['status', '--short'])
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter(Boolean),
+    options.allowedScope,
+    statusFilePath,
+  ).join('\n');
+  const diffRange = options.baseRef && options.headSha
+    ? `${options.baseRef}..${options.headSha}`
+    : undefined;
+  const changedFiles = filterFilesByScope(uniqueStrings([
+    ...(diffRange
+      ? gitOutput(projectPath, ['diff', '--name-only', '--diff-filter=ACMRTUXB', diffRange, '--']).split(/\r?\n/)
+      : []),
+    ...worktreeChangedFiles(projectPath),
+  ].map((line) => line.trim()).filter(Boolean)), options.allowedScope);
   const selectedFiles = changedFiles.slice(0, maxFiles);
   let remainingDiffBytes = maxDiffBytes;
   const snippets: string[] = [];
 
   for (const file of selectedFiles) {
     if (remainingDiffBytes <= 0) break;
-    const diff = await diffSnippetForFile(projectPath, file, remainingDiffBytes);
+    const diff = await diffSnippetForFile(projectPath, file, remainingDiffBytes, diffRange);
     if (!diff.trim()) continue;
     const truncatedDiff = truncate(diff, remainingDiffBytes);
     remainingDiffBytes -= Buffer.byteLength(truncatedDiff, 'utf-8');
@@ -64,6 +79,13 @@ export async function buildTikGeneratedReviewContext(
     '```text',
     status.trimEnd() || '(clean)',
     '```',
+    diffRange ? [
+      '',
+      '### Review range',
+      '```text',
+      diffRange,
+      '```',
+    ].join('\n') : undefined,
     '',
     '### Changed files',
     changedFiles.length
@@ -72,14 +94,32 @@ export async function buildTikGeneratedReviewContext(
     '',
     '### Diff snippets',
     snippets.length ? snippets.join('\n\n') + diffBudgetNotice : '(no diff snippets available)',
-  ].join('\n');
+  ].filter((part): part is string => Boolean(part)).join('\n');
 }
 
-export function hasTikReviewableChanges(projectPath: string): boolean {
+export function hasTikReviewableChanges(projectPath: string, options: ReviewContextOptions = {}): boolean {
   if (!isGitWorkTree(projectPath)) {
     return true;
   }
-  return Boolean(gitOutput(projectPath, ['status', '--short']).trim());
+  if (gitOutput(projectPath, ['status', '--short']).trim()) {
+    if (!options.allowedScope?.length) return true;
+    const scopedStatus = filterFilesByScope(
+      gitOutput(projectPath, ['status', '--short']).split(/\r?\n/).filter(Boolean),
+      options.allowedScope,
+      statusFilePath,
+    );
+    if (scopedStatus.length) return true;
+  }
+  if (options.baseRef && options.headSha) {
+    const scopedRangeFiles = filterFilesByScope(
+      gitOutput(projectPath, ['diff', '--name-only', '--diff-filter=ACMRTUXB', `${options.baseRef}..${options.headSha}`, '--'])
+        .split(/\r?\n/)
+        .filter(Boolean),
+      options.allowedScope,
+    );
+    return scopedRangeFiles.length > 0;
+  }
+  return false;
 }
 
 function isGitWorkTree(projectPath: string): boolean {
@@ -95,8 +135,10 @@ function gitOutput(cwd: string, args: string[]): string {
   return result.status === 0 ? result.stdout.trimEnd() : '';
 }
 
-async function diffSnippetForFile(projectPath: string, file: string, maxBytes: number): Promise<string> {
-  const diff = gitOutput(projectPath, ['diff', '--', file]);
+async function diffSnippetForFile(projectPath: string, file: string, maxBytes: number, diffRange?: string): Promise<string> {
+  const rangeDiff = diffRange ? gitOutput(projectPath, ['diff', diffRange, '--', file]) : '';
+  const worktreeDiff = gitOutput(projectPath, ['diff', '--', file]);
+  const diff = [rangeDiff, worktreeDiff].filter((part) => part.trim()).join('\n');
   if (diff.trim()) return diff;
 
   const content = await fs.readFile(path.join(projectPath, file), 'utf-8').catch(() => '');
@@ -112,6 +154,13 @@ async function diffSnippetForFile(projectPath: string, file: string, maxBytes: n
   ].join('\n');
 }
 
+function worktreeChangedFiles(projectPath: string): string[] {
+  return [
+    ...gitOutput(projectPath, ['diff', '--name-only', '--diff-filter=ACMRTUXB', 'HEAD', '--']).split(/\r?\n/),
+    ...gitOutput(projectPath, ['ls-files', '--others', '--exclude-standard']).split(/\r?\n/),
+  ];
+}
+
 function truncate(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, 'utf-8');
   if (bytes.length <= maxBytes) return value;
@@ -120,4 +169,31 @@ function truncate(value: string, maxBytes: number): string {
 
 function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values));
+}
+
+function filterFilesByScope(
+  values: string[],
+  allowedScope: string[] | undefined,
+  extractPath: (value: string) => string = (value) => value,
+): string[] {
+  const scopes = normalizeScopes(allowedScope);
+  if (!scopes.length) return values;
+  return values.filter((value) => isPathInScopes(extractPath(value), scopes));
+}
+
+function normalizeScopes(allowedScope: string[] | undefined): string[] {
+  return (allowedScope || [])
+    .map((scope) => scope.trim().replace(/^\.?\//, '').replace(/\/+$/, ''))
+    .filter(Boolean);
+}
+
+function isPathInScopes(filePath: string, scopes: string[]): boolean {
+  const normalized = filePath.trim().replace(/^\.?\//, '');
+  return scopes.some((scope) => normalized === scope || normalized.startsWith(`${scope}/`));
+}
+
+function statusFilePath(line: string): string {
+  const match = line.match(/^\s*(?:[ MADRCU?!]{1,2})\s+(.+)$/);
+  const value = match?.[1] || line;
+  return value.includes(' -> ') ? value.split(' -> ').at(-1) || value : value;
 }

@@ -1404,6 +1404,129 @@ describe('workbench API routes', () => {
     await waitFor(async () => (await workbench.readTask(task.id))?.status === 'in_review');
   });
 
+  it('starts an externally-owned Claude review through the Tik workflow API', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    await fs.mkdir(path.join(root, '.tik'), { recursive: true });
+    await fs.writeFile(path.join(root, '.tik', 'WORKFLOW.md'), [
+      '---',
+      'version: 2',
+      'routing:',
+      '  rules:',
+      '    - labels_any: [needs-claude-review]',
+      '      runner: claude-code',
+      '      mode: claude_print',
+      '  default_runner: codex',
+      '  default_mode: codex_app_server',
+      'concurrency:',
+      '  lock: repository_branch',
+      '---',
+      'Review {{ task.shortIdentifier }}.',
+    ].join('\n'), 'utf-8');
+    await fs.writeFile(path.join(repo, 'feature.ts'), 'export const before = 1;\n', 'utf-8');
+    await runGit(repo, ['init']);
+    await runGit(repo, ['config', 'user.email', 'test@example.com']);
+    await runGit(repo, ['config', 'user.name', 'Tik Test']);
+    await runGit(repo, ['add', 'feature.ts']);
+    await runGit(repo, ['commit', '-m', 'init']);
+    await fs.writeFile(path.join(repo, 'feature.ts'), 'export const after = 2;\n', 'utf-8');
+    await runGit(repo, ['add', 'feature.ts']);
+    await runGit(repo, ['commit', '-m', 'change']);
+    const headSha = await runGit(repo, ['rev-parse', 'HEAD']);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const runtimeRunner = new CompletingRuntimeRunner();
+    const mockKernel = {
+      projectPath: repo,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      getSession: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const task = await workbench.createReviewRound({
+      rootTaskId: 'external-review',
+      round: 1,
+      maxRounds: 3,
+      idempotencyKey: 'explicit-server-external-review',
+      labels: ['external-claude-review'],
+      changeRequest: {
+        scm: 'internal',
+        repo: 'repo',
+        id: 'external-review',
+        type: 'internal_review',
+        title: 'Review repo change',
+        baseRef: 'HEAD~1',
+        headRef: 'HEAD',
+        headSha,
+      },
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    });
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root, runtimeRunners: { 'claude-code': runtimeRunner } },
+    );
+    servers.push(server);
+
+    const preview = await server.inject({
+      method: 'GET',
+      url: `/api/v1/tasks/${task.id}/routing-preview`,
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json()).toMatchObject({
+      runnable: false,
+      reason: 'blocked',
+    });
+
+    const run = await server.inject({
+      method: 'POST',
+      url: `/api/v1/agent-loop/tasks/${task.id}/claude-review-runs`,
+    });
+    expect(run.statusCode).toBe(200);
+    expect(run.json()).toMatchObject({
+      queued: false,
+      result: {
+        dispatched: [task.shortIdentifier],
+        failed: [],
+      },
+    });
+    expect(run.json().runId).toEqual(expect.any(String));
+    expect(runtimeRunner.preparedInputs).toHaveLength(1);
+    expect(runtimeRunner.preparedInputs[0]).toMatchObject({
+      projectPath: repo,
+      runnerMode: 'claude_print',
+    });
+    expect(runtimeRunner.startedInputs[0]).toMatchObject({
+      cwd: repo,
+      mode: 'claude_print',
+    });
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('ReviewResult JSON');
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain(`http://127.0.0.1:3300/api/v1/agent-loop/tasks/${task.id}/review-result`);
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain(`HEAD~1..${headSha}`);
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('-export const before = 1;');
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('+export const after = 2;');
+    await waitFor(async () => (await workbench.readTask(task.id))?.status === 'in_review');
+  });
+
   it('reports blocked workflow v2 tasks as not runnable in routing preview', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);
@@ -3328,4 +3451,12 @@ async function readJsonIfReady(filePath: string): Promise<any> {
   } catch {
     return {};
   }
+}
+
+async function runGit(cwd: string, args: string[]): Promise<string> {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf-8' });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(' ')} failed in ${cwd}: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trim();
 }

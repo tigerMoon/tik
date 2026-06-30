@@ -16,6 +16,7 @@ Tik 是一个 `task-first` 的 agent runtime。
 - Linear-like Dashboard workspace / project / task hierarchy
 - Workspace SDD control plane (`workspace run/status/report/board/next/retry`)
 - Workspace-managed worktree isolation (`worktree list/status/path/create/use/remove`)
+- Tik-native Claude Code review workflow (`codex-skill/tik-claude-review` + `claude-plugin/agent-loop-claude-review`)
 
 ## Architecture
 
@@ -48,6 +49,7 @@ User → CLI / Dashboard → API Server → ExecutionKernel
 - `Search discipline`: path-aware glob、scoped grep、repo candidate resolution、shell probe suppression
 - `Execution isolation`: workspace 项目默认可切到受管 worktree 执行，源工作区保持干净
 - `Workspace hierarchy`: Dashboard 以 Workspace 为顶层，Project 绑定到 Workspace，Task 可绑定到 Workspace 或 Project
+- `Claude review workflow`: Codex skill 和 Claude Code plugin 只做 workflow 入口，task 创建、review context、Claude Code 启动、ReviewResult 接入和状态流转都由 Tik API 实现
 
 ## Project Structure
 
@@ -60,6 +62,8 @@ tik/
 │   ├── ace/         # Fitness / drift / entropy / convergence
 │   ├── cli/         # tik CLI
 │   └── dashboard/   # Web dashboard
+├── codex-skill/tik-claude-review/ # Codex 全局 skill：调用 Tik API 编排 Claude review
+├── claude-plugin/agent-loop-claude-review/ # Claude Code plugin：执行 Tik 提供的 review 指令
 ├── design/baseline.md      # 当前实现基线
 ├── design/skill-compatibility.md # ~/.agents/skills 与 Tik 的兼容约束
 └── design/claw-gap.md
@@ -205,6 +209,62 @@ tik tracker watch --workflow WORKFLOW.md --provider codex
 ```
 
 `--provider mock` 只 mock LLM provider，不 mock task importer；不传 `--file` 时，任务来源就是本地 Workbench Task。`--file` 会读取 JSON snapshot。`tracker.kind: linear` 不再作为 daemon 运行时来源，运行 `tik tracker *` 时会直接报错，避免外部 tracker 和本地 task 双写。
+
+### Claude Code Review Workflow
+
+Tik 支持一条专用的 Claude Code review 链路，用来让当前 Codex 会话把 worktree 改动交给 Claude Code 做 CR，同时避免普通 `tracker watch` 抢走这个 review task。
+
+职责边界：
+- Tik 负责创建 Workbench task、固定 `headSha`、生成 review context、启动 `claude-code` runtime、接收 `ReviewResult`、推进状态和后续修复路由。
+- Codex 全局 skill `tik-claude-review` 是薄 workflow，只调用 Tik API 创建/启动/等待/处理 review task。
+- Claude Code plugin `agent-loop-claude-review` 只提供 `review-tik-agent-loop` skill，让 Claude Code 按 Tik 提供的上下文审查并提交结构化 `ReviewResult`。
+- 带 `external-claude-review` label 的 task 不会被普通 `tik tracker tick/watch` 执行；必须通过专用 review endpoint 启动。
+
+安装本地 Codex skill 和 Claude plugin：
+
+```bash
+rsync -a --delete codex-skill/tik-claude-review/ ~/.codex/skills/tik-claude-review/
+
+claude plugin marketplace add /Users/huyuehui/ace/tik/claude-plugin --scope user
+claude plugin install agent-loop-claude-review@tik-local --scope user
+```
+
+安装后建议新开 Codex / Claude Code 会话，让 skill 和 plugin manifest 重新加载。
+
+运行环境：
+
+```bash
+export TIK_API_BASE_URL=http://127.0.0.1:3300/api
+export TIK_CLAUDE_CODE_PLUGIN_DIRS=/Users/huyuehui/ace/tik/claude-plugin/agent-loop-claude-review
+export TIK_CLAUDE_CODE_ADD_DIRS=/Users/huyuehui/ace/tik
+export TIK_CLAUDE_CODE_PERMISSION_MODE=bypassPermissions
+```
+
+核心 API：
+
+```text
+POST /api/v1/agent-loop/worktree-review-rounds
+POST /api/v1/agent-loop/tasks/:id/claude-review-runs
+POST /api/v1/agent-loop/tasks/:id/review-result
+POST /api/v1/agent-loop/tasks/:id/stale
+```
+
+review 范围由 Tik 判定：
+- 如果 task 记录了 `agentLoop.baseRef` 和 `agentLoop.headSha`，Tik 会生成这个固定范围的 diff。
+- 如果 worktree 还有 dirty/untracked 文件，Tik 会把这些本地改动也放进 review context。
+- `agentLoop.allowedScope` 会限制 Claude 只审查允许范围内的文件。
+- 启动前 Tik 校验当前 worktree HEAD 必须等于记录的 `headSha`；Claude 提交结果前也会按同一上下文做 stale 检查。
+
+一键从 Codex skill 创建并启动 review：
+
+```bash
+node codex-skill/tik-claude-review/scripts/tik-claude-review.mjs run \
+  --root-task TASK-123 \
+  --base main \
+  --review-focus "correctness,regression risk"
+```
+
+Claude Code 完成后会向 Tik 提交 `ReviewResult`。如果 `blockingIssues.length > 0`，Tik 会把同一个 task 切到 `agentLoop.kind=codex_fix` / `phase=needs_codex_fix`，但仍保留 `external-claude-review`，由当前 Codex 会话处理修复；没有 blocker 时，结果进入人工确认或项目既有审批策略。
 
 `WORKFLOW.md` 示例：
 

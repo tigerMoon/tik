@@ -156,7 +156,10 @@ export class TrackerDaemon {
       if (workflow?.version === 2) {
         try {
           const routing = workflow.resolveRouting?.(task);
-          if (shouldRunClaudeReview(routing, task) && !hasTikReviewableChanges(projectPath)) {
+          if (shouldRunClaudeReview(routing, task) && !hasTikReviewableChanges(projectPath, {
+            baseRef: task.agentLoop?.changeRequest.baseRef,
+            headSha: task.agentLoop?.headSha || task.agentLoop?.changeRequest.headSha,
+          })) {
             result.skipped.push({ shortIdentifier: task.shortIdentifier, reason: 'no-reviewable-changes' });
             continue;
           }
@@ -247,6 +250,76 @@ export class TrackerDaemon {
       if (outcome.failed) result.failed.push(outcome.failed);
     }
 
+    state.recent = appendRecent(state.recent, result, new Date(this.now()).toISOString());
+    await this.options.stateStore.save(state);
+    return result;
+  }
+
+  async runExplicitTask(task: TrackedTask): Promise<TrackerDaemonTickResult> {
+    const result: TrackerDaemonTickResult = {
+      dispatched: [],
+      stopped: [],
+      skipped: [],
+      failed: [],
+    };
+    const workflow = await this.resolveWorkflow();
+    const state = await this.options.stateStore.load().catch(() => emptyState());
+    const attempt = state.retries[task.id]?.attempt || 0;
+    const runId = workflow?.version === 2 ? buildAgentRunId(task, attempt, this.now()) : undefined;
+    try {
+      const projectPath = task.repository?.executionPath || task.repository?.path || this.options.defaultProjectPath;
+      const routing = workflow?.version === 2 ? workflow.resolveRouting?.(task) : undefined;
+      const prompt = await this.renderWorkflowPrompt(task, {
+        attempt,
+        workflow,
+        routing,
+        projectPath,
+      });
+      if (workflow?.version === 2 && runId && routing) {
+        await this.createAgentRun(task, {
+          runId,
+          attempt,
+          projectPath,
+          workflow,
+          routing,
+        });
+      }
+      if (workflow?.version === 2 && runId && routing && this.options.runtimeRunners?.[routing.runner]) {
+        await this.launchRuntimeRunner(task, {
+          runId,
+          attempt,
+          projectPath,
+          prompt,
+          workflow,
+          routing,
+        });
+      } else {
+        const launched = await this.options.launcher.launchTask?.(task, {
+          workspaceRoot: this.options.workspaceRoot,
+          projectPath,
+          prompt,
+          attempt,
+          runId,
+          workflowConfigHash: workflow?.workflowConfigHash,
+          workflowPromptHash: workflow?.workflowPromptHash,
+          routing,
+        });
+        if (!launched) throw new Error('Tracker daemon launcher does not implement launchTask.');
+      }
+      delete state.retries[task.id];
+      result.dispatched.push(task.shortIdentifier);
+      if (runId) {
+        result.runIds = { ...(result.runIds || {}), [task.shortIdentifier]: runId };
+      }
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      await this.options.launcher.markAttemptFailed?.(task.id, error);
+      if (workflow?.version === 2) {
+        await this.appendAgentRunFailure(task, runId || buildAgentRunId(task, attempt, this.now()), error);
+      }
+      state.retries[task.id] = this.nextRetry(state, task, error);
+      result.failed.push({ shortIdentifier: task.shortIdentifier, error });
+    }
     state.recent = appendRecent(state.recent, result, new Date(this.now()).toISOString());
     await this.options.stateStore.save(state);
     return result;
@@ -458,13 +531,19 @@ export class TrackerDaemon {
     if (!isClaudeReviewRouting(input.routing, task)) {
       return basePrompt;
     }
-    const reviewContext = await buildTikGeneratedReviewContext(input.projectPath).catch((error) => [
+    const reviewContext = await buildTikGeneratedReviewContext(input.projectPath, {
+      baseRef: task.agentLoop?.changeRequest.baseRef,
+      headSha: task.agentLoop?.headSha || task.agentLoop?.changeRequest.headSha,
+      allowedScope: task.agentLoop?.allowedScope,
+    }).catch((error) => [
       '## Tik-generated review context',
       '',
       `Tik failed to generate review context: ${error instanceof Error ? error.message : String(error)}`,
     ].join('\n'));
     return [
       basePrompt.trimEnd(),
+      '',
+      buildTikGeneratedClaudeReviewSubmissionPrompt(task),
       '',
       reviewContext,
     ].join('\n');
@@ -950,7 +1029,12 @@ function buildRuntimeEnv(
     TIK_RUNNER_MODE: input.mode,
     TIK_WORKSPACE_ROOT: input.workspaceRoot,
     TIK_PROJECT_PATH: input.projectPath,
+    TIK_API_BASE_URL: runtimeApiBaseUrl(),
   };
+}
+
+function runtimeApiBaseUrl(): string {
+  return (process.env.TIK_API_BASE_URL || 'http://127.0.0.1:3300/api').replace(/\/$/, '');
 }
 
 const BASE_RUNTIME_ENV_KEYS = [
@@ -1114,6 +1198,70 @@ function buildTikGeneratedCodexFixPrompt(task: TrackedTask): string {
       '### Original task description',
       truncatePromptSection(task.description, 2_000),
     ].join('\n') : undefined,
+  ].filter((part): part is string => Boolean(part)).join('\n');
+}
+
+function buildTikGeneratedClaudeReviewSubmissionPrompt(task: TrackedTask): string {
+  const metadata = task.agentLoop;
+  const expectedHeadSha = metadata?.headSha || metadata?.changeRequest.headSha;
+  return [
+    '## Tik Claude Code review contract',
+    '',
+    'You are running inside a Tik-managed Claude Code review workflow.',
+    'Review only the recorded change and do not edit files, commit, push, merge, approve externally, or call GitHub/GitLab review APIs.',
+    expectedHeadSha ? `Recorded head SHA: ${expectedHeadSha}` : undefined,
+    metadata?.changeRequest.baseRef && expectedHeadSha
+      ? `Review diff range: ${metadata.changeRequest.baseRef}..${expectedHeadSha}`
+      : undefined,
+    '',
+    'Before reviewing, compare the recorded head SHA with `git rev-parse HEAD` in the repository.',
+    `If it differs, POST { "expectedHeadSha": "${expectedHeadSha || '<recorded-head-sha>'}", "actualHeadSha": "<current-head-sha>" } to ${runtimeApiBaseUrl()}/v1/agent-loop/tasks/${task.id}/stale and stop.`,
+    '',
+    'When finished, submit only a ReviewResult JSON object through Tik. Do not finish by printing JSON only; the review is complete only after the Tik POST succeeds.',
+    `POST ${runtimeApiBaseUrl()}/v1/agent-loop/tasks/${task.id}/review-result`,
+    `Runtime env also exposes TIK_API_BASE_URL=${runtimeApiBaseUrl()}.`,
+    '',
+    'Submission command pattern:',
+    '```bash',
+    `cat > /tmp/tik-review-result-${task.id}.json <<'JSON'`,
+    '{',
+    '  "verdict": "approve",',
+    `  "headShaReviewed": "${expectedHeadSha || '<recorded-head-sha>'}",`,
+    `  "currentHeadSha": "${expectedHeadSha || '<current-head-sha>'}",`,
+    '  "blockingIssues": [],',
+    '  "nonBlockingSuggestions": [],',
+    '  "testsNeeded": [],',
+    '  "markdown": "No blocking findings.",',
+    '  "reviewerWorkerId": "claude-code"',
+    '}',
+    'JSON',
+    `curl -sS -X POST "$TIK_API_BASE_URL/v1/agent-loop/tasks/${task.id}/review-result" -H 'Content-Type: application/json' --data-binary @/tmp/tik-review-result-${task.id}.json`,
+    '```',
+    'Replace the JSON body with the actual review result before running the command.',
+    '',
+    'ReviewResult JSON schema:',
+    '```json',
+    JSON.stringify({
+      verdict: 'request_changes',
+      headShaReviewed: expectedHeadSha || '<recorded-head-sha>',
+      currentHeadSha: expectedHeadSha || '<current-head-sha>',
+      blockingIssues: [
+        {
+          title: 'Short blocking issue title',
+          file: 'relative/path.ts',
+          line: 42,
+          reason: 'Why this blocks acceptance.',
+          suggestedFix: 'Concrete fix direction.',
+        },
+      ],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Human-readable review summary.',
+      reviewerWorkerId: 'claude-code',
+    }, null, 2),
+    '```',
+    '',
+    'Use `verdict=approve` only when there are zero blocking issues. Use `verdict=request_changes` when `blockingIssues` is non-empty.',
   ].filter((part): part is string => Boolean(part)).join('\n');
 }
 

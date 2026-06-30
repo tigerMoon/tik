@@ -1155,6 +1155,162 @@ describe('TrackerDaemon', () => {
     await waitForWorkbenchTask(workbench, 'task-review-context', (candidate) => candidate?.status === 'in_review');
   });
 
+  it('keeps worktree diff snippets in Claude review prompts when a head sha is pinned', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    await fs.writeFile(path.join(repo, 'feature.ts'), 'export const oldValue = 1;\n', 'utf-8');
+    await runGit(repo, ['init']);
+    await runGit(repo, ['config', 'user.email', 'test@example.com']);
+    await runGit(repo, ['config', 'user.name', 'Tik Test']);
+    await runGit(repo, ['add', 'feature.ts']);
+    await runGit(repo, ['commit', '-m', 'init']);
+    const headSha = await runGit(repo, ['rev-parse', 'HEAD']);
+    await fs.writeFile(path.join(repo, 'feature.ts'), 'export const dirtyValue = 3;\n', 'utf-8');
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const reviewTask = await workbench.createReviewRound({
+      rootTaskId: 'task-root',
+      round: 1,
+      maxRounds: 2,
+      changeRequest: {
+        scm: 'internal',
+        repo: 'repo',
+        id: 'task-root',
+        type: 'internal_review',
+        title: 'Review pinned head with local diff',
+        baseRef: 'HEAD',
+        headRef: 'main',
+        headSha,
+      },
+      idempotencyKey: 'review-pinned-head-with-dirty-worktree',
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    });
+
+    const runtimeRunner = new CompletingRuntimeRunner('claude-code');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({
+        root,
+        runner: 'claude-code',
+        mode: 'claude_print',
+        renderPrompt: (trackedTask) => `Review ${trackedTask.shortIdentifier}.`,
+      }),
+    });
+
+    const trackedTask = (await new WorkflowV2WorkbenchTaskImporter(workbench, repo).fetchTaskStatesByIds?.([reviewTask.id]))![0]!;
+    const result = await daemon.runExplicitTask(trackedTask);
+
+    expect(result.dispatched).toEqual(['TIK-1']);
+    const prompt = runtimeRunner.preparedInputs[0]?.renderedPrompt || '';
+    expect(prompt).toContain(`HEAD..${headSha}`);
+    expect(prompt).toContain('M feature.ts');
+    expect(prompt).toContain('-export const oldValue = 1;');
+    expect(prompt).toContain('+export const dirtyValue = 3;');
+    await waitForWorkbenchTask(workbench, reviewTask.id, (candidate) => candidate?.status === 'in_review');
+  });
+
+  it('limits Claude review context to the agent-loop allowed scope', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(path.join(repo, 'src'), { recursive: true });
+    await fs.mkdir(path.join(repo, 'docs'), { recursive: true });
+    await fs.writeFile(path.join(repo, 'src', 'feature.ts'), 'export const oldValue = 1;\n', 'utf-8');
+    await fs.writeFile(path.join(repo, 'docs', 'notes.md'), 'old notes\n', 'utf-8');
+    await runGit(repo, ['init']);
+    await runGit(repo, ['config', 'user.email', 'test@example.com']);
+    await runGit(repo, ['config', 'user.name', 'Tik Test']);
+    await runGit(repo, ['add', '.']);
+    await runGit(repo, ['commit', '-m', 'init']);
+    const headSha = await runGit(repo, ['rev-parse', 'HEAD']);
+    await fs.writeFile(path.join(repo, 'src', 'feature.ts'), 'export const scopedValue = 2;\n', 'utf-8');
+    await fs.writeFile(path.join(repo, 'docs', 'notes.md'), 'unrelated notes\n', 'utf-8');
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const reviewTask = await workbench.createReviewRound({
+      rootTaskId: 'task-root',
+      round: 1,
+      maxRounds: 2,
+      changeRequest: {
+        scm: 'internal',
+        repo: 'repo',
+        id: 'task-root',
+        type: 'internal_review',
+        title: 'Review scoped local diff',
+        baseRef: 'HEAD',
+        headRef: 'main',
+        headSha,
+      },
+      idempotencyKey: 'review-allowed-scope-context',
+      allowedScope: ['src'],
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    });
+
+    const runtimeRunner = new CompletingRuntimeRunner('claude-code');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({
+        root,
+        runner: 'claude-code',
+        mode: 'claude_print',
+        renderPrompt: (trackedTask) => `Review ${trackedTask.shortIdentifier}.`,
+      }),
+    });
+
+    const trackedTask = (await new WorkflowV2WorkbenchTaskImporter(workbench, repo).fetchTaskStatesByIds?.([reviewTask.id]))![0]!;
+    const result = await daemon.runExplicitTask(trackedTask);
+
+    expect(result.dispatched).toEqual(['TIK-1']);
+    const prompt = runtimeRunner.preparedInputs[0]?.renderedPrompt || '';
+    expect(prompt).toContain('src/feature.ts');
+    expect(prompt).toContain('+export const scopedValue = 2;');
+    expect(prompt).not.toContain('docs/notes.md');
+    expect(prompt).not.toContain('unrelated notes');
+    await waitForWorkbenchTask(workbench, reviewTask.id, (candidate) => candidate?.status === 'in_review');
+  });
+
   it('does not dispatch Claude review when there are no reviewable git changes', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
     tempDirs.push(root);
@@ -1233,6 +1389,107 @@ describe('TrackerDaemon', () => {
       reason: 'no-reviewable-changes',
     });
     expect(runtimeRunner.preparedInputs).toHaveLength(0);
+  });
+
+  it('explicitly runs externally-owned Claude reviews through the Tik runtime workflow', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    await fs.writeFile(path.join(repo, 'feature.ts'), 'export const before = 1;\n', 'utf-8');
+    await runGit(repo, ['init']);
+    await runGit(repo, ['config', 'user.email', 'test@example.com']);
+    await runGit(repo, ['config', 'user.name', 'Tik Test']);
+    await runGit(repo, ['add', 'feature.ts']);
+    await runGit(repo, ['commit', '-m', 'init']);
+    await fs.writeFile(path.join(repo, 'feature.ts'), 'export const after = 2;\n', 'utf-8');
+    await runGit(repo, ['add', 'feature.ts']);
+    await runGit(repo, ['commit', '-m', 'change']);
+    const headSha = await runGit(repo, ['rev-parse', 'HEAD']);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const reviewTask = await workbench.createReviewRound({
+      rootTaskId: 'external-review',
+      round: 1,
+      maxRounds: 3,
+      idempotencyKey: 'explicit-external-review',
+      labels: ['external-claude-review'],
+      changeRequest: {
+        scm: 'internal',
+        repo: 'repo',
+        id: 'external-review',
+        type: 'internal_review',
+        baseRef: 'HEAD~1',
+        headRef: 'HEAD',
+        headSha,
+      },
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    });
+    const taskRecord = await workbench.readTask(reviewTask.id);
+    expect(taskRecord?.labels).toContain('external-claude-review');
+
+    const runtimeRunner = new CompletingRuntimeRunner('claude-code');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({
+        root,
+        runner: 'claude-code',
+        mode: 'claude_print',
+        renderPrompt: (trackedTask) => `Review ${trackedTask.shortIdentifier}.`,
+      }),
+    });
+
+    const result = await daemon.runExplicitTask({
+      ...task(taskRecord!.id, taskRecord!.shortIdentifier),
+      stateKind: 'blocked',
+      state: taskRecord!.status,
+      labels: taskRecord!.labels || [],
+      agentLoop: taskRecord!.agentLoop,
+      repository: {
+        name: 'repo',
+        path: repo,
+        executionPath: repo,
+        sourcePath: repo,
+      },
+      sourceKind: 'workbench',
+    });
+
+    expect(result.dispatched).toEqual([taskRecord!.shortIdentifier]);
+    expect(result.skipped).toEqual([]);
+    expect(runtimeRunner.preparedInputs[0]).toMatchObject({
+      runnerMode: 'claude_print',
+      projectPath: repo,
+    });
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('Review range');
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('ReviewResult JSON');
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain(`http://127.0.0.1:3300/api/v1/agent-loop/tasks/${reviewTask.id}/review-result`);
+    expect(runtimeRunner.startedInputs[0]?.env).toMatchObject({
+      TIK_API_BASE_URL: 'http://127.0.0.1:3300/api',
+    });
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain(`HEAD~1..${headSha}`);
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('-export const before = 1;');
+    expect(runtimeRunner.preparedInputs[0]?.renderedPrompt).toContain('+export const after = 2;');
+    await waitForWorkbenchTask(workbench, reviewTask.id, (candidate) => candidate?.status === 'in_review');
   });
 
   it('records Claude review output as a task comment and routes blocking reviews to Codex fix', async () => {

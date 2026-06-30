@@ -5,6 +5,10 @@ import type { AgentRunCompletion, PreparedRun } from './agent-runtime-runner.js'
 
 export type RuntimeChildProcess = EventEmitter & {
   pid?: number;
+  stdin?: {
+    write(chunk: string | Uint8Array): unknown;
+    end(): unknown;
+  };
   stdout?: EventEmitter;
   stderr?: EventEmitter;
   kill(signal?: NodeJS.Signals): boolean;

@@ -211,7 +211,12 @@ describe('AgentRuntimeRunner implementations', () => {
 
   it('prepares claude print runs with a persisted prompt file', async () => {
     const input = await makeInput();
-    const runner = new ClaudeCodeRunner({ mode: 'claude_print' });
+    const runner = new ClaudeCodeRunner({
+      mode: 'claude_print',
+      pluginDirs: ['/plugins/review'],
+      addDirs: [input.projectPath],
+      permissionMode: 'bypassPermissions',
+    });
 
     const prepared = await runner.prepare(input);
 
@@ -225,10 +230,13 @@ describe('AgentRuntimeRunner implementations', () => {
     expect(prepared.args).toEqual([
       '--print',
       '--permission-mode',
-      'dontAsk',
+      'bypassPermissions',
       '--output-format',
       'text',
-      'Implement TIK-1.',
+      '--plugin-dir',
+      '/plugins/review',
+      '--add-dir',
+      input.projectPath,
     ]);
     await expect(fs.readFile(prepared.promptFile!, 'utf-8')).resolves.toBe('Implement TIK-1.');
   });
@@ -253,11 +261,13 @@ describe('AgentRuntimeRunner implementations', () => {
     const input = await makeInput();
     const child = new EventEmitter() as EventEmitter & {
       pid: number;
+      stdin: { write: ReturnType<typeof vi.fn>; end: ReturnType<typeof vi.fn> };
       stdout: EventEmitter;
       stderr: EventEmitter;
       kill: ReturnType<typeof vi.fn>;
     };
     child.pid = 4321;
+    child.stdin = { write: vi.fn(), end: vi.fn() };
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     child.kill = vi.fn();
@@ -278,11 +288,12 @@ describe('AgentRuntimeRunner implementations', () => {
       'dontAsk',
       '--output-format',
       'text',
-      'Implement TIK-1.',
     ], expect.objectContaining({
       cwd: input.projectPath,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     }));
+    expect(child.stdin.write).toHaveBeenCalledWith('Implement TIK-1.');
+    expect(child.stdin.end).toHaveBeenCalled();
     await expect(fs.readFile(path.join(input.workspaceRoot, '.tik', 'runs', 'run-1', 'stdout.log'), 'utf-8')).resolves.toBe('review ok\n');
     await expect(fs.readFile(path.join(input.workspaceRoot, '.tik', 'runs', 'run-1', 'stderr.log'), 'utf-8')).resolves.toBe('warn\n');
   });

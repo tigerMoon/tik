@@ -1842,6 +1842,12 @@ export class WorkbenchService {
     if (!task) {
       return null;
     }
+    if (task.agentLoop?.kind && task.agentLoop.kind !== 'claude_review') {
+      return this.projectTaskState(task, bundle.timeline);
+    }
+    if (task.agentLoop?.reviewResult) {
+      return this.projectTaskState(task, bundle.timeline);
+    }
 
     const decision = classifyClaudeReviewOutput(stdout);
     const updatedAt = new Date().toISOString();

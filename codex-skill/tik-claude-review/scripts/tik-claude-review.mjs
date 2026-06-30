@@ -17,6 +17,9 @@ async function main() {
       case 'create':
         await createReview(options);
         break;
+      case 'start':
+        await startReview(options);
+        break;
       case 'wait':
         await waitForReview(options);
         break;
@@ -42,6 +45,7 @@ async function main() {
 
 async function createWaitProcess(options) {
   const created = await createReview(options, { returnResult: true });
+  await startReview({ ...options, task: created.task.id }, { returnResult: true });
   await waitForReview({ ...options, task: created.task.id }, { returnResult: true });
   await processReview({ ...options, task: created.task.id });
 }
@@ -106,7 +110,25 @@ async function createReview(options, behavior = {}) {
       label: 'needs-claude-review',
       agentLoopKind: 'claude_review',
     },
-    claudeCodePrompt: 'Use $review-tik-agent-loop to claim and review this Tik agent-loop task.',
+    startCommand: `node codex-skill/tik-claude-review/scripts/tik-claude-review.mjs start --task ${response.task?.id}`,
+  });
+  if (behavior.returnResult) {
+    return response;
+  }
+}
+
+async function startReview(options, behavior = {}) {
+  const taskId = requireOption(options.task, '--task is required');
+  const response = await tikFetch(options, `/v1/agent-loop/tasks/${encodeURIComponent(taskId)}/claude-review-runs`, {
+    method: 'POST',
+  });
+  await writeJsonIfRequested(options.output, response);
+  printJson({
+    action: 'started',
+    taskId,
+    runId: response.runId,
+    dispatched: response.result?.dispatched || [],
+    failed: response.result?.failed || [],
   });
   if (behavior.returnResult) {
     return response;
@@ -309,9 +331,10 @@ function printHelp() {
   console.log(`
 Usage:
   tik-claude-review.mjs create [options]
+  tik-claude-review.mjs start --task <task-id> [options]
   tik-claude-review.mjs wait --task <task-id> [options]
   tik-claude-review.mjs process --task <task-id> [options]
-  tik-claude-review.mjs run [options]
+  tik-claude-review.mjs run [options]  # create/start/wait/process
 
 Options:
   --api-base-url <url>       Tik API base URL. Defaults to TIK_API_BASE_URL or ${DEFAULT_API_BASE_URL}
@@ -329,7 +352,7 @@ Options:
   --acceptance-criteria <csv> Acceptance criteria hints.
   --allowed-scope <csv>      Scope hints.
   --label <csv>              Extra labels. external-claude-review is always added.
-  --task <id>                Task id/identifier for wait/process.
+  --task <id>                Task id/identifier for start/wait/process.
   --timeout-ms <n>           Wait timeout. Defaults to 1800000.
   --interval-ms <n>          Poll interval. Defaults to 10000.
   --output <path>            Write full JSON response to a file.

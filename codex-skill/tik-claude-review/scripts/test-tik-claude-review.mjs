@@ -40,6 +40,17 @@ try {
         sendJson(res, { tasks });
         return;
       }
+      if (req.method === 'POST' && req.url === '/api/v1/agent-loop/tasks/task-review/claude-review-runs') {
+        sendJson(res, {
+          queued: false,
+          runId: 'run-review-1',
+          result: {
+            dispatched: ['TIK-REVIEW'],
+            failed: [],
+          },
+        });
+        return;
+      }
       sendJson(res, { error: { message: `Unexpected route ${req.method} ${req.url}` } }, 404);
     } catch (error) {
       sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
@@ -53,6 +64,11 @@ try {
   assert.equal(create.action, 'created');
   assert.equal(create.taskId, 'task-review');
   assert.equal(create.trackerOwned, false);
+
+  const started = await run(['start', '--api-base-url', apiBaseUrl, '--task', 'task-review']);
+  assert.equal(started.action, 'started');
+  assert.equal(started.runId, 'run-review-1');
+  assert.deepEqual(started.dispatched, ['TIK-REVIEW']);
 
   tasks[0] = {
     ...tasks[0],

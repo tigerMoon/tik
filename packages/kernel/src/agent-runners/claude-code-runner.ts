@@ -22,6 +22,9 @@ import { collectGitDiffSummary, collectTranscriptFromRunLogs } from './runtime-c
 export interface ClaudeCodeRunnerOptions {
   mode?: Extract<AgentRuntimeMode, 'claude_print' | 'claude_hooked'>;
   executable?: string;
+  pluginDirs?: string[];
+  addDirs?: string[];
+  permissionMode?: 'acceptEdits' | 'auto' | 'bypassPermissions' | 'default' | 'dontAsk' | 'plan';
   spawnProcess?: (command: string, args: string[], options: SpawnOptions) => RuntimeChildProcess;
 }
 
@@ -29,6 +32,9 @@ export class ClaudeCodeRunner implements AgentRuntimeRunner {
   readonly name = 'claude-code' as const;
   private readonly mode?: Extract<AgentRuntimeMode, 'claude_print' | 'claude_hooked'>;
   private readonly executable: string;
+  private readonly pluginDirs: string[];
+  private readonly addDirs: string[];
+  private readonly permissionMode: NonNullable<ClaudeCodeRunnerOptions['permissionMode']>;
   private readonly statuses = new Map<string, AgentRunStatusSnapshot>();
   private readonly children = new Map<string, RuntimeChildProcess>();
   private readonly preparedRuns = new Map<string, PreparedRun>();
@@ -37,6 +43,9 @@ export class ClaudeCodeRunner implements AgentRuntimeRunner {
   constructor(options: ClaudeCodeRunnerOptions = {}) {
     this.mode = options.mode;
     this.executable = options.executable || 'claude';
+    this.pluginDirs = options.pluginDirs || splitPathList(process.env.TIK_CLAUDE_CODE_PLUGIN_DIRS);
+    this.addDirs = options.addDirs || splitPathList(process.env.TIK_CLAUDE_CODE_ADD_DIRS);
+    this.permissionMode = options.permissionMode || normalizePermissionMode(process.env.TIK_CLAUDE_CODE_PERMISSION_MODE) || 'dontAsk';
     this.spawnProcess = options.spawnProcess || ((command, args, spawnOptions) => spawn(command, args, spawnOptions) as RuntimeChildProcess);
   }
 
@@ -49,7 +58,11 @@ export class ClaudeCodeRunner implements AgentRuntimeRunner {
       mode,
       cwd: input.worktreePath || input.projectPath,
       command: this.executable,
-      args: buildClaudeArgs(mode, input.renderedPrompt),
+      args: buildClaudeArgs(mode, input.renderedPrompt, {
+        pluginDirs: this.pluginDirs,
+        addDirs: this.addDirs,
+        permissionMode: this.permissionMode,
+      }),
       promptFile,
       prompt: input.renderedPrompt,
       timeoutMs: input.timeoutMs,
@@ -65,8 +78,12 @@ export class ClaudeCodeRunner implements AgentRuntimeRunner {
     const child = this.spawnProcess(command, args, {
       cwd: input.cwd,
       env: buildRuntimeProcessEnv(input),
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
+    if (input.prompt !== undefined) {
+      child.stdin?.write(input.prompt);
+      child.stdin?.end();
+    }
     this.children.set(input.runId, child);
     const logAttachment = attachProcessLogs(input, child);
     const completion = childCompletion(
@@ -123,18 +140,49 @@ function normalizeClaudeMode(mode: AgentRuntimeMode): Extract<AgentRuntimeMode, 
 }
 
 function buildClaudeArgs(
-  mode: Extract<AgentRuntimeMode, 'claude_print' | 'claude_hooked'>,
-  prompt: string,
+  _mode: Extract<AgentRuntimeMode, 'claude_print' | 'claude_hooked'>,
+  _prompt: string,
+  options: {
+    pluginDirs?: string[];
+    addDirs?: string[];
+    permissionMode: NonNullable<ClaudeCodeRunnerOptions['permissionMode']>;
+  },
 ): string[] {
   const printArgs = [
     '--print',
     '--permission-mode',
-    'dontAsk',
+    options.permissionMode,
     '--output-format',
     'text',
-    prompt,
+    ...flatRepeat('--plugin-dir', options.pluginDirs || []),
+    ...flatRepeat('--add-dir', options.addDirs || []),
   ];
-  return mode === 'claude_hooked' ? printArgs : printArgs;
+  return printArgs;
+}
+
+function flatRepeat(flag: string, values: string[]): string[] {
+  return values.flatMap((value) => value ? [flag, value] : []);
+}
+
+function splitPathList(value: string | undefined): string[] {
+  return (value || '')
+    .split(path.delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizePermissionMode(value: string | undefined): ClaudeCodeRunnerOptions['permissionMode'] | undefined {
+  if (
+    value === 'acceptEdits'
+    || value === 'auto'
+    || value === 'bypassPermissions'
+    || value === 'default'
+    || value === 'dontAsk'
+    || value === 'plan'
+  ) {
+    return value;
+  }
+  return undefined;
 }
 
 async function writePromptFile(input: AgentRunInput): Promise<string> {
