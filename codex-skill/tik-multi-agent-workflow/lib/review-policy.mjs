@@ -1,4 +1,4 @@
-export function decideAfterReview({ workflow, subtaskId, task, result, validationPassed }) {
+export function decideAfterReview({ workflow, subtaskId, task, result, validationPassed, validationEvidence }) {
   const round = Number(task?.agentLoop?.round || 1);
   const maxRounds = Number(task?.agentLoop?.maxRounds || workflow?.maxRounds || 3);
   const blockingIssues = result?.blockingIssues || [];
@@ -27,8 +27,29 @@ export function decideAfterReview({ workflow, subtaskId, task, result, validatio
       action: 'complete_subtask',
       subtaskId,
       reason: 'Claude approved and validation passed.',
-      inputs: { round, maxRounds, reviewTaskId: task?.id },
+      inputs: {
+        round,
+        maxRounds,
+        reviewTaskId: task?.id,
+        validationEvidenceId: validationEvidence?.id,
+        currentHeadSha: result?.headShaReviewed,
+      },
       confidence: result?.confidence,
+    };
+  }
+
+  if (result?.verdict === 'approve') {
+    return {
+      action: 'validate_subtask',
+      subtaskId,
+      reason: 'Claude approved, but there is no passing validation evidence for the reviewed head.',
+      inputs: {
+        round,
+        maxRounds,
+        reviewTaskId: task?.id,
+        reviewedHeadSha: result?.headShaReviewed,
+        validationEvidenceId: validationEvidence?.id,
+      },
     };
   }
 

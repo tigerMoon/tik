@@ -53,14 +53,28 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs p
   --workflow wf_123 \
   --subtask st_001 \
   --task <review-task-id>
+
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs continue \
+  --workflow wf_123
+
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs final-review \
+  --workflow wf_123
+
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs process-final-review \
+  --workflow wf_123 \
+  --task <final-review-task-id>
 ```
 
 ## Command Notes
 
 - `next` reads Tik state and computes the next action locally in the skill.
-- `accept-plan` stores a TaskGraph returned by Claude planner or edited by Codex/human.
+- `accept-plan` stores a TaskGraph returned by Claude planner or edited by Codex/human. Tik also auto-stores a planner invocation result when it contains `taskGraph`.
 - `review` creates a Tik-owned external Claude review task. Use `--start` if the workflow should immediately ask Tik to launch Claude Code.
-- `process-review` reads the Tik review task result and records the Codex decision: fix, re-review, human review, or complete subtask.
-- `continue` runs only safe automated steps; it returns instructions when current Codex session must implement or fix.
+- `process-review` reads the Tik review task result and records the Codex decision: fix, validate, human review, or complete subtask.
+- `fix` records blocker fix evidence, moves the subtask back to validation, and re-review is allowed only after validation passes on the fixed head.
+- `continue` runs safe automated steps: plan request, validation, review/re-review request, and final review request. It returns instructions when current Codex session must implement or fix.
+- `final-review` is required after all subtasks are done.
+- `process-final-review` can complete the workflow only when final Claude review approves.
+- `status` includes the workflow timeline for Dashboard/CLI cross-checking.
 
 Tik guard rejection means the requested action is unsafe or illegal. The skill must inspect the guard and choose the next Codex policy action.

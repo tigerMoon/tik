@@ -11,7 +11,8 @@
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
-    "test": "node scripts/check-readme-links.mjs && turbo run test",
+    "test": "node scripts/check-readme-links.mjs && turbo run test && pnpm run test:multi-agent-skill",
+    "test:multi-agent-skill": "node codex-skill/tik-multi-agent-workflow/scripts/test-tik-multi-agent-workflow.mjs",
     "lint": "turbo run lint",
     "clean": "turbo run clean && rm -rf node_modules",
     "typecheck": "turbo run typecheck"

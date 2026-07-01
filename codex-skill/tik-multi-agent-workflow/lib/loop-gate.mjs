@@ -34,13 +34,24 @@ export function decideNextAction(state) {
     };
   }
 
-  const implemented = Object.values(subtasks).find((subtask) => subtask.status === 'implemented' || subtask.status === 'approved');
+  const implemented = Object.values(subtasks).find((subtask) => subtask.status === 'implemented');
   if (implemented) {
     return {
       action: 'validate_subtask',
       subtaskId: implemented.subtaskId,
       reason: 'Subtask has implementation evidence and should be validated.',
       evidenceRefs: implemented.evidenceRefs || [],
+      inputs: {},
+    };
+  }
+
+  const validated = Object.values(subtasks).find((subtask) => subtask.status === 'validated' || subtask.status === 'approved');
+  if (validated) {
+    return {
+      action: 'request_claude_review',
+      subtaskId: validated.subtaskId,
+      reason: 'Subtask has passed validation and should be reviewed by Claude through Tik.',
+      evidenceRefs: validated.evidenceRefs || [],
       inputs: {},
     };
   }

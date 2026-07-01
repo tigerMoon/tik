@@ -20,12 +20,14 @@ const SUBTASK_TRANSITIONS: Record<SubtaskRunStatus, SubtaskRunStatus[]> = {
   pending: ['ready', 'blocked', 'human_review_required'],
   ready: ['executing', 'blocked', 'human_review_required'],
   executing: ['implemented', 'validation_failed', 'blocked', 'human_review_required'],
-  implemented: ['validating', 'approved', 'reviewing', 'validation_failed', 'blocked', 'human_review_required'],
-  validating: ['approved', 'validation_failed', 'blocked', 'human_review_required'],
+  implemented: ['validating', 'validated', 'approved', 'reviewing', 'validation_failed', 'blocked', 'human_review_required'],
+  validating: ['validated', 'approved', 'validation_failed', 'blocked', 'human_review_required'],
+  validated: ['reviewing', 'done', 'blocked', 'human_review_required'],
   validation_failed: ['executing', 'implemented', 'blocked', 'human_review_required'],
-  reviewing: ['needs_fix', 'approved', 'done', 'blocked', 'human_review_required'],
+  reviewing: ['implemented', 'needs_fix', 'review_approved', 'approved', 'done', 'blocked', 'human_review_required'],
   needs_fix: ['fixing', 'executing', 'implemented', 'blocked', 'human_review_required'],
   fixing: ['implemented', 'reviewing', 'blocked', 'human_review_required'],
+  review_approved: ['done', 'blocked', 'human_review_required'],
   approved: ['reviewing', 'done', 'blocked', 'human_review_required'],
   done: ['human_review_required'],
   blocked: ['ready', 'executing', 'human_review_required'],
@@ -286,6 +288,14 @@ export class FileMultiAgentWorkflowStore {
 
     await fs.mkdir(this.evidenceDir(id), { recursive: true });
     await this.writeJsonFileAtomic(this.evidenceFile(id, evidence.id), evidence);
+    if (evidence.headSha) {
+      const workflow = await this.requireWorkflow(id);
+      await this.writeWorkflow({
+        ...workflow,
+        currentHeadSha: evidence.headSha,
+        updatedAt: now,
+      });
+    }
     await this.appendEvent(id, 'evidence.recorded', 'codex-workflow', {
       evidenceId: evidence.id,
       subtaskId: evidence.subtaskId,

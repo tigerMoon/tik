@@ -1047,6 +1047,29 @@ export async function createServer(
     },
   );
 
+  fastify.post<{ Params: { workflowId: string }; Body: RecordWorkflowDecisionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/decisions/preflight',
+    async (req, reply) => {
+      try {
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        }
+        const guard = evaluateWorkflowDecisionGuard(bundle, req.body.decision);
+        if (!guard.accepted) {
+          reply.code(409);
+        }
+        return {
+          decision: req.body.decision,
+          guard,
+          workflow: bundle.workflow,
+        };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
   fastify.get<{ Params: { workflowId: string } }>(
     '/api/v1/multi-agent/workflows/:workflowId/timeline',
     async (req, reply) => {
@@ -1168,6 +1191,13 @@ export async function createServer(
           result: req.body.result,
           error: req.body.error,
         });
+        const taskGraph = invocation.role === 'planner' && invocation.status === 'completed'
+          ? extractTaskGraphFromInvocationResult(invocation.result)
+          : null;
+        if (taskGraph) {
+          const stored = await multiAgentStore.putTaskGraph(req.params.workflowId, taskGraph);
+          return { invocation, taskGraph: stored };
+        }
         return { invocation };
       } catch (error) {
         return sendV1CaughtError(reply, error);
@@ -3109,4 +3139,22 @@ function isMultiAgentInvocationTerminalStatus(
   status: AgentInvocationRecord['status'] | undefined,
 ): status is 'completed' | 'failed' | 'cancelled' {
   return status === 'completed' || status === 'failed' || status === 'cancelled';
+}
+
+function extractTaskGraphFromInvocationResult(result: Record<string, unknown> | undefined): TaskGraph | null {
+  if (!result || typeof result !== 'object') {
+    return null;
+  }
+  const candidate = result.taskGraph && typeof result.taskGraph === 'object'
+    ? result.taskGraph
+    : result;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return null;
+  }
+  const graph = candidate as Partial<TaskGraph>;
+  return typeof graph.workflowId === 'string'
+    && typeof graph.version === 'number'
+    && Array.isArray(graph.subtasks)
+    ? graph as TaskGraph
+    : null;
 }

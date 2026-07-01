@@ -40,6 +40,13 @@ export async function recordDecision(options, workflowId, decision) {
   });
 }
 
+export async function preflightDecision(options, workflowId, decision) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions/preflight`, {
+    method: 'POST',
+    body: { decision },
+  });
+}
+
 export async function recordEvidence(options, workflowId, evidence) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/evidence`, {
     method: 'POST',

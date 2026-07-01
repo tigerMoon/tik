@@ -39,6 +39,7 @@ try {
   await mkdir(workspaceRoot, { recursive: true });
   await mkdir(projectPath, { recursive: true });
   await mkdir(reportDir, { recursive: true });
+  const verificationHeadSha = readGitHead(projectPath) || 'real-service-head-1';
 
   child = await startTikServe({ host, port, projectPath: workspaceRoot });
   report.server = {
@@ -73,7 +74,7 @@ try {
     repo: path.basename(projectPath),
     baseRef: 'main',
     headRef: 'codex/multi-agent-workflow-service-codex-workflow',
-    headSha: 'real-service-head-1',
+    headSha: verificationHeadSha,
     maxRounds: 2,
     workspaceBinding: buildWorkspaceBinding(workspaceRoot, projectPath),
     metadata: {
@@ -125,7 +126,7 @@ try {
     title: 'Real-service implementation evidence',
     summary: 'Implementation evidence recorded through the external Tik service.',
     subtaskId: 'st-real-service',
-    headSha: 'real-service-head-1',
+    headSha: verificationHeadSha,
     payload: {
       servicePid: child.process.pid,
       apiBaseUrl: child.apiBaseUrl,
@@ -135,7 +136,7 @@ try {
 
   const subtaskImplemented = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
     status: 'implemented',
-    implementationHeadSha: 'real-service-head-1',
+    implementationHeadSha: verificationHeadSha,
     evidenceRefs: ['ev-real-service-implementation'],
   });
   recordStep('subtask.implemented', subtaskImplemented);
@@ -156,9 +157,49 @@ try {
     subtaskId: 'st-real-service',
     command: 'node scripts/verify-multi-agent-real-service.mjs',
     passed: true,
-    headSha: 'real-service-head-1',
+    headSha: verificationHeadSha,
   });
   recordStep('evidence.validation', validationEvidence);
+
+  const subtaskValidated = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
+    status: 'validated',
+    validationRunIds: ['ev-real-service-validation'],
+    evidenceRefs: ['ev-real-service-validation'],
+    lastValidatedHeadSha: verificationHeadSha,
+  });
+  recordStep('subtask.validated', subtaskValidated);
+
+  const workflowReviewEvidence = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/evidence`, {
+    id: 'ev-real-service-review',
+    kind: 'review',
+    title: 'Real-service review evidence',
+    summary: 'Review evidence recorded through the external Tik service.',
+    subtaskId: 'st-real-service',
+    passed: true,
+    headSha: verificationHeadSha,
+    payload: {
+      result: {
+        verdict: 'approve',
+        headShaReviewed: verificationHeadSha,
+        currentHeadSha: verificationHeadSha,
+        blockingIssues: [],
+      },
+    },
+  });
+  recordStep('evidence.review', workflowReviewEvidence);
+
+  const subtaskReviewed = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
+    status: 'reviewing',
+    reviewRoundIds: ['rr-real-service'],
+  });
+  recordStep('subtask.reviewing', subtaskReviewed);
+
+  const subtaskReviewApproved = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
+    status: 'review_approved',
+    evidenceRefs: ['ev-real-service-review'],
+    lastReviewedHeadSha: verificationHeadSha,
+  });
+  recordStep('subtask.review_approved', subtaskReviewApproved);
 
   const decision = {
     id: 'dec-real-service-complete-subtask',
@@ -169,9 +210,9 @@ try {
     decidedAt: new Date().toISOString(),
     action: 'complete_subtask',
     reason: 'External Tik service accepted implementation and validation evidence.',
-    evidenceRefs: ['ev-real-service-implementation', 'ev-real-service-validation'],
+    evidenceRefs: ['ev-real-service-implementation', 'ev-real-service-validation', 'ev-real-service-review'],
     inputs: {
-      currentHeadSha: 'real-service-head-1',
+      currentHeadSha: verificationHeadSha,
     },
     expectedTikMutation: {
       taskStatus: 'completed',
@@ -192,17 +233,90 @@ try {
   }, { okStatuses: [409] });
   recordStep('workflow.decision.missing_evidence_guard', missingEvidenceDecision);
 
-  const subtaskApproved = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
-    status: 'approved',
-    evidenceRefs: ['ev-real-service-validation'],
-    lastValidatedHeadSha: 'real-service-head-1',
-  });
-  recordStep('subtask.approved', subtaskApproved);
-
   const subtaskDone = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
     status: 'done',
   });
   recordStep('subtask.done', subtaskDone);
+
+  const requestFinalReviewDecision = {
+    id: 'dec-real-service-request-final-review',
+    workflowId,
+    rootTaskId: taskId,
+    decidedBy: 'codex-workflow',
+    decidedAt: new Date().toISOString(),
+    action: 'request_final_review',
+    reason: 'All subtasks are done; request final Claude review before completing the workflow.',
+    evidenceRefs: ['ev-real-service-implementation', 'ev-real-service-validation', 'ev-real-service-review'],
+    inputs: {
+      currentHeadSha: verificationHeadSha,
+      taskGraphVersion: graph.version,
+    },
+  };
+  const finalReviewRequested = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions`, {
+    decision: requestFinalReviewDecision,
+  });
+  recordStep('workflow.decision.request_final_review', finalReviewRequested);
+
+  const completeWithoutFinalReview = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions`, {
+    decision: {
+      id: 'dec-real-service-complete-without-final-review',
+      workflowId,
+      rootTaskId: taskId,
+      decidedBy: 'codex-workflow',
+      decidedAt: new Date().toISOString(),
+      action: 'complete_workflow',
+      reason: 'Intentional guard check: final approval is required.',
+      evidenceRefs: [],
+      inputs: {
+        currentHeadSha: verificationHeadSha,
+      },
+    },
+  }, { okStatuses: [409] });
+  recordStep('workflow.decision.complete_without_final_review_guard', completeWithoutFinalReview);
+
+  const finalReview = await createDashboardReviewEvidence(client, {
+    rootTaskId: taskId,
+    headSha: verificationHeadSha,
+    title: '[REAL FINAL REVIEW RESULT] MultiAgentWorkflowService dashboard evidence',
+    idempotencyPrefix: 'real-service-final-review',
+  });
+  report.finalReview = finalReview;
+
+  const finalReviewEvidence = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/evidence`, {
+    id: 'ev-real-service-final-review',
+    kind: 'review',
+    title: 'Real-service final review evidence',
+    summary: 'Final review evidence recorded through the external Tik service.',
+    passed: true,
+    headSha: verificationHeadSha,
+    payload: {
+      taskId: finalReview.taskId,
+      final: true,
+      result: finalReview.finalTask.agentLoop?.reviewResult,
+    },
+  });
+  recordStep('evidence.final_review', finalReviewEvidence);
+
+  const workflowCompletedDecision = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions`, {
+    decision: {
+      id: 'dec-real-service-complete-workflow',
+      workflowId,
+      rootTaskId: taskId,
+      decidedBy: 'codex-workflow',
+      decidedAt: new Date().toISOString(),
+      action: 'complete_workflow',
+      reason: 'Final Claude review approved the real-service workflow.',
+      evidenceRefs: ['ev-real-service-final-review'],
+      inputs: {
+        currentHeadSha: verificationHeadSha,
+        finalReviewApproved: true,
+        reviewTaskId: finalReview.taskId,
+      },
+      confidence: 0.95,
+    },
+  });
+  recordStep('workflow.decision.complete_workflow', workflowCompletedDecision);
+  await captureWorkflow(client, workflowId, 'workflow_completed');
 
   const taskCompleted = await client.post(`/v1/tasks/${encodeURIComponent(taskId)}/transitions`, {
     to: 'completed',
@@ -231,12 +345,6 @@ try {
   await captureWorkflow(client, workflowId, 'final');
   await capturePersistedFiles(workspaceRoot, taskId, workflowId);
 
-  const reviewEvidence = await createDashboardReviewEvidence(client, {
-    rootTaskId: taskId,
-    headSha: readGitHead(projectPath) || 'real-service-head-1',
-  });
-  report.reviewEvidence = reviewEvidence;
-
   report.completedAt = new Date().toISOString();
   report.result = {
     status: 'passed',
@@ -250,15 +358,17 @@ try {
       agentLoopPhase: snapshot.task?.agentLoop?.phase,
     })),
     workflowEventTypes: report.workflowTimeline.map((event) => event.type),
-    reviewTaskId: reviewEvidence.taskId,
-    reviewTaskShortIdentifier: reviewEvidence.shortIdentifier,
-    reviewTaskStatus: reviewEvidence.finalTask.status,
+    reviewTaskId: finalReview.taskId,
+    reviewTaskShortIdentifier: finalReview.shortIdentifier,
+    reviewTaskStatus: finalReview.finalTask.status,
     reviewTaskAgentLoop: {
-      kind: reviewEvidence.finalTask.agentLoop?.kind,
-      phase: reviewEvidence.finalTask.agentLoop?.phase,
-      verdict: reviewEvidence.finalTask.agentLoop?.reviewResult?.verdict,
-      blockingIssueCount: reviewEvidence.finalTask.agentLoop?.reviewResult?.blockingIssues?.length ?? null,
+      kind: finalReview.finalTask.agentLoop?.kind,
+      phase: finalReview.finalTask.agentLoop?.phase,
+      verdict: finalReview.finalTask.agentLoop?.reviewResult?.verdict,
+      blockingIssueCount: finalReview.finalTask.agentLoop?.reviewResult?.blockingIssues?.length ?? null,
     },
+    finalReviewGuard: completeWithoutFinalReview.body.guard,
+    workflowStatus: workflowCompletedDecision.body.workflow?.status,
     invalidTransitionStatus: illegalTaskTransition.status,
     missingEvidenceGuard: missingEvidenceDecision.body.guard,
   };
@@ -331,11 +441,11 @@ async function createDashboardReviewEvidence(client, input) {
     round: 1,
     maxRounds: 2,
     repo: path.basename(projectPath),
-    title: '[REAL REVIEW RESULT] MultiAgentWorkflowService dashboard evidence',
+    title: input.title || '[REAL REVIEW RESULT] MultiAgentWorkflowService dashboard evidence',
     baseRef: 'main',
     headRef: 'codex/multi-agent-workflow-service-codex-workflow',
     headSha: input.headSha,
-    idempotencyKey: `real-service-review:${input.rootTaskId}:${input.headSha}:r1:${Date.now()}`,
+    idempotencyKey: `${input.idempotencyPrefix || 'real-service-review'}:${input.rootTaskId}:${input.headSha}:r1:${Date.now()}`,
     labels: ['external-claude-review', 'real-service', 'multi-agent', 'dashboard-evidence'],
     allowedScope: [
       'packages/kernel/src/multi-agent/**',

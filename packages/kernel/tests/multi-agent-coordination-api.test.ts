@@ -103,7 +103,7 @@ describe('multi-agent coordination API', () => {
       'st-ui': { status: 'pending', fixRound: 0 },
     });
 
-    const evidence = await server.inject({
+    const validationEvidence = await server.inject({
       method: 'POST',
       url: '/api/v1/multi-agent/workflows/wf-auth/evidence',
       payload: {
@@ -114,9 +114,74 @@ describe('multi-agent coordination API', () => {
         subtaskId: 'st-api',
         command: 'pnpm --filter @tik/kernel test',
         passed: true,
+        headSha: 'abc123',
       },
     });
-    expect(evidence.statusCode).toBe(200);
+    expect(validationEvidence.statusCode).toBe(200);
+    const reviewEvidence = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-auth/evidence',
+      payload: {
+        id: 'ev-review',
+        kind: 'review',
+        title: 'Claude review approved',
+        subtaskId: 'st-api',
+        passed: true,
+        headSha: 'abc123',
+        payload: {
+          result: {
+            verdict: 'approve',
+            headShaReviewed: 'abc123',
+            currentHeadSha: 'abc123',
+            blockingIssues: [],
+          },
+        },
+      },
+    });
+    expect(reviewEvidence.statusCode).toBe(200);
+
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-auth/subtasks/st-api',
+      payload: {
+        status: 'executing',
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-auth/subtasks/st-api',
+      payload: {
+        status: 'implemented',
+        evidenceRefs: ['ev-validation'],
+        implementationHeadSha: 'abc123',
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-auth/subtasks/st-api',
+      payload: {
+        status: 'validated',
+        validationRunIds: ['ev-validation'],
+        lastValidatedHeadSha: 'abc123',
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-auth/subtasks/st-api',
+      payload: {
+        status: 'reviewing',
+        reviewRoundIds: ['rr-1'],
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-auth/subtasks/st-api',
+      payload: {
+        status: 'review_approved',
+        evidenceRefs: ['ev-review'],
+        lastReviewedHeadSha: 'abc123',
+      },
+    });
 
     const decision = {
       id: 'dec-complete-api',
@@ -127,7 +192,10 @@ describe('multi-agent coordination API', () => {
       decidedAt: '2026-06-30T00:00:00.000Z',
       action: 'complete_subtask',
       reason: 'Validation passed and Claude approved.',
-      evidenceRefs: ['ev-validation'],
+      evidenceRefs: ['ev-validation', 'ev-review'],
+      inputs: {
+        currentHeadSha: 'abc123',
+      },
       expectedTikMutation: {
         taskStatus: 'done',
       },
@@ -149,44 +217,23 @@ describe('multi-agent coordination API', () => {
       },
     });
 
-    await server.inject({
-      method: 'PATCH',
-      url: '/api/v1/multi-agent/workflows/wf-auth/subtasks/st-api',
-      payload: {
-        status: 'executing',
-      },
-    });
-    await server.inject({
-      method: 'PATCH',
-      url: '/api/v1/multi-agent/workflows/wf-auth/subtasks/st-api',
-      payload: {
-        status: 'implemented',
-        evidenceRefs: ['ev-validation'],
-        lastValidatedHeadSha: 'abc123',
-      },
-    });
-    await server.inject({
-      method: 'PATCH',
-      url: '/api/v1/multi-agent/workflows/wf-auth/subtasks/st-api',
-      payload: {
-        status: 'approved',
-      },
-    });
     const updateSubtask = await server.inject({
       method: 'PATCH',
       url: '/api/v1/multi-agent/workflows/wf-auth/subtasks/st-api',
       payload: {
         status: 'done',
-        evidenceRefs: ['ev-validation'],
+        evidenceRefs: ['ev-validation', 'ev-review'],
         lastValidatedHeadSha: 'abc123',
+        lastReviewedHeadSha: 'abc123',
       },
     });
     expect(updateSubtask.statusCode).toBe(200);
     expect(updateSubtask.json().subtask).toMatchObject({
       subtaskId: 'st-api',
       status: 'done',
-      evidenceRefs: ['ev-validation'],
+      evidenceRefs: ['ev-validation', 'ev-review'],
       lastValidatedHeadSha: 'abc123',
+      lastReviewedHeadSha: 'abc123',
     });
 
     const readWorkflow = await server.inject({
@@ -207,7 +254,7 @@ describe('multi-agent coordination API', () => {
       },
     });
     expect(readWorkflow.json().decisions).toHaveLength(1);
-    expect(readWorkflow.json().evidence).toHaveLength(1);
+    expect(readWorkflow.json().evidence).toHaveLength(2);
 
     const timeline = await server.inject({
       method: 'GET',
@@ -218,10 +265,13 @@ describe('multi-agent coordination API', () => {
       'workflow.created',
       'task_graph.created',
       'evidence.recorded',
+      'evidence.recorded',
+      'subtask.updated',
+      'subtask.updated',
+      'subtask.updated',
+      'subtask.updated',
+      'subtask.updated',
       'decision.recorded',
-      'subtask.updated',
-      'subtask.updated',
-      'subtask.updated',
       'subtask.updated',
     ]);
 
@@ -302,6 +352,638 @@ describe('multi-agent coordination API', () => {
       },
     });
     expect(maxRounds.json().decision.action).toBe('request_re_review');
+  });
+
+  it('preflights workflow decisions without appending decision history', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-preflight',
+        goal: 'Preflight decisions',
+        rootTaskId: 'root-preflight',
+        headSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-preflight/task-graph',
+      payload: {
+        graph: buildTaskGraph('wf-preflight', 1, [
+          { id: 'st-api', dependsOn: [] },
+        ]),
+      },
+    });
+
+    const decision = buildDecision('wf-preflight', {
+      id: 'dec-preflight-execute',
+      action: 'execute_subtask',
+      subtaskId: 'st-api',
+      reason: 'Preflight execution.',
+      inputs: { currentHeadSha: 'head-1' },
+    });
+    const preflight = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-preflight/decisions/preflight',
+      payload: { decision },
+    });
+    expect(preflight.statusCode).toBe(200);
+    expect(preflight.json()).toMatchObject({
+      guard: { accepted: true, code: 'ok' },
+      decision,
+    });
+
+    const readWorkflow = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-preflight',
+    });
+    expect(readWorkflow.json().decisions).toHaveLength(0);
+    expect(readWorkflow.json().workflow.lastDecisionId).toBeUndefined();
+  });
+
+  it('stores a planner TaskGraph automatically when a planner invocation completes', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-planner-auto',
+        goal: 'Planner writes TaskGraph',
+        rootTaskId: 'root-planner-auto',
+        headSha: 'head-1',
+      },
+    });
+    const invocation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-planner-auto/agent-invocations',
+      payload: {
+        role: 'planner',
+        runner: 'claude-code',
+        promptContract: 'task-graph.v1',
+      },
+    });
+    const invocationId = invocation.json().invocation.id;
+    await server.inject({
+      method: 'POST',
+      url: `/api/v1/multi-agent/workflows/wf-planner-auto/agent-invocations/${invocationId}/start`,
+    });
+
+    const graph = buildTaskGraph('wf-planner-auto', 1, [
+      { id: 'st-api', dependsOn: [] },
+      { id: 'st-ui', dependsOn: ['st-api'] },
+    ]);
+    const completed = await server.inject({
+      method: 'POST',
+      url: `/api/v1/multi-agent/workflows/wf-planner-auto/agent-invocations/${invocationId}/result`,
+      payload: {
+        status: 'completed',
+        result: {
+          taskGraph: graph,
+        },
+      },
+    });
+
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json().taskGraph).toMatchObject({
+      graph,
+      subtasks: {
+        'st-api': { status: 'ready' },
+        'st-ui': { status: 'pending' },
+      },
+    });
+
+    const readWorkflow = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-planner-auto',
+    });
+    expect(readWorkflow.json().taskGraph).toMatchObject(graph);
+  });
+
+  it('requires final review approval before completing a workflow', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-final-review',
+        goal: 'Final review gate',
+        rootTaskId: 'root-final-review',
+        headSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-final-review/task-graph',
+      payload: {
+        graph: buildTaskGraph('wf-final-review', 1, [
+          { id: 'st-api', dependsOn: [] },
+        ]),
+      },
+    });
+    await moveSubtaskToDone(server, 'wf-final-review', 'st-api', 'head-1');
+
+    const withoutFinalReview = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-final-review/decisions',
+      payload: {
+        decision: buildDecision('wf-final-review', {
+          id: 'dec-complete-without-final-review',
+          action: 'complete_workflow',
+          reason: 'Should need final review.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(withoutFinalReview.statusCode).toBe(409);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-final-review/evidence',
+      payload: {
+        id: 'ev-final-review',
+        kind: 'review',
+        title: 'Final review approved',
+        passed: true,
+        headSha: 'head-1',
+        payload: {
+          result: {
+            verdict: 'approve',
+            workflowId: 'wf-final-review',
+            headShaReviewed: 'head-1',
+            blockingIssues: [],
+          },
+        },
+      },
+    });
+
+    const complete = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-final-review/decisions',
+      payload: {
+        decision: buildDecision('wf-final-review', {
+          id: 'dec-complete-with-final-review',
+          action: 'complete_workflow',
+          reason: 'Final review approved.',
+          evidenceRefs: ['ev-final-review'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(complete.statusCode).toBe(200);
+    expect(complete.json().workflow.status).toBe('completed');
+  });
+
+  it('allows DAG-ready pending subtasks to start only after dependencies are done', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-dag-ready',
+        goal: 'Advance DAG subtasks',
+        rootTaskId: 'root-dag-ready',
+        headSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-dag-ready/task-graph',
+      payload: {
+        graph: buildTaskGraph('wf-dag-ready', 1, [
+          { id: 'st-api', dependsOn: [] },
+          { id: 'st-ui', dependsOn: ['st-api'] },
+        ]),
+      },
+    });
+
+    const beforeDependency = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-dag-ready/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-dag-ready', {
+          id: 'dec-execute-ui-too-early',
+          action: 'execute_subtask',
+          subtaskId: 'st-ui',
+          reason: 'Dependent subtask should not start before st-api is done.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(beforeDependency.statusCode).toBe(409);
+    expect(beforeDependency.json().guard).toMatchObject({
+      accepted: false,
+      code: 'invalid_transition',
+    });
+
+    await moveSubtaskToDone(server, 'wf-dag-ready', 'st-api', 'head-1');
+    const afterDependency = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-dag-ready/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-dag-ready', {
+          id: 'dec-execute-ui-after-api',
+          action: 'execute_subtask',
+          subtaskId: 'st-ui',
+          reason: 'Dependency is done, so the pending subtask is DAG-ready.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(afterDependency.statusCode).toBe(200);
+    expect(afterDependency.json().guard).toMatchObject({
+      accepted: true,
+      code: 'ok',
+    });
+  });
+
+  it('allows re-review only after a fix is validated on the current head', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-fix-rereview',
+        goal: 'Fix then re-review',
+        rootTaskId: 'root-fix-rereview',
+        headSha: 'head-1',
+        maxRounds: 3,
+      },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/task-graph',
+      payload: {
+        graph: buildTaskGraph('wf-fix-rereview', 1, [
+          { id: 'st-api', dependsOn: [] },
+        ]),
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/subtasks/st-api',
+      payload: { status: 'executing' },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/subtasks/st-api',
+      payload: { status: 'implemented', implementationHeadSha: 'head-1' },
+    });
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/evidence',
+      payload: {
+        id: 'ev-validation-before-fix',
+        kind: 'validation',
+        title: 'Validation before fix',
+        subtaskId: 'st-api',
+        passed: true,
+        headSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/subtasks/st-api',
+      payload: {
+        status: 'validated',
+        validationRunIds: ['ev-validation-before-fix'],
+        evidenceRefs: ['ev-validation-before-fix'],
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/subtasks/st-api',
+      payload: {
+        status: 'reviewing',
+        reviewRoundIds: ['review-1'],
+      },
+    });
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/evidence',
+      payload: {
+        id: 'ev-review-blocking',
+        kind: 'review',
+        title: 'Claude review blocked',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          result: {
+            verdict: 'request_changes',
+            headShaReviewed: 'head-1',
+            blockingIssues: [{ title: 'Missing test' }],
+          },
+        },
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/subtasks/st-api',
+      payload: {
+        status: 'needs_fix',
+        evidenceRefs: ['ev-review-blocking'],
+        blockerFindingIds: ['review-1:blocking:1'],
+        fixRound: 1,
+      },
+    });
+
+    const fixDecision = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-fix-rereview', {
+          id: 'dec-fix-blocker',
+          action: 'fix_claude_blockers',
+          subtaskId: 'st-api',
+          reason: 'Blocking review findings need a fix.',
+          evidenceRefs: ['ev-validation-before-fix', 'ev-review-blocking'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(fixDecision.statusCode).toBe(200);
+
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/subtasks/st-api',
+      payload: { status: 'fixing' },
+    });
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/evidence',
+      payload: {
+        id: 'ev-fix',
+        kind: 'fix',
+        title: 'Fix blockers',
+        subtaskId: 'st-api',
+        headSha: 'head-2',
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/subtasks/st-api',
+      payload: {
+        status: 'implemented',
+        implementationHeadSha: 'head-2',
+        evidenceRefs: ['ev-fix'],
+      },
+    });
+
+    const reReviewBeforeValidation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-fix-rereview', {
+          id: 'dec-rereview-before-validation',
+          action: 'request_re_review',
+          subtaskId: 'st-api',
+          reason: 'Re-review should wait for validation after fix.',
+          evidenceRefs: ['ev-fix'],
+          inputs: { currentHeadSha: 'head-2', round: 2, fixRecorded: true },
+        }),
+      },
+    });
+    expect(reReviewBeforeValidation.statusCode).toBe(409);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/evidence',
+      payload: {
+        id: 'ev-validation-after-fix',
+        kind: 'validation',
+        title: 'Validation after fix',
+        subtaskId: 'st-api',
+        passed: true,
+        headSha: 'head-2',
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/subtasks/st-api',
+      payload: {
+        status: 'validated',
+        validationRunIds: ['ev-validation-after-fix'],
+        evidenceRefs: ['ev-validation-after-fix'],
+      },
+    });
+
+    const reReviewAfterValidation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-rereview/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-fix-rereview', {
+          id: 'dec-rereview-after-validation',
+          action: 'request_re_review',
+          subtaskId: 'st-api',
+          reason: 'Fix was validated on the current head, so re-review is legal.',
+          evidenceRefs: ['ev-fix', 'ev-validation-after-fix'],
+          inputs: { currentHeadSha: 'head-2', round: 2, fixRecorded: true },
+        }),
+      },
+    });
+    expect(reReviewAfterValidation.statusCode).toBe(200);
+    expect(reReviewAfterValidation.json().guard).toMatchObject({
+      accepted: true,
+      code: 'ok',
+    });
+  });
+
+  it('rejects action decisions that skip validation or Claude review approval', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-action-guard',
+        goal: 'Guard action-specific transitions',
+        rootTaskId: 'root-action-guard',
+        headSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/task-graph',
+      payload: {
+        graph: buildTaskGraph('wf-action-guard', 1, [
+          { id: 'st-api', dependsOn: [] },
+        ]),
+      },
+    });
+
+    const prematureReview = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/decisions',
+      payload: {
+        decision: buildDecision('wf-action-guard', {
+          id: 'dec-review-before-validation',
+          action: 'request_claude_review',
+          subtaskId: 'st-api',
+          reason: 'Review before validation should be rejected.',
+          inputs: { currentHeadSha: 'head-1', round: 1 },
+        }),
+      },
+    });
+    expect(prematureReview.statusCode).toBe(409);
+    expect(prematureReview.json().guard).toMatchObject({
+      accepted: false,
+      code: 'invalid_transition',
+    });
+
+    const validation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/evidence',
+      payload: {
+        id: 'ev-validation',
+        kind: 'validation',
+        title: 'Validation passed',
+        subtaskId: 'st-api',
+        command: 'pnpm test',
+        passed: true,
+        headSha: 'head-1',
+      },
+    });
+    expect(validation.statusCode).toBe(200);
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/subtasks/st-api',
+      payload: {
+        status: 'executing',
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/subtasks/st-api',
+      payload: {
+        status: 'implemented',
+        evidenceRefs: ['ev-validation'],
+        implementationHeadSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/subtasks/st-api',
+      payload: {
+        status: 'validated',
+        validationRunIds: ['ev-validation'],
+        lastValidatedHeadSha: 'head-1',
+      },
+    });
+
+    const requestReview = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/decisions',
+      payload: {
+        decision: buildDecision('wf-action-guard', {
+          id: 'dec-request-review',
+          action: 'request_claude_review',
+          subtaskId: 'st-api',
+          reason: 'Validated subtask is ready for Claude review.',
+          evidenceRefs: ['ev-validation'],
+          inputs: { currentHeadSha: 'head-1', round: 1 },
+        }),
+      },
+    });
+    expect(requestReview.statusCode).toBe(200);
+
+    const completeWithoutReview = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/decisions',
+      payload: {
+        decision: buildDecision('wf-action-guard', {
+          id: 'dec-complete-without-review',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Completion without review should be rejected.',
+          evidenceRefs: ['ev-validation'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(completeWithoutReview.statusCode).toBe(409);
+    expect(completeWithoutReview.json().guard).toMatchObject({
+      accepted: false,
+      code: 'invalid_transition',
+    });
+
+    const review = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/evidence',
+      payload: {
+        id: 'ev-review',
+        kind: 'review',
+        title: 'Claude review approve',
+        subtaskId: 'st-api',
+        passed: true,
+        headSha: 'head-1',
+        payload: {
+          result: {
+            verdict: 'approve',
+            headShaReviewed: 'head-1',
+            currentHeadSha: 'head-1',
+            blockingIssues: [],
+          },
+        },
+      },
+    });
+    expect(review.statusCode).toBe(200);
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/subtasks/st-api',
+      payload: {
+        status: 'reviewing',
+        reviewRoundIds: ['review-task-1'],
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/subtasks/st-api',
+      payload: {
+        status: 'review_approved',
+        evidenceRefs: ['ev-review'],
+        lastReviewedHeadSha: 'head-1',
+        blockerFindingIds: [],
+      },
+    });
+
+    const complete = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-action-guard/decisions',
+      payload: {
+        decision: buildDecision('wf-action-guard', {
+          id: 'dec-complete-after-review',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Validation and Claude review approved the same head.',
+          evidenceRefs: ['ev-validation', 'ev-review'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(complete.statusCode).toBe(200);
   });
 
   it('rejects workflow creation when the effective worktree is outside the workspace root', async () => {
@@ -677,4 +1359,114 @@ function buildTaskGraph(
       assignedReviewer: 'claude-code',
     })),
   };
+}
+
+function buildDecision(
+  workflowId: string,
+  patch: {
+    id: string;
+    action: string;
+    reason: string;
+    subtaskId?: string;
+    evidenceRefs?: string[];
+    inputs?: Record<string, unknown>;
+  },
+) {
+  return {
+    workflowId,
+    rootTaskId: `root-${workflowId}`,
+    decidedBy: 'codex-workflow',
+    decidedAt: '2026-07-01T00:00:00.000Z',
+    evidenceRefs: [],
+    ...patch,
+  };
+}
+
+async function moveSubtaskToDone(
+  server: { inject: (input: any) => Promise<any> },
+  workflowId: string,
+  subtaskId: string,
+  headSha: string,
+) {
+  await server.inject({
+    method: 'POST',
+    url: `/api/v1/multi-agent/workflows/${workflowId}/evidence`,
+    payload: {
+      id: `ev-${subtaskId}-validation`,
+      kind: 'validation',
+      title: `${subtaskId} validation`,
+      subtaskId,
+      passed: true,
+      headSha,
+    },
+  });
+  await server.inject({
+    method: 'POST',
+    url: `/api/v1/multi-agent/workflows/${workflowId}/evidence`,
+    payload: {
+      id: `ev-${subtaskId}-review`,
+      kind: 'review',
+      title: `${subtaskId} review`,
+      subtaskId,
+      passed: true,
+      headSha,
+      payload: {
+        result: {
+          verdict: 'approve',
+          headShaReviewed: headSha,
+          currentHeadSha: headSha,
+          blockingIssues: [],
+        },
+      },
+    },
+  });
+  await server.inject({
+    method: 'PATCH',
+    url: `/api/v1/multi-agent/workflows/${workflowId}/subtasks/${subtaskId}`,
+    payload: {
+      status: 'executing',
+    },
+  });
+  await server.inject({
+    method: 'PATCH',
+    url: `/api/v1/multi-agent/workflows/${workflowId}/subtasks/${subtaskId}`,
+    payload: {
+      status: 'implemented',
+      implementationHeadSha: headSha,
+      evidenceRefs: [`ev-${subtaskId}-validation`],
+    },
+  });
+  await server.inject({
+    method: 'PATCH',
+    url: `/api/v1/multi-agent/workflows/${workflowId}/subtasks/${subtaskId}`,
+    payload: {
+      status: 'validated',
+      validationRunIds: [`ev-${subtaskId}-validation`],
+      lastValidatedHeadSha: headSha,
+    },
+  });
+  await server.inject({
+    method: 'PATCH',
+    url: `/api/v1/multi-agent/workflows/${workflowId}/subtasks/${subtaskId}`,
+    payload: {
+      status: 'reviewing',
+      reviewRoundIds: [`rr-${subtaskId}`],
+    },
+  });
+  await server.inject({
+    method: 'PATCH',
+    url: `/api/v1/multi-agent/workflows/${workflowId}/subtasks/${subtaskId}`,
+    payload: {
+      status: 'review_approved',
+      evidenceRefs: [`ev-${subtaskId}-review`],
+      lastReviewedHeadSha: headSha,
+    },
+  });
+  await server.inject({
+    method: 'PATCH',
+    url: `/api/v1/multi-agent/workflows/${workflowId}/subtasks/${subtaskId}`,
+    payload: {
+      status: 'done',
+    },
+  });
 }
