@@ -61,6 +61,75 @@ export async function updateSubtask(options, workflowId, subtaskId, patch) {
   });
 }
 
+export async function createContract(options, workflowId, subtaskId, contract) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(subtaskId)}/contracts`, {
+    method: 'POST',
+    body: contract,
+  });
+}
+
+export async function acceptContract(options, workflowId, subtaskId, contractId, input = {}) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(subtaskId)}/contracts/${encodeURIComponent(contractId)}/accept`, {
+    method: 'POST',
+    body: input,
+  });
+}
+
+export async function createEvaluationRun(options, workflowId, subtaskId, evaluationRun) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(subtaskId)}/evaluations`, {
+    method: 'POST',
+    body: evaluationRun,
+  });
+}
+
+export async function createInvocation(options, workflowId, invocation) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations`, {
+    method: 'POST',
+    body: invocation,
+  });
+}
+
+export async function startInvocation(options, workflowId, invocationId) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(invocationId)}/start`, {
+    method: 'POST',
+  });
+}
+
+export async function completeInvocation(options, workflowId, invocationId, result) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(invocationId)}/result`, {
+    method: 'POST',
+    body: result,
+  });
+}
+
+export async function recordEvaluationResult(options, workflowId, subtaskId, evaluationRunId, result) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(subtaskId)}/evaluations/${encodeURIComponent(evaluationRunId)}/result`, {
+    method: 'POST',
+    body: { result },
+  });
+}
+
+export async function validateEvaluationReadonly(options, workflowId, subtaskId, evaluationRunId, input) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(subtaskId)}/evaluations/${encodeURIComponent(evaluationRunId)}/validate-readonly`, {
+    method: 'POST',
+    body: input,
+  });
+}
+
+export async function recordQuestionerOutput(options, workflowId, output) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/questioner-outputs`, {
+    method: 'POST',
+    body: output,
+  });
+}
+
+export async function createTask(options, task) {
+  return tikFetch(options, '/v1/tasks', {
+    method: 'POST',
+    body: task,
+  });
+}
+
 export async function readTask(options, taskId) {
   const payload = await tikFetch(options, '/v1/tasks', { method: 'GET' });
   const task = (payload.tasks || []).find((item) =>
@@ -70,4 +139,18 @@ export async function readTask(options, taskId) {
     throw new Error(`Tik task not found: ${taskId}`);
   }
   return task;
+}
+
+export async function commentTask(options, taskId, comment) {
+  return tikFetch(options, `/v1/tasks/${encodeURIComponent(taskId)}/comments`, {
+    method: 'POST',
+    body: comment,
+  });
+}
+
+export async function transitionTask(options, taskId, transition) {
+  return tikFetch(options, `/v1/tasks/${encodeURIComponent(taskId)}/transitions`, {
+    method: 'POST',
+    body: transition,
+  });
 }

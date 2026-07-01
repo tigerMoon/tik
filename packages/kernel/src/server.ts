@@ -21,8 +21,12 @@ import type {
   WorkbenchTaskRecord,
   WorkbenchTaskStatus,
   AgentInvocationRecord,
+  CodexEvaluationResult,
   CreateMultiAgentWorkflowInput,
+  EvaluationRun,
   MultiAgentWorkflowRecord,
+  QuestionerOutput,
+  SprintContract,
   SubtaskRunState,
   TaskGraph,
   WorkflowDecision,
@@ -155,6 +159,67 @@ interface MultiAgentWorkflowPatchBody {
   metadata?: Record<string, unknown>;
 }
 
+interface CreateSprintContractBody {
+  id?: string;
+  version?: number;
+  status?: SprintContract['status'];
+  goal: string;
+  scope: SprintContract['scope'];
+  deliverables: SprintContract['deliverables'];
+  acceptanceCriteria: SprintContract['acceptanceCriteria'];
+  verificationPlan: SprintContract['verificationPlan'];
+  questionerOutputRefs?: string[];
+  acceptedBy?: SprintContract['acceptedBy'];
+  acceptedAt?: string;
+  headShaAtAcceptance?: string;
+}
+
+interface AcceptSprintContractBody {
+  acceptedBy?: SprintContract['acceptedBy'];
+  headShaAtAcceptance?: string;
+  questionerOutputRefs?: string[];
+}
+
+interface CreateEvaluationRunBody {
+  id?: string;
+  contractId: string;
+  evaluator?: EvaluationRun['evaluator'];
+  status?: EvaluationRun['status'];
+  headSha: string;
+  readonlyPolicy?: EvaluationRun['readonlyPolicy'];
+  artifactRefs?: string[];
+}
+
+interface UpdateEvaluationRunBody {
+  status?: EvaluationRun['status'];
+  headSha?: string;
+  readonlyPolicy?: Partial<EvaluationRun['readonlyPolicy']>;
+  artifactRefs?: string[];
+}
+
+interface RecordEvaluationResultBody {
+  result: CodexEvaluationResult;
+}
+
+interface ValidateEvaluationReadonlyBody {
+  gitStatusBefore?: string;
+  gitStatusAfter?: string;
+  allowedWritePaths?: string[];
+  forbiddenWritePaths?: string[];
+}
+
+interface RecordQuestionerOutputBody {
+  id?: string;
+  subtaskId?: string;
+  intent: QuestionerOutput['intent'];
+  actor: QuestionerOutput['actor'];
+  verdict: QuestionerOutput['verdict'];
+  questions?: QuestionerOutput['questions'];
+  risks?: QuestionerOutput['risks'];
+  missingTests?: QuestionerOutput['missingTests'];
+  suggestedContractChanges?: QuestionerOutput['suggestedContractChanges'];
+}
+
 interface RecordWorkflowDecisionBody {
   decision: WorkflowDecision;
 }
@@ -197,12 +262,22 @@ interface CreateAgentInvocationBody {
   input?: Record<string, unknown>;
   allowedPaths?: string[];
   validationCommands?: string[];
+  threadId?: string;
+  headSha?: string;
+  evidenceRefs?: string[];
+  evaluationRunId?: string;
+  readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
 }
 
 interface UpdateAgentInvocationBody {
   status: AgentInvocationRecord['status'];
   result?: Record<string, unknown>;
   error?: string;
+  threadId?: string;
+  headSha?: string;
+  evidenceRefs?: string[];
+  evaluationRunId?: string;
+  readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
 }
 
 interface CreateArtifactBody {
@@ -1123,6 +1198,168 @@ export async function createServer(
     },
   );
 
+  fastify.post<{ Params: { workflowId: string; subtaskId: string }; Body: CreateSprintContractBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/subtasks/:subtaskId/contracts',
+    async (req, reply) => {
+      try {
+        const contract = await multiAgentStore.createContract(req.params.workflowId, req.params.subtaskId, req.body);
+        return { contract };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.get<{ Params: { workflowId: string; subtaskId: string } }>(
+    '/api/v1/multi-agent/workflows/:workflowId/subtasks/:subtaskId/contracts/latest',
+    async (req, reply) => {
+      try {
+        const contract = await multiAgentStore.readLatestContract(req.params.workflowId, req.params.subtaskId);
+        if (!contract) {
+          return sendV1Error(reply, 404, 'contract_not_found', 'SprintContract not found');
+        }
+        return { contract };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string; subtaskId: string; contractId: string }; Body: AcceptSprintContractBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/subtasks/:subtaskId/contracts/:contractId/accept',
+    async (req, reply) => {
+      try {
+        const contract = await multiAgentStore.acceptContract(req.params.workflowId, req.params.subtaskId, req.params.contractId, req.body);
+        return { contract };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string; subtaskId: string; contractId: string } }>(
+    '/api/v1/multi-agent/workflows/:workflowId/subtasks/:subtaskId/contracts/:contractId/stale',
+    async (req, reply) => {
+      try {
+        const contract = await multiAgentStore.staleContract(req.params.workflowId, req.params.subtaskId, req.params.contractId);
+        return { contract };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string; subtaskId: string }; Body: CreateEvaluationRunBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/subtasks/:subtaskId/evaluations',
+    async (req, reply) => {
+      try {
+        const evaluationRun = await multiAgentStore.createEvaluationRun(req.params.workflowId, req.params.subtaskId, req.body);
+        return { evaluationRun };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.patch<{ Params: { workflowId: string; subtaskId: string; evaluationRunId: string }; Body: UpdateEvaluationRunBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/subtasks/:subtaskId/evaluations/:evaluationRunId',
+    async (req, reply) => {
+      try {
+        const evaluationRun = await multiAgentStore.updateEvaluationRun(
+          req.params.workflowId,
+          req.params.subtaskId,
+          req.params.evaluationRunId,
+          req.body,
+        );
+        return { evaluationRun };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string; subtaskId: string; evaluationRunId: string }; Body: RecordEvaluationResultBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/subtasks/:subtaskId/evaluations/:evaluationRunId/result',
+    async (req, reply) => {
+      try {
+        const evaluationRun = await multiAgentStore.recordEvaluationResult(
+          req.params.workflowId,
+          req.params.subtaskId,
+          req.params.evaluationRunId,
+          req.body.result,
+        );
+        return { evaluationRun };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.get<{ Params: { workflowId: string; subtaskId: string } }>(
+    '/api/v1/multi-agent/workflows/:workflowId/subtasks/:subtaskId/evaluations/latest',
+    async (req, reply) => {
+      try {
+        const evaluationRun = await multiAgentStore.readLatestEvaluationRun(req.params.workflowId, req.params.subtaskId);
+        if (!evaluationRun) {
+          return sendV1Error(reply, 404, 'evaluation_not_found', 'EvaluationRun not found');
+        }
+        return { evaluationRun };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string; subtaskId: string; evaluationRunId: string }; Body: ValidateEvaluationReadonlyBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/subtasks/:subtaskId/evaluations/:evaluationRunId/validate-readonly',
+    async (req, reply) => {
+      try {
+        const result = await multiAgentStore.validateEvaluationReadonly(
+          req.params.workflowId,
+          req.params.subtaskId,
+          req.params.evaluationRunId,
+          req.body,
+        );
+        if (!result.guard.accepted) {
+          reply.code(409);
+        }
+        return result;
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: RecordQuestionerOutputBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/questioner-outputs',
+    async (req, reply) => {
+      try {
+        const questionerOutput = await multiAgentStore.recordQuestionerOutput(req.params.workflowId, req.body);
+        return { questionerOutput };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.get<{ Params: { workflowId: string }; Querystring: { intent?: QuestionerOutput['intent']; subtaskId?: string } }>(
+    '/api/v1/multi-agent/workflows/:workflowId/questioner-outputs/latest',
+    async (req, reply) => {
+      try {
+        const questionerOutput = await multiAgentStore.readLatestQuestionerOutput(req.params.workflowId, {
+          intent: req.query.intent,
+          subtaskId: req.query.subtaskId,
+        });
+        if (!questionerOutput) {
+          return sendV1Error(reply, 404, 'questioner_output_not_found', 'QuestionerOutput not found');
+        }
+        return { questionerOutput };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
   fastify.post<{ Params: { workflowId: string }; Body: RecordEvidenceBody }>(
     '/api/v1/multi-agent/workflows/:workflowId/evidence',
     async (req, reply) => {
@@ -1190,6 +1427,11 @@ export async function createServer(
           status: req.body.status,
           result: req.body.result,
           error: req.body.error,
+          threadId: req.body.threadId,
+          headSha: req.body.headSha,
+          evidenceRefs: req.body.evidenceRefs,
+          evaluationRunId: req.body.evaluationRunId,
+          readonlyPolicy: req.body.readonlyPolicy,
         });
         const taskGraph = invocation.role === 'planner' && invocation.status === 'completed'
           ? extractTaskGraphFromInvocationResult(invocation.result)

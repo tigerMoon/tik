@@ -14,7 +14,10 @@ decisions, and Dashboard-visible audit history.
 | `plan` | Request a Claude planner invocation through Tik. When the planner invocation completes with `taskGraph`, Tik stores it automatically. | `request_dynamic_plan` decision plus planner `AgentInvocationRecord` and TaskGraph writeback. |
 | `accept-plan` | Store a reviewed or edited TaskGraph. | TaskGraph plus initialized subtask run states. |
 | `next` | Compute the next local Codex policy action from Tik state. | Guarded `WorkflowDecision`. |
+| Contract APIs | Store and accept per-subtask SprintContracts before build when v1 policy requires it. | `SprintContract` history and contract events. |
 | `execute` | Record Codex implementation evidence for a subtask. | Implementation evidence, subtask state, validation decision. |
+| Evaluation APIs | Record isolated Codex Evaluator runs, results, artifacts, and readonly validation. | `EvaluationRun`, `CodexEvaluationResult`, readonly guard result. |
+| Questioner APIs | Store Claude Code Questioner outputs for contract, evaluation, and final evidence challenges. | `QuestionerOutput` records and timeline events. |
 | `validate` | Run a validation command and persist the result. | Validation evidence, pass/fail state, next review/fix decision. |
 | `review` | Create a Tik-owned external Claude review task for a subtask. | Workbench task with `external-claude-review`, review metadata, subtask review state. |
 | `process-review` | Read a Tik ReviewResult and decide fix, validation retry, human review, or subtask completion. | Review evidence, guarded workflow decision, `review_approved -> done` state when approved. |
@@ -39,6 +42,20 @@ guardrails, review task creation, state transitions, and the Dashboard-visible
 history. Claude Code planner/reviewer output is treated as input, not as an
 automatic authority.
 
+When a workflow policy enables the v1 Codex Evaluator / Claude Questioner gates,
+the core loop is:
+
+```text
+accepted SprintContract
+  -> Codex Builder implementation evidence
+  -> isolated readonly Codex Evaluator pass
+  -> Claude Questioner no blocking evidence questions
+  -> complete_subtask
+  -> final Codex evaluation
+  -> final Claude Questioner no blocking questions
+  -> complete_workflow
+```
+
 ## Typical Use
 
 ```bash
@@ -54,15 +71,47 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs a
   --workflow <workflow-id> \
   --task-graph /path/to/task-graph.json
 
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs draft-contract \
+  --workflow <workflow-id> \
+  --subtask <subtask-id>
+
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs accept-contract \
+  --workflow <workflow-id> \
+  --subtask <subtask-id> \
+  --contract <contract-id>
+
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-builder \
+  --workflow <workflow-id> \
+  --subtask <subtask-id> \
+  --invocation inv-builder-<subtask-id> \
+  --thread <builder-codex-thread-id>
+
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute \
   --workflow <workflow-id> \
   --subtask <subtask-id> \
-  --summary "Implemented the scoped change."
+  --summary "Implemented the scoped change." \
+  --changed-files "packages/kernel/src/server.ts,packages/shared/src/types/multi-agent.ts" \
+  --invocation inv-builder-<subtask-id> \
+  --thread <builder-codex-thread-id>
 
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs validate \
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-evaluator \
   --workflow <workflow-id> \
   --subtask <subtask-id> \
-  --command "pnpm test"
+  --invocation inv-evaluator-<subtask-id> \
+  --thread <evaluator-codex-thread-id>
+
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs evaluate \
+  --workflow <workflow-id> \
+  --subtask <subtask-id> \
+  --command "pnpm test" \
+  --invocation inv-evaluator-<subtask-id> \
+  --thread <evaluator-codex-thread-id>
+
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs record-questioner \
+  --workflow <workflow-id> \
+  --subtask <subtask-id> \
+  --intent question_evaluation \
+  --verdict evidence_sufficient
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs review \
   --workflow <workflow-id> \
@@ -137,11 +186,17 @@ pnpm run test:multi-agent-skill
   executable only after dependencies are `done`.
 - Each subtask follows `execute -> validate -> review`; validation uses
   `validated`, while Claude approval uses `review_approved`.
+- In v1 policy mode, each subtask requires an accepted `SprintContract`, same-head
+  implementation/evaluation evidence, readonly evaluator validation, and no
+  blocking `question_evaluation` output.
 - Claude blocking findings route to `fix -> validate -> re-review`.
 - `complete_subtask` is guarded by same-head passing validation and Claude
-  approval evidence.
+  approval evidence in legacy mode, or by Codex Evaluator plus Claude Questioner
+  evidence gates in v1 policy mode.
 - After all subtasks are `done`, the workflow must request final review.
-- `complete_workflow` is guarded by approved final review evidence.
+- `complete_workflow` is guarded by approved final review evidence in legacy
+  mode, or by final Codex evaluation plus `question_final_evidence` output in v1
+  policy mode.
 - Preflight guard rejection prevents partial state mutation for unsafe commands.
 - CLI `status` and the Dashboard timeline expose the workflow event history.
 

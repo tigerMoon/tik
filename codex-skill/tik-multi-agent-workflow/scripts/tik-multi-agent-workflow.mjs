@@ -9,13 +9,25 @@ import { decideAfterReview } from '../lib/review-policy.mjs';
 import { findSubtask } from '../lib/task-graph.mjs';
 import { buildWorkspaceBinding, git, resolveProjectPath } from '../lib/git.mjs';
 import {
+  acceptContract,
+  createContract,
+  createInvocation,
+  createTask,
+  createEvaluationRun,
+  commentTask,
+  completeInvocation,
   readTask,
   readWorkflow,
   recordDecision,
   recordEvidence,
+  recordEvaluationResult,
+  recordQuestionerOutput,
   preflightDecision,
+  startInvocation,
   tikFetch,
+  transitionTask,
   updateSubtask,
+  validateEvaluationReadonly,
 } from '../lib/tik-client.mjs';
 import { instructionForDecision, printJson } from '../lib/output.mjs';
 
@@ -30,11 +42,26 @@ async function main() {
       case 'init':
         await initWorkflow(options);
         break;
+      case 'create-task':
+        await createWorkflowTask(options);
+        break;
+      case 'comment-task':
+        await commentWorkflowTask(options);
+        break;
+      case 'transition-task':
+        await transitionWorkflowTask(options);
+        break;
       case 'plan':
         await requestPlan(options);
         break;
       case 'accept-plan':
         await acceptPlan(options);
+        break;
+      case 'draft-contract':
+        await draftContract(options);
+        break;
+      case 'accept-contract':
+        await acceptSprintContract(options);
         break;
       case 'next':
         await next(options);
@@ -42,8 +69,29 @@ async function main() {
       case 'execute':
         await execute(options);
         break;
+      case 'start-builder':
+        await startBuilder(options);
+        break;
+      case 'start-evaluator':
+        await startEvaluator(options);
+        break;
+      case 'complete-invocation':
+        await finishInvocation(options);
+        break;
       case 'validate':
         await validate(options);
+        break;
+      case 'evaluate':
+        await evaluate(options);
+        break;
+      case 'record-questioner':
+        await recordQuestioner(options);
+        break;
+      case 'complete-subtask':
+        await completeSubtask(options);
+        break;
+      case 'complete-workflow':
+        await completeWorkflow(options);
         break;
       case 'review':
         await requestReview(options);
@@ -100,6 +148,9 @@ async function initWorkflow(options) {
     headSha,
     maxRounds: numberOption(options.maxRounds, 3),
     workspaceBinding: buildWorkspaceBinding(projectPath, options),
+    policy: options.v1 || options.codexEvaluatorQuestioner
+      ? codexEvaluatorQuestionerPolicy()
+      : undefined,
   };
   const response = await tikFetch(options, '/v1/multi-agent/workflows', {
     method: 'POST',
@@ -113,7 +164,64 @@ async function initWorkflow(options) {
     status: response.workflow?.status,
     driver: response.workflow?.driver,
     headSha: response.workflow?.currentHeadSha,
+    policy: response.workflow?.policy,
     nextCommand: `node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs next --workflow ${response.workflow?.id}`,
+  });
+}
+
+async function createWorkflowTask(options) {
+  const projectPath = resolveProjectPath(options.path);
+  const title = requireOption(options.title, '--title is required');
+  const goal = requireOption(options.goal, '--goal is required');
+  const response = await createTask(options, {
+    id: stringOption(options.task),
+    title,
+    goal,
+    description: stringOption(options.description),
+    status: stringOption(options.status) || 'todo',
+    priority: numberOption(options.priority, undefined),
+    labels: splitList(options.label) || ['multi-agent'],
+    workspaceBinding: buildWorkspaceBinding(projectPath, options),
+  });
+  printJson({
+    action: 'task-created',
+    taskId: response.task?.id,
+    shortIdentifier: response.task?.shortIdentifier || response.task?.identifier,
+    status: response.task?.status,
+    title: response.task?.title,
+    nextCommand: `node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs init --root-task ${response.task?.id} --goal "${escapeDoubleQuoted(goal)}"`,
+  });
+}
+
+async function commentWorkflowTask(options) {
+  const taskRef = requireOption(options.task, '--task is required');
+  const task = await readTask(options, taskRef);
+  const response = await commentTask(options, task.id, {
+    authorKind: stringOption(options.authorKind) || 'agent',
+    authorId: stringOption(options.authorId) || 'codex',
+    body: requireOption(options.body, '--body is required'),
+  });
+  printJson({
+    action: 'task-commented',
+    taskId: response.task?.id,
+    shortIdentifier: response.task?.shortIdentifier || response.task?.identifier,
+    commentCount: response.task?.comments?.length || 0,
+  });
+}
+
+async function transitionWorkflowTask(options) {
+  const taskRef = requireOption(options.task, '--task is required');
+  const task = await readTask(options, taskRef);
+  const response = await transitionTask(options, task.id, {
+    to: requireOption(options.to, '--to is required'),
+    reason: stringOption(options.reason),
+    actor: stringOption(options.actor) || 'agent',
+  });
+  printJson({
+    action: 'task-transitioned',
+    taskId: response.task?.id,
+    shortIdentifier: response.task?.shortIdentifier || response.task?.identifier,
+    status: response.task?.status,
   });
 }
 
@@ -187,6 +295,52 @@ async function next(options) {
   });
 }
 
+async function draftContract(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const subtaskId = requireOption(options.subtask, '--subtask is required');
+  const state = await readWorkflow(options, workflowId);
+  const subtask = findSubtask(state.taskGraph, subtaskId);
+  if (!subtask) {
+    throw new Error(`Subtask not found in TaskGraph: ${subtaskId}`);
+  }
+  const headSha = options.headSha || state.workflow.currentHeadSha || git(resolveProjectPath(options.path), ['rev-parse', 'HEAD'], { optional: true });
+  const contract = options.contractJson
+    ? JSON.parse(String(options.contractJson))
+    : options.contract
+      ? await readJsonFile(options.contract)
+      : buildDefaultContract(state, subtask, headSha);
+  const response = await createContract(options, workflowId, subtaskId, contract);
+  await updateSubtask(options, workflowId, subtaskId, { status: 'contract_drafting' });
+  printJson({
+    action: 'contract-drafted',
+    workflowId,
+    subtaskId,
+    contract: response.contract,
+    nextCommand: `node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs accept-contract --workflow ${workflowId} --subtask ${subtaskId} --contract ${response.contract?.id}`,
+  });
+}
+
+async function acceptSprintContract(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const subtaskId = requireOption(options.subtask, '--subtask is required');
+  const contractId = requireOption(options.contract, '--contract is required');
+  const state = await readWorkflow(options, workflowId);
+  const headSha = options.headSha || state.workflow.currentHeadSha || git(resolveProjectPath(options.path), ['rev-parse', 'HEAD'], { optional: true });
+  const response = await acceptContract(options, workflowId, subtaskId, contractId, {
+    acceptedBy: 'codex-workflow-plugin',
+    headShaAtAcceptance: headSha,
+    questionerOutputRefs: splitList(options.questionerOutputRefs) || [],
+  });
+  const subtask = await updateSubtask(options, workflowId, subtaskId, { status: 'contract_accepted' });
+  printJson({
+    action: 'contract-accepted',
+    workflowId,
+    subtaskId,
+    contract: response.contract,
+    subtask: subtask.subtask,
+  });
+}
+
 async function execute(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
   const subtaskId = requireOption(options.subtask, '--subtask is required');
@@ -215,6 +369,12 @@ async function execute(options) {
     await updateSubtask(options, workflowId, subtaskId, { status: 'ready' });
   }
   await updateSubtask(options, workflowId, subtaskId, { status: 'executing' });
+  const changedFiles = splitList(options.changedFiles)?.map((file) => ({
+    path: file,
+    changeType: 'modified',
+  }));
+  const invocationId = stringOption(options.invocation);
+  const threadId = stringOption(options.thread);
   const evidence = await recordEvidence(options, workflowId, {
     id: stringOption(options.evidenceId),
     kind: 'implementation',
@@ -222,7 +382,27 @@ async function execute(options) {
     summary: options.summary || 'Codex session recorded implementation evidence.',
     subtaskId,
     headSha,
+    payload: omitUndefined({
+      changedFiles,
+      builderInvocationId: invocationId,
+      builderThreadId: threadId,
+    }),
   });
+  let invocation = null;
+  if (invocationId) {
+    invocation = await completeInvocation(options, workflowId, invocationId, {
+      status: 'completed',
+      threadId,
+      headSha,
+      evidenceRefs: [evidence.evidence.id],
+      result: omitUndefined({
+        threadId,
+        headSha,
+        evidenceRefs: [evidence.evidence.id],
+        changedFiles,
+      }),
+    });
+  }
   const subtask = await updateSubtask(options, workflowId, subtaskId, {
     status: 'implemented',
     implementationHeadSha: headSha,
@@ -240,9 +420,112 @@ async function execute(options) {
     workflowId,
     subtaskId,
     evidence: evidence.evidence,
+    invocation: invocation?.invocation,
     subtask: subtask.subtask,
     decision: finalDecision,
     guard: recorded.guard,
+  });
+}
+
+async function startBuilder(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const subtaskId = requireOption(options.subtask, '--subtask is required');
+  const state = await readWorkflow(options, workflowId);
+  const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
+  const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
+  const invocation = await createInvocation(options, workflowId, {
+    id: stringOption(options.invocation),
+    subtaskId,
+    role: 'executor',
+    runner: 'codex',
+    promptContract: stringOption(options.promptContract) || 'codex-builder.v1',
+    input: {
+      goal: state.workflow.goal,
+      subtaskId,
+      contractId: latestContractId(state, subtaskId),
+      currentHeadSha: headSha,
+    },
+    allowedPaths: collectSubtaskAllowedPaths(state, subtaskId),
+    validationCommands: collectSubtaskValidationCommands(state, subtaskId),
+    threadId: stringOption(options.thread),
+    headSha,
+  });
+  const started = await startInvocation(options, workflowId, invocation.invocation.id);
+  printJson({
+    action: 'builder-started',
+    workflowId,
+    subtaskId,
+    invocation: started.invocation,
+    instruction: 'Run the Builder in a dedicated Codex subagent thread, then call execute with --invocation and --thread.',
+  });
+}
+
+async function startEvaluator(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const subtaskId = requireOption(options.subtask, '--subtask is required');
+  const state = await readWorkflow(options, workflowId);
+  const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
+  const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
+  const invocation = await createInvocation(options, workflowId, {
+    id: stringOption(options.invocation),
+    subtaskId,
+    role: 'evaluator',
+    runner: 'codex-evaluator',
+    promptContract: stringOption(options.promptContract) || 'codex-evaluator.v1',
+    input: {
+      goal: state.workflow.goal,
+      subtaskId,
+      contractId: latestContractId(state, subtaskId) || (subtaskId === '__final__' ? '__final__' : undefined),
+      currentHeadSha: headSha,
+      readonly: true,
+    },
+    allowedPaths: [
+      '.tik/multi-agent/',
+      'test-results/',
+      'playwright-report/',
+      'coverage/',
+      '.tmp/evaluation/',
+    ],
+    validationCommands: collectSubtaskValidationCommands(state, subtaskId),
+    threadId: stringOption(options.thread),
+    headSha,
+    readonlyPolicy: {
+      enforced: true,
+      violations: [],
+    },
+  });
+  const started = await startInvocation(options, workflowId, invocation.invocation.id);
+  printJson({
+    action: 'evaluator-started',
+    workflowId,
+    subtaskId,
+    invocation: started.invocation,
+    instruction: 'Run the Evaluator in a separate readonly Codex subagent thread, then call evaluate with --invocation and --thread.',
+  });
+}
+
+async function finishInvocation(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const invocationId = requireOption(options.invocation, '--invocation is required');
+  const response = await completeInvocation(options, workflowId, invocationId, {
+    status: stringOption(options.status) || 'completed',
+    threadId: stringOption(options.thread),
+    headSha: stringOption(options.headSha),
+    evidenceRefs: splitList(options.evidenceRefs),
+    evaluationRunId: stringOption(options.evaluation),
+    readonlyPolicy: buildReadonlyPolicyFromOptions(options),
+    result: omitUndefined({
+      threadId: stringOption(options.thread),
+      headSha: stringOption(options.headSha),
+      evidenceRefs: splitList(options.evidenceRefs),
+      evaluationRunId: stringOption(options.evaluation),
+      readonlyPolicy: buildReadonlyPolicyFromOptions(options),
+    }),
+  });
+  printJson({
+    action: 'invocation-completed',
+    workflowId,
+    invocation: response.invocation,
   });
 }
 
@@ -338,6 +621,234 @@ async function validate(options) {
   if (!passed && options.failOnValidationError) {
     process.exitCode = result.status || 1;
   }
+}
+
+async function evaluate(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const subtaskId = requireOption(options.subtask, '--subtask is required');
+  const state = await readWorkflow(options, workflowId);
+  const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
+  const contractId = options.contract || latestContractId(state, subtaskId) || (subtaskId === '__final__' ? '__final__' : undefined);
+  if (!contractId) {
+    throw new Error('--contract is required when no accepted contract is stored');
+  }
+  const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
+  const gitStatusBefore = git(projectPath, ['status', '--porcelain=v1'], { optional: true }) || '';
+  const evaluationRun = await createEvaluationRun(options, workflowId, subtaskId, {
+    id: stringOption(options.evaluation),
+    contractId,
+    headSha,
+    evaluator: {
+      kind: 'codex-evaluator',
+      sessionId: stringOption(options.thread) || stringOption(options.session),
+      runnerId: stringOption(options.invocation),
+    },
+  });
+  if (subtaskId !== '__final__') {
+    await updateSubtask(options, workflowId, subtaskId, { status: 'evaluating' });
+  }
+  const command = options.command || inferEvaluationCommand(state, subtaskId);
+  let commandResult = null;
+  if (command) {
+    const result = spawnSync(command, {
+      cwd: projectPath,
+      encoding: 'utf-8',
+      shell: true,
+    });
+    commandResult = {
+      commandId: stringOption(options.commandId) || 'cmd-evaluate',
+      command,
+      status: result.status === 0 ? 'passed' : 'failed',
+      exitCode: result.status,
+      summary: result.status === 0 ? 'Evaluation command passed.' : 'Evaluation command failed.',
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
+  }
+  const gitStatusAfter = git(projectPath, ['status', '--porcelain=v1'], { optional: true }) || '';
+  const readonly = await safeValidateEvaluationReadonly(options, workflowId, subtaskId, evaluationRun.evaluationRun.id, {
+    gitStatusBefore,
+    gitStatusAfter,
+  });
+  const verdict = readonly.guard?.accepted === false
+    ? 'fail'
+    : commandResult && commandResult.status !== 'passed'
+      ? 'fail'
+      : 'pass';
+  const result = {
+    workflowId,
+    subtaskId,
+    contractId,
+    evaluatorRunId: evaluationRun.evaluationRun.id,
+    headSha,
+    verdict,
+    criteriaResults: [],
+    commandResults: commandResult
+      ? [{
+        commandId: commandResult.commandId,
+        command: commandResult.command,
+        status: commandResult.status,
+        exitCode: commandResult.exitCode,
+        summary: commandResult.summary,
+      }]
+      : [],
+    runtimeFindings: verdict === 'pass'
+      ? []
+      : [{
+        id: 'evaluation_failed',
+        severity: 'blocker',
+        title: 'Evaluation failed',
+        observed: commandResult?.summary || readonly.guard?.message || 'Evaluation did not pass.',
+        expected: 'Evaluation passes without readonly violations.',
+        reproductionSteps: command ? [command] : ['Inspect evaluator artifacts and readonly guard output.'],
+      }],
+    coverageGaps: [],
+    confidence: verdict === 'pass' ? 0.85 : 0.25,
+  };
+  const recorded = await recordEvaluationResult(options, workflowId, subtaskId, evaluationRun.evaluationRun.id, result);
+  let invocation = null;
+  if (options.invocation) {
+    invocation = await completeInvocation(options, workflowId, String(options.invocation), {
+      status: verdict === 'pass' ? 'completed' : 'failed',
+      threadId: stringOption(options.thread),
+      headSha,
+      evaluationRunId: evaluationRun.evaluationRun.id,
+      readonlyPolicy: {
+        enforced: readonly.guard?.accepted !== false,
+        violations: recorded.evaluationRun?.readonlyPolicy?.violations || readonly.evaluationRun?.readonlyPolicy?.violations || [],
+      },
+      result: {
+        threadId: stringOption(options.thread),
+        headSha,
+        evaluationRunId: evaluationRun.evaluationRun.id,
+        readonlyPolicy: {
+          enforced: readonly.guard?.accepted !== false,
+          violations: recorded.evaluationRun?.readonlyPolicy?.violations || readonly.evaluationRun?.readonlyPolicy?.violations || [],
+        },
+      },
+    });
+  }
+  if (subtaskId !== '__final__') {
+    await updateSubtask(options, workflowId, subtaskId, {
+      status: verdict === 'pass' ? 'evaluation_passed' : 'evaluation_failed',
+      validationRunIds: [evaluationRun.evaluationRun.id],
+    });
+  }
+  printJson({
+    action: 'evaluation-recorded',
+    workflowId,
+    subtaskId,
+    passed: verdict === 'pass',
+    evaluationRun: recorded.evaluationRun,
+    invocation: invocation?.invocation,
+    readonly: readonly.guard,
+    command: commandResult ? {
+      command: commandResult.command,
+      status: commandResult.status,
+      exitCode: commandResult.exitCode,
+    } : undefined,
+  });
+  if (verdict !== 'pass' && options.failOnValidationError) {
+    process.exitCode = commandResult?.exitCode || 1;
+  }
+}
+
+async function recordQuestioner(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const output = options.outputJson
+    ? JSON.parse(String(options.outputJson))
+    : options.output
+      ? await readJsonFile(options.output)
+      : buildDefaultQuestionerOutput(options);
+  const response = await recordQuestionerOutput(options, workflowId, output);
+  if (output.subtaskId && output.intent === 'question_evaluation') {
+    await updateSubtask(options, workflowId, output.subtaskId, {
+      status: output.questions?.some((question) => question.priority === 'blocking') ? 'needs_fix' : 'questioning_evidence',
+      blockerFindingIds: (output.questions || [])
+        .filter((question) => question.priority === 'blocking')
+        .map((question) => `${output.id || response.questionerOutput.id}:${question.id}`),
+    });
+  }
+  printJson({
+    action: 'questioner-output-recorded',
+    workflowId,
+    questionerOutput: response.questionerOutput,
+  });
+}
+
+async function completeSubtask(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const subtaskId = requireOption(options.subtask, '--subtask is required');
+  const state = await readWorkflow(options, workflowId);
+  const decision = buildDecision(state.workflow, {
+    action: 'complete_subtask',
+    subtaskId,
+    reason: stringOption(options.reason) || 'Codex Evaluator passed and Claude Questioner found no blocking evidence questions.',
+    evidenceRefs: state.subtasks?.[subtaskId]?.evidenceRefs || [],
+    inputs: {
+      currentHeadSha: state.workflow.currentHeadSha,
+      contractId: latestContractId(state, subtaskId),
+      evaluationRunId: latestEvaluationId(state, subtaskId),
+      questionerOutputId: latestQuestionerOutputId(state, subtaskId, 'question_evaluation'),
+    },
+  });
+  const preflight = await safePreflightDecision(options, workflowId, decision);
+  if (!preflight.guard?.accepted) {
+    printJson({
+      action: 'subtask-complete-rejected',
+      workflowId,
+      subtaskId,
+      decision,
+      guard: preflight.guard,
+    });
+    return;
+  }
+  const recorded = await safeRecordDecision(options, workflowId, decision);
+  const subtask = await updateSubtask(options, workflowId, subtaskId, {
+    status: 'done',
+  });
+  printJson({
+    action: 'subtask-completed',
+    workflowId,
+    subtaskId,
+    decision,
+    guard: recorded.guard,
+    subtask: subtask.subtask,
+  });
+}
+
+async function completeWorkflow(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const state = await readWorkflow(options, workflowId);
+  const decision = buildDecision(state.workflow, {
+    action: 'complete_workflow',
+    reason: stringOption(options.reason) || 'All subtasks are done, final evaluation passed, and final Questioner found no blocking questions.',
+    evidenceRefs: collectSubtaskEvidenceRefs(state),
+    inputs: {
+      currentHeadSha: state.workflow.currentHeadSha,
+      taskGraphVersion: state.taskGraph?.version,
+      evaluationRunId: latestEvaluationId(state, '__final__'),
+      questionerOutputId: latestQuestionerOutputId(state, undefined, 'question_final_evidence'),
+    },
+  });
+  const preflight = await safePreflightDecision(options, workflowId, decision);
+  if (!preflight.guard?.accepted) {
+    printJson({
+      action: 'workflow-complete-rejected',
+      workflowId,
+      decision,
+      guard: preflight.guard,
+    });
+    return;
+  }
+  const recorded = await safeRecordDecision(options, workflowId, decision);
+  printJson({
+    action: 'workflow-completed',
+    workflowId,
+    decision,
+    guard: recorded.guard,
+    workflow: recorded.workflow,
+  });
 }
 
 async function requestReview(options) {
@@ -826,9 +1337,148 @@ async function safePreflightDecision(options, workflowId, decision) {
   }
 }
 
+async function safeValidateEvaluationReadonly(options, workflowId, subtaskId, evaluationRunId, input) {
+  try {
+    return await validateEvaluationReadonly(options, workflowId, subtaskId, evaluationRunId, input);
+  } catch (error) {
+    if (error?.status === 409 && error.payload?.guard) {
+      return error.payload;
+    }
+    throw error;
+  }
+}
+
 function inferValidationCommand(state, subtaskId) {
   const subtask = findSubtask(state.taskGraph, subtaskId);
   return subtask?.validationCommands?.[0];
+}
+
+function inferEvaluationCommand(state, subtaskId) {
+  if (subtaskId === '__final__') {
+    return state.taskGraph?.finalValidationCommands?.[0];
+  }
+  const contract = latestAcceptedContract(state, subtaskId);
+  return contract?.verificationPlan?.commands?.find((command) => command.required)?.command
+    || contract?.verificationPlan?.commands?.[0]?.command
+    || inferValidationCommand(state, subtaskId);
+}
+
+function latestContractId(state, subtaskId) {
+  return latestAcceptedContract(state, subtaskId)?.id || latestContract(state, subtaskId)?.id;
+}
+
+function latestEvaluationId(state, subtaskId) {
+  return latestEvaluation(state, subtaskId)?.id;
+}
+
+function latestEvaluation(state, subtaskId) {
+  return (state.evaluationRuns || [])
+    .filter((run) => run.subtaskId === subtaskId)
+    .sort((left, right) => String(right.startedAt || '').localeCompare(String(left.startedAt || '')))[0];
+}
+
+function latestQuestionerOutputId(state, subtaskId, intent) {
+  return (state.questionerOutputs || [])
+    .filter((output) => output.subtaskId === subtaskId && output.intent === intent)
+    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))[0]?.id;
+}
+
+function codexEvaluatorQuestionerPolicy() {
+  return {
+    requireAcceptedContract: true,
+    requireEvaluationPassForComplete: true,
+    requireQuestionerAfterEvaluation: true,
+    requireSameHeadShaForEvidence: true,
+    allowHumanOverride: false,
+  };
+}
+
+function latestAcceptedContract(state, subtaskId) {
+  return (state.contracts || [])
+    .filter((contract) => contract.subtaskId === subtaskId && contract.status === 'accepted')
+    .sort((left, right) => (right.version || 0) - (left.version || 0) || String(right.acceptedAt || '').localeCompare(String(left.acceptedAt || '')))[0];
+}
+
+function latestContract(state, subtaskId) {
+  return (state.contracts || [])
+    .filter((contract) => contract.subtaskId === subtaskId)
+    .sort((left, right) => (right.version || 0) - (left.version || 0) || String(right.acceptedAt || '').localeCompare(String(left.acceptedAt || '')))[0];
+}
+
+function buildDefaultContract(state, subtask, headSha) {
+  const criteria = (subtask.acceptanceCriteria || []).map((criterion, index) => {
+    if (typeof criterion === 'object' && criterion) {
+      return {
+        id: criterion.id || `ac-${index + 1}`,
+        statement: criterion.statement || String(criterion),
+        priority: criterion.priority || 'must',
+        verificationMethod: criterion.verificationMethod || 'command',
+      };
+    }
+    return {
+      id: `ac-${index + 1}`,
+      statement: String(criterion),
+      priority: 'must',
+      verificationMethod: 'command',
+    };
+  });
+  return {
+    version: 1,
+    status: 'draft',
+    goal: subtask.goal,
+    scope: {
+      allowedPaths: subtask.allowedPaths || [],
+      blockedPaths: subtask.blockedPaths || [],
+    },
+    deliverables: [{
+      id: `deliver-${subtask.id}`,
+      description: subtask.goal || subtask.title,
+      expectedFiles: subtask.expectedChangedFiles,
+    }],
+    acceptanceCriteria: criteria.length ? criteria : [{
+      id: 'ac-1',
+      statement: `Complete ${subtask.title || subtask.id}.`,
+      priority: 'must',
+      verificationMethod: 'command',
+    }],
+    verificationPlan: {
+      commands: (subtask.validationCommands || state.taskGraph?.finalValidationCommands || []).map((command, index) => ({
+        id: `cmd-${index + 1}`,
+        command,
+        hardTimeoutMs: 120000,
+        required: true,
+      })),
+    },
+    questionerOutputRefs: [],
+    headShaAtAcceptance: headSha,
+  };
+}
+
+function buildDefaultQuestionerOutput(options) {
+  const intent = requireOption(options.intent, '--intent is required');
+  const blockingQuestions = splitList(options.blockingQuestion) || [];
+  return {
+    id: stringOption(options.questionerOutput),
+    subtaskId: stringOption(options.subtask),
+    intent,
+    actor: {
+      kind: 'claude-code-questioner',
+      invocationId: stringOption(options.invocation),
+    },
+    verdict: blockingQuestions.length > 0
+      ? 'need_clarification'
+      : stringOption(options.verdict) || 'evidence_sufficient',
+    questions: blockingQuestions.map((question, index) => ({
+      id: `q-${index + 1}`,
+      priority: 'blocking',
+      question,
+      whyItMatters: 'Questioner marked this as blocking evidence or contract risk.',
+      expectedAnswerType: 'evidence',
+    })),
+    risks: [],
+    missingTests: [],
+    suggestedContractChanges: [],
+  };
 }
 
 function nextReviewRound(subtask) {
@@ -866,6 +1516,29 @@ function collectSubtaskEvidenceRefs(state) {
 
 function collectAllowedPaths(state) {
   return Array.from(new Set((state.taskGraph?.subtasks || []).flatMap((subtask) => subtask.allowedPaths || [])));
+}
+
+function collectSubtaskAllowedPaths(state, subtaskId) {
+  return findSubtask(state.taskGraph, subtaskId)?.allowedPaths || [];
+}
+
+function collectSubtaskValidationCommands(state, subtaskId) {
+  if (subtaskId === '__final__') {
+    return state.taskGraph?.finalValidationCommands || [];
+  }
+  return findSubtask(state.taskGraph, subtaskId)?.validationCommands || [];
+}
+
+function buildReadonlyPolicyFromOptions(options) {
+  if (!options.readonly && !options.readonlyViolations && !options.allowedWritePaths && !options.forbiddenWritePaths) {
+    return undefined;
+  }
+  return {
+    enforced: options.readonly !== 'false',
+    allowedWritePaths: splitList(options.allowedWritePaths),
+    forbiddenWritePaths: splitList(options.forbiddenWritePaths),
+    violations: splitList(options.readonlyViolations) || [],
+  };
 }
 
 async function readWorkflowTimeline(options, workflowId) {
@@ -944,6 +1617,10 @@ function numberOption(value, fallback) {
   return parsed;
 }
 
+function escapeDoubleQuoted(value) {
+  return String(value).replace(/["\\]/g, '\\$&');
+}
+
 async function readJsonFile(filePath) {
   const resolved = path.resolve(String(filePath));
   return JSON.parse(await import('node:fs/promises').then((fs) => fs.readFile(resolved, 'utf-8')));
@@ -960,12 +1637,24 @@ function printHelp() {
   const script = path.relative(process.cwd(), fileURLToPath(import.meta.url));
   console.log(`
 Usage:
+  node ${script} create-task --title <title> --goal <goal> [--path <repo>]
+  node ${script} comment-task --task <task-id> --body <text>
+  node ${script} transition-task --task <task-id> --to <status>
   node ${script} init --goal <goal> [--path <repo>]
   node ${script} plan --workflow <workflow-id>
   node ${script} accept-plan --workflow <workflow-id> --task-graph <file>
+  node ${script} draft-contract --workflow <workflow-id> --subtask <id>
+  node ${script} accept-contract --workflow <workflow-id> --subtask <id> --contract <contract-id>
   node ${script} next --workflow <workflow-id>
-  node ${script} execute --workflow <workflow-id> --subtask <id> --summary <text>
+  node ${script} start-builder --workflow <workflow-id> --subtask <id> --invocation <id> --thread <thread-id>
+  node ${script} execute --workflow <workflow-id> --subtask <id> --summary <text> [--changed-files <comma-list>]
+  node ${script} start-evaluator --workflow <workflow-id> --subtask <id> --invocation <id> --thread <thread-id>
   node ${script} validate --workflow <workflow-id> --subtask <id> --command <cmd>
+  node ${script} evaluate --workflow <workflow-id> --subtask <id> --command <cmd>
+  node ${script} complete-invocation --workflow <workflow-id> --invocation <id>
+  node ${script} record-questioner --workflow <workflow-id> --intent <intent> [--subtask <id>]
+  node ${script} complete-subtask --workflow <workflow-id> --subtask <id>
+  node ${script} complete-workflow --workflow <workflow-id>
   node ${script} review --workflow <workflow-id> --subtask <id> [--start]
   node ${script} process-review --workflow <workflow-id> --subtask <id> --task <review-task-id>
   node ${script} final-review --workflow <workflow-id> [--start]
@@ -985,6 +1674,10 @@ Options:
   --base <ref>               Base ref. Defaults to HEAD~1.
   --head-ref <ref>           Head ref. Defaults to current branch or HEAD.
   --head-sha <sha>           Head sha. Defaults to git rev-parse HEAD.
+  --changed-files <list>     Comma-separated changed files for implementation evidence.
+  --invocation <id>          Tik AgentInvocation id for a Codex subagent thread.
+  --thread <id>              Codex subagent thread/session id.
+  --v1                       Enable Codex Evaluator / Claude Questioner gates.
   --round <n>                Review round.
   --max-rounds <n>           Max review rounds. Defaults to 3.
   --output <path>            Write full JSON response to a file.

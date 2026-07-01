@@ -17,8 +17,13 @@ let graph = null;
 let subtasks = {};
 let decisions = [];
 let evidence = [];
+let contracts = [];
+let evaluationRuns = [];
+let questionerOutputs = [];
+let invocations = [];
 let reviewTask = null;
 let finalReviewTask = null;
+let rootTask = null;
 let subtaskStatusHistory = [];
 let events = [];
 
@@ -40,9 +45,59 @@ try {
           headRef: body.headRef,
           currentHeadSha: body.headSha,
           maxRounds: body.maxRounds || 3,
+          policy: body.policy,
         };
         events.push({ type: 'workflow.created', payload: { workflowId: workflow.id } });
         sendJson(res, { workflow });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/tasks') {
+        const body = await readRequestJson(req);
+        rootTask = {
+          id: body.id || 'task-root',
+          identifier: 'TIK-ROOT',
+          shortIdentifier: 'TIK-ROOT',
+          title: body.title,
+          description: body.description,
+          goal: body.goal,
+          status: body.status || 'new',
+          priority: body.priority,
+          labels: body.labels || [],
+          comments: [],
+          workspaceBinding: body.workspaceBinding,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        sendJson(res, { task: rootTask });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/tasks/task-root/comments') {
+        const body = await readRequestJson(req);
+        rootTask = {
+          ...rootTask,
+          comments: [
+            ...(rootTask.comments || []),
+            {
+              id: 'comment-root-1',
+              authorKind: body.authorKind || 'agent',
+              authorId: body.authorId,
+              body: body.body,
+              createdAt: new Date().toISOString(),
+            },
+          ],
+          updatedAt: new Date().toISOString(),
+        };
+        sendJson(res, { task: rootTask });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/tasks/task-root/transitions') {
+        const body = await readRequestJson(req);
+        rootTask = {
+          ...rootTask,
+          status: body.to,
+          updatedAt: new Date().toISOString(),
+        };
+        sendJson(res, { task: rootTask });
         return;
       }
       if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-cli') {
@@ -52,6 +107,10 @@ try {
           subtasks,
           decisions,
           evidence,
+          contracts,
+          evaluationRuns,
+          questionerOutputs,
+          invocations,
           events,
         });
         return;
@@ -103,6 +162,186 @@ try {
         sendJson(res, { subtask: subtasks['st-api'] });
         return;
       }
+      if (req.method === 'PATCH' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/__final__') {
+        sendJson(res, { subtask: { subtaskId: '__final__', ...await readRequestJson(req) } });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/st-api/contracts') {
+        const body = await readRequestJson(req);
+        const contract = {
+          id: body.id || 'contract-st-api-v1',
+          workflowId: 'wf-cli',
+          subtaskId: 'st-api',
+          ...body,
+        };
+        contracts.push(contract);
+        events.push({ type: 'contract.created', payload: { contractId: contract.id, subtaskId: 'st-api' } });
+        sendJson(res, { contract });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/st-api/contracts/contract-st-api-v1/accept') {
+        const body = await readRequestJson(req);
+        const contract = {
+          ...contracts.find((item) => item.id === 'contract-st-api-v1'),
+          status: 'accepted',
+          acceptedBy: body.acceptedBy,
+          acceptedAt: new Date().toISOString(),
+          headShaAtAcceptance: body.headShaAtAcceptance,
+        };
+        contracts = contracts.filter((item) => item.id !== contract.id).concat(contract);
+        events.push({ type: 'contract.accepted', payload: { contractId: contract.id, subtaskId: 'st-api' } });
+        sendJson(res, { contract });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/st-api/evaluations') {
+        const body = await readRequestJson(req);
+        const evaluationRun = {
+          id: body.id || 'eval-st-api-v1',
+          workflowId: 'wf-cli',
+          subtaskId: 'st-api',
+          status: 'created',
+          readonlyPolicy: {
+            enforced: true,
+            allowedWritePaths: ['.tik/multi-agent/'],
+            forbiddenWritePaths: ['packages/'],
+          },
+          artifactRefs: [],
+          startedAt: new Date().toISOString(),
+          ...body,
+        };
+        evaluationRuns.push(evaluationRun);
+        events.push({ type: 'evaluation.created', payload: { evaluationRunId: evaluationRun.id, subtaskId: 'st-api' } });
+        sendJson(res, { evaluationRun });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/st-api/evaluations/eval-st-api-v1/validate-readonly') {
+        const body = await readRequestJson(req);
+        evaluationRuns = evaluationRuns.map((run) => run.id === 'eval-st-api-v1'
+          ? {
+            ...run,
+            readonlyPolicy: {
+              ...run.readonlyPolicy,
+              gitStatusBefore: body.gitStatusBefore,
+              gitStatusAfter: body.gitStatusAfter,
+              violations: [],
+            },
+          }
+          : run);
+        sendJson(res, { evaluationRun: evaluationRuns.find((run) => run.id === 'eval-st-api-v1'), guard: { accepted: true, code: 'ok' } });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/st-api/evaluations/eval-st-api-v1/result') {
+        const body = await readRequestJson(req);
+        evaluationRuns = evaluationRuns.map((run) => run.id === 'eval-st-api-v1'
+          ? {
+            ...run,
+            status: body.result.verdict === 'pass' ? 'passed' : 'failed',
+            result: body.result,
+            completedAt: new Date().toISOString(),
+          }
+          : run);
+        events.push({ type: 'evaluation.result.recorded', payload: { evaluationRunId: 'eval-st-api-v1', subtaskId: 'st-api' } });
+        sendJson(res, { evaluationRun: evaluationRuns.find((run) => run.id === 'eval-st-api-v1') });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/__final__/evaluations') {
+        const body = await readRequestJson(req);
+        const evaluationRun = {
+          id: body.id || 'eval-final-v1',
+          workflowId: 'wf-cli',
+          subtaskId: '__final__',
+          status: 'created',
+          readonlyPolicy: {
+            enforced: true,
+            allowedWritePaths: ['.tik/multi-agent/'],
+            forbiddenWritePaths: ['packages/'],
+          },
+          artifactRefs: [],
+          startedAt: new Date().toISOString(),
+          ...body,
+        };
+        evaluationRuns.push(evaluationRun);
+        sendJson(res, { evaluationRun });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/__final__/evaluations/eval-final-v1/validate-readonly') {
+        evaluationRuns = evaluationRuns.map((run) => run.id === 'eval-final-v1'
+          ? {
+            ...run,
+            readonlyPolicy: {
+              ...run.readonlyPolicy,
+              violations: [],
+            },
+          }
+          : run);
+        sendJson(res, { evaluationRun: evaluationRuns.find((run) => run.id === 'eval-final-v1'), guard: { accepted: true, code: 'ok' } });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/__final__/evaluations/eval-final-v1/result') {
+        const body = await readRequestJson(req);
+        evaluationRuns = evaluationRuns.map((run) => run.id === 'eval-final-v1'
+          ? {
+            ...run,
+            status: body.result.verdict === 'pass' ? 'passed' : 'failed',
+            result: body.result,
+            completedAt: new Date().toISOString(),
+          }
+          : run);
+        sendJson(res, { evaluationRun: evaluationRuns.find((run) => run.id === 'eval-final-v1') });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/questioner-outputs') {
+        const body = await readRequestJson(req);
+        const questionerOutput = {
+          id: body.id || 'q-cli',
+          workflowId: 'wf-cli',
+          createdAt: new Date().toISOString(),
+          ...body,
+        };
+        questionerOutputs.push(questionerOutput);
+        events.push({ type: 'questioner.output.recorded', payload: { questionerOutputId: questionerOutput.id } });
+        sendJson(res, { questionerOutput });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/agent-invocations') {
+        const body = await readRequestJson(req);
+        const invocation = {
+          id: body.id || `inv-${invocations.length + 1}`,
+          workflowId: 'wf-cli',
+          status: 'created',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          ...body,
+        };
+        invocations.push(invocation);
+        events.push({ type: 'agent_invocation.created', payload: { invocationId: invocation.id, role: invocation.role, runner: invocation.runner } });
+        sendJson(res, { invocation });
+        return;
+      }
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/start$/)) {
+        const invocationId = route.split('/').at(-2);
+        invocations = invocations.map((item) => item.id === invocationId
+          ? { ...item, status: 'started', startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+          : item);
+        sendJson(res, { invocation: invocations.find((item) => item.id === invocationId) });
+        return;
+      }
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/result$/)) {
+        const invocationId = route.split('/').at(-2);
+        const body = await readRequestJson(req);
+        invocations = invocations.map((item) => item.id === invocationId
+          ? {
+            ...item,
+            ...body,
+            status: body.status,
+            result: body.result,
+            completedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }
+          : item);
+        sendJson(res, { invocation: invocations.find((item) => item.id === invocationId) });
+        return;
+      }
       if (
         req.method === 'POST'
         && (route === '/api/v1/multi-agent/workflows/wf-cli/decisions'
@@ -131,7 +370,7 @@ try {
       if (req.method === 'POST' && route === '/api/v1/agent-loop/worktree-review-rounds') {
         const body = await readRequestJson(req);
         assert.equal(body.labels.includes('external-claude-review'), true);
-        assert.equal(body.rootTaskId, 'wf-cli');
+        assert.equal(body.rootTaskId, 'task-root');
         const isFinalReview = body.title?.includes('Final');
         const task = {
           id: isFinalReview ? 'task-final-review' : `task-review-${body.round || 1}`,
@@ -155,7 +394,7 @@ try {
         return;
       }
       if (req.method === 'GET' && route === '/api/v1/tasks') {
-        sendJson(res, { tasks: [reviewTask, finalReviewTask].filter(Boolean) });
+        sendJson(res, { tasks: [rootTask, reviewTask, finalReviewTask].filter(Boolean) });
         return;
       }
       sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
@@ -167,16 +406,51 @@ try {
   const address = server.address();
   const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
 
+  const createdTask = await run([
+    'create-task',
+    '--api-base-url', apiBaseUrl,
+    '--path', repo,
+    '--title', 'Formal workflow task',
+    '--goal', 'Carry a full multi-agent workflow',
+    '--status', 'todo',
+    '--label', 'multi-agent,formal-workflow',
+  ]);
+  assert.equal(createdTask.action, 'task-created');
+  assert.equal(createdTask.taskId, 'task-root');
+  assert.equal(createdTask.shortIdentifier, 'TIK-ROOT');
+  assert.equal(rootTask.status, 'todo');
+
+  const commentedTask = await run([
+    'comment-task',
+    '--api-base-url', apiBaseUrl,
+    '--task', 'TIK-ROOT',
+    '--body', 'Formal workflow started through the skill.',
+  ]);
+  assert.equal(commentedTask.action, 'task-commented');
+  assert.equal(rootTask.comments.length, 1);
+
+  const transitionedTask = await run([
+    'transition-task',
+    '--api-base-url', apiBaseUrl,
+    '--task', 'TIK-ROOT',
+    '--to', 'in_progress',
+    '--reason', 'Workflow execution started.',
+  ]);
+  assert.equal(transitionedTask.action, 'task-transitioned');
+  assert.equal(rootTask.status, 'in_progress');
+
   const init = await run([
     'init',
     '--api-base-url', apiBaseUrl,
     '--path', repo,
     '--goal', 'Implement auth workflow',
-    '--root-task', 'wf-cli',
+    '--root-task', 'task-root',
+    '--workflow', 'wf-cli',
     '--base', 'main',
   ]);
   assert.equal(init.action, 'initialized');
   assert.equal(init.workflowId, 'wf-cli');
+  assert.equal(init.rootTaskId, 'task-root');
 
   const putGraph = await run([
     'accept-plan',
@@ -210,15 +484,37 @@ try {
   assert.equal(next.decision.subtaskId, 'st-api');
   assert.match(next.instruction, /Implement subtask st-api/);
 
+  const builderStarted = await run([
+    'start-builder',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--invocation', 'inv-builder-cli',
+    '--thread', 'builder-thread-cli',
+    '--path', repo,
+  ]);
+  assert.equal(builderStarted.action, 'builder-started');
+  assert.equal(builderStarted.invocation.status, 'started');
+  assert.equal(builderStarted.invocation.threadId, 'builder-thread-cli');
+
   const execute = await run([
     'execute',
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
     '--summary', 'Implemented API',
+    '--changed-files', 'packages/kernel/src/multi-agent/guard.ts,packages/kernel/src/server.ts',
+    '--invocation', 'inv-builder-cli',
+    '--thread', 'builder-thread-cli',
   ]);
   assert.equal(execute.action, 'execution-recorded');
   assert.equal(subtasks['st-api'].status, 'implemented');
+  assert.equal(execute.invocation.status, 'completed');
+  assert.deepEqual(execute.invocation.evidenceRefs, ['ev-cli']);
+  assert.deepEqual(evidence[0].payload.changedFiles, [
+    { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+    { path: 'packages/kernel/src/server.ts', changeType: 'modified' },
+  ]);
 
   const validate = await run([
     'validate',
@@ -246,6 +542,334 @@ try {
     },
   });
   assert.equal(legacyApprovedNext.action, 'request_claude_review');
+
+  const v1Policy = {
+    requireAcceptedContract: true,
+    requireEvaluationPassForComplete: true,
+    requireQuestionerAfterEvaluation: true,
+    requireSameHeadShaForEvidence: true,
+  };
+  const v1DraftContractNext = decideNextAction({
+    workflow: { ...workflow, policy: v1Policy },
+    taskGraph: graph,
+    subtasks: {
+      'st-api': {
+        subtaskId: 'st-api',
+        status: 'ready',
+        evidenceRefs: [],
+      },
+    },
+    contracts: [],
+    evaluationRuns: [],
+    questionerOutputs: [],
+  });
+  assert.equal(v1DraftContractNext.action, 'draft_contract');
+  assert.equal(v1DraftContractNext.subtaskId, 'st-api');
+
+  const v1EvaluateNext = decideNextAction({
+    workflow: { ...workflow, policy: v1Policy },
+    taskGraph: graph,
+    subtasks: {
+      'st-api': {
+        subtaskId: 'st-api',
+        status: 'implemented',
+        evidenceRefs: ['ev-impl'],
+      },
+    },
+    evidence: [{ id: 'ev-impl', kind: 'implementation', subtaskId: 'st-api', headSha: workflow.currentHeadSha, createdAt: new Date().toISOString() }],
+    contracts: [{
+      id: 'contract-st-api-v1',
+      subtaskId: 'st-api',
+      status: 'accepted',
+      version: 1,
+      acceptedAt: new Date().toISOString(),
+    }],
+    evaluationRuns: [],
+    questionerOutputs: [],
+  });
+  assert.equal(v1EvaluateNext.action, 'run_codex_evaluator');
+  assert.equal(v1EvaluateNext.subtaskId, 'st-api');
+
+  const v1QuestionEvaluationNext = decideNextAction({
+    workflow: { ...workflow, policy: v1Policy },
+    taskGraph: graph,
+    subtasks: {
+      'st-api': {
+        subtaskId: 'st-api',
+        status: 'evaluation_passed',
+        evidenceRefs: ['ev-impl'],
+      },
+    },
+    evidence: [{ id: 'ev-impl', kind: 'implementation', subtaskId: 'st-api', headSha: workflow.currentHeadSha, createdAt: new Date().toISOString() }],
+    contracts: [{
+      id: 'contract-st-api-v1',
+      subtaskId: 'st-api',
+      status: 'accepted',
+      version: 1,
+      acceptedAt: new Date().toISOString(),
+    }],
+    evaluationRuns: [{
+      id: 'eval-pass',
+      subtaskId: 'st-api',
+      status: 'passed',
+      headSha: workflow.currentHeadSha,
+      result: { verdict: 'pass', headSha: workflow.currentHeadSha },
+      startedAt: new Date().toISOString(),
+    }],
+    questionerOutputs: [],
+  });
+  assert.equal(v1QuestionEvaluationNext.action, 'ask_claude_question_evaluation');
+  assert.equal(v1QuestionEvaluationNext.subtaskId, 'st-api');
+
+  const v1ReadonlyViolationNext = decideNextAction({
+    workflow: { ...workflow, policy: v1Policy },
+    taskGraph: graph,
+    subtasks: {
+      'st-api': {
+        subtaskId: 'st-api',
+        status: 'evaluation_failed',
+        evidenceRefs: ['ev-impl'],
+      },
+    },
+    evidence: [{ id: 'ev-impl', kind: 'implementation', subtaskId: 'st-api', headSha: workflow.currentHeadSha, createdAt: new Date().toISOString() }],
+    contracts: [{
+      id: 'contract-st-api-v1',
+      subtaskId: 'st-api',
+      status: 'accepted',
+      version: 1,
+      acceptedAt: new Date().toISOString(),
+    }],
+    evaluationRuns: [{
+      id: 'eval-invalidated',
+      subtaskId: 'st-api',
+      status: 'invalidated',
+      headSha: workflow.currentHeadSha,
+      readonlyPolicy: {
+        enforced: true,
+        allowedWritePaths: ['.tik/multi-agent/'],
+        forbiddenWritePaths: ['packages/'],
+        violations: ['packages/kernel/src/multi-agent/guard.ts'],
+      },
+      result: { verdict: 'fail', headSha: workflow.currentHeadSha },
+      startedAt: new Date().toISOString(),
+    }],
+    questionerOutputs: [],
+  });
+  assert.equal(v1ReadonlyViolationNext.action, 'request_human_review');
+  assert.equal(v1ReadonlyViolationNext.inputs.evaluationRunId, 'eval-invalidated');
+
+  const v1CompleteNext = decideNextAction({
+    workflow: { ...workflow, policy: v1Policy },
+    taskGraph: graph,
+    subtasks: {
+      'st-api': {
+        subtaskId: 'st-api',
+        status: 'questioning_evidence',
+        evidenceRefs: ['ev-impl'],
+      },
+    },
+    evidence: [{ id: 'ev-impl', kind: 'implementation', subtaskId: 'st-api', headSha: workflow.currentHeadSha, createdAt: new Date().toISOString() }],
+    contracts: [{
+      id: 'contract-st-api-v1',
+      subtaskId: 'st-api',
+      status: 'accepted',
+      version: 1,
+      acceptedAt: new Date().toISOString(),
+    }],
+    evaluationRuns: [{
+      id: 'eval-pass',
+      subtaskId: 'st-api',
+      status: 'passed',
+      headSha: workflow.currentHeadSha,
+      result: { verdict: 'pass', headSha: workflow.currentHeadSha },
+      startedAt: new Date().toISOString(),
+    }],
+    questionerOutputs: [{
+      id: 'q-clear',
+      subtaskId: 'st-api',
+      intent: 'question_evaluation',
+      verdict: 'evidence_sufficient',
+      questions: [],
+      createdAt: new Date().toISOString(),
+    }],
+  });
+  assert.equal(v1CompleteNext.action, 'complete_subtask');
+  assert.equal(v1CompleteNext.subtaskId, 'st-api');
+
+  const v1FinalEvaluationNext = decideNextAction({
+    workflow: { ...workflow, policy: v1Policy },
+    taskGraph: graph,
+    subtasks: {
+      'st-api': {
+        subtaskId: 'st-api',
+        status: 'done',
+        evidenceRefs: ['ev-impl'],
+      },
+    },
+    evaluationRuns: [],
+    questionerOutputs: [],
+  });
+  assert.equal(v1FinalEvaluationNext.action, 'run_final_evaluation');
+
+  const v1FinalQuestionerNext = decideNextAction({
+    workflow: { ...workflow, policy: v1Policy },
+    taskGraph: graph,
+    subtasks: {
+      'st-api': {
+        subtaskId: 'st-api',
+        status: 'done',
+        evidenceRefs: ['ev-impl'],
+      },
+    },
+    evaluationRuns: [{
+      id: 'eval-final-pass',
+      subtaskId: '__final__',
+      status: 'passed',
+      headSha: workflow.currentHeadSha,
+      result: { verdict: 'pass', headSha: workflow.currentHeadSha },
+      startedAt: new Date().toISOString(),
+    }],
+    questionerOutputs: [],
+  });
+  assert.equal(v1FinalQuestionerNext.action, 'ask_claude_question_final_evidence');
+
+  const v1WorkflowCompleteNext = decideNextAction({
+    workflow: { ...workflow, policy: v1Policy },
+    taskGraph: graph,
+    subtasks: {
+      'st-api': {
+        subtaskId: 'st-api',
+        status: 'done',
+        evidenceRefs: ['ev-impl'],
+      },
+    },
+    evaluationRuns: [{
+      id: 'eval-final-pass',
+      subtaskId: '__final__',
+      status: 'passed',
+      headSha: workflow.currentHeadSha,
+      result: { verdict: 'pass', headSha: workflow.currentHeadSha },
+      startedAt: new Date().toISOString(),
+    }],
+    questionerOutputs: [{
+      id: 'q-final-clear',
+      intent: 'question_final_evidence',
+      verdict: 'evidence_sufficient',
+      questions: [],
+      createdAt: new Date().toISOString(),
+    }],
+  });
+  assert.equal(v1WorkflowCompleteNext.action, 'complete_workflow');
+
+  const draftedContract = await run([
+    'draft-contract',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+  ]);
+  assert.equal(draftedContract.action, 'contract-drafted');
+  assert.equal(draftedContract.contract.id, 'contract-st-api-v1');
+  assert.equal(contracts[0].status, 'draft');
+
+  const acceptedContract = await run([
+    'accept-contract',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--contract', 'contract-st-api-v1',
+  ]);
+  assert.equal(acceptedContract.action, 'contract-accepted');
+  assert.equal(acceptedContract.contract.status, 'accepted');
+  assert.equal(subtasks['st-api'].status, 'contract_accepted');
+
+  const evaluatorStarted = await run([
+    'start-evaluator',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--invocation', 'inv-evaluator-cli',
+    '--thread', 'evaluator-thread-cli',
+    '--path', repo,
+  ]);
+  assert.equal(evaluatorStarted.action, 'evaluator-started');
+  assert.equal(evaluatorStarted.invocation.status, 'started');
+  assert.equal(evaluatorStarted.invocation.threadId, 'evaluator-thread-cli');
+
+  const evaluated = await run([
+    'evaluate',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--evaluation', 'eval-st-api-v1',
+    '--command', `${process.execPath} -e "process.exit(0)"`,
+    '--invocation', 'inv-evaluator-cli',
+    '--thread', 'evaluator-thread-cli',
+  ]);
+  assert.equal(evaluated.action, 'evaluation-recorded');
+  assert.equal(evaluated.passed, true);
+  assert.equal(evaluated.invocation.status, 'completed');
+  assert.equal(evaluated.invocation.evaluationRunId, 'eval-st-api-v1');
+  assert.equal(evaluated.invocation.threadId, 'evaluator-thread-cli');
+  assert.equal(evaluationRuns[0].status, 'passed');
+  assert.equal(subtasks['st-api'].status, 'evaluation_passed');
+
+  const questioned = await run([
+    'record-questioner',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--intent', 'question_evaluation',
+    '--verdict', 'evidence_sufficient',
+  ]);
+  assert.equal(questioned.action, 'questioner-output-recorded');
+  assert.equal(questionerOutputs[0].intent, 'question_evaluation');
+  assert.equal(subtasks['st-api'].status, 'questioning_evidence');
+
+  const v1CompletedSubtask = await run([
+    'complete-subtask',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+  ]);
+  assert.equal(v1CompletedSubtask.action, 'subtask-completed');
+  assert.equal(v1CompletedSubtask.decision.action, 'complete_subtask');
+  assert.equal(subtasks['st-api'].status, 'done');
+
+  const finalEvaluated = await run([
+    'evaluate',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', '__final__',
+    '--evaluation', 'eval-final-v1',
+    '--command', `${process.execPath} -e "process.exit(0)"`,
+  ]);
+  assert.equal(finalEvaluated.action, 'evaluation-recorded');
+  assert.equal(finalEvaluated.passed, true);
+
+  const finalQuestioned = await run([
+    'record-questioner',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--intent', 'question_final_evidence',
+    '--verdict', 'evidence_sufficient',
+  ]);
+  assert.equal(finalQuestioned.action, 'questioner-output-recorded');
+
+  const v1CompletedWorkflow = await run([
+    'complete-workflow',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+  ]);
+  assert.equal(v1CompletedWorkflow.action, 'workflow-completed');
+  assert.equal(v1CompletedWorkflow.decision.action, 'complete_workflow');
+  assert.equal(workflow.status, 'completed');
+
+  subtasks['st-api'] = {
+    ...subtasks['st-api'],
+    status: 'validated',
+    evidenceRefs: mergeTestRefs(subtasks['st-api'].evidenceRefs, ['ev-cli']),
+    validationRunIds: mergeTestRefs(subtasks['st-api'].validationRunIds, ['ev-cli']),
+  };
 
   const review = await run([
     'review',
@@ -887,6 +1511,10 @@ function buildGraph(workflowId) {
     globalAcceptanceCriteria: [],
     finalValidationCommands: [],
   };
+}
+
+function mergeTestRefs(...groups) {
+  return Array.from(new Set(groups.flatMap((group) => group || []).filter(Boolean)));
 }
 
 function listen(server) {

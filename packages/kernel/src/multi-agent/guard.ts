@@ -1,9 +1,12 @@
 import * as path from 'node:path';
 import type {
+  EvaluationRun,
   GuardResult,
   MultiAgentWorkflowBundle,
   MultiAgentWorkflowEvidence,
   MultiAgentWorkflowRecord,
+  QuestionerOutput,
+  SprintContract,
   WorkflowDecision,
 } from '@tik/shared';
 
@@ -17,7 +20,7 @@ export function evaluateWorkflowDecisionGuard(
     });
   }
 
-  if (decision.decidedBy !== 'codex-workflow') {
+  if (decision.decidedBy !== 'codex-workflow' && decision.decidedBy !== 'codex-workflow-plugin') {
     return reject('invalid_transition', 'Only codex-workflow decisions can be recorded on multi-agent workflows.');
   }
 
@@ -100,11 +103,27 @@ function validateActionTransition(
       return guardCanExecuteSubtask(bundle, decision, [
         'pending',
         'ready',
+        'contract_accepted',
         'validation_failed',
+        'evaluation_failed',
         'needs_fix',
         'fixing',
         'blocked',
       ]);
+
+    case 'draft_contract':
+    case 'ask_claude_question_contract':
+    case 'accept_contract':
+    case 'record_implementation':
+    case 'run_codex_evaluator':
+    case 'ask_claude_question_evaluation':
+    case 'fix_evaluation_findings':
+    case 're_evaluate':
+    case 'ask_claude_question_requirement':
+    case 'ask_claude_question_task_graph':
+    case 'run_final_evaluation':
+    case 'ask_claude_question_final_evidence':
+      return accept();
 
     case 'validate_subtask':
       if (hasPlannedReviewResult(decision)) {
@@ -159,6 +178,9 @@ function validateActionTransition(
     }
 
     case 'complete_subtask': {
+      if (usesCodexEvaluatorQuestionerGate(bundle)) {
+        return guardCompleteSubtaskV1(bundle, decision);
+      }
       const statusGuard = requireSubtaskStatus(bundle, decision, ['review_approved', 'approved', 'reviewing']);
       if (!statusGuard.accepted) return statusGuard;
       const validation = latestPassedValidationForSubtask(bundle, decision.subtaskId);
@@ -201,6 +223,9 @@ function validateActionTransition(
     case 'complete_workflow':
       if (!allSubtasksDone(bundle)) {
         return reject('invalid_transition', 'Completing a workflow requires all subtasks to be done.');
+      }
+      if (usesCodexEvaluatorQuestionerGate(bundle)) {
+        return guardCompleteWorkflowV1(bundle, decision);
       }
       if (!hasApprovedFinalReview(bundle) && !plannedFinalReviewApproved(decision)) {
         return reject('invalid_transition', 'Completing a workflow requires approved final review evidence.');
@@ -248,6 +273,8 @@ function guardCanExecuteSubtask(
   const statusGuard = requireSubtaskStatus(bundle, decision, allowed);
   if (!statusGuard.accepted) return statusGuard;
   if (!bundle.taskGraph || !decision.subtaskId) return accept();
+  const contractGuard = requireAcceptedContractIfPolicyRequires(bundle, decision.subtaskId);
+  if (!contractGuard.accepted) return contractGuard;
   const spec = bundle.taskGraph.subtasks.find((subtask) => subtask.id === decision.subtaskId);
   const missingDependencies = (spec?.dependsOn || [])
     .filter((dependencyId) => bundle.subtasks[dependencyId]?.status !== 'done');
@@ -255,6 +282,232 @@ function guardCanExecuteSubtask(
     return reject('invalid_transition', `Subtask ${decision.subtaskId} has unfinished dependencies: ${missingDependencies.join(', ')}.`, {
       subtaskId: decision.subtaskId,
       missingDependencies,
+    });
+  }
+  return accept();
+}
+
+function guardCompleteSubtaskV1(
+  bundle: MultiAgentWorkflowBundle,
+  decision: WorkflowDecision,
+): GuardResult {
+  const statusGuard = requireSubtaskStatus(bundle, decision, [
+    'evaluation_passed',
+    'questioning_evidence',
+    'reviewing',
+    'review_approved',
+    'approved',
+  ]);
+  if (!statusGuard.accepted) return statusGuard;
+  const subtaskId = decision.subtaskId;
+  if (!subtaskId) {
+    return reject('invalid_transition', 'complete_subtask requires subtaskId.');
+  }
+
+  const contract = latestAcceptedContract(bundle, subtaskId);
+  if (!contract) {
+    return reject('missing_contract', `Subtask ${subtaskId} has no accepted SprintContract.`);
+  }
+
+  const implementation = latestImplementationEvidence(bundle, subtaskId);
+  if (!implementation) {
+    return reject('missing_implementation_evidence', `Subtask ${subtaskId} has no implementation evidence.`);
+  }
+
+  const evaluation = latestEvaluationRun(bundle, subtaskId);
+  if (!evaluation?.result) {
+    return reject('missing_evaluation_result', `Subtask ${subtaskId} has no Codex evaluation result.`);
+  }
+  if (evaluation.status === 'invalidated' || !evaluation.readonlyPolicy.enforced || (evaluation.readonlyPolicy.violations?.length || 0) > 0) {
+    return reject('readonly_policy_violated', 'Codex evaluator readonly policy was not satisfied.', {
+      evaluationRunId: evaluation.id,
+      violations: evaluation.readonlyPolicy.violations || [],
+    });
+  }
+  if (evaluation.status !== 'passed' || evaluation.result.verdict !== 'pass') {
+    return reject('evaluation_not_passed', 'Completing a subtask requires a passing Codex evaluation result.', {
+      evaluationRunId: evaluation.id,
+      status: evaluation.status,
+      verdict: evaluation.result.verdict,
+    });
+  }
+
+  const decisionHeadSha = readStringInput(decision.inputs, 'currentHeadSha')
+    || readStringInput(decision.inputs, 'headSha')
+    || bundle.workflow.currentHeadSha;
+  if (bundle.workflow.policy?.requireSameHeadShaForEvidence !== false) {
+    const expectedHead = decisionHeadSha || bundle.workflow.currentHeadSha;
+    if (expectedHead && implementation.headSha && implementation.headSha !== expectedHead) {
+      return reject('head_sha_mismatch', 'Implementation evidence head does not match workflow head.', {
+        expectedHeadSha: expectedHead,
+        implementationHeadSha: implementation.headSha,
+      });
+    }
+    if (expectedHead && evaluation.result.headSha !== expectedHead) {
+      return reject('head_sha_mismatch', 'Evaluation result head does not match workflow head.', {
+        expectedHeadSha: expectedHead,
+        evaluationHeadSha: evaluation.result.headSha,
+      });
+    }
+    if (implementation.headSha && implementation.headSha !== evaluation.result.headSha) {
+      return reject('head_sha_mismatch', 'Implementation and evaluation evidence were recorded for different heads.', {
+        implementationHeadSha: implementation.headSha,
+        evaluationHeadSha: evaluation.result.headSha,
+      });
+    }
+  }
+
+  const scopeGuard = requireImplementationWithinContractScope(implementation, contract);
+  if (!scopeGuard.accepted) return scopeGuard;
+
+  const subagentGuard = requireIsolatedCodexSubagents(bundle, subtaskId, implementation, evaluation);
+  if (!subagentGuard.accepted) return subagentGuard;
+
+  if (bundle.workflow.policy?.requireQuestionerAfterEvaluation) {
+    const questioner = latestQuestionerOutput(bundle, subtaskId, 'question_evaluation');
+    if (!questioner) {
+      return reject('blocking_question_unresolved', 'Claude Questioner must inspect evaluation evidence before completion.');
+    }
+    if (hasBlockingQuestions(questioner)) {
+      return reject('blocking_question_unresolved', 'Claude Questioner has unresolved blocking questions.', {
+        questionerOutputId: questioner.id,
+      });
+    }
+  }
+
+  return accept();
+}
+
+function requireIsolatedCodexSubagents(
+  bundle: MultiAgentWorkflowBundle,
+  subtaskId: string,
+  implementation: MultiAgentWorkflowEvidence,
+  evaluation: EvaluationRun,
+): GuardResult {
+  const builder = latestCompletedInvocation(bundle, subtaskId, (invocation) =>
+    invocation.role === 'executor'
+    && invocation.runner === 'codex'
+    && (invocation.evidenceRefs || []).includes(implementation.id)
+  );
+  if (!builder) {
+    return reject('missing_subagent_invocation', 'Subtask completion requires a completed Codex Builder subagent invocation linked to implementation evidence.', {
+      subtaskId,
+      evidenceId: implementation.id,
+    });
+  }
+
+  const evaluator = latestCompletedInvocation(bundle, subtaskId, (invocation) =>
+    invocation.role === 'evaluator'
+    && invocation.runner === 'codex-evaluator'
+    && invocation.evaluationRunId === evaluation.id
+  );
+  if (!evaluator) {
+    return reject('missing_subagent_invocation', 'Subtask completion requires a completed Codex Evaluator subagent invocation linked to the evaluation run.', {
+      subtaskId,
+      evaluationRunId: evaluation.id,
+    });
+  }
+
+  if (!builder.threadId || !evaluator.threadId) {
+    return reject('missing_subagent_invocation', 'Builder and Evaluator invocations must record their Codex subagent thread ids.', {
+      builderInvocationId: builder.id,
+      evaluatorInvocationId: evaluator.id,
+    });
+  }
+  if (builder.threadId === evaluator.threadId) {
+    return reject('subagent_thread_not_isolated', 'Builder and Evaluator must run in different Codex subagent threads.', {
+      builderInvocationId: builder.id,
+      evaluatorInvocationId: evaluator.id,
+      threadId: builder.threadId,
+    });
+  }
+
+  if (builder.headSha && implementation.headSha && builder.headSha !== implementation.headSha) {
+    return reject('head_sha_mismatch', 'Builder invocation head does not match implementation evidence head.', {
+      builderHeadSha: builder.headSha,
+      implementationHeadSha: implementation.headSha,
+    });
+  }
+  if (evaluator.headSha && evaluation.result?.headSha && evaluator.headSha !== evaluation.result.headSha) {
+    return reject('head_sha_mismatch', 'Evaluator invocation head does not match evaluation result head.', {
+      evaluatorHeadSha: evaluator.headSha,
+      evaluationHeadSha: evaluation.result.headSha,
+    });
+  }
+
+  const readonlyPolicy = evaluator.readonlyPolicy;
+  if (!readonlyPolicy?.enforced || (readonlyPolicy.violations?.length || 0) > 0) {
+    return reject('readonly_policy_violated', 'Codex Evaluator subagent invocation did not satisfy readonly policy.', {
+      evaluatorInvocationId: evaluator.id,
+      violations: readonlyPolicy?.violations || [],
+    });
+  }
+
+  return accept();
+}
+
+function guardCompleteWorkflowV1(
+  bundle: MultiAgentWorkflowBundle,
+  decision: WorkflowDecision,
+): GuardResult {
+  const evaluation = latestEvaluationRun(bundle, '__final__');
+  if (!evaluation?.result) {
+    return reject('missing_evaluation_result', 'Completing a v1 workflow requires a final Codex evaluation result.');
+  }
+  if (evaluation.status === 'invalidated' || !evaluation.readonlyPolicy.enforced || (evaluation.readonlyPolicy.violations?.length || 0) > 0) {
+    return reject('readonly_policy_violated', 'Final Codex evaluation readonly policy was not satisfied.', {
+      evaluationRunId: evaluation.id,
+      violations: evaluation.readonlyPolicy.violations || [],
+    });
+  }
+  if (evaluation.status !== 'passed' || evaluation.result.verdict !== 'pass') {
+    return reject('evaluation_not_passed', 'Completing a workflow requires a passing final Codex evaluation result.', {
+      evaluationRunId: evaluation.id,
+      status: evaluation.status,
+      verdict: evaluation.result.verdict,
+    });
+  }
+
+  const decisionHeadSha = readStringInput(decision.inputs, 'currentHeadSha')
+    || readStringInput(decision.inputs, 'headSha')
+    || bundle.workflow.currentHeadSha;
+  if (decisionHeadSha && evaluation.result.headSha && decisionHeadSha !== evaluation.result.headSha) {
+    return reject('head_sha_mismatch', 'Final evaluation head does not match workflow completion head.', {
+      expectedHeadSha: decisionHeadSha,
+      evaluationHeadSha: evaluation.result.headSha,
+    });
+  }
+
+  if (bundle.workflow.policy?.requireQuestionerAfterEvaluation) {
+    const questioner = latestQuestionerOutput(bundle, undefined, 'question_final_evidence');
+    if (!questioner) {
+      return reject('blocking_question_unresolved', 'Claude Questioner must inspect final evidence before workflow completion.');
+    }
+    if (hasBlockingQuestions(questioner)) {
+      return reject('blocking_question_unresolved', 'Claude Questioner has unresolved final blocking questions.', {
+        questionerOutputId: questioner.id,
+      });
+    }
+  }
+
+  return accept();
+}
+
+function requireAcceptedContractIfPolicyRequires(
+  bundle: MultiAgentWorkflowBundle,
+  subtaskId: string,
+): GuardResult {
+  if (!bundle.workflow.policy?.requireAcceptedContract) {
+    return accept();
+  }
+  const latest = latestContract(bundle, subtaskId);
+  if (!latest) {
+    return reject('missing_contract', `Subtask ${subtaskId} has no SprintContract.`);
+  }
+  if (latest.status !== 'accepted') {
+    return reject('contract_not_accepted', `Latest SprintContract ${latest.id} is ${latest.status}.`, {
+      contractId: latest.id,
+      status: latest.status,
     });
   }
   return accept();
@@ -318,6 +571,155 @@ function latestEvidenceForSubtask(
   return bundle.evidence
     .filter((item) => item.subtaskId === subtaskId && item.kind === kind && predicate(item))
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+}
+
+function latestCompletedInvocation(
+  bundle: MultiAgentWorkflowBundle,
+  subtaskId: string,
+  predicate: (item: MultiAgentWorkflowBundle['invocations'][number]) => boolean,
+): MultiAgentWorkflowBundle['invocations'][number] | undefined {
+  return bundle.invocations
+    .filter((item) => item.subtaskId === subtaskId && item.status === 'completed' && predicate(item))
+    .sort((left, right) => String(right.completedAt || right.updatedAt).localeCompare(String(left.completedAt || left.updatedAt)))[0];
+}
+
+function latestImplementationEvidence(
+  bundle: MultiAgentWorkflowBundle,
+  subtaskId: string,
+): MultiAgentWorkflowEvidence | undefined {
+  return latestEvidenceForSubtask(bundle, subtaskId, 'implementation')
+    || latestEvidenceForSubtask(bundle, subtaskId, 'fix');
+}
+
+function latestContract(
+  bundle: MultiAgentWorkflowBundle,
+  subtaskId: string,
+): SprintContract | undefined {
+  return bundle.contracts
+    .filter((contract) => contract.subtaskId === subtaskId)
+    .sort((left, right) => right.version - left.version || latestContractTime(right).localeCompare(latestContractTime(left)))[0];
+}
+
+function latestAcceptedContract(
+  bundle: MultiAgentWorkflowBundle,
+  subtaskId: string,
+): SprintContract | undefined {
+  return bundle.contracts
+    .filter((contract) => contract.subtaskId === subtaskId && contract.status === 'accepted')
+    .sort((left, right) => right.version - left.version || latestContractTime(right).localeCompare(latestContractTime(left)))[0];
+}
+
+function latestContractTime(contract: SprintContract): string {
+  return contract.acceptedAt || '';
+}
+
+function latestEvaluationRun(
+  bundle: MultiAgentWorkflowBundle,
+  subtaskId: string,
+): EvaluationRun | undefined {
+  return bundle.evaluationRuns
+    .filter((run) => run.subtaskId === subtaskId)
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
+}
+
+function latestQuestionerOutput(
+  bundle: MultiAgentWorkflowBundle,
+  subtaskId: string | undefined,
+  intent: QuestionerOutput['intent'],
+): QuestionerOutput | undefined {
+  return bundle.questionerOutputs
+    .filter((output) => output.subtaskId === subtaskId && output.intent === intent)
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+}
+
+function hasBlockingQuestions(output: QuestionerOutput): boolean {
+  return output.questions.some((question) => question.priority === 'blocking');
+}
+
+function requireImplementationWithinContractScope(
+  evidence: MultiAgentWorkflowEvidence,
+  contract: SprintContract,
+): GuardResult {
+  const changedFiles = readChangedFiles(evidence);
+  if (changedFiles.length === 0) {
+    return accept();
+  }
+  const allowedPaths = contract.scope.allowedPaths || [];
+  const blockedPaths = contract.scope.blockedPaths || [];
+  const blocked = changedFiles.filter((file) => matchesAnyPath(file, blockedPaths));
+  if (blocked.length > 0) {
+    return reject('worktree_out_of_scope', 'Implementation touched contract blocked paths.', {
+      blocked,
+      blockedPaths,
+    });
+  }
+  const outside = allowedPaths.length > 0
+    ? changedFiles.filter((file) => !matchesAnyPath(file, allowedPaths))
+    : [];
+  if (outside.length > 0) {
+    return reject('worktree_out_of_scope', 'Implementation changed files outside contract allowed paths.', {
+      outside,
+      allowedPaths,
+    });
+  }
+  return accept();
+}
+
+function readChangedFiles(evidence: MultiAgentWorkflowEvidence): string[] {
+  const changedFiles = evidence.payload?.changedFiles;
+  if (!Array.isArray(changedFiles)) {
+    return [];
+  }
+  return changedFiles
+    .map((entry) => {
+      if (typeof entry === 'string') return entry;
+      if (entry && typeof entry === 'object' && 'path' in entry && typeof entry.path === 'string') {
+        return entry.path;
+      }
+      return undefined;
+    })
+    .filter((entry): entry is string => Boolean(entry))
+    .map((entry) => entry.replace(/\\/g, '/').replace(/^\.\/+/, ''));
+}
+
+function matchesAnyPath(filePath: string, patterns: string[]): boolean {
+  const normalizedFile = filePath.replace(/\\/g, '/').replace(/^\.\/+/, '');
+  return patterns.some((pattern) => {
+    const normalizedPattern = pattern.replace(/\\/g, '/').replace(/^\.\/+/, '');
+    if (normalizedPattern.includes('*')) {
+      return globPathToRegExp(normalizedPattern).test(normalizedFile);
+    }
+    return normalizedPattern.endsWith('/')
+      ? normalizedFile === normalizedPattern.slice(0, -1) || normalizedFile.startsWith(normalizedPattern)
+      : normalizedFile === normalizedPattern || normalizedFile.startsWith(`${normalizedPattern}/`);
+  });
+}
+
+function globPathToRegExp(pattern: string): RegExp {
+  const source = pattern
+    .split(/(\*\*)/g)
+    .map((part) => {
+      if (part === '**') return '.*';
+      return part
+        .split('*')
+        .map(escapeRegExp)
+        .join('[^/]*');
+    })
+    .join('');
+  return new RegExp(`^${source}$`);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+}
+
+function usesCodexEvaluatorQuestionerGate(bundle: MultiAgentWorkflowBundle): boolean {
+  const policy = bundle.workflow.policy;
+  return Boolean(
+    policy?.requireAcceptedContract
+      || policy?.requireEvaluationPassForComplete
+      || policy?.requireQuestionerAfterEvaluation,
+  );
 }
 
 function requireEvidenceHeadMatchesDecision(

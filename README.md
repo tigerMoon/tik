@@ -8,6 +8,7 @@ Tik is a local-first engineering control plane for coding agents. It keeps work 
 - Providers: `codex` default, plus `claude`, `openai`, `codex-delegate`, and `mock`.
 - Workspace flow: split demand into projects, clarify/spec/plan/execute phases, managed worktree lanes.
 - Tracker flow: local Workbench tasks can be dispatched by `tik tracker tick/watch`.
+- Multi-agent workflow: TaskGraph/SprintContract execution with isolated Codex Builder/Evaluator subagent threads, readonly evaluation, Claude Questioner gates, evidence guards, and Dashboard timeline.
 - Dashboard: task timeline, workspace/project views, artifact review, decisions, and worktree lanes.
 - Tool safety: file tools and structured `glob`/`grep` resolve paths inside the workspace and reject traversal, absolute escapes, and symlink escapes.
 
@@ -22,7 +23,7 @@ tik/
 │   ├── ace/         # convergence/evaluation
 │   ├── cli/         # tik CLI
 │   └── dashboard/   # web dashboard
-├── codex-skill/     # Tik Claude-review Codex skill
+├── codex-skill/     # Tik multi-agent workflow and Claude-review Codex skills
 ├── claude-plugin/   # Claude Code review plugin
 ├── design/          # design notes and deeper plans
 ├── docs/            # supporting docs
@@ -68,6 +69,26 @@ Dashboard dev server runs at `http://localhost:5173` and proxies `/api` to `http
 
 ```bash
 VITE_API_BASE_URL=http://localhost:3001/api pnpm --filter @tik/dashboard dev
+```
+
+## Multi-Agent Workflow
+
+Tik can act as the durable control plane for governed multi-agent implementation workflows. In v1 policy mode, the core loop is:
+
+```text
+TaskGraph -> SprintContract -> Codex Builder -> readonly Codex Evaluator -> Claude Questioner -> complete_subtask -> final evaluation -> complete_workflow
+```
+
+The main Codex workflow thread owns orchestration and loop gates. Implementation and evaluation are recorded as separate Codex subagent invocations: Builder and Evaluator must use different `threadId`s, Evaluator is readonly/source-write forbidden, and Tik persists each invocation's `headSha`, evidence references, evaluation run, readonly policy result, guard decision, and timeline events. `complete_subtask` rejects missing evidence, same-thread Builder/Evaluator runs, mismatched heads, readonly violations, or blocking Questioner output.
+
+The Codex skill driver lives at [codex-skill/tik-multi-agent-workflow](./codex-skill/tik-multi-agent-workflow/README.md). Typical commands:
+
+```bash
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs init --goal "implement governed workflow" --path . --v1
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-builder --workflow <workflow-id> --subtask <id> --invocation inv-builder-<id> --thread <builder-thread-id>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute --workflow <workflow-id> --subtask <id> --changed-files "packages/kernel/src/server.ts" --invocation inv-builder-<id> --thread <builder-thread-id>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-evaluator --workflow <workflow-id> --subtask <id> --invocation inv-evaluator-<id> --thread <evaluator-thread-id>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs evaluate --workflow <workflow-id> --subtask <id> --command "pnpm test" --invocation inv-evaluator-<id> --thread <evaluator-thread-id>
 ```
 
 ## CLI Commands
