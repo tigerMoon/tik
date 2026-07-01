@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import type { EnvironmentPackManifest } from '@tik/shared';
-import { canArchiveWorkbenchTask, canRetryWorkbenchTask } from '@tik/shared';
+import { canRetryWorkbenchTask } from '@tik/shared';
 import type {
   UpdateWorkbenchTaskBriefResult,
   UpdateWorkbenchTaskConfigurationInput,
@@ -11,6 +11,8 @@ import type {
 } from '../../api/client';
 import {
   buildTaskStatusBannerSpec,
+  canArchiveWorkbenchTaskFromBanner,
+  DASHBOARD_AGENT_LOOP_APPROVE_COMMENT,
   getPreferredReviewArtifactId,
   type TaskStatusBannerAction,
 } from '../../view-models/workbench';
@@ -133,8 +135,11 @@ export function TaskDetailPanel(props: TaskDetailPanelProps) {
           await onRetryTask(task);
           break;
         case 'archive':
-          if (!canArchiveWorkbenchTask(task.status)) break;
+          if (!canArchiveWorkbenchTaskFromBanner(task)) break;
           await onArchiveTask(task);
+          break;
+        case 'approve-review':
+          await onAddTaskComment(task, DASHBOARD_AGENT_LOOP_APPROVE_COMMENT);
           break;
         case 'cancel':
         case 'stop':

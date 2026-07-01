@@ -1219,23 +1219,47 @@ export class WorkbenchService {
     }
 
     const force = options.force === true;
-    if (!force && !canArchiveWorkbenchTask(bundle.task.status)) {
+    const shouldApproveHumanReview = this.canArchiveAgentLoopHumanReview(bundle.task);
+    if (!force && !shouldApproveHumanReview && !canArchiveWorkbenchTask(bundle.task.status)) {
       throw new Error(`Workbench task ${taskId} cannot be archived from status ${bundle.task.status}`);
     }
 
     const updatedAt = new Date().toISOString();
-    const archiveSummary = force && !canArchiveWorkbenchTask(bundle.task.status)
+    const archiveSummary = shouldApproveHumanReview
+      ? 'Human review approved and archived from the active work queue.'
+      : force && !canArchiveWorkbenchTask(bundle.task.status)
       ? 'Stale task archived after its runtime record went missing.'
       : 'Task archived from the active work queue.';
     const archivedTask: WorkbenchTaskRecord = {
       ...bundle.task,
       status: 'archived',
+      labels: shouldApproveHumanReview
+        ? this.applyAgentLoopLabels(bundle.task.labels, 'complete')
+        : bundle.task.labels,
       updatedAt,
+      lastProgressAt: updatedAt,
       latestSummary: archiveSummary,
       waitingReason: undefined,
       waitingDecisionId: undefined,
+      agentLoop: shouldApproveHumanReview && bundle.task.agentLoop
+        ? {
+            ...bundle.task.agentLoop,
+            phase: 'complete',
+            nextReviewRound: undefined,
+          }
+        : bundle.task.agentLoop,
     };
 
+    if (shouldApproveHumanReview) {
+      await this.store.appendTimelineItem({
+        id: generateId(),
+        taskId,
+        kind: 'summary',
+        actor: 'user',
+        body: 'Human review approved before archive.',
+        createdAt: updatedAt,
+      });
+    }
     await this.cleanupInactiveTaskStateIfNeeded(archivedTask, 'human');
     await this.store.appendTimelineItem({
       id: generateId(),
@@ -1247,6 +1271,12 @@ export class WorkbenchService {
     });
     await this.store.upsertTask(archivedTask);
     return archivedTask;
+  }
+
+  private canArchiveAgentLoopHumanReview(task: WorkbenchTaskRecord): boolean {
+    return task.status === 'in_review'
+      && task.agentLoop?.kind === 'human_review'
+      && task.agentLoop.phase === 'needs_human_review';
   }
 
   private async drainEventQueue(): Promise<void> {

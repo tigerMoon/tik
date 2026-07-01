@@ -1,4 +1,4 @@
-import { extractModifiedFilesFromEvidenceBody, isWorkbenchTerminalStatus } from '@tik/shared';
+import { canArchiveWorkbenchTask, extractModifiedFilesFromEvidenceBody, isWorkbenchTerminalStatus } from '@tik/shared';
 import type {
   AgentLoopMetadata,
   WorkbenchArtifactRecord as SharedWorkbenchArtifactRecord,
@@ -26,6 +26,23 @@ export interface WorkbenchTaskSummary {
   agentLoop?: AgentLoopMetadata;
   lastAdjustment?: WorkbenchTaskAdjustmentRecord;
   comments?: WorkbenchTaskCommentRecord[];
+}
+
+export const DASHBOARD_AGENT_LOOP_APPROVE_COMMENT =
+  '/approve\nApproved from the Dashboard human review banner.';
+
+export function isAgentLoopHumanReviewReady(
+  task: Pick<WorkbenchTaskSummary, 'status' | 'agentLoop'>,
+): boolean {
+  return task.status === 'in_review'
+    && task.agentLoop?.kind === 'human_review'
+    && task.agentLoop.phase === 'needs_human_review';
+}
+
+export function canArchiveWorkbenchTaskFromBanner(
+  task: Pick<WorkbenchTaskSummary, 'status' | 'agentLoop'>,
+): boolean {
+  return canArchiveWorkbenchTask(task.status) || isAgentLoopHumanReviewReady(task);
 }
 
 export interface WorkbenchTimelineNode {
@@ -1526,6 +1543,7 @@ export type TaskStatusBannerActionKind = 'primary' | 'secondary' | 'danger';
 export type TaskStatusBannerAction =
   | { id: 'retry'; label: string; kind: TaskStatusBannerActionKind }
   | { id: 'archive'; label: string; kind: TaskStatusBannerActionKind }
+  | { id: 'approve-review'; label: string; kind: TaskStatusBannerActionKind }
   | { id: 'cancel'; label: string; kind: TaskStatusBannerActionKind }
   | { id: 'resume'; label: string; kind: TaskStatusBannerActionKind }
   | { id: 'open-review'; label: string; kind: TaskStatusBannerActionKind }
@@ -1553,6 +1571,7 @@ interface TaskStatusBannerInput {
   attempts?: Array<{ attemptNumber: number; outcome?: string; error?: string }>;
   blockedBy?: Array<{ state?: string | null }>;
   blockedByTaskIds?: string[];
+  agentLoop?: AgentLoopMetadata;
 }
 
 export function buildTaskStatusBannerSpec(
@@ -1599,6 +1618,20 @@ export function buildTaskStatusBannerSpec(
       };
 
     case 'in_review':
+      if (isAgentLoopHumanReviewReady(task)) {
+        return {
+          tone: 'yellow',
+          icon: '⚠',
+          headline: 'Human review',
+          detail: task.waitingReason?.trim() || 'Agent-loop review is ready for human approval or archive.',
+          actions: [
+            { id: 'approve-review', label: 'Approve', kind: 'primary' },
+            { id: 'archive', label: 'Archive', kind: 'secondary' },
+            { id: 'open-review', label: 'Open review', kind: 'secondary' },
+          ],
+          decisionDriven: false,
+        };
+      }
       return {
         tone: 'yellow',
         icon: '⚠',

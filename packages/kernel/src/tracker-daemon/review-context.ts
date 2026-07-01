@@ -183,13 +183,22 @@ function filterFilesByScope(
 
 function normalizeScopes(allowedScope: string[] | undefined): string[] {
   return (allowedScope || [])
-    .map((scope) => scope.trim().replace(/^\.?\//, '').replace(/\/+$/, ''))
+    .map((scope) => normalizeScope(scope))
     .filter(Boolean);
 }
 
 function isPathInScopes(filePath: string, scopes: string[]): boolean {
   const normalized = filePath.trim().replace(/^\.?\//, '');
   return scopes.some((scope) => normalized === scope || normalized.startsWith(`${scope}/`));
+}
+
+function normalizeScope(scope: string): string {
+  let normalized = scope.trim().replace(/^\.?\//, '');
+  normalized = normalized.replace(/\/\*\*\/\*$/, '');
+  normalized = normalized.replace(/\/\*\*$/, '');
+  normalized = normalized.replace(/\/\*$/, '');
+  normalized = normalized.replace(/\/+$/, '');
+  return normalized;
 }
 
 function statusFilePath(line: string): string {

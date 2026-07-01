@@ -416,6 +416,141 @@ describe('WorkbenchService agent loop work items', () => {
     expect(timeline.map((item) => item.body).join('\n')).toContain('Human review approved');
   });
 
+  it('archives a completed human review loop without reviving it to in_review', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-human-archive',
+    });
+    await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'approve',
+      headShaReviewed: 'abc123',
+      blockingIssues: [],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Ready for human review.',
+    });
+
+    await service.addComment(reviewTask.id, {
+      authorKind: 'human',
+      authorId: 'operator',
+      body: '/approve\nLooks good.',
+    });
+
+    const archived = await service.archiveTask(reviewTask.id);
+
+    expect(archived?.status).toBe('archived');
+    expect(archived?.agentLoop).toMatchObject({
+      kind: 'human_review',
+      phase: 'complete',
+    });
+    expect(archived?.labels).toEqual(['agent-loop', 'loop-complete']);
+    const stored = await service.readTask(reviewTask.id);
+    expect(stored?.status).toBe('archived');
+    const timeline = await service.readTimeline(reviewTask.id);
+    expect(timeline.map((item) => item.body).join('\n')).toContain('Task archived from the active work queue.');
+  });
+
+  it('lets a human archive the human review phase and records approval first', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-human-direct-archive',
+    });
+    await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'approve',
+      headShaReviewed: 'abc123',
+      blockingIssues: [],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Ready for human review.',
+    });
+
+    const archived = await service.archiveTask(reviewTask.id);
+
+    expect(archived?.status).toBe('archived');
+    expect(archived?.agentLoop).toMatchObject({
+      kind: 'human_review',
+      phase: 'complete',
+    });
+    expect(archived?.latestSummary).toBe('Human review approved and archived from the active work queue.');
+    const timeline = await service.readTimeline(reviewTask.id);
+    expect(timeline.map((item) => item.body).join('\n')).toContain('Human review approved before archive.');
+    expect(timeline.map((item) => item.body).join('\n')).toContain('Human review approved and archived from the active work queue.');
+  });
+
+  it('rejects direct archive for human review metadata outside the explicit human review phase', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-human-undefined-phase-archive',
+    });
+    await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'approve',
+      headShaReviewed: 'abc123',
+      blockingIssues: [],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Ready for human review.',
+    });
+
+    await service.addComment(reviewTask.id, {
+      authorKind: 'human',
+      authorId: 'operator',
+      body: '/approve\nApproved.',
+    });
+    await service.updateTaskTrackerMetadata(reviewTask.id, { status: 'in_review' });
+
+    await expect(service.archiveTask(reviewTask.id)).rejects.toThrow('cannot be archived from status in_review');
+
+    const stored = await service.readTask(reviewTask.id);
+    expect(stored).toMatchObject({
+      status: 'in_review',
+      agentLoop: {
+        phase: 'complete',
+      },
+    });
+  });
+
+  it('rejects direct archive when human review metadata has no explicit phase', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-human-missing-phase-archive',
+    });
+    await service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'approve',
+      headShaReviewed: 'abc123',
+      blockingIssues: [],
+      nonBlockingSuggestions: [],
+      testsNeeded: [],
+      markdown: 'Ready for human review.',
+    });
+    await service.updateTaskTrackerMetadata(reviewTask.id, { status: 'completed' });
+    await service.updateTaskTrackerMetadata(reviewTask.id, {
+      status: 'in_review',
+      labels: ['agent-loop', 'human-review'],
+    });
+
+    const stored = await service.readTask(reviewTask.id);
+    delete stored!.agentLoop!.phase;
+    await (service as unknown as { store: { upsertTask: (task: unknown) => Promise<void> } }).store.upsertTask(stored);
+
+    await expect(service.archiveTask(reviewTask.id)).rejects.toThrow('cannot be archived from status in_review');
+  });
+
   it('lets a human request another Codex pass from human review with /retry', async () => {
     const { service } = await makeService();
     const reviewTask = await service.createReviewRound({

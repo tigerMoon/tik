@@ -1,0 +1,5 @@
+version: 1
+agents:
+  default:
+    short_description: "Drive Tik multi-agent workflows"
+    default_prompt: "Use $tik-multi-agent-workflow to drive the workflow while Tik stores state and guardrails."

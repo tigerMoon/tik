@@ -4,6 +4,8 @@ import {
   allowedMetadataStatuses,
   buildRunProofPanelModel,
   buildTaskStatusBannerSpec,
+  canArchiveWorkbenchTaskFromBanner,
+  DASHBOARD_AGENT_LOOP_APPROVE_COMMENT,
   buildWorkbenchAcceptanceDigest,
   buildWorkbenchAcceptanceSummary,
   buildWorkbenchEvidenceDigest,
@@ -1074,11 +1076,13 @@ describe('task status banner spec', () => {
     waitingReason: string;
     attempts: Array<{ attemptNumber: number; outcome?: string; error?: string }>;
     blockedBy: Array<{ state?: string | null }>;
+    agentLoop: import('@tik/shared').AgentLoopMetadata;
   }> = {}) => ({
     status: overrides.status ?? 'todo' as import('@tik/shared').WorkbenchTaskStatus,
     waitingReason: overrides.waitingReason,
     attempts: overrides.attempts,
     blockedBy: overrides.blockedBy,
+    agentLoop: overrides.agentLoop,
   });
 
   it('returns null for active execution states (banner hidden)', () => {
@@ -1132,6 +1136,89 @@ describe('task status banner spec', () => {
     expect(spec!.detail).toBe('Latest review artifact needs acceptance.');
     expect(spec!.actions.map((action) => action.id)).toEqual(['open-review', 'stop']);
     expect(spec!.actions.find((action) => action.id === 'open-review')?.label).toBe('Open review');
+  });
+
+  it('renders agent-loop human review banner with approve and archive actions', () => {
+    const spec = buildTaskStatusBannerSpec(baseTask({
+      status: 'in_review',
+      agentLoop: {
+        kind: 'human_review',
+        phase: 'needs_human_review',
+        rootTaskId: 'TASK-123',
+        round: 1,
+        maxRounds: 3,
+        headSha: 'abc123',
+        idempotencyKey: 'review-human',
+        changeRequest: {
+          scm: 'internal',
+          repo: 'tik',
+          id: 'TASK-123:abc123',
+          type: 'internal_review',
+          baseRef: 'main',
+          headRef: 'codex/review',
+          headSha: 'abc123',
+        },
+      },
+    }));
+
+    expect(spec).not.toBeNull();
+    expect(spec!.headline).toBe('Human review');
+    expect(spec!.actions.map((action) => action.id)).toEqual(['approve-review', 'archive', 'open-review']);
+  });
+
+  it('falls back to the default review banner when human review phase is not explicit', () => {
+    const spec = buildTaskStatusBannerSpec(baseTask({
+      status: 'in_review',
+      agentLoop: {
+        kind: 'human_review',
+        phase: 'complete',
+        rootTaskId: 'TASK-123',
+        round: 1,
+        maxRounds: 3,
+        headSha: 'abc123',
+        idempotencyKey: 'review-human-complete',
+        changeRequest: {
+          scm: 'internal',
+          repo: 'tik',
+          id: 'TASK-123:abc123',
+          type: 'internal_review',
+          baseRef: 'main',
+          headRef: 'codex/review',
+          headSha: 'abc123',
+        },
+      },
+    }));
+
+    expect(spec).not.toBeNull();
+    expect(spec!.headline).toBe('In review');
+    expect(spec!.actions.map((action) => action.id)).toEqual(['open-review', 'stop']);
+  });
+
+  it('centralizes dashboard archive and approve-review action protocol', () => {
+    expect(canArchiveWorkbenchTaskFromBanner(baseTask({ status: 'completed' }))).toBe(true);
+    expect(canArchiveWorkbenchTaskFromBanner(baseTask({ status: 'in_review' }))).toBe(false);
+    expect(canArchiveWorkbenchTaskFromBanner(baseTask({
+      status: 'in_review',
+      agentLoop: {
+        kind: 'human_review',
+        phase: 'needs_human_review',
+        rootTaskId: 'TASK-123',
+        round: 1,
+        maxRounds: 3,
+        headSha: 'abc123',
+        idempotencyKey: 'review-human-archive',
+        changeRequest: {
+          scm: 'internal',
+          repo: 'tik',
+          id: 'TASK-123:abc123',
+          type: 'internal_review',
+          baseRef: 'main',
+          headRef: 'codex/review',
+          headSha: 'abc123',
+        },
+      },
+    }))).toBe(true);
+    expect(DASHBOARD_AGENT_LOOP_APPROVE_COMMENT).toContain('/approve');
   });
 
   it('renders failed banner with retry + cancel and surfaces last attempt error', () => {

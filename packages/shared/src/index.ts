@@ -34,6 +34,9 @@ export * from './types/subtask.js';
 // Workbench
 export * from './types/workbench.js';
 
+// Multi-agent workflow coordination
+export * from './types/multi-agent.js';
+
 // Environment Packs
 export * from './types/environment-pack.js';
 
