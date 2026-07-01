@@ -213,6 +213,11 @@ interface RecordQuestionerOutputBody {
   subtaskId?: string;
   intent: QuestionerOutput['intent'];
   actor: QuestionerOutput['actor'];
+  source?: QuestionerOutput['source'];
+  headSha?: string;
+  evaluationRunId?: string;
+  contractId?: string;
+  artifactRef?: string;
   verdict: QuestionerOutput['verdict'];
   questions?: QuestionerOutput['questions'];
   risks?: QuestionerOutput['risks'];
@@ -263,10 +268,13 @@ interface CreateAgentInvocationBody {
   allowedPaths?: string[];
   validationCommands?: string[];
   threadId?: string;
+  actualSubagentThreadId?: string;
+  parentThreadId?: string;
   headSha?: string;
   evidenceRefs?: string[];
   evaluationRunId?: string;
   readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
+  runtimeAttestation?: AgentInvocationRecord['runtimeAttestation'];
 }
 
 interface UpdateAgentInvocationBody {
@@ -274,10 +282,17 @@ interface UpdateAgentInvocationBody {
   result?: Record<string, unknown>;
   error?: string;
   threadId?: string;
+  actualSubagentThreadId?: string;
+  parentThreadId?: string;
   headSha?: string;
   evidenceRefs?: string[];
   evaluationRunId?: string;
   readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
+  runtimeAttestation?: AgentInvocationRecord['runtimeAttestation'];
+}
+
+interface StartAgentInvocationBody {
+  runtimeAttestation?: AgentInvocationRecord['runtimeAttestation'];
 }
 
 interface CreateArtifactBody {
@@ -1399,12 +1414,13 @@ export async function createServer(
     },
   );
 
-  fastify.post<{ Params: { workflowId: string; invocationId: string } }>(
+  fastify.post<{ Params: { workflowId: string; invocationId: string }; Body: StartAgentInvocationBody }>(
     '/api/v1/multi-agent/workflows/:workflowId/agent-invocations/:invocationId/start',
     async (req, reply) => {
       try {
         const invocation = await multiAgentStore.updateInvocation(req.params.workflowId, req.params.invocationId, {
           status: 'started',
+          runtimeAttestation: req.body?.runtimeAttestation,
         });
         return { invocation };
       } catch (error) {
@@ -1428,10 +1444,13 @@ export async function createServer(
           result: req.body.result,
           error: req.body.error,
           threadId: req.body.threadId,
+          actualSubagentThreadId: req.body.actualSubagentThreadId,
+          parentThreadId: req.body.parentThreadId,
           headSha: req.body.headSha,
           evidenceRefs: req.body.evidenceRefs,
           evaluationRunId: req.body.evaluationRunId,
           readonlyPolicy: req.body.readonlyPolicy,
+          runtimeAttestation: req.body.runtimeAttestation,
         });
         const taskGraph = invocation.role === 'planner' && invocation.status === 'completed'
           ? extractTaskGraphFromInvocationResult(invocation.result)

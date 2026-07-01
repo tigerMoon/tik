@@ -490,6 +490,8 @@ try {
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
     '--invocation', 'inv-builder-cli',
+    '--runtime-attested',
+    '--parent-thread', 'workflow-thread-cli',
     '--thread', 'builder-thread-cli',
     '--path', repo,
   ]);
@@ -505,6 +507,8 @@ try {
     '--summary', 'Implemented API',
     '--changed-files', 'packages/kernel/src/multi-agent/guard.ts,packages/kernel/src/server.ts',
     '--invocation', 'inv-builder-cli',
+    '--runtime-attested',
+    '--parent-thread', 'workflow-thread-cli',
     '--thread', 'builder-thread-cli',
   ]);
   assert.equal(execute.action, 'execution-recorded');
@@ -788,6 +792,8 @@ try {
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
     '--invocation', 'inv-evaluator-cli',
+    '--runtime-attested',
+    '--parent-thread', 'workflow-thread-cli',
     '--thread', 'evaluator-thread-cli',
     '--path', repo,
   ]);
@@ -803,6 +809,8 @@ try {
     '--evaluation', 'eval-st-api-v1',
     '--command', `${process.execPath} -e "process.exit(0)"`,
     '--invocation', 'inv-evaluator-cli',
+    '--runtime-attested',
+    '--parent-thread', 'workflow-thread-cli',
     '--thread', 'evaluator-thread-cli',
   ]);
   assert.equal(evaluated.action, 'evaluation-recorded');
@@ -819,6 +827,11 @@ try {
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
     '--intent', 'question_evaluation',
+    '--invocation', 'claude-questioner-cli',
+    '--head-sha', 'head-v1',
+    '--contract', 'contract-st-api-v1',
+    '--evaluation', 'eval-st-api-v1',
+    '--artifact-ref', '.tik/multi-agent/workflows/wf-cli/questioner/q-cli.json',
     '--verdict', 'evidence_sufficient',
   ]);
   assert.equal(questioned.action, 'questioner-output-recorded');
@@ -851,6 +864,10 @@ try {
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
     '--intent', 'question_final_evidence',
+    '--invocation', 'claude-final-questioner-cli',
+    '--head-sha', 'head-v1',
+    '--evaluation', 'eval-final-v1',
+    '--artifact-ref', '.tik/multi-agent/workflows/wf-cli/questioner/q-final-cli.json',
     '--verdict', 'evidence_sufficient',
   ]);
   assert.equal(finalQuestioned.action, 'questioner-output-recorded');

@@ -72,6 +72,7 @@ export type GuardResultCode =
   | 'missing_implementation_evidence'
   | 'missing_evaluation_result'
   | 'evaluation_not_passed'
+  | 'evaluation_evidence_insufficient'
   | 'blocking_question_unresolved'
   | 'head_sha_mismatch'
   | 'readonly_policy_violated'
@@ -238,6 +239,8 @@ export interface AgentInvocationRecord {
   allowedPaths?: string[];
   validationCommands?: string[];
   threadId?: string;
+  actualSubagentThreadId?: string;
+  parentThreadId?: string;
   headSha?: string;
   evidenceRefs?: string[];
   evaluationRunId?: string;
@@ -247,6 +250,7 @@ export interface AgentInvocationRecord {
     forbiddenWritePaths?: string[];
     violations?: string[];
   };
+  runtimeAttestation?: SubagentRuntimeAttestation;
   status: MultiAgentInvocationStatus;
   result?: Record<string, unknown>;
   error?: string;
@@ -254,6 +258,18 @@ export interface AgentInvocationRecord {
   updatedAt: string;
   startedAt?: string;
   completedAt?: string;
+}
+
+export interface SubagentRuntimeAttestation {
+  source: 'codex-subagent-runtime' | 'codex-plugin-hook';
+  parentThreadId: string;
+  actualSubagentThreadId: string;
+  role: MultiAgentInvocationRole;
+  startedAt: string;
+  stoppedAt?: string;
+  headSha?: string;
+  evidenceRefs?: string[];
+  readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
 }
 
 export interface TaskGraphPatch {
@@ -524,6 +540,11 @@ export interface QuestionerOutput {
     kind: 'claude-code-questioner';
     invocationId?: string;
   };
+  source?: 'claude-plugin';
+  headSha?: string;
+  evaluationRunId?: string;
+  contractId?: string;
+  artifactRef?: string;
   verdict:
     | 'need_clarification'
     | 'contract_ready'

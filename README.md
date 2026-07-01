@@ -79,16 +79,16 @@ Tik can act as the durable control plane for governed multi-agent implementation
 TaskGraph -> SprintContract -> Codex Builder -> readonly Codex Evaluator -> Claude Questioner -> complete_subtask -> final evaluation -> complete_workflow
 ```
 
-The main Codex workflow thread owns orchestration and loop gates. Implementation and evaluation are recorded as separate Codex subagent invocations: Builder and Evaluator must use different `threadId`s, Evaluator is readonly/source-write forbidden, and Tik persists each invocation's `headSha`, evidence references, evaluation run, readonly policy result, guard decision, and timeline events. `complete_subtask` rejects missing evidence, same-thread Builder/Evaluator runs, mismatched heads, readonly violations, or blocking Questioner output.
+The main Codex workflow thread owns orchestration and loop gates. Implementation and evaluation are recorded as runtime-attested Codex subagent invocations: Builder and Evaluator must have different actual subagent thread ids, Evaluator is readonly/source-write forbidden, and Tik persists each invocation's `headSha`, evidence references, evaluation run, readonly policy result, guard decision, and timeline events. `complete_subtask` rejects missing evidence, hand-filled thread ids without runtime attestation, same-thread Builder/Evaluator runs, mismatched heads, readonly violations, thin evaluation evidence, or blocking Questioner output.
 
 The Codex skill driver lives at [codex-skill/tik-multi-agent-workflow](./codex-skill/tik-multi-agent-workflow/README.md). Typical commands:
 
 ```bash
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs init --goal "implement governed workflow" --path . --v1
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-builder --workflow <workflow-id> --subtask <id> --invocation inv-builder-<id> --thread <builder-thread-id>
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute --workflow <workflow-id> --subtask <id> --changed-files "packages/kernel/src/server.ts" --invocation inv-builder-<id> --thread <builder-thread-id>
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-evaluator --workflow <workflow-id> --subtask <id> --invocation inv-evaluator-<id> --thread <evaluator-thread-id>
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs evaluate --workflow <workflow-id> --subtask <id> --command "pnpm test" --invocation inv-evaluator-<id> --thread <evaluator-thread-id>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-builder --workflow <workflow-id> --subtask <id> --invocation inv-builder-<id> --runtime-attested --parent-thread <workflow-thread-id> --thread <builder-thread-id>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute --workflow <workflow-id> --subtask <id> --invocation inv-builder-<id> --runtime-attested --parent-thread <workflow-thread-id> --thread <builder-thread-id>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-evaluator --workflow <workflow-id> --subtask <id> --invocation inv-evaluator-<id> --runtime-attested --parent-thread <workflow-thread-id> --thread <evaluator-thread-id>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs evaluate --workflow <workflow-id> --subtask <id> --command "pnpm test" --invocation inv-evaluator-<id> --runtime-attested --parent-thread <workflow-thread-id> --thread <evaluator-thread-id>
 ```
 
 ## CLI Commands

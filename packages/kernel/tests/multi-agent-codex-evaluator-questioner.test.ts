@@ -287,6 +287,11 @@ describe('codex evaluator and Claude questioner workflow', () => {
         subtaskId: 'st-api',
         intent: 'question_evaluation',
         actor: { kind: 'claude-code-questioner', invocationId: 'claude-q-1' },
+        source: 'claude-plugin',
+        headSha: 'head-1',
+        evaluationRunId: 'eval-pass',
+        contractId: 'contract-st-api-v1',
+        artifactRef: 'questioner://claude-q-1',
         verdict: 'need_clarification',
         questions: [
           {
@@ -331,6 +336,11 @@ describe('codex evaluator and Claude questioner workflow', () => {
         subtaskId: 'st-api',
         intent: 'question_evaluation',
         actor: { kind: 'claude-code-questioner', invocationId: 'claude-q-2' },
+        source: 'claude-plugin',
+        headSha: 'head-1',
+        evaluationRunId: 'eval-pass',
+        contractId: 'contract-st-api-v1',
+        artifactRef: 'questioner://claude-q-2',
         verdict: 'evidence_sufficient',
         questions: [],
         risks: [],
@@ -511,8 +521,8 @@ describe('codex evaluator and Claude questioner workflow', () => {
       code: 'missing_subagent_invocation',
     });
 
-    await createCompletedInvocation(server, 'wf-subagent-isolation', {
-      id: 'inv-builder-threaded',
+    const manualBuilder = await createInvocationRecord(server, 'wf-subagent-isolation', {
+      id: 'inv-builder-manual-start',
       subtaskId: 'st-api',
       role: 'executor',
       runner: 'codex',
@@ -521,36 +531,14 @@ describe('codex evaluator and Claude questioner workflow', () => {
       headSha: 'head-1',
       evidenceRefs: ['ev-impl'],
     });
-    await createCompletedInvocation(server, 'wf-subagent-isolation', {
-      id: 'inv-evaluator-missing-thread',
-      subtaskId: 'st-api',
-      role: 'evaluator',
-      runner: 'codex-evaluator',
-      promptContract: 'codex-evaluator.v1',
-      headSha: 'head-1',
-      evaluationRunId: 'eval-pass',
-      readonlyPolicy: { enforced: true, violations: [] },
-    });
-
-    const missingThread = await server.inject({
+    expect(manualBuilder.statusCode).toBe(200);
+    const missingRuntimeThread = await server.inject({
       method: 'POST',
-      url: '/api/v1/multi-agent/workflows/wf-subagent-isolation/decisions/preflight',
-      payload: {
-        decision: buildDecision('wf-subagent-isolation', {
-          id: 'dec-complete-missing-thread',
-          action: 'complete_subtask',
-          subtaskId: 'st-api',
-          reason: 'Builder and Evaluator invocations must include Codex subagent thread ids.',
-          evidenceRefs: ['ev-impl'],
-          inputs: { currentHeadSha: 'head-1' },
-        }),
-      },
+      url: '/api/v1/multi-agent/workflows/wf-subagent-isolation/agent-invocations/inv-builder-manual-start/start',
+      payload: {},
     });
-    expect(missingThread.statusCode).toBe(409);
-    expect(missingThread.json().guard).toMatchObject({
-      accepted: false,
-      code: 'missing_subagent_invocation',
-    });
+    expect(missingRuntimeThread.statusCode).toBe(409);
+    expect(missingRuntimeThread.json().error).toMatchObject({ code: 'missing_subagent_invocation' });
 
     await createCompletedInvocation(server, 'wf-subagent-isolation', {
       id: 'inv-builder',
@@ -625,6 +613,334 @@ describe('codex evaluator and Claude questioner workflow', () => {
     expect(complete.json().guard).toMatchObject({
       accepted: true,
       code: 'ok',
+    });
+  });
+
+  it('rejects v1 subtask completion when implementation evidence has no derived changed files', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-empty-changes', root);
+    await putSingleSubtaskGraph(server, 'wf-empty-changes');
+    await createAcceptedContract(server, 'wf-empty-changes');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-empty-changes/evidence',
+      payload: {
+        id: 'ev-empty-impl',
+        kind: 'implementation',
+        title: 'Implementation with omitted changed files',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {},
+      },
+    });
+    await moveSubtaskToQuestioningEvidence(server, 'wf-empty-changes', 'st-api', 'ev-empty-impl');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-empty-changes/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-empty-changes',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-empty-changes' },
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-empty-changes', 'eval-empty-changes');
+    await recordClearQuestioner(server, 'wf-empty-changes', 'q-empty-changes', {
+      evaluationRunId: 'eval-empty-changes',
+    });
+    await createCompletedInvocation(server, 'wf-empty-changes', {
+      id: 'inv-builder-empty-changes',
+      subtaskId: 'st-api',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+      threadId: 'builder-thread-empty-changes',
+      headSha: 'head-1',
+      evidenceRefs: ['ev-empty-impl'],
+    });
+    await createCompletedInvocation(server, 'wf-empty-changes', {
+      id: 'inv-evaluator-empty-changes',
+      subtaskId: 'st-api',
+      role: 'evaluator',
+      runner: 'codex-evaluator',
+      promptContract: 'codex-evaluator.v1',
+      threadId: 'evaluator-thread-empty-changes',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-empty-changes',
+      readonlyPolicy: { enforced: true, violations: [] },
+    });
+
+    const complete = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-empty-changes/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-empty-changes', {
+          id: 'dec-complete-empty-changes',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Implementation evidence with omitted changed files must not bypass scope guard.',
+          evidenceRefs: ['ev-empty-impl'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+
+    expect(complete.statusCode).toBe(409);
+    expect(complete.json().guard).toMatchObject({
+      accepted: false,
+      code: 'missing_implementation_evidence',
+    });
+  });
+
+  it('rejects v1 subtask completion when a passing evaluation lacks must-criteria coverage and real evidence', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-thin-evaluation', root);
+    await putSingleSubtaskGraph(server, 'wf-thin-evaluation');
+    await createAcceptedContract(server, 'wf-thin-evaluation');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-thin-evaluation/evidence',
+      payload: {
+        id: 'ev-thin-impl',
+        kind: 'implementation',
+        title: 'Implementation evidence',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    await moveSubtaskToQuestioningEvidence(server, 'wf-thin-evaluation', 'st-api', 'ev-thin-impl');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-thin-evaluation/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-thin-pass',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-thin-pass' },
+      },
+    });
+    const thinResult = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-thin-evaluation/subtasks/st-api/evaluations/eval-thin-pass/result',
+      payload: {
+        result: {
+          workflowId: 'wf-thin-evaluation',
+          subtaskId: 'st-api',
+          contractId: 'contract-st-api-v1',
+          evaluatorRunId: 'eval-thin-pass',
+          headSha: 'head-1',
+          verdict: 'pass',
+          criteriaResults: [],
+          commandResults: [],
+          runtimeFindings: [],
+          coverageGaps: [],
+          confidence: 0.9,
+        },
+      },
+    });
+    expect(thinResult.statusCode).toBe(200);
+
+    await recordClearQuestioner(server, 'wf-thin-evaluation', 'q-thin-clear', {
+      evaluationRunId: 'eval-thin-pass',
+    });
+    await createCompletedInvocation(server, 'wf-thin-evaluation', {
+      id: 'inv-builder-thin',
+      subtaskId: 'st-api',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+      threadId: 'builder-thread-thin',
+      headSha: 'head-1',
+      evidenceRefs: ['ev-thin-impl'],
+    });
+    await createCompletedInvocation(server, 'wf-thin-evaluation', {
+      id: 'inv-evaluator-thin',
+      subtaskId: 'st-api',
+      role: 'evaluator',
+      runner: 'codex-evaluator',
+      promptContract: 'codex-evaluator.v1',
+      threadId: 'evaluator-thread-thin',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-thin-pass',
+      readonlyPolicy: { enforced: true, violations: [] },
+    });
+
+    const complete = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-thin-evaluation/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-thin-evaluation', {
+          id: 'dec-complete-thin-evaluation',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Passing verdict without criteria/evidence must not complete.',
+          evidenceRefs: ['ev-thin-impl'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+
+    expect(complete.statusCode).toBe(409);
+    expect(complete.json().guard).toMatchObject({
+      accepted: false,
+      code: 'evaluation_evidence_insufficient',
+    });
+  });
+
+  it('rejects hand-filled subagent thread ids without runtime attestation', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-manual-thread-ids', root);
+    await putSingleSubtaskGraph(server, 'wf-manual-thread-ids');
+    await createAcceptedContract(server, 'wf-manual-thread-ids');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-manual-thread-ids/evidence',
+      payload: {
+        id: 'ev-manual-impl',
+        kind: 'implementation',
+        title: 'Implementation evidence',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    await moveSubtaskToQuestioningEvidence(server, 'wf-manual-thread-ids', 'st-api', 'ev-manual-impl');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-manual-thread-ids/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-manual-thread-ids',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-manual-thread-ids' },
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-manual-thread-ids', 'eval-manual-thread-ids');
+    await recordClearQuestioner(server, 'wf-manual-thread-ids', 'q-manual-thread-ids', {
+      evaluationRunId: 'eval-manual-thread-ids',
+    });
+    const manualBuilder = await createInvocationRecord(server, 'wf-manual-thread-ids', {
+      id: 'inv-builder-manual',
+      subtaskId: 'st-api',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+      threadId: 'builder-thread-manual',
+      headSha: 'head-1',
+      evidenceRefs: ['ev-manual-impl'],
+    });
+    expect(manualBuilder.statusCode).toBe(200);
+    const manualStart = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-manual-thread-ids/agent-invocations/inv-builder-manual/start',
+      payload: {},
+    });
+    expect(manualStart.statusCode).toBe(409);
+    expect(manualStart.json().error).toMatchObject({ code: 'missing_subagent_invocation' });
+
+    const manualEvaluator = await createInvocationRecord(server, 'wf-manual-thread-ids', {
+      id: 'inv-evaluator-manual',
+      subtaskId: 'st-api',
+      role: 'evaluator',
+      runner: 'codex-evaluator',
+      promptContract: 'codex-evaluator.v1',
+      threadId: 'evaluator-thread-manual',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-manual-thread-ids',
+      readonlyPolicy: { enforced: true, violations: [] },
+    });
+    expect(manualEvaluator.statusCode).toBe(200);
+
+    const complete = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-manual-thread-ids/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-manual-thread-ids', {
+          id: 'dec-complete-manual-thread-ids',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Hand-filled thread ids without runtime hook attestation must not complete.',
+          evidenceRefs: ['ev-manual-impl'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+
+    expect(complete.statusCode).toBe(409);
+    expect(complete.json().guard).toMatchObject({
+      accepted: false,
+      code: 'missing_subagent_invocation',
+    });
+  });
+
+  it('guards v1 intermediate evaluator and final-evaluation actions', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-action-guards', root);
+    await putSingleSubtaskGraph(server, 'wf-action-guards');
+    await createAcceptedContract(server, 'wf-action-guards');
+
+    const evaluatorBeforeImplementation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-action-guards/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-action-guards', {
+          id: 'dec-run-evaluator-before-implementation',
+          action: 'run_codex_evaluator',
+          subtaskId: 'st-api',
+          reason: 'Evaluator requires implementation evidence first.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(evaluatorBeforeImplementation.statusCode).toBe(409);
+    expect(evaluatorBeforeImplementation.json().guard).toMatchObject({
+      accepted: false,
+      code: 'missing_implementation_evidence',
+    });
+
+    const finalEvaluationBeforeDone = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-action-guards/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-action-guards', {
+          id: 'dec-run-final-before-done',
+          action: 'run_final_evaluation',
+          reason: 'Final evaluation requires all subtasks done.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(finalEvaluationBeforeDone.statusCode).toBe(409);
+    expect(finalEvaluationBeforeDone.json().guard).toMatchObject({
+      accepted: false,
+      code: 'invalid_transition',
     });
   });
 
@@ -718,6 +1034,11 @@ describe('codex evaluator and Claude questioner workflow', () => {
         id: 'q-final-clear',
         intent: 'question_final_evidence',
         actor: { kind: 'claude-code-questioner', invocationId: 'claude-final-q' },
+        source: 'claude-plugin',
+        headSha: 'head-1',
+        evaluationRunId: 'eval-final-pass',
+        contractId: '__final__',
+        artifactRef: 'questioner://claude-final-q',
         verdict: 'evidence_sufficient',
         questions: [],
         risks: [],
@@ -966,6 +1287,11 @@ async function recordClearQuestioner(
   server: { inject: (input: any) => Promise<any> },
   workflowId: string,
   questionerId: string,
+  options: {
+    evaluationRunId?: string;
+    contractId?: string;
+    headSha?: string;
+  } = {},
 ) {
   const response = await server.inject({
     method: 'POST',
@@ -975,6 +1301,11 @@ async function recordClearQuestioner(
       subtaskId: 'st-api',
       intent: 'question_evaluation',
       actor: { kind: 'claude-code-questioner', invocationId: questionerId },
+      source: 'claude-plugin',
+      headSha: options.headSha || 'head-1',
+      evaluationRunId: options.evaluationRunId || 'eval-pass',
+      contractId: options.contractId || 'contract-st-api-v1',
+      artifactRef: `questioner://${questionerId}`,
       verdict: 'evidence_sufficient',
       questions: [],
       risks: [],
@@ -1002,29 +1333,29 @@ async function createCompletedInvocation(
       enforced: boolean;
       violations: string[];
     };
+    runtimeAttested?: boolean;
   },
 ) {
-  const created = await server.inject({
-    method: 'POST',
-    url: `/api/v1/multi-agent/workflows/${workflowId}/agent-invocations`,
-    payload: {
-      id: input.id,
-      subtaskId: input.subtaskId,
+  const runtimeAttestation = input.runtimeAttested === false
+    ? undefined
+    : {
+      source: 'codex-subagent-runtime',
+      parentThreadId: `parent-${workflowId}`,
+      actualSubagentThreadId: input.threadId,
       role: input.role,
-      runner: input.runner,
-      promptContract: input.promptContract,
-      threadId: input.threadId,
-      headSha: input.headSha,
-      evidenceRefs: input.evidenceRefs,
-      evaluationRunId: input.evaluationRunId,
-      readonlyPolicy: input.readonlyPolicy,
-    },
+      startedAt: '2026-07-01T00:00:00.000Z',
+      stoppedAt: '2026-07-01T00:01:00.000Z',
+    };
+  const created = await createInvocationRecord(server, workflowId, {
+    ...input,
+    runtimeAttestation,
   });
   expect(created.statusCode).toBe(200);
 
   const started = await server.inject({
     method: 'POST',
     url: `/api/v1/multi-agent/workflows/${workflowId}/agent-invocations/${input.id}/start`,
+    payload: runtimeAttestation ? { runtimeAttestation } : {},
   });
   expect(started.statusCode).toBe(200);
 
@@ -1039,11 +1370,52 @@ async function createCompletedInvocation(
         evidenceRefs: input.evidenceRefs,
         evaluationRunId: input.evaluationRunId,
         readonlyPolicy: input.readonlyPolicy,
+        runtimeAttestation,
       },
+      runtimeAttestation,
     },
   });
   expect(completed.statusCode).toBe(200);
   return completed;
+}
+
+async function createInvocationRecord(
+  server: { inject: (input: any) => Promise<any> },
+  workflowId: string,
+  input: {
+    id: string;
+    subtaskId: string;
+    role: 'executor' | 'evaluator';
+    runner: 'codex' | 'codex-evaluator';
+    promptContract: string;
+    threadId?: string;
+    headSha: string;
+    evidenceRefs?: string[];
+    evaluationRunId?: string;
+    readonlyPolicy?: {
+      enforced: boolean;
+      violations: string[];
+    };
+    runtimeAttestation?: Record<string, unknown>;
+  },
+) {
+  return server.inject({
+    method: 'POST',
+    url: `/api/v1/multi-agent/workflows/${workflowId}/agent-invocations`,
+    payload: {
+      id: input.id,
+      subtaskId: input.subtaskId,
+      role: input.role,
+      runner: input.runner,
+      promptContract: input.promptContract,
+      threadId: input.threadId,
+      headSha: input.headSha,
+      evidenceRefs: input.evidenceRefs,
+      evaluationRunId: input.evaluationRunId,
+      readonlyPolicy: input.readonlyPolicy,
+      runtimeAttestation: input.runtimeAttestation,
+    },
+  });
 }
 
 async function moveSubtaskToDone(

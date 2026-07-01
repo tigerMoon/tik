@@ -111,19 +111,66 @@ function validateActionTransition(
         'blocked',
       ]);
 
-    case 'draft_contract':
-    case 'ask_claude_question_contract':
-    case 'accept_contract':
-    case 'record_implementation':
-    case 'run_codex_evaluator':
-    case 'ask_claude_question_evaluation':
-    case 'fix_evaluation_findings':
-    case 're_evaluate':
     case 'ask_claude_question_requirement':
     case 'ask_claude_question_task_graph':
-    case 'run_final_evaluation':
-    case 'ask_claude_question_final_evidence':
       return accept();
+
+    case 'draft_contract':
+      return requireSubtaskStatus(bundle, decision, ['pending', 'ready', 'contract_drafting', 'contract_questioning']);
+
+    case 'ask_claude_question_contract': {
+      const statusGuard = requireSubtaskStatus(bundle, decision, ['contract_drafting', 'contract_questioning']);
+      if (!statusGuard.accepted) return statusGuard;
+      return decision.subtaskId && latestContract(bundle, decision.subtaskId)
+        ? accept()
+        : reject('missing_contract', 'Questioning a contract requires a drafted SprintContract.');
+    }
+
+    case 'accept_contract': {
+      const statusGuard = requireSubtaskStatus(bundle, decision, ['contract_drafting', 'contract_questioning']);
+      if (!statusGuard.accepted) return statusGuard;
+      const contract = decision.subtaskId ? latestContract(bundle, decision.subtaskId) : undefined;
+      if (!contract) {
+        return reject('missing_contract', 'Accepting a contract requires a drafted SprintContract.');
+      }
+      const questioner = latestQuestionerOutput(bundle, decision.subtaskId, 'question_contract');
+      if (questioner && hasBlockingQuestions(questioner) && !bundle.workflow.policy?.allowHumanOverride) {
+        return reject('blocking_question_unresolved', 'Contract has unresolved blocking Questioner output.', {
+          questionerOutputId: questioner.id,
+        });
+      }
+      return accept();
+    }
+
+    case 'record_implementation':
+      return guardCanRecordImplementation(bundle, decision);
+
+    case 'run_codex_evaluator':
+    case 're_evaluate':
+      return guardCanRunCodexEvaluator(bundle, decision);
+
+    case 'ask_claude_question_evaluation':
+      return guardCanQuestionEvaluation(bundle, decision);
+
+    case 'fix_evaluation_findings':
+      return guardCanFixEvaluationFindings(bundle, decision);
+
+    case 'run_final_evaluation':
+      if (!allSubtasksDone(bundle)) {
+        return reject('invalid_transition', 'Final Codex evaluation requires all subtasks to be done.');
+      }
+      return accept();
+
+    case 'ask_claude_question_final_evidence': {
+      if (!allSubtasksDone(bundle)) {
+        return reject('invalid_transition', 'Final evidence questioning requires all subtasks to be done.');
+      }
+      const evaluation = latestEvaluationRun(bundle, '__final__');
+      if (!evaluation?.result) {
+        return reject('missing_evaluation_result', 'Final evidence questioning requires a final Codex evaluation result.');
+      }
+      return accept();
+    }
 
     case 'validate_subtask':
       if (hasPlannedReviewResult(decision)) {
@@ -332,6 +379,9 @@ function guardCompleteSubtaskV1(
     });
   }
 
+  const evaluationEvidenceGuard = requireEvaluationCoversContract(evaluation, contract);
+  if (!evaluationEvidenceGuard.accepted) return evaluationEvidenceGuard;
+
   const decisionHeadSha = readStringInput(decision.inputs, 'currentHeadSha')
     || readStringInput(decision.inputs, 'headSha')
     || bundle.workflow.currentHeadSha;
@@ -408,17 +458,26 @@ function requireIsolatedCodexSubagents(
     });
   }
 
-  if (!builder.threadId || !evaluator.threadId) {
-    return reject('missing_subagent_invocation', 'Builder and Evaluator invocations must record their Codex subagent thread ids.', {
+  if (!isRuntimeAttestedInvocation(builder) || !isRuntimeAttestedInvocation(evaluator)) {
+    return reject('missing_subagent_invocation', 'Builder and Evaluator invocations must be attested by the Codex subagent runtime.', {
       builderInvocationId: builder.id,
       evaluatorInvocationId: evaluator.id,
     });
   }
-  if (builder.threadId === evaluator.threadId) {
+
+  const builderThreadId = builder.actualSubagentThreadId || builder.runtimeAttestation?.actualSubagentThreadId || builder.threadId;
+  const evaluatorThreadId = evaluator.actualSubagentThreadId || evaluator.runtimeAttestation?.actualSubagentThreadId || evaluator.threadId;
+  if (!builderThreadId || !evaluatorThreadId) {
+    return reject('missing_subagent_invocation', 'Builder and Evaluator invocations must record actual Codex subagent thread ids.', {
+      builderInvocationId: builder.id,
+      evaluatorInvocationId: evaluator.id,
+    });
+  }
+  if (builderThreadId === evaluatorThreadId) {
     return reject('subagent_thread_not_isolated', 'Builder and Evaluator must run in different Codex subagent threads.', {
       builderInvocationId: builder.id,
       evaluatorInvocationId: evaluator.id,
-      threadId: builder.threadId,
+      threadId: builderThreadId,
     });
   }
 
@@ -583,6 +642,82 @@ function latestCompletedInvocation(
     .sort((left, right) => String(right.completedAt || right.updatedAt).localeCompare(String(left.completedAt || left.updatedAt)))[0];
 }
 
+function guardCanRecordImplementation(
+  bundle: MultiAgentWorkflowBundle,
+  decision: WorkflowDecision,
+): GuardResult {
+  const statusGuard = guardCanExecuteSubtask(bundle, decision, ['contract_accepted', 'building', 'executing']);
+  if (!statusGuard.accepted) return statusGuard;
+  if (decision.evidenceRefs.length > 0) {
+    const implementation = latestImplementationEvidence(bundle, decision.subtaskId || '');
+    if (!implementation) {
+      return reject('missing_implementation_evidence', 'Recording implementation requires implementation evidence.');
+    }
+    const scopeGuard = latestAcceptedContract(bundle, decision.subtaskId || '')
+      ? requireImplementationWithinContractScope(implementation, latestAcceptedContract(bundle, decision.subtaskId || '')!)
+      : accept();
+    if (!scopeGuard.accepted) return scopeGuard;
+  }
+  return accept();
+}
+
+function guardCanRunCodexEvaluator(
+  bundle: MultiAgentWorkflowBundle,
+  decision: WorkflowDecision,
+): GuardResult {
+  if (!decision.subtaskId) {
+    return reject('invalid_transition', `${decision.action} requires subtaskId.`);
+  }
+  const contractGuard = requireAcceptedContractIfPolicyRequires(bundle, decision.subtaskId);
+  if (!contractGuard.accepted) return contractGuard;
+  const implementation = latestImplementationEvidence(bundle, decision.subtaskId);
+  if (!implementation) {
+    return reject('missing_implementation_evidence', 'Codex Evaluator requires implementation evidence.');
+  }
+  const statusGuard = requireSubtaskStatus(bundle, decision, [
+    'implemented',
+    'evaluation_failed',
+    'needs_fix',
+    'fixing',
+  ]);
+  if (!statusGuard.accepted) return statusGuard;
+  const contract = latestAcceptedContract(bundle, decision.subtaskId);
+  if (contract) {
+    const scopeGuard = requireImplementationWithinContractScope(implementation, contract);
+    if (!scopeGuard.accepted) return scopeGuard;
+  }
+  return requireEvidenceHeadMatchesDecision(bundle, decision, implementation, 'implementation');
+}
+
+function guardCanQuestionEvaluation(
+  bundle: MultiAgentWorkflowBundle,
+  decision: WorkflowDecision,
+): GuardResult {
+  const statusGuard = requireSubtaskStatus(bundle, decision, ['evaluation_passed', 'evaluation_failed', 'questioning_evidence']);
+  if (!statusGuard.accepted) return statusGuard;
+  const evaluation = latestEvaluationRun(bundle, decision.subtaskId || '');
+  if (!evaluation?.result) {
+    return reject('missing_evaluation_result', 'Questioning evaluation evidence requires a Codex evaluation result.');
+  }
+  return accept();
+}
+
+function guardCanFixEvaluationFindings(
+  bundle: MultiAgentWorkflowBundle,
+  decision: WorkflowDecision,
+): GuardResult {
+  const statusGuard = requireSubtaskStatus(bundle, decision, ['evaluation_failed', 'needs_fix', 'questioning_evidence']);
+  if (!statusGuard.accepted) return statusGuard;
+  const evaluation = latestEvaluationRun(bundle, decision.subtaskId || '');
+  const questioner = latestQuestionerOutput(bundle, decision.subtaskId, 'question_evaluation');
+  const hasFailedEvaluation = evaluation?.result?.verdict === 'fail' || evaluation?.status === 'failed';
+  const hasBlockingQuestion = questioner ? hasBlockingQuestions(questioner) : false;
+  if (!hasFailedEvaluation && !hasBlockingQuestion) {
+    return reject('invalid_transition', 'Fixing evaluation findings requires failed evaluation evidence or blocking Questioner output.');
+  }
+  return accept();
+}
+
 function latestImplementationEvidence(
   bundle: MultiAgentWorkflowBundle,
   subtaskId: string,
@@ -642,7 +777,7 @@ function requireImplementationWithinContractScope(
 ): GuardResult {
   const changedFiles = readChangedFiles(evidence);
   if (changedFiles.length === 0) {
-    return accept();
+    return reject('missing_implementation_evidence', 'Implementation evidence must include Tik-derived changed files for contract scope validation.');
   }
   const allowedPaths = contract.scope.allowedPaths || [];
   const blockedPaths = contract.scope.blockedPaths || [];
@@ -663,6 +798,65 @@ function requireImplementationWithinContractScope(
     });
   }
   return accept();
+}
+
+function requireEvaluationCoversContract(
+  evaluation: EvaluationRun,
+  contract: SprintContract,
+): GuardResult {
+  const result = evaluation.result;
+  if (!result) {
+    return reject('missing_evaluation_result', 'Evaluation result is required.');
+  }
+
+  const mustCriteria = contract.acceptanceCriteria.filter((criterion) => criterion.priority === 'must');
+  const resultsByCriterion = new Map(result.criteriaResults.map((criterionResult) => [criterionResult.criterionId, criterionResult]));
+  const missingOrFailed = mustCriteria
+    .filter((criterion) => resultsByCriterion.get(criterion.id)?.status !== 'pass')
+    .map((criterion) => criterion.id);
+  if (missingOrFailed.length > 0) {
+    return reject('evaluation_evidence_insufficient', 'Evaluation result must pass every must acceptance criterion.', {
+      evaluationRunId: evaluation.id,
+      missingOrFailedCriteria: missingOrFailed,
+    });
+  }
+
+  const hasCommandEvidence = result.commandResults.some((command) =>
+    command.status === 'passed' || command.status === 'failed' || command.status === 'timeout'
+  );
+  const hasArtifactEvidence = result.criteriaResults.some((criterion) => (criterion.artifactRefs?.length || 0) > 0)
+    || evaluation.artifactRefs.length > 0;
+  const hasReproductionEvidence = result.criteriaResults.some((criterion) => (criterion.reproductionSteps?.length || 0) > 0)
+    || result.runtimeFindings.some((finding) => finding.reproductionSteps.length > 0);
+  if (!hasCommandEvidence && !hasArtifactEvidence && !hasReproductionEvidence) {
+    return reject('evaluation_evidence_insufficient', 'Evaluation result must include command, artifact, or reproduction evidence.', {
+      evaluationRunId: evaluation.id,
+    });
+  }
+
+  if (result.coverageGaps.length > 0) {
+    return reject('evaluation_evidence_insufficient', 'Evaluation result has unresolved coverage gaps.', {
+      evaluationRunId: evaluation.id,
+      coverageGaps: result.coverageGaps,
+    });
+  }
+
+  return accept();
+}
+
+function isRuntimeAttestedInvocation(
+  invocation: MultiAgentWorkflowBundle['invocations'][number],
+): boolean {
+  const attestation = invocation.runtimeAttestation;
+  const actualThreadId = invocation.actualSubagentThreadId || attestation?.actualSubagentThreadId;
+  return Boolean(
+    attestation
+      && (attestation.source === 'codex-subagent-runtime' || attestation.source === 'codex-plugin-hook')
+      && attestation.role === invocation.role
+      && attestation.parentThreadId
+      && actualThreadId
+      && actualThreadId === attestation.actualSubagentThreadId,
+  );
 }
 
 function readChangedFiles(evidence: MultiAgentWorkflowEvidence): string[] {

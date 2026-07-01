@@ -89,9 +89,10 @@ export async function createInvocation(options, workflowId, invocation) {
   });
 }
 
-export async function startInvocation(options, workflowId, invocationId) {
+export async function startInvocation(options, workflowId, invocationId, input = {}) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(invocationId)}/start`, {
     method: 'POST',
+    body: input,
   });
 }
 

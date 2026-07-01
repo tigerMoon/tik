@@ -89,10 +89,13 @@ interface CreateAgentInvocationInput {
   allowedPaths?: string[];
   validationCommands?: string[];
   threadId?: string;
+  actualSubagentThreadId?: string;
+  parentThreadId?: string;
   headSha?: string;
   evidenceRefs?: string[];
   evaluationRunId?: string;
   readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
+  runtimeAttestation?: AgentInvocationRecord['runtimeAttestation'];
 }
 
 export class FileMultiAgentWorkflowStore {
@@ -614,6 +617,11 @@ export class FileMultiAgentWorkflowStore {
     input: Omit<Partial<QuestionerOutput>, 'workflowId' | 'createdAt'> & {
       intent: QuestionerOutput['intent'];
       actor: QuestionerOutput['actor'];
+      source?: QuestionerOutput['source'];
+      headSha?: string;
+      evaluationRunId?: string;
+      contractId?: string;
+      artifactRef?: string;
       verdict: QuestionerOutput['verdict'];
       questions?: QuestionerOutput['questions'];
       risks?: QuestionerOutput['risks'];
@@ -626,12 +634,18 @@ export class FileMultiAgentWorkflowStore {
     if (input.subtaskId) {
       await this.requireSubtask(id, input.subtaskId);
     }
+    assertQuestionerRuntimeSource(input);
     const output: QuestionerOutput = {
       id: this.normalizeId(input.id || `q_${generateId()}`),
       workflowId: id,
       subtaskId: input.subtaskId,
       intent: input.intent,
       actor: input.actor,
+      source: input.source,
+      headSha: input.headSha,
+      evaluationRunId: input.evaluationRunId,
+      contractId: input.contractId,
+      artifactRef: input.artifactRef,
       verdict: input.verdict,
       questions: input.questions || [],
       risks: input.risks || [],
@@ -676,10 +690,13 @@ export class FileMultiAgentWorkflowStore {
       allowedPaths: input.allowedPaths,
       validationCommands: input.validationCommands,
       threadId: input.threadId,
+      actualSubagentThreadId: input.actualSubagentThreadId || input.runtimeAttestation?.actualSubagentThreadId,
+      parentThreadId: input.parentThreadId || input.runtimeAttestation?.parentThreadId,
       headSha: input.headSha,
       evidenceRefs: input.evidenceRefs || [],
       evaluationRunId: input.evaluationRunId,
       readonlyPolicy: input.readonlyPolicy,
+      runtimeAttestation: input.runtimeAttestation,
       status: 'created',
       createdAt: now,
       updatedAt: now,
@@ -708,10 +725,13 @@ export class FileMultiAgentWorkflowStore {
       result?: Record<string, unknown>;
       error?: string;
       threadId?: string;
+      actualSubagentThreadId?: string;
+      parentThreadId?: string;
       headSha?: string;
       evidenceRefs?: string[];
       evaluationRunId?: string;
       readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
+      runtimeAttestation?: AgentInvocationRecord['runtimeAttestation'];
     },
   ): Promise<AgentInvocationRecord> {
     const id = this.normalizeId(workflowId);
@@ -720,6 +740,12 @@ export class FileMultiAgentWorkflowStore {
       throw new MultiAgentCoordinationError('invocation_not_found', `Agent invocation not found: ${invocationId}.`);
     }
     assertInvocationTransition(existing.status, patch.status);
+    const runtimeAttestation = patch.runtimeAttestation
+      ?? readRuntimeAttestationFromRecord(patch.result)
+      ?? existing.runtimeAttestation;
+    if (requiresRuntimeAttestation(existing) && patch.status !== 'cancelled') {
+      assertValidRuntimeAttestation(existing, patch.status, runtimeAttestation);
+    }
 
     const now = new Date().toISOString();
     const updated: AgentInvocationRecord = {
@@ -727,11 +753,23 @@ export class FileMultiAgentWorkflowStore {
       status: patch.status,
       result: patch.result ?? existing.result,
       error: patch.error ?? existing.error,
-      threadId: patch.threadId ?? readStringFromRecord(patch.result, 'threadId') ?? existing.threadId,
-      headSha: patch.headSha ?? readStringFromRecord(patch.result, 'headSha') ?? existing.headSha,
-      evidenceRefs: mergeUnique(existing.evidenceRefs, patch.evidenceRefs ?? readStringArrayFromRecord(patch.result, 'evidenceRefs')),
+      threadId: patch.threadId
+        ?? runtimeAttestation?.actualSubagentThreadId
+        ?? readStringFromRecord(patch.result, 'threadId')
+        ?? existing.threadId,
+      actualSubagentThreadId: patch.actualSubagentThreadId
+        ?? runtimeAttestation?.actualSubagentThreadId
+        ?? readStringFromRecord(patch.result, 'actualSubagentThreadId')
+        ?? existing.actualSubagentThreadId,
+      parentThreadId: patch.parentThreadId
+        ?? runtimeAttestation?.parentThreadId
+        ?? readStringFromRecord(patch.result, 'parentThreadId')
+        ?? existing.parentThreadId,
+      headSha: patch.headSha ?? runtimeAttestation?.headSha ?? readStringFromRecord(patch.result, 'headSha') ?? existing.headSha,
+      evidenceRefs: mergeUnique(existing.evidenceRefs, patch.evidenceRefs ?? runtimeAttestation?.evidenceRefs ?? readStringArrayFromRecord(patch.result, 'evidenceRefs')),
       evaluationRunId: patch.evaluationRunId ?? readStringFromRecord(patch.result, 'evaluationRunId') ?? existing.evaluationRunId,
-      readonlyPolicy: patch.readonlyPolicy ?? readReadonlyPolicyFromRecord(patch.result) ?? existing.readonlyPolicy,
+      readonlyPolicy: patch.readonlyPolicy ?? runtimeAttestation?.readonlyPolicy ?? readReadonlyPolicyFromRecord(patch.result) ?? existing.readonlyPolicy,
+      runtimeAttestation,
       updatedAt: now,
       startedAt: patch.status === 'started' ? now : existing.startedAt,
       completedAt: patch.status === 'completed' || patch.status === 'failed' || patch.status === 'cancelled'
@@ -1090,6 +1128,76 @@ function assertInvocationTransition(from: MultiAgentInvocationStatus, to: MultiA
   );
 }
 
+function requiresRuntimeAttestation(invocation: AgentInvocationRecord): boolean {
+  return invocation.runner === 'codex' || invocation.runner === 'codex-evaluator';
+}
+
+function assertValidRuntimeAttestation(
+  invocation: AgentInvocationRecord,
+  nextStatus: MultiAgentInvocationStatus,
+  attestation: AgentInvocationRecord['runtimeAttestation'] | undefined,
+): void {
+  if (!attestation) {
+    throw new MultiAgentCoordinationError(
+      'missing_subagent_invocation',
+      `Codex invocation ${invocation.id} must be updated by a runtime-attested subagent hook.`,
+    );
+  }
+  if (attestation.source !== 'codex-subagent-runtime' && attestation.source !== 'codex-plugin-hook') {
+    throw new MultiAgentCoordinationError(
+      'missing_subagent_invocation',
+      `Codex invocation ${invocation.id} has unsupported runtime attestation source.`,
+    );
+  }
+  if (attestation.role !== invocation.role) {
+    throw new MultiAgentCoordinationError(
+      'missing_subagent_invocation',
+      `Codex invocation ${invocation.id} runtime role ${attestation.role} does not match ${invocation.role}.`,
+    );
+  }
+  if (!attestation.parentThreadId || !attestation.actualSubagentThreadId) {
+    throw new MultiAgentCoordinationError(
+      'missing_subagent_invocation',
+      `Codex invocation ${invocation.id} runtime attestation must include parentThreadId and actualSubagentThreadId.`,
+    );
+  }
+  if (nextStatus === 'completed' && !attestation.stoppedAt) {
+    throw new MultiAgentCoordinationError(
+      'missing_subagent_invocation',
+      `Codex invocation ${invocation.id} completion requires SubagentStop attestation.`,
+    );
+  }
+}
+
+function assertQuestionerRuntimeSource(input: {
+  intent: QuestionerOutput['intent'];
+  actor: QuestionerOutput['actor'];
+  source?: QuestionerOutput['source'];
+  headSha?: string;
+  evaluationRunId?: string;
+  contractId?: string;
+  artifactRef?: string;
+}): void {
+  if (input.source !== 'claude-plugin' || !input.actor?.invocationId || !input.headSha || !input.artifactRef) {
+    throw new MultiAgentCoordinationError(
+      'missing_evidence',
+      'Questioner output must come from the Claude plugin and include invocationId, headSha, and artifactRef.',
+    );
+  }
+  if ((input.intent === 'question_evaluation' || input.intent === 'question_final_evidence') && !input.evaluationRunId) {
+    throw new MultiAgentCoordinationError(
+      'missing_evaluation_result',
+      'Evaluation Questioner output must reference an evaluationRunId.',
+    );
+  }
+  if ((input.intent === 'question_contract' || input.intent === 'question_evaluation') && !input.contractId) {
+    throw new MultiAgentCoordinationError(
+      'missing_contract',
+      'Contract or evaluation Questioner output must reference a contractId.',
+    );
+  }
+}
+
 function findDuplicate(values: string[]): string | null {
   const seen = new Set<string>();
   for (const value of values) {
@@ -1127,6 +1235,48 @@ function readReadonlyPolicyFromRecord(
     forbiddenWritePaths: readStringArrayFromRecord(policy, 'forbiddenWritePaths'),
     violations: readStringArrayFromRecord(policy, 'violations') || [],
   };
+}
+
+function readRuntimeAttestationFromRecord(
+  record: Record<string, unknown> | undefined,
+): AgentInvocationRecord['runtimeAttestation'] | undefined {
+  const value = record?.runtimeAttestation;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const attestation = value as Record<string, unknown>;
+  const source = readStringFromRecord(attestation, 'source');
+  const parentThreadId = readStringFromRecord(attestation, 'parentThreadId');
+  const actualSubagentThreadId = readStringFromRecord(attestation, 'actualSubagentThreadId');
+  const role = readStringFromRecord(attestation, 'role');
+  const startedAt = readStringFromRecord(attestation, 'startedAt');
+  if (
+    (source !== 'codex-subagent-runtime' && source !== 'codex-plugin-hook')
+    || !parentThreadId
+    || !actualSubagentThreadId
+    || !isInvocationRole(role)
+    || !startedAt
+  ) {
+    return undefined;
+  }
+  return {
+    source,
+    parentThreadId,
+    actualSubagentThreadId,
+    role,
+    startedAt,
+    stoppedAt: readStringFromRecord(attestation, 'stoppedAt'),
+    headSha: readStringFromRecord(attestation, 'headSha'),
+    evidenceRefs: readStringArrayFromRecord(attestation, 'evidenceRefs'),
+    readonlyPolicy: readReadonlyPolicyFromRecord(attestation),
+  };
+}
+
+function isInvocationRole(value: string | undefined): value is AgentInvocationRecord['role'] {
+  return value === 'planner'
+    || value === 'reviewer'
+    || value === 'final-reviewer'
+    || value === 'executor'
+    || value === 'questioner'
+    || value === 'evaluator';
 }
 
 function assertWorkspaceBindingInsideRoot(binding: MultiAgentWorkflowRecord['workspaceBinding']): void {

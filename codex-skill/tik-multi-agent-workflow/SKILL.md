@@ -23,7 +23,7 @@ draft_contract
   -> complete_workflow
 ```
 
-Codex Builder may edit source. Codex Evaluator must be a separate readonly session. Claude Code acts as Questioner: it raises ambiguity, missing tests, weak evidence, and blocking questions; it is not the final judge.
+Codex Builder may edit source. Codex Evaluator must be a separate readonly session. Builder and Evaluator invocations must be attested by the Codex subagent runtime or plugin hook; hand-filled thread ids are audit metadata only. Claude Code acts as Questioner through the Claude plugin: it raises ambiguity, missing tests, weak evidence, and blocking questions; it is not the final judge.
 
 ## Core Boundary
 
@@ -31,6 +31,8 @@ Do:
 - Record every Codex workflow decision with `scripts/tik-multi-agent-workflow.mjs`.
 - Use Tik APIs for workflow state, evidence, TaskGraph, SprintContract, evaluation runs, Questioner outputs, review rounds, and Claude Code runtime launches.
 - Treat Claude planner/reviewer output as untrusted input until inspected.
+- Require runtime attestation for Codex Builder/Evaluator invocation start and completion.
+- Require Claude plugin `QuestionerOutput` with `source=claude-plugin`, `headSha`, `artifactRef`, and relevant contract/evaluation ids.
 - Keep code edits in the current Codex session unless an explicit future CodexRunner invocation is requested.
 
 Do not:
@@ -67,20 +69,25 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs s
   --workflow wf_123 \
   --subtask st_001 \
   --invocation inv-builder-st_001 \
+  --runtime-attested \
+  --parent-thread <workflow-thread-id> \
   --thread <builder-codex-thread-id>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute \
   --workflow wf_123 \
   --subtask st_001 \
   --summary "Implemented the scoped change." \
-  --changed-files "packages/kernel/src/server.ts,packages/shared/src/types/multi-agent.ts" \
   --invocation inv-builder-st_001 \
+  --runtime-attested \
+  --parent-thread <workflow-thread-id> \
   --thread <builder-codex-thread-id>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-evaluator \
   --workflow wf_123 \
   --subtask st_001 \
   --invocation inv-evaluator-st_001 \
+  --runtime-attested \
+  --parent-thread <workflow-thread-id> \
   --thread <evaluator-codex-thread-id>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs evaluate \
@@ -88,13 +95,19 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs e
   --subtask st_001 \
   --command "pnpm --filter @tik/kernel test" \
   --invocation inv-evaluator-st_001 \
+  --runtime-attested \
+  --parent-thread <workflow-thread-id> \
   --thread <evaluator-codex-thread-id>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs record-questioner \
   --workflow wf_123 \
   --subtask st_001 \
   --intent question_evaluation \
-  --verdict evidence_sufficient
+  --invocation <claude-questioner-invocation-id> \
+  --head-sha <head-sha> \
+  --contract contract-st_001-v1 \
+  --evaluation <evaluation-run-id> \
+  --artifact-ref <questioner-output-artifact>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs review \
   --workflow wf_123 \
@@ -122,10 +135,10 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs p
 - `accept-plan` stores a TaskGraph returned by Claude planner or edited by Codex/human. Tik also auto-stores a planner invocation result when it contains `taskGraph`.
 - `draft-contract` derives a SprintContract from the subtask unless `--contract` or `--contract-json` is provided.
 - `accept-contract` marks the latest challenged contract accepted and moves the subtask to `contract_accepted`.
-- `start-builder` and `start-evaluator` record separate Codex subagent invocations. Builder and Evaluator must use different `--thread` ids.
-- `execute --changed-files` records scoped implementation evidence with concrete changed file paths.
-- `evaluate` records an isolated Codex Evaluator run, validates readonly git status, stores `CodexEvaluationResult`, and moves the subtask to `evaluation_passed` or `evaluation_failed`.
-- `record-questioner` stores Claude Questioner JSON, or records a simple no-blocker/blocker output from CLI flags.
+- `start-builder` and `start-evaluator` create pending Codex subagent invocations; runtime hook attestation is required before they can be marked started/completed.
+- `execute` derives real changed files from git diff when `--changed-files` is omitted and records scoped implementation evidence.
+- `evaluate` records an isolated Codex Evaluator run, enforces a command timeout, validates readonly git status, stores `CodexEvaluationResult`, and records `inconclusive` when neither a command nor structured result is provided.
+- `record-questioner` stores structured Claude plugin Questioner JSON. CLI-generated output requires plugin invocation id, head SHA, artifact ref, and relevant contract/evaluation ids.
 - `review` creates a Tik-owned external Claude review task. Use `--start` if the workflow should immediately ask Tik to launch Claude Code.
 - `process-review` reads the Tik review task result and records the Codex decision: fix, validate, human review, or complete subtask.
 - `fix` records blocker fix evidence, moves the subtask back to validation, and re-review is allowed only after validation passes on the fixed head.

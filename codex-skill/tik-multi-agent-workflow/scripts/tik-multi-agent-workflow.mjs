@@ -345,7 +345,8 @@ async function execute(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
   const subtaskId = requireOption(options.subtask, '--subtask is required');
   const state = await readWorkflow(options, workflowId);
-  const headSha = git(resolveProjectPath(options.path), ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
+  const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
+  const headSha = git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
   const decision = buildDecision(state.workflow, {
     action: 'execute_subtask',
     subtaskId,
@@ -369,7 +370,7 @@ async function execute(options) {
     await updateSubtask(options, workflowId, subtaskId, { status: 'ready' });
   }
   await updateSubtask(options, workflowId, subtaskId, { status: 'executing' });
-  const changedFiles = splitList(options.changedFiles)?.map((file) => ({
+  const changedFiles = deriveChangedFiles(projectPath, state, subtaskId, options).map((file) => ({
     path: file,
     changeType: 'modified',
   }));
@@ -390,16 +391,28 @@ async function execute(options) {
   });
   let invocation = null;
   if (invocationId) {
+    const runtimeAttestation = buildRuntimeAttestation(options, {
+      role: 'executor',
+      headSha,
+      evidenceRefs: [evidence.evidence.id],
+      stopped: true,
+    });
     invocation = await completeInvocation(options, workflowId, invocationId, {
       status: 'completed',
       threadId,
+      actualSubagentThreadId: runtimeAttestation?.actualSubagentThreadId,
+      parentThreadId: runtimeAttestation?.parentThreadId,
       headSha,
       evidenceRefs: [evidence.evidence.id],
+      runtimeAttestation,
       result: omitUndefined({
         threadId,
+        actualSubagentThreadId: runtimeAttestation?.actualSubagentThreadId,
+        parentThreadId: runtimeAttestation?.parentThreadId,
         headSha,
         evidenceRefs: [evidence.evidence.id],
         changedFiles,
+        runtimeAttestation,
       }),
     });
   }
@@ -433,6 +446,11 @@ async function startBuilder(options) {
   const state = await readWorkflow(options, workflowId);
   const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
   const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
+  const runtimeAttestation = buildRuntimeAttestation(options, {
+    role: 'executor',
+    headSha,
+    stopped: false,
+  });
   const invocation = await createInvocation(options, workflowId, {
     id: stringOption(options.invocation),
     subtaskId,
@@ -448,15 +466,22 @@ async function startBuilder(options) {
     allowedPaths: collectSubtaskAllowedPaths(state, subtaskId),
     validationCommands: collectSubtaskValidationCommands(state, subtaskId),
     threadId: stringOption(options.thread),
+    actualSubagentThreadId: runtimeAttestation?.actualSubagentThreadId,
+    parentThreadId: runtimeAttestation?.parentThreadId,
     headSha,
+    runtimeAttestation,
   });
-  const started = await startInvocation(options, workflowId, invocation.invocation.id);
+  const started = runtimeAttestation
+    ? await startInvocation(options, workflowId, invocation.invocation.id, { runtimeAttestation })
+    : invocation;
   printJson({
-    action: 'builder-started',
+    action: runtimeAttestation ? 'builder-started' : 'builder-pending',
     workflowId,
     subtaskId,
     invocation: started.invocation,
-    instruction: 'Run the Builder in a dedicated Codex subagent thread, then call execute with --invocation and --thread.',
+    instruction: runtimeAttestation
+      ? 'Run the Builder in the attested Codex subagent thread, then call execute with the matching runtime attestation.'
+      : 'Spawn the Builder as a dedicated Codex subagent. A runtime hook must call start with actualSubagentThreadId before completion can pass.',
   });
 }
 
@@ -466,6 +491,15 @@ async function startEvaluator(options) {
   const state = await readWorkflow(options, workflowId);
   const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
   const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
+  const runtimeAttestation = buildRuntimeAttestation(options, {
+    role: 'evaluator',
+    headSha,
+    stopped: false,
+    readonlyPolicy: {
+      enforced: true,
+      violations: [],
+    },
+  });
   const invocation = await createInvocation(options, workflowId, {
     id: stringOption(options.invocation),
     subtaskId,
@@ -488,38 +522,58 @@ async function startEvaluator(options) {
     ],
     validationCommands: collectSubtaskValidationCommands(state, subtaskId),
     threadId: stringOption(options.thread),
+    actualSubagentThreadId: runtimeAttestation?.actualSubagentThreadId,
+    parentThreadId: runtimeAttestation?.parentThreadId,
     headSha,
     readonlyPolicy: {
       enforced: true,
       violations: [],
     },
+    runtimeAttestation,
   });
-  const started = await startInvocation(options, workflowId, invocation.invocation.id);
+  const started = runtimeAttestation
+    ? await startInvocation(options, workflowId, invocation.invocation.id, { runtimeAttestation })
+    : invocation;
   printJson({
-    action: 'evaluator-started',
+    action: runtimeAttestation ? 'evaluator-started' : 'evaluator-pending',
     workflowId,
     subtaskId,
     invocation: started.invocation,
-    instruction: 'Run the Evaluator in a separate readonly Codex subagent thread, then call evaluate with --invocation and --thread.',
+    instruction: runtimeAttestation
+      ? 'Run the Evaluator in the attested readonly Codex subagent thread, then call evaluate with the matching runtime attestation.'
+      : 'Spawn the Evaluator as a separate readonly Codex subagent. A runtime hook must call start with actualSubagentThreadId before completion can pass.',
   });
 }
 
 async function finishInvocation(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
   const invocationId = requireOption(options.invocation, '--invocation is required');
+  const runtimeAttestation = buildRuntimeAttestation(options, {
+    role: stringOption(options.role) || 'executor',
+    headSha: stringOption(options.headSha),
+    evidenceRefs: splitList(options.evidenceRefs),
+    stopped: true,
+    readonlyPolicy: buildReadonlyPolicyFromOptions(options),
+  });
   const response = await completeInvocation(options, workflowId, invocationId, {
     status: stringOption(options.status) || 'completed',
     threadId: stringOption(options.thread),
+    actualSubagentThreadId: runtimeAttestation?.actualSubagentThreadId,
+    parentThreadId: runtimeAttestation?.parentThreadId,
     headSha: stringOption(options.headSha),
     evidenceRefs: splitList(options.evidenceRefs),
     evaluationRunId: stringOption(options.evaluation),
     readonlyPolicy: buildReadonlyPolicyFromOptions(options),
+    runtimeAttestation,
     result: omitUndefined({
       threadId: stringOption(options.thread),
+      actualSubagentThreadId: runtimeAttestation?.actualSubagentThreadId,
+      parentThreadId: runtimeAttestation?.parentThreadId,
       headSha: stringOption(options.headSha),
       evidenceRefs: splitList(options.evidenceRefs),
       evaluationRunId: stringOption(options.evaluation),
       readonlyPolicy: buildReadonlyPolicyFromOptions(options),
+      runtimeAttestation,
     }),
   });
   printJson({
@@ -647,6 +701,11 @@ async function evaluate(options) {
   if (subtaskId !== '__final__') {
     await updateSubtask(options, workflowId, subtaskId, { status: 'evaluating' });
   }
+  const structuredResult = options.resultJson
+    ? JSON.parse(String(options.resultJson))
+    : options.result
+      ? await readJsonFile(options.result)
+      : null;
   const command = options.command || inferEvaluationCommand(state, subtaskId);
   let commandResult = null;
   if (command) {
@@ -654,13 +713,20 @@ async function evaluate(options) {
       cwd: projectPath,
       encoding: 'utf-8',
       shell: true,
+      timeout: numberOption(options.timeoutMs, 120000),
     });
     commandResult = {
       commandId: stringOption(options.commandId) || 'cmd-evaluate',
       command,
-      status: result.status === 0 ? 'passed' : 'failed',
+      status: result.error?.code === 'ETIMEDOUT'
+        ? 'timeout'
+        : result.status === 0
+          ? 'passed'
+          : 'failed',
       exitCode: result.status,
-      summary: result.status === 0 ? 'Evaluation command passed.' : 'Evaluation command failed.',
+      summary: result.error?.code === 'ETIMEDOUT'
+        ? 'Evaluation command timed out.'
+        : result.status === 0 ? 'Evaluation command passed.' : 'Evaluation command failed.',
       stdout: result.stdout,
       stderr: result.stderr,
     };
@@ -672,9 +738,25 @@ async function evaluate(options) {
   });
   const verdict = readonly.guard?.accepted === false
     ? 'fail'
-    : commandResult && commandResult.status !== 'passed'
+    : structuredResult?.verdict
+      ? structuredResult.verdict
+      : commandResult && commandResult.status !== 'passed'
       ? 'fail'
+      : !commandResult
+        ? 'inconclusive'
       : 'pass';
+  const coverageGaps = Array.isArray(structuredResult?.coverageGaps)
+    ? structuredResult.coverageGaps
+    : !commandResult
+      ? [{
+        criterionId: 'all',
+        description: 'Evaluator did not run a command or provide a structured result.',
+        reason: 'No evaluator command or structured result was provided.',
+      }]
+      : [];
+  const criteriaResults = Array.isArray(structuredResult?.criteriaResults)
+    ? structuredResult.criteriaResults
+    : buildCriteriaResultsFromCommand(state, subtaskId, commandResult, coverageGaps);
   const result = {
     workflowId,
     subtaskId,
@@ -682,7 +764,7 @@ async function evaluate(options) {
     evaluatorRunId: evaluationRun.evaluationRun.id,
     headSha,
     verdict,
-    criteriaResults: [],
+    criteriaResults,
     commandResults: commandResult
       ? [{
         commandId: commandResult.commandId,
@@ -692,7 +774,9 @@ async function evaluate(options) {
         summary: commandResult.summary,
       }]
       : [],
-    runtimeFindings: verdict === 'pass'
+    runtimeFindings: Array.isArray(structuredResult?.runtimeFindings)
+      ? structuredResult.runtimeFindings
+      : verdict === 'pass'
       ? []
       : [{
         id: 'evaluation_failed',
@@ -702,29 +786,39 @@ async function evaluate(options) {
         expected: 'Evaluation passes without readonly violations.',
         reproductionSteps: command ? [command] : ['Inspect evaluator artifacts and readonly guard output.'],
       }],
-    coverageGaps: [],
+    coverageGaps,
     confidence: verdict === 'pass' ? 0.85 : 0.25,
   };
   const recorded = await recordEvaluationResult(options, workflowId, subtaskId, evaluationRun.evaluationRun.id, result);
   let invocation = null;
   if (options.invocation) {
+    const readonlyPolicy = {
+      enforced: readonly.guard?.accepted !== false,
+      violations: recorded.evaluationRun?.readonlyPolicy?.violations || readonly.evaluationRun?.readonlyPolicy?.violations || [],
+    };
+    const runtimeAttestation = buildRuntimeAttestation(options, {
+      role: 'evaluator',
+      headSha,
+      stopped: true,
+      readonlyPolicy,
+    });
     invocation = await completeInvocation(options, workflowId, String(options.invocation), {
       status: verdict === 'pass' ? 'completed' : 'failed',
       threadId: stringOption(options.thread),
+      actualSubagentThreadId: runtimeAttestation?.actualSubagentThreadId,
+      parentThreadId: runtimeAttestation?.parentThreadId,
       headSha,
       evaluationRunId: evaluationRun.evaluationRun.id,
-      readonlyPolicy: {
-        enforced: readonly.guard?.accepted !== false,
-        violations: recorded.evaluationRun?.readonlyPolicy?.violations || readonly.evaluationRun?.readonlyPolicy?.violations || [],
-      },
+      readonlyPolicy,
+      runtimeAttestation,
       result: {
         threadId: stringOption(options.thread),
+        actualSubagentThreadId: runtimeAttestation?.actualSubagentThreadId,
+        parentThreadId: runtimeAttestation?.parentThreadId,
         headSha,
         evaluationRunId: evaluationRun.evaluationRun.id,
-        readonlyPolicy: {
-          enforced: readonly.guard?.accepted !== false,
-          violations: recorded.evaluationRun?.readonlyPolicy?.violations || readonly.evaluationRun?.readonlyPolicy?.violations || [],
-        },
+        readonlyPolicy,
+        runtimeAttestation,
       },
     });
   }
@@ -1457,14 +1551,28 @@ function buildDefaultContract(state, subtask, headSha) {
 function buildDefaultQuestionerOutput(options) {
   const intent = requireOption(options.intent, '--intent is required');
   const blockingQuestions = splitList(options.blockingQuestion) || [];
+  const invocationId = requireOption(options.invocation, '--invocation is required for Claude plugin Questioner output');
+  const headSha = requireOption(options.headSha, '--head-sha is required for Claude plugin Questioner output');
+  const artifactRef = requireOption(options.artifactRef, '--artifact-ref is required for Claude plugin Questioner output');
+  const evaluationRunId = (intent === 'question_evaluation' || intent === 'question_final_evidence')
+    ? requireOption(options.evaluation, '--evaluation is required for evaluation Questioner output')
+    : stringOption(options.evaluation);
+  const contractId = (intent === 'question_contract' || intent === 'question_evaluation')
+    ? requireOption(options.contract, '--contract is required for contract/evaluation Questioner output')
+    : stringOption(options.contract);
   return {
     id: stringOption(options.questionerOutput),
     subtaskId: stringOption(options.subtask),
     intent,
     actor: {
       kind: 'claude-code-questioner',
-      invocationId: stringOption(options.invocation),
+      invocationId,
     },
+    source: 'claude-plugin',
+    headSha,
+    evaluationRunId,
+    contractId,
+    artifactRef,
     verdict: blockingQuestions.length > 0
       ? 'need_clarification'
       : stringOption(options.verdict) || 'evidence_sufficient',
@@ -1529,6 +1637,70 @@ function collectSubtaskValidationCommands(state, subtaskId) {
   return findSubtask(state.taskGraph, subtaskId)?.validationCommands || [];
 }
 
+function deriveChangedFiles(projectPath, state, subtaskId, options) {
+  const explicit = splitList(options.changedFiles);
+  if (explicit?.length) {
+    return explicit;
+  }
+  const contract = latestAcceptedContract(state, subtaskId);
+  const base = contract?.headShaAtAcceptance || state.workflow.currentHeadSha || state.workflow.baseRef;
+  const fromGit = base
+    ? splitLines(git(projectPath, ['diff', '--name-only', `${base}..HEAD`], { optional: true }))
+    : [];
+  if (fromGit.length > 0) {
+    return fromGit;
+  }
+  return splitLines(git(projectPath, ['diff', '--name-only'], { optional: true }));
+}
+
+function buildCriteriaResultsFromCommand(state, subtaskId, commandResult, coverageGaps) {
+  const contract = latestAcceptedContract(state, subtaskId);
+  const mustCriteria = contract?.acceptanceCriteria?.filter((criterion) => criterion.priority === 'must') || [];
+  if (!commandResult || coverageGaps.length > 0) {
+    return mustCriteria.map((criterion) => ({
+      criterionId: criterion.id,
+      status: 'not_tested',
+      evidence: 'No evaluator command or structured criterion result was provided.',
+    }));
+  }
+  return mustCriteria.map((criterion) => ({
+    criterionId: criterion.id,
+    status: commandResult.status === 'passed' ? 'pass' : 'fail',
+    evidence: commandResult.summary,
+    reproductionSteps: [commandResult.command],
+  }));
+}
+
+function buildRuntimeAttestation(options, input) {
+  const runtimeAttestation = options.runtimeAttestationJson
+    ? JSON.parse(String(options.runtimeAttestationJson))
+    : null;
+  if (runtimeAttestation) {
+    return runtimeAttestation;
+  }
+  if (!options.runtimeAttested) {
+    return undefined;
+  }
+  const actualSubagentThreadId = stringOption(options.actualSubagentThread) || stringOption(options.thread);
+  const parentThreadId = stringOption(options.parentThread);
+  if (!actualSubagentThreadId || !parentThreadId) {
+    throw new Error('--runtime-attested requires --parent-thread and --thread or --actual-subagent-thread');
+  }
+  return omitUndefined({
+    source: stringOption(options.attestationSource) || 'codex-plugin-hook',
+    parentThreadId,
+    actualSubagentThreadId,
+    role: input.role,
+    startedAt: stringOption(options.subagentStartedAt) || new Date().toISOString(),
+    stoppedAt: input.stopped
+      ? stringOption(options.subagentStoppedAt) || new Date().toISOString()
+      : stringOption(options.subagentStoppedAt),
+    headSha: input.headSha,
+    evidenceRefs: input.evidenceRefs,
+    readonlyPolicy: input.readonlyPolicy,
+  });
+}
+
 function buildReadonlyPolicyFromOptions(options) {
   if (!options.readonly && !options.readonlyViolations && !options.allowedWritePaths && !options.forbiddenWritePaths) {
     return undefined;
@@ -1539,6 +1711,11 @@ function buildReadonlyPolicyFromOptions(options) {
     forbiddenWritePaths: splitList(options.forbiddenWritePaths),
     violations: splitList(options.readonlyViolations) || [],
   };
+}
+
+function splitLines(value) {
+  if (!value) return [];
+  return String(value).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
 async function readWorkflowTimeline(options, workflowId) {
