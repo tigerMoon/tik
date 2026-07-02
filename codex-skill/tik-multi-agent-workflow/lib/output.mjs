@@ -17,8 +17,12 @@ export function instructionForDecision(decision, state) {
     case 'run_codex_evaluator':
     case 're_evaluate':
       return `Start an isolated read-only Codex Evaluator session for subtask ${decision.subtaskId}, then record its EvaluationResult.`;
+    case 'run_final_evaluation':
+      return 'Start an isolated read-only Codex Evaluator session for final workflow evidence, then record its EvaluationResult.';
     case 'ask_claude_question_evaluation':
       return `Ask Claude Questioner to challenge the evaluation evidence for subtask ${decision.subtaskId}.`;
+    case 'ask_claude_question_final_evidence':
+      return 'Ask Claude Questioner to challenge final evidence before completing the workflow.';
     case 'fix_evaluation_findings':
       return `Fix Codex Evaluator or Claude Questioner findings for subtask ${decision.subtaskId}, then re-evaluate.`;
     case 'validate_subtask':

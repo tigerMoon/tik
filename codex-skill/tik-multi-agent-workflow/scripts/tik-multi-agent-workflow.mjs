@@ -998,7 +998,7 @@ async function requestReview(options) {
       reviewFocus: splitList(options.reviewFocus) || subtask?.reviewFocus,
       reviewInputSource: reviewInputSourceOption(options),
       mergeRequestUrl: options.mergeRequestUrl || options.mrUrl,
-      fetchRemote: options.fetchRemote,
+      fetchRemote: reviewFetchRemoteOption(options),
       fetchRef: options.fetchRef,
       createdBy: 'codex',
       workspaceBinding: state.workflow.workspaceBinding || buildWorkspaceBinding(projectPath, options),
@@ -1156,7 +1156,15 @@ async function processReview(options) {
       blockerFindingIds: [],
       fixRound,
     });
-  } else if (decision.action !== 'validate_subtask') {
+  } else if (decision.action === 'validate_subtask') {
+    await updateSubtask(options, workflowId, subtaskId, {
+      status: 'implemented',
+      lastReviewedHeadSha: result.headShaReviewed,
+      evidenceRefs,
+      blockerFindingIds: [],
+      fixRound,
+    });
+  } else {
     await updateSubtask(options, workflowId, subtaskId, {
       status: statusForReviewDecision(decision.action),
       lastReviewedHeadSha: result.headShaReviewed,
@@ -1204,6 +1212,17 @@ async function requestFinalReview(options) {
     });
     return;
   }
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
+  if (recorded.guard?.accepted === false) {
+    printJson({
+      action: 'final-review-rejected',
+      workflowId,
+      headSha,
+      decision,
+      guard: recorded.guard,
+    });
+    return;
+  }
   const response = await tikFetch(options, '/v1/agent-loop/worktree-review-rounds', {
     method: 'POST',
     body: {
@@ -1227,20 +1246,19 @@ async function requestFinalReview(options) {
       reviewFocus: ['final workflow integration', 'all subtasks done', 'regression risk'],
       reviewInputSource: reviewInputSourceOption(options),
       mergeRequestUrl: options.mergeRequestUrl || options.mrUrl,
-      fetchRemote: options.fetchRemote,
+      fetchRemote: reviewFetchRemoteOption(options),
       fetchRef: options.fetchRef,
       createdBy: 'codex',
       workspaceBinding: state.workflow.workspaceBinding || buildWorkspaceBinding(projectPath, options),
     },
   });
   const taskId = response.task?.id;
-  const finalDecision = {
+  const outputDecision = {
     ...decision,
     reviewRoundId: taskId,
     reason: 'Codex workflow requested final Tik-owned Claude review.',
     inputs: { ...decision.inputs, reviewTaskId: taskId },
   };
-  const recorded = await safeRecordDecision(options, workflowId, finalDecision, state);
   let started = null;
   if (options.start) {
     started = await tikFetch(options, `/v1/agent-loop/tasks/${encodeURIComponent(taskId)}/claude-review-runs`, {
@@ -1253,7 +1271,7 @@ async function requestFinalReview(options) {
     taskId,
     shortIdentifier: response.task?.shortIdentifier,
     headSha,
-    decision: finalDecision,
+    decision: outputDecision,
     guard: recorded.guard,
     started,
   });
@@ -1279,17 +1297,19 @@ async function processFinalReview(options) {
     throw new Error(`Task ${taskId} does not have an agentLoop.reviewResult yet.`);
   }
   const approved = result.verdict === 'approve' && (result.blockingIssues || []).length === 0;
+  const finalReviewEvidenceId = reviewEvidenceIdForTask(task.id);
   const plannedDecision = buildDecision(state.workflow, {
     action: approved ? 'complete_workflow' : 'request_human_review',
     reviewRoundId: task.id,
     reason: approved
       ? 'Final Claude review approved the workflow.'
       : 'Final Claude review did not approve the workflow.',
-    evidenceRefs: [],
+    evidenceRefs: [finalReviewEvidenceId],
     inputs: {
       currentHeadSha: result.headShaReviewed || result.currentHeadSha || state.workflow.currentHeadSha,
       reviewTaskId: task.id,
       finalReviewApproved: approved,
+      plannedReviewEvidenceId: finalReviewEvidenceId,
       plannedFinalReviewResult: result,
     },
     risks: (result.blockingIssues || []).map((issue) => issue.title || issue.reason).filter(Boolean),
@@ -1307,7 +1327,28 @@ async function processFinalReview(options) {
     });
     return;
   }
+  const decision = {
+    ...plannedDecision,
+    inputs: omitUndefined({
+      ...plannedDecision.inputs,
+      plannedFinalReviewResult: undefined,
+    }),
+  };
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
+  if (recorded.guard?.accepted === false) {
+    printJson({
+      action: 'final-review-process-rejected',
+      workflowId,
+      reviewTaskId: task.id,
+      verdict: result.verdict,
+      blockingIssueCount: (result.blockingIssues || []).length,
+      decision,
+      guard: recorded.guard,
+    });
+    return;
+  }
   const evidence = await recordEvidence(options, workflowId, {
+    id: finalReviewEvidenceId,
     kind: 'review',
     title: `Final Claude review ${task.shortIdentifier || task.id}`,
     summary: `${result.verdict} with ${(result.blockingIssues || []).length} blocking issue(s).`,
@@ -1318,15 +1359,6 @@ async function processFinalReview(options) {
       result,
     },
   });
-  const decision = {
-    ...plannedDecision,
-    evidenceRefs: [evidence.evidence.id],
-    inputs: omitUndefined({
-      ...plannedDecision.inputs,
-      plannedFinalReviewResult: undefined,
-    }),
-  };
-  const recorded = await safeRecordDecision(options, workflowId, decision, state);
   printJson({
     action: approved ? 'workflow-completed' : 'final-review-needs-human',
     workflowId,
@@ -2373,6 +2405,10 @@ function mergeLabels(value, required) {
 
 function reviewInputSourceOption(options) {
   return options.reviewInputSource || (options.mergeRequestUrl || options.mrUrl ? 'merge_request' : 'local_diff');
+}
+
+function reviewFetchRemoteOption(options) {
+  return options.fetchRemote || (reviewInputSourceOption(options) === 'merge_request' ? 'origin' : undefined);
 }
 
 function numberOption(value, fallback) {

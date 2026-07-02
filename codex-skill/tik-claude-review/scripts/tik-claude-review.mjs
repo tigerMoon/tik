@@ -60,6 +60,7 @@ async function createReview(options, behavior = {}) {
   const round = numberOption(options.round, 1);
   const maxRounds = numberOption(options.maxRounds, 3);
   const title = options.title || `Claude Code review for ${repo} at ${headSha.slice(0, 12)}`;
+  const reviewInputSource = options.reviewInputSource || (options.mergeRequestUrl || options.mrUrl ? 'merge_request' : 'local_diff');
   const body = {
     rootTaskId,
     round,
@@ -81,9 +82,9 @@ async function createReview(options, behavior = {}) {
     allowedScope: splitList(options.allowedScope),
     acceptanceCriteria: splitList(options.acceptanceCriteria),
     reviewFocus: splitList(options.reviewFocus),
-    reviewInputSource: options.reviewInputSource || (options.mergeRequestUrl || options.mrUrl ? 'merge_request' : 'local_diff'),
+    reviewInputSource,
     mergeRequestUrl: options.mergeRequestUrl || options.mrUrl,
-    fetchRemote: options.fetchRemote,
+    fetchRemote: options.fetchRemote || (reviewInputSource === 'merge_request' ? 'origin' : undefined),
     fetchRef: options.fetchRef,
     createdBy: 'codex',
     workspaceBinding: {

@@ -71,7 +71,6 @@ try {
     '--root-task', 'TASK-1',
     '--review-input-source', 'merge_request',
     '--merge-request-url', 'https://gitlab.example.com/group/repo/-/merge_requests/123',
-    '--fetch-remote', 'origin',
     '--fetch-ref', 'refs/merge-requests/123/head',
   ]);
   assert.equal(create.action, 'created');
