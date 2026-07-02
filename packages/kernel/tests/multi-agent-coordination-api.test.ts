@@ -406,6 +406,102 @@ describe('multi-agent coordination API', () => {
     expect(readWorkflow.json().workflow.lastDecisionId).toBeUndefined();
   });
 
+  it('allocates a new SprintContract version instead of overwriting an accepted contract', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-contract-versioning',
+        goal: 'Keep accepted contract history intact',
+        rootTaskId: 'root-contract-versioning',
+        headSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-contract-versioning/task-graph',
+      payload: {
+        graph: buildTaskGraph('wf-contract-versioning', 1, [
+          { id: 'st-api', dependsOn: [] },
+        ]),
+      },
+    });
+
+    const firstDraft = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-contract-versioning/subtasks/st-api/contracts',
+      payload: buildSprintContractPayload({
+        id: 'contract-st-api-v1',
+        version: 1,
+        goal: 'Initial scope',
+      }),
+    });
+    expect(firstDraft.statusCode).toBe(200);
+    expect(firstDraft.json().contract).toMatchObject({
+      id: 'contract-st-api-v1',
+      version: 1,
+      status: 'draft',
+      goal: 'Initial scope',
+    });
+
+    const acceptFirst = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-contract-versioning/subtasks/st-api/contracts/contract-st-api-v1/accept',
+    });
+    expect(acceptFirst.statusCode).toBe(200);
+    expect(acceptFirst.json().contract).toMatchObject({
+      id: 'contract-st-api-v1',
+      version: 1,
+      status: 'accepted',
+      goal: 'Initial scope',
+    });
+
+    const secondDraft = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-contract-versioning/subtasks/st-api/contracts',
+      payload: buildSprintContractPayload({
+        id: 'contract-st-api-v1',
+        version: 1,
+        goal: 'Expanded scope',
+      }),
+    });
+    expect(secondDraft.statusCode).toBe(200);
+    expect(secondDraft.json().contract).toMatchObject({
+      id: 'contract-st-api-v2',
+      version: 2,
+      status: 'draft',
+      goal: 'Expanded scope',
+    });
+
+    const latest = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-contract-versioning/subtasks/st-api/contracts/latest',
+    });
+    expect(latest.statusCode).toBe(200);
+    expect(latest.json().contract).toMatchObject({
+      id: 'contract-st-api-v2',
+      version: 2,
+      status: 'draft',
+    });
+
+    const firstAfterRedraft = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-contract-versioning/subtasks/st-api/contracts/contract-st-api-v1/accept',
+    });
+    expect(firstAfterRedraft.statusCode).toBe(200);
+    expect(firstAfterRedraft.json().contract).toMatchObject({
+      id: 'contract-st-api-v1',
+      version: 1,
+      status: 'accepted',
+      goal: 'Initial scope',
+    });
+  });
+
   it('stores a planner TaskGraph automatically when a planner invocation completes', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
     tempDirs.push(root);
@@ -1467,6 +1563,41 @@ function buildDecision(
     decidedAt: '2026-07-01T00:00:00.000Z',
     evidenceRefs: [],
     ...patch,
+  };
+}
+
+function buildSprintContractPayload(patch: {
+  id?: string;
+  version?: number;
+  goal?: string;
+} = {}) {
+  return {
+    id: patch.id,
+    version: patch.version,
+    status: 'draft',
+    goal: patch.goal || 'Implement st-api',
+    scope: {
+      allowedPaths: ['packages/kernel/src'],
+      blockedPaths: [],
+    },
+    deliverables: [{
+      id: 'deliver-st-api',
+      description: patch.goal || 'Implement st-api',
+      expectedFiles: ['packages/kernel/src/multi-agent/workflow-store.ts'],
+    }],
+    acceptanceCriteria: [{
+      id: 'ac-1',
+      statement: 'Contract behavior is auditable.',
+      priority: 'must',
+      verificationMethod: 'test',
+    }],
+    verificationPlan: {
+      commands: [{
+        id: 'cmd-1',
+        command: 'pnpm --filter @tik/kernel test',
+        required: true,
+      }],
+    },
   };
 }
 

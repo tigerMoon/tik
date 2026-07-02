@@ -191,6 +191,7 @@ export interface SubagentRuntimeAttestation {
     parentThreadId: string;
     actualSubagentThreadId: string;
     role: MultiAgentInvocationRole;
+    nonce: string;
     startedAt: string;
     stoppedAt?: string;
     headSha?: string;

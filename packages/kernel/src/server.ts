@@ -332,6 +332,7 @@ interface HookStartAgentInvocationBody {
   parentThreadId: string;
   actualSubagentThreadId: string;
   role: AgentInvocationRecord['role'];
+  nonce: string;
   startedAt?: string;
 }
 

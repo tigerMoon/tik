@@ -111,6 +111,7 @@ interface HookStartInvocationInput {
   parentThreadId: string;
   actualSubagentThreadId: string;
   role: AgentInvocationRecord['role'];
+  nonce: string;
   startedAt?: string;
 }
 
@@ -452,9 +453,23 @@ export class FileMultiAgentWorkflowStore {
     const id = this.normalizeId(workflowId);
     const workflow = await this.requireWorkflow(id);
     await this.requireSubtask(id, subtaskId);
-    const version = input.version ?? (await this.nextContractVersion(id, subtaskId));
+    const contracts = await this.readContracts(id, subtaskId);
+    const requestedVersion = input.version ?? (await this.nextContractVersion(id, subtaskId));
+    const requestedId = this.normalizeId(input.id || `contract-${subtaskId}-v${requestedVersion}`);
+    const usedVersions = new Set(contracts.map((contract) => contract.version));
+    const usedIds = new Set(contracts.map((contract) => contract.id));
+    let version = requestedVersion;
+    let contractId = requestedId;
+    if (usedVersions.has(version) || usedIds.has(contractId)) {
+      version = Math.max(0, ...usedVersions) + 1;
+      contractId = `contract-${subtaskId}-v${version}`;
+      while (usedVersions.has(version) || usedIds.has(contractId)) {
+        version += 1;
+        contractId = `contract-${subtaskId}-v${version}`;
+      }
+    }
     const contract: SprintContract = {
-      id: this.normalizeId(input.id || `contract-${subtaskId}-v${version}`),
+      id: contractId,
       workflowId: id,
       subtaskId,
       version,
@@ -792,8 +807,31 @@ export class FileMultiAgentWorkflowStore {
       await this.requireSubtask(id, input.subtaskId);
     }
     assertQuestionerRuntimeSource(input);
+    if (!input.actor.invocationId) {
+      throw new MultiAgentCoordinationError(
+        'missing_evidence',
+        'Questioner output must come from the Claude plugin and include invocationId, headSha, and artifactRef.',
+      );
+    }
+    const invocationId = input.actor.invocationId;
+    const invocation = await this.readInvocation(id, invocationId);
+    const outputIdCandidate = input.id || readQuestionerOutputFromInvocationResult(
+      invocation?.result,
+    )?.id;
+    if (invocation && !outputIdCandidate) {
+      throw new MultiAgentCoordinationError(
+        'missing_evidence',
+        'Questioner output id must be provided by the Claude plugin invocation result.',
+      );
+    }
+    const outputId = this.normalizeId(outputIdCandidate || '');
+    const inputWithId = {
+      ...input,
+      id: outputId,
+    };
+    await this.assertQuestionerInvocationProvesOutput(id, inputWithId);
     const output: QuestionerOutput = {
-      id: this.normalizeId(input.id || `q_${generateId()}`),
+      id: outputId,
       workflowId: id,
       subtaskId: input.subtaskId,
       intent: input.intent,
@@ -819,6 +857,89 @@ export class FileMultiAgentWorkflowStore {
       verdict: output.verdict,
     });
     return output;
+  }
+
+  private async assertQuestionerInvocationProvesOutput(
+    workflowId: string,
+    input: Omit<Partial<QuestionerOutput>, 'workflowId' | 'createdAt'> & {
+      intent: QuestionerOutput['intent'];
+      actor: QuestionerOutput['actor'];
+      source: QuestionerOutput['source'];
+      headSha: string;
+      evaluationRunId?: string;
+      finalEvaluationRunId?: string;
+      contractId?: string;
+      artifactRef?: string;
+    },
+  ): Promise<void> {
+    const invocationId = input.actor.invocationId;
+    const invocation = invocationId ? await this.readInvocation(workflowId, invocationId) : null;
+    if (!invocation) {
+      throw new MultiAgentCoordinationError(
+        'missing_subagent_invocation',
+        'Questioner output must reference a Tik-owned Claude Questioner invocation.',
+      );
+    }
+    if (invocation.role !== 'questioner' || invocation.runner !== 'claude-code') {
+      throw new MultiAgentCoordinationError(
+        'missing_subagent_invocation',
+        `Questioner output invocation ${invocation.id} must be role=questioner and runner=claude-code.`,
+      );
+    }
+    if (invocation.status !== 'completed') {
+      throw new MultiAgentCoordinationError(
+        'missing_subagent_invocation',
+        `Questioner output invocation ${invocation.id} must be completed before output can be recorded.`,
+      );
+    }
+    if ((invocation.subtaskId || input.subtaskId) && invocation.subtaskId !== input.subtaskId) {
+      throw new MultiAgentCoordinationError(
+        'missing_subagent_invocation',
+        `Questioner output subtask ${input.subtaskId || '(none)'} does not match invocation subtask ${invocation.subtaskId || '(none)'}.`,
+      );
+    }
+    if (invocation.headSha && invocation.headSha !== input.headSha) {
+      throw new MultiAgentCoordinationError(
+        'head_sha_mismatch',
+        `Questioner output head ${input.headSha} does not match invocation head ${invocation.headSha}.`,
+      );
+    }
+    const invocationEvaluationRunId = invocation.evaluationRunId || readStringFromRecord(invocation.result, 'evaluationRunId');
+    const inputEvaluationRunId = input.evaluationRunId || input.finalEvaluationRunId;
+    if (invocationEvaluationRunId && invocationEvaluationRunId !== inputEvaluationRunId) {
+      throw new MultiAgentCoordinationError(
+        'missing_evidence',
+        `Questioner output evaluation ${inputEvaluationRunId || '(none)'} does not match invocation evaluation ${invocationEvaluationRunId}.`,
+      );
+    }
+    const resultOutput = readQuestionerOutputFromInvocationResult(invocation.result);
+    if (!resultOutput) {
+      throw new MultiAgentCoordinationError(
+        'missing_evidence',
+        `Questioner invocation ${invocation.id} result must include questionerOutput.`,
+      );
+    }
+    assertQuestionerResultFieldMatches(input, resultOutput, 'id');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'subtaskId');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'intent');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'source');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'headSha');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'evaluationRunId');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'finalEvaluationRunId');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'contractId');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'artifactRef');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'verdict');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'questions');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'risks');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'missingTests');
+    assertQuestionerResultFieldMatches(input, resultOutput, 'suggestedContractChanges');
+    const resultInvocationId = resultOutput.actor?.invocationId;
+    if (resultInvocationId && resultInvocationId !== invocation.id) {
+      throw new MultiAgentCoordinationError(
+        'missing_subagent_invocation',
+        `Questioner invocation result references ${resultInvocationId}, expected ${invocation.id}.`,
+      );
+    }
   }
 
   async readLatestQuestionerOutput(
@@ -1231,6 +1352,12 @@ export class FileMultiAgentWorkflowStore {
         `Codex invocation ${existing.id} hook attestation must include parentThreadId and actualSubagentThreadId.`,
       );
     }
+    if (!input.nonce) {
+      throw new MultiAgentCoordinationError(
+        'missing_subagent_invocation',
+        `Codex invocation ${existing.id} hook attestation must include nonce.`,
+      );
+    }
 
     const now = new Date().toISOString();
     const startedAt = input.startedAt || now;
@@ -1239,6 +1366,7 @@ export class FileMultiAgentWorkflowStore {
       parentThreadId: input.parentThreadId,
       actualSubagentThreadId: input.actualSubagentThreadId,
       role: existing.role,
+      nonce: input.nonce,
       startedAt,
     };
     const updated: AgentInvocationRecord = {
@@ -1725,7 +1853,8 @@ function assertQuestionerRuntimeSource(input: {
       'Questioner output must come from the Claude plugin and include invocationId, headSha, and artifactRef.',
     );
   }
-  if ((input.intent === 'question_evaluation' || input.intent === 'question_final_evidence') && !input.evaluationRunId) {
+  const evaluationRunId = input.evaluationRunId || input.finalEvaluationRunId;
+  if ((input.intent === 'question_evaluation' || input.intent === 'question_final_evidence') && !evaluationRunId) {
     throw new MultiAgentCoordinationError(
       'missing_evaluation_result',
       'Evaluation Questioner output must reference an evaluationRunId.',
@@ -1737,6 +1866,42 @@ function assertQuestionerRuntimeSource(input: {
       'Contract or evaluation Questioner output must reference a contractId.',
     );
   }
+}
+
+function readQuestionerOutputFromInvocationResult(result: Record<string, unknown> | undefined): Partial<QuestionerOutput> | null {
+  if (!result || typeof result !== 'object') {
+    return null;
+  }
+  const candidate = result.questionerOutput && typeof result.questionerOutput === 'object'
+    ? result.questionerOutput
+    : result;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return null;
+  }
+  return candidate as Partial<QuestionerOutput>;
+}
+
+function assertQuestionerResultFieldMatches(
+  input: Partial<QuestionerOutput>,
+  result: Partial<QuestionerOutput>,
+  field: keyof QuestionerOutput,
+): void {
+  const inputValue = input[field];
+  const resultValue = result[field];
+  if (inputValue === undefined && resultValue === undefined) {
+    return;
+  }
+  if (typeof inputValue === 'object' || typeof resultValue === 'object') {
+    if (JSON.stringify(inputValue ?? null) === JSON.stringify(resultValue ?? null)) {
+      return;
+    }
+  } else if (inputValue === resultValue) {
+    return;
+  }
+  throw new MultiAgentCoordinationError(
+    'missing_evidence',
+    `Questioner output ${String(field)} does not match the completed invocation result.`,
+  );
 }
 
 function findDuplicate(values: string[]): string | null {

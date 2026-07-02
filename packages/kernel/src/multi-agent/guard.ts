@@ -428,7 +428,7 @@ function guardCompleteSubtaskV1(
     if (!questioner) {
       return reject('blocking_question_unresolved', 'Claude Questioner must inspect evaluation evidence before completion.');
     }
-    const questionerGuard = requireQuestionerMatchesEvaluation(questioner, evaluation, contract);
+    const questionerGuard = requireQuestionerMatchesEvaluation(bundle, questioner, evaluation, contract);
     if (!questionerGuard.accepted) return questionerGuard;
     if (hasBlockingQuestions(questioner)) {
       return reject('blocking_question_unresolved', 'Claude Questioner has unresolved blocking questions.', {
@@ -577,7 +577,7 @@ function guardCompleteWorkflowV1(
     if (!questioner) {
       return reject('blocking_question_unresolved', 'Claude Questioner must inspect final evidence before workflow completion.');
     }
-    const questionerGuard = requireQuestionerMatchesFinalEvaluation(questioner, evaluation);
+    const questionerGuard = requireQuestionerMatchesFinalEvaluation(bundle, questioner, evaluation);
     if (!questionerGuard.accepted) return questionerGuard;
     if (hasBlockingQuestions(questioner)) {
       return reject('blocking_question_unresolved', 'Claude Questioner has unresolved final blocking questions.', {
@@ -910,6 +910,7 @@ function hasBlockingQuestions(output: QuestionerOutput): boolean {
 }
 
 function requireQuestionerMatchesEvaluation(
+  bundle: MultiAgentWorkflowBundle,
   output: QuestionerOutput,
   evaluation: EvaluationRun,
   contract: SprintContract,
@@ -953,10 +954,11 @@ function requireQuestionerMatchesEvaluation(
       questionerOutputId: output.id,
     });
   }
-  return accept();
+  return requireCompletedQuestionerInvocation(bundle, output);
 }
 
 function requireQuestionerMatchesFinalEvaluation(
+  bundle: MultiAgentWorkflowBundle,
   output: QuestionerOutput,
   evaluation: EvaluationRun,
 ): GuardResult {
@@ -993,7 +995,109 @@ function requireQuestionerMatchesFinalEvaluation(
       questionerOutputId: output.id,
     });
   }
+  return requireCompletedQuestionerInvocation(bundle, output);
+}
+
+function requireCompletedQuestionerInvocation(
+  bundle: MultiAgentWorkflowBundle,
+  output: QuestionerOutput,
+): GuardResult {
+  const invocation = bundle.invocations.find((candidate) => candidate.id === output.actor.invocationId);
+  if (!invocation) {
+    return reject('missing_subagent_invocation', 'Questioner output must reference a Tik-owned Claude Questioner invocation.', {
+      questionerOutputId: output.id,
+      invocationId: output.actor.invocationId,
+    });
+  }
+  if (invocation.role !== 'questioner' || invocation.runner !== 'claude-code') {
+    return reject('missing_subagent_invocation', 'Questioner invocation must be role=questioner and runner=claude-code.', {
+      questionerOutputId: output.id,
+      invocationId: invocation.id,
+      role: invocation.role,
+      runner: invocation.runner,
+    });
+  }
+  if (invocation.status !== 'completed') {
+    return reject('missing_subagent_invocation', 'Questioner invocation must be completed before its output can satisfy a guard.', {
+      questionerOutputId: output.id,
+      invocationId: invocation.id,
+      status: invocation.status,
+    });
+  }
+  const resultOutput = readQuestionerOutputFromInvocationResult(invocation.result);
+  if (!resultOutput) {
+    return reject('missing_evidence', 'Questioner invocation result must include questionerOutput.', {
+      questionerOutputId: output.id,
+      invocationId: invocation.id,
+    });
+  }
+  const resultGuard = requireQuestionerOutputMatchesInvocationResult(output, resultOutput);
+  if (!resultGuard.accepted) {
+    return resultGuard;
+  }
   return accept();
+}
+
+function readQuestionerOutputFromInvocationResult(result: Record<string, unknown> | undefined): Partial<QuestionerOutput> | null {
+  if (!result || typeof result !== 'object') {
+    return null;
+  }
+  const candidate = result.questionerOutput && typeof result.questionerOutput === 'object'
+    ? result.questionerOutput
+    : result;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return null;
+  }
+  return candidate as Partial<QuestionerOutput>;
+}
+
+function requireQuestionerOutputMatchesInvocationResult(
+  output: QuestionerOutput,
+  result: Partial<QuestionerOutput>,
+): GuardResult {
+  const fields: Array<keyof QuestionerOutput> = [
+    'id',
+    'subtaskId',
+    'intent',
+    'source',
+    'headSha',
+    'evaluationRunId',
+    'finalEvaluationRunId',
+    'contractId',
+    'artifactRef',
+    'verdict',
+    'questions',
+    'risks',
+    'missingTests',
+    'suggestedContractChanges',
+  ];
+  for (const field of fields) {
+    if (!questionerFieldMatches(output[field], result[field])) {
+      return reject('missing_evidence', `Questioner output ${String(field)} does not match the completed invocation result.`, {
+        questionerOutputId: output.id,
+        field,
+      });
+    }
+  }
+  const resultInvocationId = result.actor?.invocationId;
+  if (resultInvocationId && resultInvocationId !== output.actor.invocationId) {
+    return reject('missing_subagent_invocation', 'Questioner invocation result references a different invocation id.', {
+      questionerOutputId: output.id,
+      expectedInvocationId: output.actor.invocationId,
+      actualInvocationId: resultInvocationId,
+    });
+  }
+  return accept();
+}
+
+function questionerFieldMatches(left: unknown, right: unknown): boolean {
+  if (left === undefined && right === undefined) {
+    return true;
+  }
+  if (typeof left === 'object' || typeof right === 'object') {
+    return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+  }
+  return left === right;
 }
 
 function requireImplementationWithinContractScope(
@@ -1086,6 +1190,7 @@ function isRuntimeAttestedInvocation(
       && attestation.source === 'codex-plugin-hook'
       && attestation.role === invocation.role
       && attestation.parentThreadId
+      && attestation.nonce
       && actualThreadId
       && actualThreadId === attestation.actualSubagentThreadId,
   );

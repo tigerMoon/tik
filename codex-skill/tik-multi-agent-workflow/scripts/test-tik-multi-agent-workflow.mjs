@@ -331,6 +331,22 @@ try {
       }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/questioner-outputs') {
         const body = await readRequestJson(req);
+        const invocation = invocations.find((item) => item.id === body.actor?.invocationId);
+        if (
+          !invocation
+          || invocation.role !== 'questioner'
+          || invocation.runner !== 'claude-code'
+          || invocation.status !== 'completed'
+          || invocation.result?.questionerOutput?.artifactRef !== body.artifactRef
+        ) {
+          sendJson(res, {
+            error: {
+              code: 'missing_subagent_invocation',
+              message: 'Questioner output must reference a completed Tik-owned Claude Questioner invocation.',
+            },
+          }, 409);
+          return;
+        }
         const questionerOutput = {
           id: body.id || 'q-cli',
           workflowId: 'wf-cli',
@@ -375,6 +391,7 @@ try {
               parentThreadId: body.parentThreadId,
               actualSubagentThreadId: body.actualSubagentThreadId,
               role: item.role,
+              nonce: body.nonce,
               startedAt: body.startedAt || new Date().toISOString(),
             },
             startedAt: new Date().toISOString(),
@@ -405,6 +422,37 @@ try {
               readonlyPolicy: body.readonlyPolicy,
             },
             attestationToken: undefined,
+            completedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }
+          : item);
+        sendJson(res, { invocation: invocations.find((item) => item.id === invocationId) });
+        return;
+      }
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/start$/)) {
+        const invocationId = route.split('/').at(-2);
+        invocations = invocations.map((item) => item.id === invocationId
+          ? {
+            ...item,
+            status: 'started',
+            startedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }
+          : item);
+        sendJson(res, { invocation: invocations.find((item) => item.id === invocationId) });
+        return;
+      }
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/result$/)) {
+        const invocationId = route.split('/').at(-2);
+        const body = await readRequestJson(req);
+        invocations = invocations.map((item) => item.id === invocationId
+          ? {
+            ...item,
+            ...body,
+            status: body.status,
+            result: body.result,
+            headSha: body.headSha,
+            evaluationRunId: body.evaluationRunId,
             completedAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           }
@@ -601,6 +649,7 @@ try {
     '--invocation', 'inv-builder-cli',
     '--parent-thread', 'workflow-thread-cli',
     '--thread', 'builder-thread-cli',
+    '--nonce', 'nonce-builder-cli',
     '--path', repo,
   ]);
   assert.equal(builderStarted.action, 'builder-started');
@@ -930,6 +979,7 @@ try {
     '--invocation', 'inv-evaluator-cli',
     '--parent-thread', 'workflow-thread-cli',
     '--thread', 'evaluator-thread-cli',
+    '--nonce', 'nonce-evaluator-cli',
     '--path', repo,
     '--evaluator-artifact-path', 'reports/evaluator/',
     '--evaluator-artifact-path', 'custom-artifacts/result.json',
@@ -993,8 +1043,23 @@ try {
     validationRunIds: ['eval-st-api-v1'],
   };
 
+  const questionerStarted = await run([
+    'start-questioner',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--intent', 'question_evaluation',
+    '--invocation', 'claude-questioner-cli',
+    '--head-sha', 'head-v1',
+    '--contract', 'contract-st-api-v1',
+    '--evaluation', 'eval-st-api-v1',
+    '--artifact-ref', '.tik/multi-agent/workflows/wf-cli/questioner/q-cli.json',
+  ]);
+  assert.equal(questionerStarted.action, 'questioner-started');
+  assert.equal(questionerStarted.invocation.status, 'started');
+
   const questioned = await run([
-    'ask-claude',
+    'complete-questioner',
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
@@ -1031,8 +1096,22 @@ try {
   assert.equal(finalEvaluated.action, 'evaluation-recorded');
   assert.equal(finalEvaluated.passed, true);
 
+  const finalQuestionerStarted = await run([
+    'start-questioner',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--intent', 'question_final_evidence',
+    '--invocation', 'claude-final-questioner-cli',
+    '--head-sha', 'head-v1',
+    '--evaluation', 'eval-final-v1',
+    '--artifact-ref', '.tik/multi-agent/workflows/wf-cli/questioner/q-final-cli.json',
+  ]);
+  assert.equal(finalQuestionerStarted.action, 'questioner-started');
+  assert.equal(finalQuestionerStarted.invocation.input.finalEvaluationRunId, 'eval-final-v1');
+  assert.equal(finalQuestionerStarted.invocation.input.evaluationRunId, undefined);
+
   const finalQuestioned = await run([
-    'record-questioner',
+    'complete-questioner',
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
     '--intent', 'question_final_evidence',
@@ -1043,6 +1122,11 @@ try {
     '--verdict', 'evidence_sufficient',
   ]);
   assert.equal(finalQuestioned.action, 'questioner-output-recorded');
+  assert.equal(finalQuestioned.questionerOutput.finalEvaluationRunId, 'eval-final-v1');
+  assert.equal(finalQuestioned.questionerOutput.evaluationRunId, undefined);
+  const finalQuestionerInvocation = invocations.find((item) => item.id === 'claude-final-questioner-cli');
+  assert.equal(finalQuestionerInvocation?.result?.finalEvaluationRunId, 'eval-final-v1');
+  assert.equal(finalQuestionerInvocation?.result?.questionerOutput?.finalEvaluationRunId, 'eval-final-v1');
 
   const v1CompletedWorkflow = await run([
     'complete-workflow',
