@@ -379,6 +379,7 @@ describe('multi-agent v1 core runtime API', () => {
         parentThreadId: 'parent-thread',
         actualSubagentThreadId: 'builder-thread',
         role: 'executor',
+        nonce: 'nonce-builder',
       },
     });
     expect(started.statusCode).toBe(200);
@@ -624,6 +625,7 @@ describe('multi-agent v1 core runtime API', () => {
         parentThreadId: 'parent-thread',
         actualSubagentThreadId: 'builder-thread',
         role: 'executor',
+        nonce: 'nonce-builder',
         startedAt: '2026-07-01T00:00:00.000Z',
       },
     });
@@ -751,6 +753,7 @@ async function blockWorkflowWithStalledInvocation(
       parentThreadId: 'parent-thread',
       actualSubagentThreadId: 'builder-thread',
       role: 'executor',
+      nonce: 'nonce-builder',
     },
   });
   expect(started.statusCode).toBe(200);

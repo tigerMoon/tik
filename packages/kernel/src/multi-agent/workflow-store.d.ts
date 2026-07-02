@@ -28,6 +28,7 @@ interface HookStartInvocationInput {
     parentThreadId: string;
     actualSubagentThreadId: string;
     role: AgentInvocationRecord['role'];
+    nonce: string;
     startedAt?: string;
 }
 interface HookStopInvocationInput {
@@ -115,6 +116,7 @@ export declare class FileMultiAgentWorkflowStore {
         missingTests?: QuestionerOutput['missingTests'];
         suggestedContractChanges?: QuestionerOutput['suggestedContractChanges'];
     }): Promise<QuestionerOutput>;
+    private assertQuestionerInvocationProvesOutput;
     readLatestQuestionerOutput(workflowId: string, input: {
         subtaskId?: string;
         intent?: QuestionerOutput['intent'];

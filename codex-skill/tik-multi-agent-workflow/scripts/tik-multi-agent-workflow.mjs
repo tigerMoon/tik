@@ -81,6 +81,12 @@ async function main() {
       case 'start-evaluator':
         await startEvaluator(options);
         break;
+      case 'start-questioner':
+        await startQuestioner(options);
+        break;
+      case 'complete-questioner':
+        await completeQuestioner(options);
+        break;
       case 'complete-invocation':
         await finishInvocation(options);
         break;
@@ -520,6 +526,105 @@ async function startEvaluator(options) {
     subtaskId,
     invocation: redactInvocationToken(invocation.invocation),
     instruction: 'Spawn a Codex Evaluator subagent; Codex hook will attest runtime start.',
+  });
+}
+
+async function startQuestioner(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const intent = requireOption(options.intent, '--intent is required');
+  const state = await readWorkflow(options, workflowId);
+  const subtaskId = stringOption(options.subtask);
+  const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
+  const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
+  const evaluationRunId = stringOption(options.evaluation) || (
+    intent === 'question_final_evidence'
+      ? latestEvaluationId(state, '__final__')
+      : subtaskId ? latestEvaluationId(state, subtaskId) : undefined
+  );
+  const finalEvaluationRunId = intent === 'question_final_evidence'
+    ? evaluationRunId
+    : undefined;
+  const contractId = stringOption(options.contract) || (
+    intent === 'question_final_evidence'
+      ? undefined
+      : subtaskId ? latestContractId(state, subtaskId) : undefined
+  );
+  const invocation = await createInvocation(options, workflowId, {
+    id: stringOption(options.invocation),
+    subtaskId,
+    role: 'questioner',
+    runner: 'claude-code',
+    promptContract: stringOption(options.promptContract) || 'claude-questioner.v1',
+    input: omitUndefined({
+      goal: state.workflow.goal,
+      intent,
+      subtaskId,
+      contractId,
+      evaluationRunId: finalEvaluationRunId ? undefined : evaluationRunId,
+      finalEvaluationRunId,
+      headSha,
+      artifactRef: stringOption(options.artifactRef),
+    }),
+    threadId: stringOption(options.thread),
+    headSha,
+    evaluationRunId,
+  });
+  const started = options.start === false || options.start === 'false'
+    ? invocation
+    : await tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(invocation.invocation.id)}/start`, {
+      method: 'POST',
+      body: {},
+    });
+  printJson({
+    action: started.invocation.status === 'started' ? 'questioner-started' : 'questioner-pending',
+    workflowId,
+    invocation: started.invocation,
+    instruction: 'Run the Claude Questioner plugin/runtime for this invocation, then call complete-questioner with the plugin output artifact.',
+  });
+}
+
+async function completeQuestioner(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const invocationId = requireOption(options.invocation, '--invocation is required');
+  const output = options.outputJson
+    ? JSON.parse(String(options.outputJson))
+    : options.output
+      ? await readJsonFile(options.output)
+      : buildDefaultQuestionerOutput(options);
+  output.actor = {
+    ...(output.actor || {}),
+    kind: 'claude-code-questioner',
+    invocationId,
+  };
+  output.source = 'claude-plugin';
+  output.id = output.id || `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const invocation = await tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(invocationId)}/result`, {
+    method: 'POST',
+    body: {
+      status: stringOption(options.status) || 'completed',
+      headSha: output.headSha,
+      evaluationRunId: output.evaluationRunId || output.finalEvaluationRunId,
+      result: omitUndefined({
+        evaluationRunId: output.evaluationRunId || output.finalEvaluationRunId,
+        finalEvaluationRunId: output.finalEvaluationRunId,
+        questionerOutput: output,
+      }),
+    },
+  });
+  const recorded = await recordQuestionerOutput(options, workflowId, output);
+  if (output.subtaskId && output.intent === 'question_evaluation') {
+    await updateSubtask(options, workflowId, output.subtaskId, {
+      status: output.questions?.some((question) => question.priority === 'blocking') ? 'needs_fix' : 'questioning_evidence',
+      blockerFindingIds: (output.questions || [])
+        .filter((question) => question.priority === 'blocking')
+        .map((question) => `${output.id || recorded.questionerOutput.id}:${question.id}`),
+    });
+  }
+  printJson({
+    action: 'questioner-output-recorded',
+    workflowId,
+    invocation: invocation.invocation,
+    questionerOutput: recorded.questionerOutput,
   });
 }
 
@@ -1887,7 +1992,6 @@ function buildDefaultContract(state, subtask, headSha) {
     };
   });
   return {
-    version: 1,
     status: 'draft',
     goal: subtask.goal,
     scope: {
@@ -1927,6 +2031,9 @@ function buildDefaultQuestionerOutput(options) {
   const evaluationRunId = (intent === 'question_evaluation' || intent === 'question_final_evidence')
     ? requireOption(options.evaluation, '--evaluation is required for evaluation Questioner output')
     : stringOption(options.evaluation);
+  const finalEvaluationRunId = intent === 'question_final_evidence'
+    ? evaluationRunId
+    : undefined;
   const contractId = (intent === 'question_contract' || intent === 'question_evaluation')
     ? requireOption(options.contract, '--contract is required for contract/evaluation Questioner output')
     : stringOption(options.contract);
@@ -1940,7 +2047,8 @@ function buildDefaultQuestionerOutput(options) {
     },
     source: 'claude-plugin',
     headSha,
-    evaluationRunId,
+    evaluationRunId: finalEvaluationRunId ? undefined : evaluationRunId,
+    finalEvaluationRunId,
     contractId,
     artifactRef,
     verdict: blockingQuestions.length > 0
@@ -2266,6 +2374,7 @@ function buildHookStartPayload(options, role, attestationToken) {
     parentThreadId,
     actualSubagentThreadId,
     role,
+    nonce: requireOption(options.nonce, '--nonce is required for hook-start attestation'),
     startedAt: stringOption(options.subagentStartedAt),
   });
 }
@@ -2470,6 +2579,8 @@ Usage:
   node ${script} start-evaluator --workflow <workflow-id> --subtask <id> --invocation <id> --thread <thread-id>
   node ${script} validate --workflow <workflow-id> --subtask <id> --command <cmd>
   node ${script} evaluate --workflow <workflow-id> --subtask <id> --command <cmd>
+  node ${script} start-questioner --workflow <workflow-id> --intent <intent> [--subtask <id>]
+  node ${script} complete-questioner --workflow <workflow-id> --invocation <id> --intent <intent>
   node ${script} complete-invocation --workflow <workflow-id> --invocation <id> [--status started|completed]
   node ${script} record-questioner --workflow <workflow-id> --intent <intent> [--subtask <id>]
   node ${script} complete-subtask --workflow <workflow-id> --subtask <id>
