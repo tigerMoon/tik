@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs/promises';
+import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
@@ -10,9 +11,27 @@ import {
 
 const tempDirs: string[] = [];
 
-async function makeBrowserProbeRepo(): Promise<string> {
+async function findAvailablePort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      server.close(() => {
+        if (address && typeof address === 'object') {
+          resolve(address.port);
+        } else {
+          reject(new Error('Unable to allocate an available port.'));
+        }
+      });
+    });
+  });
+}
+
+async function makeBrowserProbeRepo(): Promise<{ root: string; port: number }> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-frontend-browser-'));
   tempDirs.push(root);
+  const port = await findAvailablePort();
 
   await fs.mkdir(path.join(root, 'scripts'), { recursive: true });
   await fs.writeFile(
@@ -20,7 +39,7 @@ async function makeBrowserProbeRepo(): Promise<string> {
     JSON.stringify({
       name: 'frontend-browser-probe',
       scripts: {
-        dev: 'node ./scripts/dev-server.js 43124',
+        dev: `node ./scripts/dev-server.js ${port}`,
       },
       dependencies: {
         react: '^18.3.0',
@@ -36,7 +55,7 @@ async function makeBrowserProbeRepo(): Promise<string> {
     path.join(root, 'scripts', 'dev-server.js'),
     [
       "const http = require('http');",
-      "const port = Number(process.argv[2] || '43124');",
+      `const port = Number(process.argv[2] || '${port}');`,
       'const html = `<!doctype html>',
       '<html lang="en">',
       '<head>',
@@ -73,7 +92,7 @@ async function makeBrowserProbeRepo(): Promise<string> {
     'utf-8',
   );
 
-  return root;
+  return { root, port };
 }
 
 afterEach(async () => {
@@ -82,7 +101,7 @@ afterEach(async () => {
 
 describe('frontend browser-lite tools', () => {
   it('frontend_html_snapshot captures title, headings, and key page structure from a local preview', async () => {
-    const root = await makeBrowserProbeRepo();
+    const { root, port } = await makeBrowserProbeRepo();
 
     const result = await frontendHtmlSnapshotTool.execute({
       timeoutMs: 10_000,
@@ -97,11 +116,11 @@ describe('frontend browser-lite tools', () => {
     expect(output.h1).toEqual(['Probe Home']);
     expect(output.h2).toEqual(['Hero Section']);
     expect(output.landmarkCounts).toMatchObject({ buttons: 2, images: 1, forms: 0 });
-    expect(String(output.url || '')).toContain('127.0.0.1:43124');
+    expect(String(output.url || '')).toContain(`127.0.0.1:${port}`);
   });
 
   it('frontend_dom_query returns matches for simple selector queries against the preview DOM', async () => {
-    const root = await makeBrowserProbeRepo();
+    const { root } = await makeBrowserProbeRepo();
 
     const result = await frontendDomQueryTool.execute({
       selector: '#app',
@@ -123,7 +142,7 @@ describe('frontend browser-lite tools', () => {
   });
 
   it('frontend_accessibility_audit reports common structural accessibility issues', async () => {
-    const root = await makeBrowserProbeRepo();
+    const { root } = await makeBrowserProbeRepo();
 
     const result = await frontendAccessibilityAuditTool.execute({
       timeoutMs: 10_000,

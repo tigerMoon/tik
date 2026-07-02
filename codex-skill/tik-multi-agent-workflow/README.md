@@ -58,9 +58,11 @@ accepted SprintContract
 
 Builder and Evaluator invocations must be attested by Tik server-verified
 Codex hook facts. Tik issues a one-time `attestationToken` when an invocation is
-created; the Codex subagent hook must call `hook-start` and `hook-stop` with
-that token. Hand-filled thread ids or CLI-provided `runtimeAttestation` payloads
-are stored only as audit metadata and do not satisfy `complete_subtask`.
+created; the token is not printed by the main workflow CLI. The Codex subagent
+hook must call `hook-start` and `hook-stop` with that token, a nonce, the parent
+thread id, the actual subagent thread id, and the role. Hand-filled thread ids or
+CLI-provided `runtimeAttestation` payloads are stored only as audit metadata and
+do not satisfy `complete_subtask`.
 
 Evaluator commands run in a throwaway git worktree by default. The readonly git
 status check remains as an audit layer, while the sandbox prevents source writes
@@ -154,7 +156,7 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs e
   --subtask <subtask-id> \
   --summary "Implemented the scoped change." \
   --invocation inv-builder-<subtask-id> \
-  --attestation-token <token-from-start-builder>
+  --attestation-token <token-from-codex-hook-runtime>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-evaluator \
   --workflow <workflow-id> \
@@ -168,7 +170,7 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs e
   --subtask <subtask-id> \
   --command "pnpm test" \
   --invocation inv-evaluator-<subtask-id> \
-  --attestation-token <token-from-start-evaluator>
+  --attestation-token <token-from-codex-hook-runtime>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs record-questioner \
   --workflow <workflow-id> \

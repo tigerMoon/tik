@@ -329,6 +329,7 @@ interface StartAgentInvocationBody {}
 
 interface HookStartAgentInvocationBody {
   attestationToken: string;
+  nonce: string;
   parentThreadId: string;
   actualSubagentThreadId: string;
   role: AgentInvocationRecord['role'];

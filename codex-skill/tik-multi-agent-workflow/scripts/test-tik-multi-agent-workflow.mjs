@@ -7,6 +7,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { decideNextAction } from '../lib/loop-gate.mjs';
+import { instructionForDecision } from '../lib/output.mjs';
 
 const scriptPath = new URL('./tik-multi-agent-workflow.mjs', import.meta.url).pathname;
 const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-workflow-test-'));
@@ -26,6 +27,7 @@ let finalReviewTask = null;
 let reviewTasks = {};
 let rootTask = null;
 let subtaskStatusHistory = [];
+let hookStarts = [];
 let events = [];
 let contextSnapshots = {};
 let decisionIfMatchLog = [];
@@ -362,6 +364,9 @@ try {
       if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/hook-start$/)) {
         const invocationId = route.split('/').at(-2);
         const body = await readRequestJson(req);
+        assert.equal(typeof body.nonce, 'string');
+        assert.ok(body.nonce.length > 0);
+        hookStarts.push({ invocationId, body });
         invocations = invocations.map((item) => item.id === invocationId
           ? {
             ...item,
@@ -375,6 +380,7 @@ try {
               parentThreadId: body.parentThreadId,
               actualSubagentThreadId: body.actualSubagentThreadId,
               role: item.role,
+              nonce: body.nonce,
               startedAt: body.startedAt || new Date().toISOString(),
             },
             startedAt: new Date().toISOString(),
@@ -603,10 +609,27 @@ try {
     '--thread', 'builder-thread-cli',
     '--path', repo,
   ]);
-  assert.equal(builderStarted.action, 'builder-started');
-  assert.equal(builderStarted.invocation.status, 'started');
+  assert.equal(builderStarted.action, 'builder-pending');
+  assert.equal(builderStarted.invocation.status, 'created');
   assert.equal(builderStarted.invocation.threadId, 'builder-thread-cli');
-  assert.equal(builderStarted.attestationToken, 'att-inv-builder-cli');
+  assert.equal(builderStarted.invocation.attestationToken, undefined);
+  assert.equal(builderStarted.attestationToken, undefined);
+  assert.match(builderStarted.instruction, /Codex hook will attest runtime start/);
+
+  const builderHookStarted = await run([
+    'complete-invocation',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--invocation', 'inv-builder-cli',
+    '--attestation-token', 'att-inv-builder-cli',
+    '--status', 'started',
+    '--parent-thread', 'workflow-thread-cli',
+    '--thread', 'builder-thread-cli',
+    '--nonce', 'nonce-builder-cli',
+  ]);
+  assert.equal(builderHookStarted.action, 'invocation-started');
+  assert.equal(builderHookStarted.invocation.status, 'started');
+  assert.equal(hookStarts.at(-1).body.nonce, 'nonce-builder-cli');
 
   subtasks['st-api'] = {
     ...subtasks['st-api'],
@@ -622,7 +645,7 @@ try {
     '--changed-files', 'packages/kernel/src/multi-agent/guard.ts,packages/kernel/src/server.ts',
     '--observed-changed-files', 'packages/kernel/src/multi-agent/guard.ts,packages/kernel/src/server.ts',
     '--invocation', 'inv-builder-cli',
-    '--attestation-token', builderStarted.attestationToken,
+    '--attestation-token', 'att-inv-builder-cli',
   ]);
   assert.equal(execute.action, 'execution-recorded');
   assert.equal(subtasks['st-api'].status, 'implemented');
@@ -834,6 +857,9 @@ try {
     }],
   });
   assert.equal(v1CompleteNext.action, 'complete_subtask');
+  const v1CompleteNextOutput = { instruction: instructionForDecision(v1CompleteNext) };
+  assert.match(v1CompleteNextOutput.instruction, /contract, implementation evidence, Codex evaluation evidence/);
+  assert.match(v1CompleteNextOutput.instruction, /subagent-isolation guards/);
   assert.equal(v1CompleteNext.subtaskId, 'st-api');
 
   const v1FinalEvaluationNext = decideNextAction({
@@ -900,6 +926,8 @@ try {
     }],
   });
   assert.equal(v1WorkflowCompleteNext.action, 'complete_workflow');
+  const v1WorkflowCompleteNextOutput = { instruction: instructionForDecision(v1WorkflowCompleteNext) };
+  assert.match(v1WorkflowCompleteNextOutput.instruction, /final evaluation\/questioner evidence passes Tik guards/);
 
   const draftedContract = await run([
     'draft-contract',
@@ -934,13 +962,30 @@ try {
     '--evaluator-artifact-path', 'reports/evaluator/',
     '--evaluator-artifact-path', 'custom-artifacts/result.json',
   ]);
-  assert.equal(evaluatorStarted.action, 'evaluator-started');
-  assert.equal(evaluatorStarted.invocation.status, 'started');
+  assert.equal(evaluatorStarted.action, 'evaluator-pending');
+  assert.equal(evaluatorStarted.invocation.status, 'created');
   assert.equal(evaluatorStarted.invocation.threadId, 'evaluator-thread-cli');
-  assert.equal(evaluatorStarted.attestationToken, 'att-inv-evaluator-cli');
+  assert.equal(evaluatorStarted.invocation.attestationToken, undefined);
+  assert.equal(evaluatorStarted.attestationToken, undefined);
+  assert.match(evaluatorStarted.instruction, /Codex hook will attest runtime start/);
   assert.ok(evaluatorStarted.invocation.allowedPaths.includes('.tik/multi-agent/'));
   assert.ok(evaluatorStarted.invocation.allowedPaths.includes('reports/evaluator/'));
   assert.ok(evaluatorStarted.invocation.allowedPaths.includes('custom-artifacts/result.json'));
+
+  const evaluatorHookStarted = await run([
+    'complete-invocation',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--invocation', 'inv-evaluator-cli',
+    '--attestation-token', 'att-inv-evaluator-cli',
+    '--status', 'started',
+    '--parent-thread', 'workflow-thread-cli',
+    '--thread', 'evaluator-thread-cli',
+    '--nonce', 'nonce-evaluator-cli',
+  ]);
+  assert.equal(evaluatorHookStarted.action, 'invocation-started');
+  assert.equal(evaluatorHookStarted.invocation.status, 'started');
+  assert.equal(hookStarts.at(-1).body.nonce, 'nonce-evaluator-cli');
 
   const evaluated = await run([
     'evaluate',
@@ -950,7 +995,7 @@ try {
     '--evaluation', 'eval-st-api-v1',
     '--command', `${process.execPath} -e "console.log('evaluation ok')"`,
     '--invocation', 'inv-evaluator-cli',
-    '--attestation-token', evaluatorStarted.attestationToken,
+    '--attestation-token', 'att-inv-evaluator-cli',
   ]);
   assert.equal(evaluated.action, 'evaluation-recorded');
   assert.equal(evaluated.passed, true);

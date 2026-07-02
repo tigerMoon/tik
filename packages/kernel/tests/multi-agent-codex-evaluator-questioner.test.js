@@ -1195,6 +1195,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
                 parentThreadId: 'workflow-parent-thread',
                 actualSubagentThreadId: 'forged-thread',
                 role: 'executor',
+                nonce: 'forged-nonce',
                 startedAt: '2026-07-01T00:00:00.000Z',
                 stoppedAt: '2026-07-01T00:01:00.000Z',
             },
@@ -1211,6 +1212,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
                     parentThreadId: 'workflow-parent-thread',
                     actualSubagentThreadId: 'forged-thread',
                     role: 'executor',
+                    nonce: 'forged-nonce',
                     startedAt: '2026-07-01T00:00:00.000Z',
                 },
             },
@@ -1883,6 +1885,7 @@ async function createCompletedInvocation(server, workflowId, input) {
         url: `/api/v1/multi-agent/workflows/${workflowId}/agent-invocations/${input.id}/hook-start`,
         payload: {
             attestationToken,
+            nonce: `nonce-${input.id}`,
             parentThreadId: input.parentThreadId || 'workflow-parent-thread',
             actualSubagentThreadId: input.threadId,
             role: input.role,

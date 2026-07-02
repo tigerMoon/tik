@@ -336,6 +336,7 @@ describe('multi-agent v1 core runtime API', () => {
             url: '/api/v1/multi-agent/workflows/wf-stalled/agent-invocations/inv-builder/hook-start',
             payload: {
                 attestationToken: token,
+                nonce: 'nonce-builder',
                 parentThreadId: 'parent-thread',
                 actualSubagentThreadId: 'builder-thread',
                 role: 'executor',
@@ -561,6 +562,7 @@ describe('multi-agent v1 core runtime API', () => {
             url: '/api/v1/multi-agent/workflows/wf-stall-clock/agent-invocations/inv-builder/hook-start',
             payload: {
                 attestationToken: token,
+                nonce: 'nonce-builder',
                 parentThreadId: 'parent-thread',
                 actualSubagentThreadId: 'builder-thread',
                 role: 'executor',
@@ -665,6 +667,7 @@ async function blockWorkflowWithStalledInvocation(server, workflowId, subtaskId)
         url: `/api/v1/multi-agent/workflows/${workflowId}/agent-invocations/inv-stalled/hook-start`,
         payload: {
             attestationToken: created.json().invocation.attestationToken,
+            nonce: 'nonce-stalled',
             parentThreadId: 'parent-thread',
             actualSubagentThreadId: 'builder-thread',
             role: 'executor',

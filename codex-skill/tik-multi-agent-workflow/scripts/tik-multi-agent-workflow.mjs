@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
 import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { decideNextAction } from '../lib/loop-gate.mjs';
@@ -474,19 +475,12 @@ async function startBuilder(options) {
     headSha,
   });
   const attestationToken = requireInvocationToken(invocation.invocation);
-  const startPayload = buildHookStartPayload(options, 'executor', attestationToken);
-  const started = startPayload
-    ? await hookStartInvocation(options, workflowId, invocation.invocation.id, startPayload)
-    : invocation;
   printJson({
-    action: startPayload ? 'builder-started' : 'builder-pending',
+    action: 'builder-pending',
     workflowId,
     subtaskId,
-    invocation: started.invocation,
-    attestationToken,
-    instruction: startPayload
-      ? 'Run the Builder in this attested Codex subagent thread, then call execute with --attestation-token.'
-      : 'Spawn the Builder as a dedicated Codex subagent. The Codex hook must call hook-start with this attestationToken, then execute must call hook-stop with --attestation-token.',
+    invocation: redactInvocationToken(invocation.invocation),
+    instruction: 'Spawn a Codex Builder subagent; Codex hook will attest runtime start.',
   });
 }
 
@@ -520,28 +514,41 @@ async function startEvaluator(options) {
     },
   });
   const attestationToken = requireInvocationToken(invocation.invocation);
-  const startPayload = buildHookStartPayload(options, 'evaluator', attestationToken);
-  const started = startPayload
-    ? await hookStartInvocation(options, workflowId, invocation.invocation.id, startPayload)
-    : invocation;
   printJson({
-    action: startPayload ? 'evaluator-started' : 'evaluator-pending',
+    action: 'evaluator-pending',
     workflowId,
     subtaskId,
-    invocation: started.invocation,
-    attestationToken,
-    instruction: startPayload
-      ? 'Run the Evaluator in this attested readonly Codex subagent thread, then call evaluate with --attestation-token.'
-      : 'Spawn the Evaluator as a separate readonly Codex subagent. The Codex hook must call hook-start with this attestationToken, then evaluate must call hook-stop with --attestation-token.',
+    invocation: redactInvocationToken(invocation.invocation),
+    instruction: 'Spawn a Codex Evaluator subagent; Codex hook will attest runtime start.',
   });
 }
 
 async function finishInvocation(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
   const invocationId = requireOption(options.invocation, '--invocation is required');
+  const status = stringOption(options.status) || 'completed';
+  if (status === 'started') {
+    const state = await readWorkflow(options, workflowId);
+    const invocation = (state.invocations || []).find((item) => item.id === invocationId);
+    const role = stringOption(options.role) || invocation?.role;
+    if (!role) {
+      throw new Error('--role is required for hook-start attestation when invocation role cannot be read from workflow state');
+    }
+    const response = await hookStartInvocation(options, workflowId, invocationId, buildHookStartPayload(
+      options,
+      role,
+      requireOption(options.attestationToken, '--attestation-token is required for Codex hook-start attestation'),
+    ));
+    printJson({
+      action: 'invocation-started',
+      workflowId,
+      invocation: response.invocation,
+    });
+    return;
+  }
   const response = await hookStopInvocation(options, workflowId, invocationId, {
     attestationToken: requireOption(options.attestationToken, '--attestation-token is required for Codex hook-stop attestation'),
-    status: stringOption(options.status) || 'completed',
+    status,
     headSha: stringOption(options.headSha),
     evidenceRefs: splitList(options.evidenceRefs),
     evaluationRunId: stringOption(options.evaluation),
@@ -2236,6 +2243,14 @@ function requireInvocationToken(invocation) {
   return invocation.attestationToken;
 }
 
+function redactInvocationToken(invocation) {
+  if (!invocation || typeof invocation !== 'object') {
+    return invocation;
+  }
+  const { attestationToken: _attestationToken, ...redacted } = invocation;
+  return redacted;
+}
+
 function buildHookStartPayload(options, role, attestationToken) {
   const actualSubagentThreadId = stringOption(options.actualSubagentThread) || stringOption(options.thread);
   const parentThreadId = stringOption(options.parentThread);
@@ -2247,6 +2262,7 @@ function buildHookStartPayload(options, role, attestationToken) {
   }
   return omitUndefined({
     attestationToken,
+    nonce: stringOption(options.nonce) || randomUUID(),
     parentThreadId,
     actualSubagentThreadId,
     role,
@@ -2454,7 +2470,7 @@ Usage:
   node ${script} start-evaluator --workflow <workflow-id> --subtask <id> --invocation <id> --thread <thread-id>
   node ${script} validate --workflow <workflow-id> --subtask <id> --command <cmd>
   node ${script} evaluate --workflow <workflow-id> --subtask <id> --command <cmd>
-  node ${script} complete-invocation --workflow <workflow-id> --invocation <id>
+  node ${script} complete-invocation --workflow <workflow-id> --invocation <id> [--status started|completed]
   node ${script} record-questioner --workflow <workflow-id> --intent <intent> [--subtask <id>]
   node ${script} complete-subtask --workflow <workflow-id> --subtask <id>
   node ${script} complete-workflow --workflow <workflow-id>

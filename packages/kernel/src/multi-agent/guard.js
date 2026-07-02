@@ -881,8 +881,9 @@ function isRuntimeAttestedInvocation(invocation) {
     return Boolean(invocation.hookAttested === true
         && attestation
         && attestation.source === 'codex-plugin-hook'
-        && attestation.role === invocation.role
-        && attestation.parentThreadId
+            && attestation.role === invocation.role
+            && attestation.nonce
+            && attestation.parentThreadId
         && actualThreadId
         && actualThreadId === attestation.actualSubagentThreadId);
 }

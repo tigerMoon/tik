@@ -1288,14 +1288,15 @@ describe('codex evaluator and Claude questioner workflow', () => {
       threadId: 'forged-thread',
       headSha: 'head-1',
       evidenceRefs: ['ev-forged'],
-      runtimeAttestation: {
-        source: 'codex-plugin-hook',
-        parentThreadId: 'workflow-parent-thread',
-        actualSubagentThreadId: 'forged-thread',
-        role: 'executor',
-        startedAt: '2026-07-01T00:00:00.000Z',
-        stoppedAt: '2026-07-01T00:01:00.000Z',
-      },
+        runtimeAttestation: {
+          source: 'codex-plugin-hook',
+          parentThreadId: 'workflow-parent-thread',
+          actualSubagentThreadId: 'forged-thread',
+          role: 'executor',
+          nonce: 'forged-nonce',
+          startedAt: '2026-07-01T00:00:00.000Z',
+          stoppedAt: '2026-07-01T00:01:00.000Z',
+        },
     });
     expect(created.statusCode).toBe(200);
     expect(created.json().invocation).toHaveProperty('attestationToken');
@@ -1310,6 +1311,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
           parentThreadId: 'workflow-parent-thread',
           actualSubagentThreadId: 'forged-thread',
           role: 'executor',
+          nonce: 'forged-nonce',
           startedAt: '2026-07-01T00:00:00.000Z',
         },
       },
@@ -2081,6 +2083,7 @@ async function createCompletedInvocation(
     url: `/api/v1/multi-agent/workflows/${workflowId}/agent-invocations/${input.id}/hook-start`,
     payload: {
       attestationToken,
+      nonce: `nonce-${input.id}`,
       parentThreadId: input.parentThreadId || 'workflow-parent-thread',
       actualSubagentThreadId: input.threadId,
       role: input.role,

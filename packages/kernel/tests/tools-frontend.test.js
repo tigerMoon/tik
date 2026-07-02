@@ -1,13 +1,31 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs/promises';
+import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { frontendCommandCatalogTool, frontendPreviewProbeTool, frontendRunScriptTool } from '../src/tools-frontend.js';
 const tempDirs = [];
+async function findAvailablePort() {
+    return await new Promise((resolve, reject) => {
+        const server = net.createServer();
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => {
+            const address = server.address();
+            server.close(() => {
+                if (address && typeof address === 'object') {
+                    resolve(address.port);
+                }
+                else {
+                    reject(new Error('Unable to allocate an available port.'));
+                }
+            });
+        });
+    });
+}
 async function makeFrontendRepo(options) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-frontend-tools-'));
     tempDirs.push(root);
-    const port = 43123;
+    const port = options?.includePreviewServer ? await findAvailablePort() : undefined;
     const scripts = {
         dev: options?.includePreviewServer
             ? `node ./scripts/dev-server.js ${port}`
@@ -42,7 +60,7 @@ async function makeFrontendRepo(options) {
     if (options?.includePreviewServer) {
         await fs.writeFile(path.join(root, 'scripts', 'dev-server.js'), [
             "const http = require('http');",
-            "const port = Number(process.argv[2] || '43123');",
+            `const port = Number(process.argv[2] || '${port}');`,
             "const server = http.createServer((_req, res) => {",
             "  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });",
             "  res.end('<html><body><div id=\"app\">preview ok</div></body></html>');",
@@ -55,14 +73,14 @@ async function makeFrontendRepo(options) {
             "process.on('SIGINT', shutdown);",
         ].join('\n'), 'utf-8');
     }
-    return root;
+    return { root, port };
 }
 afterEach(async () => {
     await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
 });
 describe('frontend runtime tools', () => {
     it('frontend_command_catalog returns recommended package-manager commands and available scripts', async () => {
-        const root = await makeFrontendRepo({ packageManager: 'pnpm' });
+        const { root } = await makeFrontendRepo({ packageManager: 'pnpm' });
         const result = await frontendCommandCatalogTool.execute({}, {
             cwd: root,
             taskId: 'catalog-task',
@@ -79,7 +97,7 @@ describe('frontend runtime tools', () => {
         });
     });
     it('frontend_run_script executes a whitelisted frontend script through the detected package manager', async () => {
-        const root = await makeFrontendRepo({ packageManager: 'npm' });
+        const { root } = await makeFrontendRepo({ packageManager: 'npm' });
         const result = await frontendRunScriptTool.execute({
             script: 'build',
             timeoutMs: 10_000,
@@ -94,7 +112,7 @@ describe('frontend runtime tools', () => {
         expect(String(output.stdout || '')).toContain('build ok');
     });
     it('frontend_preview_probe starts a short-lived preview command, captures the URL, and probes the page', async () => {
-        const root = await makeFrontendRepo({ packageManager: 'npm', includePreviewServer: true });
+        const { root, port } = await makeFrontendRepo({ packageManager: 'npm', includePreviewServer: true });
         const result = await frontendPreviewProbeTool.execute({
             timeoutMs: 10_000,
         }, {
@@ -104,7 +122,7 @@ describe('frontend runtime tools', () => {
         expect(result.success).toBe(true);
         const output = result.output;
         expect(output.script).toBe('dev');
-        expect(String(output.url || '')).toContain('127.0.0.1:43123');
+        expect(String(output.url || '')).toContain(`127.0.0.1:${port}`);
         expect(output.httpStatus).toBe(200);
         expect(String(output.bodySnippet || '')).toContain('preview ok');
     });

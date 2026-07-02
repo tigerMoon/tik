@@ -108,6 +108,7 @@ interface CreateAgentInvocationInput {
 
 interface HookStartInvocationInput {
   attestationToken: string;
+  nonce: string;
   parentThreadId: string;
   actualSubagentThreadId: string;
   role: AgentInvocationRecord['role'];
@@ -1225,10 +1226,10 @@ export class FileMultiAgentWorkflowStore {
         `Codex invocation ${existing.id} runtime role ${input.role} does not match ${existing.role}.`,
       );
     }
-    if (!input.parentThreadId || !input.actualSubagentThreadId) {
+    if (!input.nonce || !input.parentThreadId || !input.actualSubagentThreadId) {
       throw new MultiAgentCoordinationError(
         'missing_subagent_invocation',
-        `Codex invocation ${existing.id} hook attestation must include parentThreadId and actualSubagentThreadId.`,
+        `Codex invocation ${existing.id} hook attestation must include nonce, parentThreadId, and actualSubagentThreadId.`,
       );
     }
 
@@ -1239,6 +1240,7 @@ export class FileMultiAgentWorkflowStore {
       parentThreadId: input.parentThreadId,
       actualSubagentThreadId: input.actualSubagentThreadId,
       role: existing.role,
+      nonce: input.nonce,
       startedAt,
     };
     const updated: AgentInvocationRecord = {

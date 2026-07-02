@@ -101,7 +101,7 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs e
   --subtask st_001 \
   --summary "Implemented the scoped change." \
   --invocation inv-builder-st_001 \
-  --attestation-token <token-from-start-builder>
+  --attestation-token <token-from-codex-hook-runtime>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-evaluator \
   --workflow wf_123 \
@@ -115,7 +115,7 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs e
   --subtask st_001 \
   --command "pnpm --filter @tik/kernel test" \
   --invocation inv-evaluator-st_001 \
-  --attestation-token <token-from-start-evaluator>
+  --attestation-token <token-from-codex-hook-runtime>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs record-questioner \
   --workflow wf_123 \
@@ -169,7 +169,8 @@ If you cannot create or accept a TaskGraph because Tik is unavailable, state tha
 - `accept-plan` stores a TaskGraph returned by Claude planner or edited by Codex/human. Tik also auto-stores a planner invocation result when it contains `taskGraph`.
 - `draft-contract` derives a SprintContract from the subtask unless `--contract` or `--contract-json` is provided.
 - `accept-contract` marks the latest challenged contract accepted and moves the subtask to `contract_accepted`.
-- `start-builder` and `start-evaluator` create Codex subagent invocations and print the one-time `attestationToken`; hook-start can be called immediately when `--parent-thread` and `--thread` are supplied, and `execute`/`evaluate` must later use `--attestation-token` for hook-stop.
+- `start-builder` and `start-evaluator` create Codex subagent invocations without printing the one-time `attestationToken` to the main workflow CLI. The token must stay in the Codex hook/runtime channel; hook-start and hook-stop use it to attest the actual subagent runtime.
+- `complete-invocation --status started` is a hook-start helper for the Codex runtime hook. It requires `--attestation-token`, `--nonce`, `--parent-thread`, and `--thread`/`--actual-subagent-thread`; do not call it from the main workflow thread with a copied token.
 - Use repeated or comma-separated `--evaluator-artifact-path` values when a readonly Evaluator needs to write artifacts outside the default `.tik/multi-agent/`, `test-results/`, `playwright-report/`, `coverage/`, and `.tmp/evaluation/` paths.
 - `execute` derives real changed files from git diff when `--changed-files` is omitted and records scoped implementation evidence.
 - `evaluate` records an isolated Codex Evaluator run, runs commands in a throwaway worktree by default, enforces a command timeout, validates readonly git status as an audit layer, stores `CodexEvaluationResult`, and records `inconclusive` when neither a command nor structured result is provided.

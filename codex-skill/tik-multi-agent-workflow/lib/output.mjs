@@ -35,9 +35,9 @@ export function instructionForDecision(decision, state) {
     case 'request_final_review':
       return 'Request final Claude review for the workflow before completion.';
     case 'complete_subtask':
-      return `Mark subtask ${decision.subtaskId} done after validation and review approval.`;
+      return `Complete subtask ${decision.subtaskId} only after contract, implementation evidence, Codex evaluation evidence, Claude Questioner approval, same-headSha, scope, and subagent-isolation guards pass.`;
     case 'complete_workflow':
-      return 'Workflow can be completed after final validation and review approval.';
+      return 'Complete workflow only after all subtasks are done and final evaluation/questioner evidence passes Tik guards.';
     case 'request_human_review':
       return 'Create or surface a human review work item; Tik guardrails or policy require a person.';
     case 'abort_workflow':
