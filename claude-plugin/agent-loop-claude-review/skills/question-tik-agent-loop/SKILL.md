@@ -15,6 +15,9 @@ Do:
 - Verify the current HEAD matches the head SHA provided by Tik.
 - Submit exactly one structured `QuestionerOutput` to `POST /v1/multi-agent/workflows/:workflowId/questioner-outputs`.
 - Set `source` to `claude-plugin` and include `actor.invocationId`, `headSha`, `artifactRef`, and the relevant `contractId` or `evaluationRunId`.
+- If HEAD does not match the head SHA provided by Tik, still submit one
+  `QuestionerOutput` with `verdict=need_clarification`, a blocking question that
+  names the expected and actual head SHAs, and no `evidence_sufficient` claim.
 
 Do not:
 - Edit files.
@@ -49,6 +52,11 @@ For `question_requirement`, `question_task_graph`, `question_contract`, `questio
 ```
 
 Use `verdict=need_clarification` when any blocking question remains. Use `verdict=risk_found` when evidence is present but material risk remains. Use `verdict=evidence_sufficient` or `no_blocking_questions` only when there are no blocking questions.
+
+Tik v1 loop gates actively consume `question_contract`, `question_evaluation`,
+and `question_final_evidence`. `question_requirement` and
+`question_task_graph` are informational hookpoints unless the Codex workflow
+driver explicitly asks for them.
 
 ## Suggested Commands
 

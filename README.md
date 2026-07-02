@@ -79,16 +79,18 @@ Tik can act as the durable control plane for governed multi-agent implementation
 TaskGraph -> SprintContract -> Codex Builder -> readonly Codex Evaluator -> Claude Questioner -> complete_subtask -> final evaluation -> complete_workflow
 ```
 
-The main Codex workflow thread owns orchestration and loop gates. Implementation and evaluation are recorded as runtime-attested Codex subagent invocations: Builder and Evaluator must have different actual subagent thread ids, Evaluator is readonly/source-write forbidden, and Tik persists each invocation's `headSha`, evidence references, evaluation run, readonly policy result, guard decision, and timeline events. `complete_subtask` rejects missing evidence, hand-filled thread ids without runtime attestation, same-thread Builder/Evaluator runs, mismatched heads, readonly violations, thin evaluation evidence, or blocking Questioner output.
+The main Codex workflow thread owns orchestration and loop gates. Implementation and evaluation are recorded as Tik hook-attested Codex subagent invocations: Tik issues a one-time `attestationToken` when an invocation is created, the Codex subagent hook must call Tik `hook-start` / `hook-stop`, and ordinary CLI payloads cannot mark `runtimeAttestation.source=codex-plugin-hook`. Builder and Evaluator must have different actual subagent thread ids, Evaluator runs in a throwaway worktree by default and remains source-write forbidden, and Tik persists each invocation's `headSha`, evidence references, evaluation run, readonly policy result, guard decision, and timeline events. `complete_subtask` rejects missing evidence, hand-filled thread ids without hook attestation, same-thread Builder/Evaluator runs, mismatched heads, readonly violations, thin evaluation evidence, or blocking Questioner output.
+
+Final workflow completion is also evidence-gated: the final evaluation must cover every global must acceptance criterion, pass every final validation command, have no coverage gaps, and match the final Claude Questioner output.
 
 The Codex skill driver lives at [codex-skill/tik-multi-agent-workflow](./codex-skill/tik-multi-agent-workflow/README.md). Typical commands:
 
 ```bash
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs init --goal "implement governed workflow" --path . --v1
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-builder --workflow <workflow-id> --subtask <id> --invocation inv-builder-<id> --runtime-attested --parent-thread <workflow-thread-id> --thread <builder-thread-id>
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute --workflow <workflow-id> --subtask <id> --invocation inv-builder-<id> --runtime-attested --parent-thread <workflow-thread-id> --thread <builder-thread-id>
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-evaluator --workflow <workflow-id> --subtask <id> --invocation inv-evaluator-<id> --runtime-attested --parent-thread <workflow-thread-id> --thread <evaluator-thread-id>
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs evaluate --workflow <workflow-id> --subtask <id> --command "pnpm test" --invocation inv-evaluator-<id> --runtime-attested --parent-thread <workflow-thread-id> --thread <evaluator-thread-id>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-builder --workflow <workflow-id> --subtask <id> --invocation inv-builder-<id> --parent-thread <workflow-thread-id> --thread <builder-thread-id>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute --workflow <workflow-id> --subtask <id> --invocation inv-builder-<id> --attestation-token <token-from-start-builder>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-evaluator --workflow <workflow-id> --subtask <id> --invocation inv-evaluator-<id> --parent-thread <workflow-thread-id> --thread <evaluator-thread-id>
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs evaluate --workflow <workflow-id> --subtask <id> --command "pnpm test" --invocation inv-evaluator-<id> --attestation-token <token-from-start-evaluator>
 ```
 
 ## CLI Commands

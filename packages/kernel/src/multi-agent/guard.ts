@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import type {
   EvaluationRun,
+  FinalWorkflowContract,
   GuardResult,
   ImplementationEvidencePayload,
   MultiAgentWorkflowBundle,
@@ -584,7 +585,89 @@ function guardCompleteWorkflowV1(
     }
   }
 
+  const finalCoverageGuard = requireFinalEvaluationCoversWorkflowContract(evaluation, bundle);
+  if (!finalCoverageGuard.accepted) return finalCoverageGuard;
+
   return accept();
+}
+
+function requireFinalEvaluationCoversWorkflowContract(
+  evaluation: EvaluationRun,
+  bundle: MultiAgentWorkflowBundle,
+): GuardResult {
+  const result = evaluation.result;
+  if (!result) {
+    return reject('missing_evaluation_result', 'Final evaluation result is required.');
+  }
+  const contract = buildFinalWorkflowContract(bundle);
+  const resultsByCriterion = new Map(result.criteriaResults.map((criterionResult) => [criterionResult.criterionId, criterionResult]));
+  const missingOrFailed = contract.globalAcceptanceCriteria
+    .filter((criterion) => criterion.priority === 'must')
+    .filter((criterion) => resultsByCriterion.get(criterion.id)?.status !== 'pass')
+    .map((criterion) => criterion.id);
+  if (missingOrFailed.length > 0) {
+    return reject('evaluation_evidence_insufficient', 'Final evaluation must pass every global must acceptance criterion.', {
+      evaluationRunId: evaluation.id,
+      missingOrFailedCriteria: missingOrFailed,
+    });
+  }
+
+  const missingCommands = contract.finalValidationCommands
+    .filter((command) => !result.commandResults.some((commandResult) =>
+      commandResult.status === 'passed'
+      && (commandResult.command === command || commandResult.commandId === command)
+    ));
+  if (missingCommands.length > 0) {
+    return reject('evaluation_evidence_insufficient', 'Final evaluation must include passed evidence for every final validation command.', {
+      evaluationRunId: evaluation.id,
+      missingCommands,
+    });
+  }
+
+  const hasRequiredEvidence = contract.requiredEvidenceKinds.every((kind) => {
+    if (kind === 'test') {
+      return result.commandResults.some((command) => command.status === 'passed')
+        || result.criteriaResults.some((criterion) => criterion.status === 'pass' && criterion.evidence.trim().length > 0)
+        || evaluation.artifactRefs.length > 0;
+    }
+    if (kind === 'questioner') {
+      return latestQuestionerOutput(bundle, undefined, 'question_final_evidence') !== undefined;
+    }
+    return true;
+  });
+  if (!hasRequiredEvidence) {
+    return reject('evaluation_evidence_insufficient', 'Final evaluation is missing required workflow evidence kinds.', {
+      evaluationRunId: evaluation.id,
+      requiredEvidenceKinds: contract.requiredEvidenceKinds,
+    });
+  }
+
+  if (result.coverageGaps.length > 0) {
+    return reject('evaluation_evidence_insufficient', 'Final evaluation has unresolved coverage gaps.', {
+      evaluationRunId: evaluation.id,
+      coverageGaps: result.coverageGaps,
+    });
+  }
+
+  return accept();
+}
+
+function buildFinalWorkflowContract(bundle: MultiAgentWorkflowBundle): FinalWorkflowContract {
+  return {
+    id: `${bundle.workflow.id}__final__`,
+    workflowId: bundle.workflow.id,
+    globalAcceptanceCriteria: normalizeGlobalAcceptanceCriteria(bundle.taskGraph?.globalAcceptanceCriteria || []),
+    requiredEvidenceKinds: ['test', 'questioner'],
+    finalValidationCommands: bundle.taskGraph?.finalValidationCommands || [],
+  };
+}
+
+function normalizeGlobalAcceptanceCriteria(criteria: string[]): FinalWorkflowContract['globalAcceptanceCriteria'] {
+  return criteria.map((criterion, index) => ({
+    id: `global-ac-${index + 1}`,
+    statement: criterion,
+    priority: 'must',
+  }));
 }
 
 function requireAcceptedContractIfPolicyRequires(
@@ -980,8 +1063,9 @@ function isRuntimeAttestedInvocation(
   const attestation = invocation.runtimeAttestation;
   const actualThreadId = invocation.actualSubagentThreadId || attestation?.actualSubagentThreadId;
   return Boolean(
-    attestation
-      && (attestation.source === 'codex-subagent-runtime' || attestation.source === 'codex-plugin-hook')
+    invocation.hookAttested === true
+      && attestation
+      && attestation.source === 'codex-plugin-hook'
       && attestation.role === invocation.role
       && attestation.parentThreadId
       && actualThreadId

@@ -13,7 +13,11 @@ Do:
 - Read the workflow from `GET ${TIK_API_BASE_URL:-http://127.0.0.1:3300/api}/v1/multi-agent/workflows/:workflowId`.
 - Review the final diff and all recorded subtask evidence.
 - Verify the current HEAD matches the workflow/review context provided by Tik.
-- Return a structured final review result to the prompt/output path requested by Tik.
+- Submit the structured final review result to
+  `POST /v1/agent-loop/tasks/:id/review-result`, the same endpoint used by
+  subtask Claude review.
+- If HEAD differs, call `POST /v1/agent-loop/tasks/:id/stale` with
+  `{ "expectedHeadSha": "...", "actualHeadSha": "..." }` and stop.
 
 Do not:
 - Edit files.
@@ -46,3 +50,9 @@ Return JSON matching:
 ```
 
 Use `verdict=request_changes` when there are blocking issues. Use `verdict=comment` for non-blocking feedback without final approval.
+
+This skill is for the legacy final Claude review path. In v1 Codex Evaluator /
+Claude Questioner policy mode, workflow completion uses final Codex evaluation
+with subtask id `__final__`, followed by `question-tik-agent-loop` with
+`intent=question_final_evidence`; this final-review skill is not part of that
+v1 completion gate.

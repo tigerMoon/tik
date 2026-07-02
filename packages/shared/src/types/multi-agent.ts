@@ -137,6 +137,14 @@ export interface TaskGraph {
   finalValidationCommands: string[];
 }
 
+export interface FinalWorkflowContract {
+  id: string;
+  workflowId: string;
+  globalAcceptanceCriteria: SubtaskAcceptanceCriterion[];
+  requiredEvidenceKinds: Array<'build' | 'test' | 'e2e' | 'smoke' | 'questioner'>;
+  finalValidationCommands: string[];
+}
+
 export interface SubtaskSpec {
   id: string;
   title: string;
@@ -269,6 +277,10 @@ export interface AgentInvocationRecord {
     forbiddenWritePaths?: string[];
     violations?: string[];
   };
+  attestationToken?: string;
+  hookAttested?: boolean;
+  attestationStartedAt?: string;
+  attestationStoppedAt?: string;
   runtimeAttestation?: SubagentRuntimeAttestation;
   status: MultiAgentInvocationStatus;
   result?: Record<string, unknown>;

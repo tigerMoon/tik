@@ -8,10 +8,16 @@ curl -sS "$base_url/v1/tasks" \
 const fs = require("node:fs");
 const payload = JSON.parse(fs.readFileSync(0, "utf8"));
 const claimableStatuses = new Set(["todo", "in_progress", "running"]);
+const reviewLabels = new Set([
+  "external-claude-review",
+  "final-claude-review",
+  "needs-claude-review",
+  "claude-review",
+]);
 const task = (payload.tasks || []).find((item) =>
   claimableStatuses.has(item.status)
   && item.agentLoop?.kind === "claude_review"
-  && ((item.labels || []).includes("needs-claude-review") || (item.labels || []).includes("claude-review"))
+  && (item.labels || []).some((label) => reviewLabels.has(label))
 );
 if (!task) {
   console.error("No claimable Tik claude_review task found.");

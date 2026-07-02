@@ -23,6 +23,7 @@ let questionerOutputs = [];
 let invocations = [];
 let reviewTask = null;
 let finalReviewTask = null;
+let reviewTasks = {};
 let rootTask = null;
 let subtaskStatusHistory = [];
 let events = [];
@@ -312,6 +313,8 @@ try {
           id: body.id || `inv-${invocations.length + 1}`,
           workflowId: 'wf-cli',
           status: 'created',
+          attestationToken: `att-${body.id || invocations.length + 1}`,
+          hookAttested: false,
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
           ...body,
@@ -321,15 +324,32 @@ try {
         sendJson(res, { invocation });
         return;
       }
-      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/start$/)) {
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/hook-start$/)) {
         const invocationId = route.split('/').at(-2);
+        const body = await readRequestJson(req);
         invocations = invocations.map((item) => item.id === invocationId
-          ? { ...item, status: 'started', startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+          ? {
+            ...item,
+            status: 'started',
+            hookAttested: true,
+            threadId: body.actualSubagentThreadId,
+            actualSubagentThreadId: body.actualSubagentThreadId,
+            parentThreadId: body.parentThreadId,
+            runtimeAttestation: {
+              source: 'codex-plugin-hook',
+              parentThreadId: body.parentThreadId,
+              actualSubagentThreadId: body.actualSubagentThreadId,
+              role: item.role,
+              startedAt: body.startedAt || new Date().toISOString(),
+            },
+            startedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }
           : item);
         sendJson(res, { invocation: invocations.find((item) => item.id === invocationId) });
         return;
       }
-      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/result$/)) {
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/hook-stop$/)) {
         const invocationId = route.split('/').at(-2);
         const body = await readRequestJson(req);
         invocations = invocations.map((item) => item.id === invocationId
@@ -338,6 +358,18 @@ try {
             ...body,
             status: body.status,
             result: body.result,
+            headSha: body.headSha,
+            evidenceRefs: body.evidenceRefs || item.evidenceRefs,
+            evaluationRunId: body.evaluationRunId,
+            readonlyPolicy: body.readonlyPolicy,
+            runtimeAttestation: {
+              ...item.runtimeAttestation,
+              stoppedAt: body.stoppedAt || new Date().toISOString(),
+              headSha: body.headSha,
+              evidenceRefs: body.evidenceRefs,
+              readonlyPolicy: body.readonlyPolicy,
+            },
+            attestationToken: undefined,
             completedAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           }
@@ -391,13 +423,13 @@ try {
         if (isFinalReview) {
           finalReviewTask = task;
         } else {
-          reviewTask = task;
+          setReviewTask(task);
         }
         sendJson(res, { task });
         return;
       }
       if (req.method === 'GET' && route === '/api/v1/tasks') {
-        sendJson(res, { tasks: [rootTask, reviewTask, finalReviewTask].filter(Boolean) });
+        sendJson(res, { tasks: [rootTask, ...Object.values(reviewTasks), finalReviewTask].filter(Boolean) });
         return;
       }
       sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
@@ -478,8 +510,8 @@ try {
         assignedReviewer: 'claude-code',
       }],
       risks: [],
-      globalAcceptanceCriteria: [],
-      finalValidationCommands: [],
+      globalAcceptanceCriteria: ['Workflow finishes with guarded evidence.'],
+      finalValidationCommands: [`${process.execPath} -e "process.exit(0)"`],
     }),
   ]);
   assert.equal(putGraph.action, 'accepted-plan');
@@ -495,7 +527,6 @@ try {
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
     '--invocation', 'inv-builder-cli',
-    '--runtime-attested',
     '--parent-thread', 'workflow-thread-cli',
     '--thread', 'builder-thread-cli',
     '--path', repo,
@@ -503,6 +534,12 @@ try {
   assert.equal(builderStarted.action, 'builder-started');
   assert.equal(builderStarted.invocation.status, 'started');
   assert.equal(builderStarted.invocation.threadId, 'builder-thread-cli');
+  assert.equal(builderStarted.attestationToken, 'att-inv-builder-cli');
+
+  subtasks['st-api'] = {
+    ...subtasks['st-api'],
+    evidenceRefs: ['ev-preflight-questioner'],
+  };
 
   const execute = await run([
     'execute',
@@ -513,12 +550,11 @@ try {
     '--changed-files', 'packages/kernel/src/multi-agent/guard.ts,packages/kernel/src/server.ts',
     '--observed-changed-files', 'packages/kernel/src/multi-agent/guard.ts,packages/kernel/src/server.ts',
     '--invocation', 'inv-builder-cli',
-    '--runtime-attested',
-    '--parent-thread', 'workflow-thread-cli',
-    '--thread', 'builder-thread-cli',
+    '--attestation-token', builderStarted.attestationToken,
   ]);
   assert.equal(execute.action, 'execution-recorded');
   assert.equal(subtasks['st-api'].status, 'implemented');
+  assert.deepEqual(subtasks['st-api'].evidenceRefs, ['ev-preflight-questioner', 'ev-cli']);
   assert.equal(execute.invocation.status, 'completed');
   assert.deepEqual(execute.invocation.evidenceRefs, ['ev-cli']);
   assert.deepEqual(evidence[0].payload.changedFiles, [
@@ -539,13 +575,15 @@ try {
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
+    '--evidence-id', 'ev-validation-cli',
     '--command', `${process.execPath} -e "console.log('validation ok')"`,
   ]);
   assert.equal(validate.action, 'validation-recorded');
   assert.equal(validate.passed, true);
-  assert.equal(validate.evidence.artifactRef, '.tik/multi-agent/workflows/wf-cli/validation/st-api/validation.stdout.log');
+  assert.equal(validate.evidence.artifactRef, '.tik/multi-agent/workflows/wf-cli/validation/st-api/ev-validation-cli.stdout.log');
   assert.match(await readFile(path.join(repo, validate.evidence.artifactRef), 'utf-8'), /validation ok/);
   assert.equal(subtasks['st-api'].status, 'validated');
+  assert.deepEqual(subtasks['st-api'].evidenceRefs, ['ev-preflight-questioner', 'ev-cli', 'ev-validation-cli']);
 
   const nextAfterValidation = await run(['next', '--api-base-url', apiBaseUrl, '--workflow', 'wf-cli']);
   assert.equal(nextAfterValidation.decision.action, 'request_claude_review');
@@ -808,14 +846,19 @@ try {
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
     '--invocation', 'inv-evaluator-cli',
-    '--runtime-attested',
     '--parent-thread', 'workflow-thread-cli',
     '--thread', 'evaluator-thread-cli',
     '--path', repo,
+    '--evaluator-artifact-path', 'reports/evaluator/',
+    '--evaluator-artifact-path', 'custom-artifacts/result.json',
   ]);
   assert.equal(evaluatorStarted.action, 'evaluator-started');
   assert.equal(evaluatorStarted.invocation.status, 'started');
   assert.equal(evaluatorStarted.invocation.threadId, 'evaluator-thread-cli');
+  assert.equal(evaluatorStarted.attestationToken, 'att-inv-evaluator-cli');
+  assert.ok(evaluatorStarted.invocation.allowedPaths.includes('.tik/multi-agent/'));
+  assert.ok(evaluatorStarted.invocation.allowedPaths.includes('reports/evaluator/'));
+  assert.ok(evaluatorStarted.invocation.allowedPaths.includes('custom-artifacts/result.json'));
 
   const evaluated = await run([
     'evaluate',
@@ -825,9 +868,7 @@ try {
     '--evaluation', 'eval-st-api-v1',
     '--command', `${process.execPath} -e "console.log('evaluation ok')"`,
     '--invocation', 'inv-evaluator-cli',
-    '--runtime-attested',
-    '--parent-thread', 'workflow-thread-cli',
-    '--thread', 'evaluator-thread-cli',
+    '--attestation-token', evaluatorStarted.attestationToken,
   ]);
   assert.equal(evaluated.action, 'evaluation-recorded');
   assert.equal(evaluated.passed, true);
@@ -951,6 +992,48 @@ try {
 
   reviewTask = {
     ...reviewTask,
+    status: 'blocked',
+    labels: ['agent-loop', 'external-claude-review', 'stale-head'],
+    agentLoop: {
+      ...reviewTask.agentLoop,
+      phase: 'stale',
+      stale: {
+        expectedHeadSha: reviewTask.agentLoop.headSha,
+        actualHeadSha: 'new-head-after-review-started',
+      },
+      reviewResult: undefined,
+    },
+  };
+  setReviewTask(reviewTask);
+
+  const staleReview = await run([
+    'process-review',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--task', 'task-review-1',
+  ]);
+  assert.equal(staleReview.action, 'review-stale');
+  assert.equal(staleReview.stale.actualHeadSha, 'new-head-after-review-started');
+  assert.equal(subtasks['st-api'].status, 'validated');
+  assert.deepEqual(subtasks['st-api'].reviewRoundIds, []);
+
+  const freshReview = await run([
+    'review',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--path', repo,
+    '--round', '1',
+    '--max-rounds', '2',
+  ]);
+  assert.equal(freshReview.action, 'review-requested');
+  assert.equal(freshReview.taskId, 'task-review-1');
+  assert.equal(subtasks['st-api'].status, 'reviewing');
+  assert.deepEqual(subtasks['st-api'].reviewRoundIds, ['task-review-1']);
+
+  reviewTask = {
+    ...reviewTask,
     status: 'in_review',
     labels: ['agent-loop', 'external-claude-review', 'human-review', 'needs-human-review'],
     agentLoop: {
@@ -968,6 +1051,7 @@ try {
       },
     },
   };
+  setReviewTask(reviewTask);
 
   const processUnvalidatedApprove = await run([
     'process-review',
@@ -1005,6 +1089,7 @@ try {
       },
     },
   };
+  setReviewTask(reviewTask);
 
   const processReview = await run([
     'process-review',
@@ -1070,6 +1155,7 @@ try {
       },
     },
   };
+  setReviewTask(reviewTask);
 
   const approveAfterFix = await run([
     'process-review',
@@ -1091,6 +1177,30 @@ try {
   assert.equal(continueToFinalReview.action, 'final-review-requested');
   assert.equal(continueToFinalReview.decision.action, 'request_final_review');
   assert.equal(continueToFinalReview.taskId, 'task-final-review');
+
+  finalReviewTask = {
+    ...finalReviewTask,
+    status: 'blocked',
+    labels: ['agent-loop', 'external-claude-review', 'final-claude-review', 'stale-head'],
+    agentLoop: {
+      ...finalReviewTask.agentLoop,
+      phase: 'stale',
+      stale: {
+        expectedHeadSha: workflow.currentHeadSha,
+        actualHeadSha: 'new-final-head',
+      },
+      reviewResult: undefined,
+    },
+  };
+
+  const staleFinalReview = await run([
+    'process-final-review',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--task', 'task-final-review',
+  ]);
+  assert.equal(staleFinalReview.action, 'final-review-stale');
+  assert.equal(staleFinalReview.stale.actualHeadSha, 'new-final-head');
 
   finalReviewTask = {
     ...finalReviewTask,
@@ -1587,6 +1697,14 @@ function buildGraph(workflowId) {
 
 function mergeTestRefs(...groups) {
   return Array.from(new Set(groups.flatMap((group) => group || []).filter(Boolean)));
+}
+
+function setReviewTask(task) {
+  reviewTask = task;
+  reviewTasks = {
+    ...reviewTasks,
+    [task.id]: task,
+  };
 }
 
 function listen(server) {

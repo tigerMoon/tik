@@ -96,8 +96,22 @@ export async function startInvocation(options, workflowId, invocationId, input =
   });
 }
 
+export async function hookStartInvocation(options, workflowId, invocationId, input = {}) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(invocationId)}/hook-start`, {
+    method: 'POST',
+    body: input,
+  });
+}
+
 export async function completeInvocation(options, workflowId, invocationId, result) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(invocationId)}/result`, {
+    method: 'POST',
+    body: result,
+  });
+}
+
+export async function hookStopInvocation(options, workflowId, invocationId, result) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(invocationId)}/hook-stop`, {
     method: 'POST',
     body: result,
   });

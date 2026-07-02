@@ -24,6 +24,7 @@ import type {
   CodexEvaluationResult,
   CreateMultiAgentWorkflowInput,
   EvaluationRun,
+  MultiAgentWorkflowBundle,
   MultiAgentWorkflowRecord,
   QuestionerOutput,
   SprintContract,
@@ -34,6 +35,7 @@ import type {
 import {
   canRetryWorkbenchTask,
   createEnvironmentPackSelection,
+  generateId,
   isWorkbenchTaskCodexDispatchable,
   isWorkbenchTaskExternallyOwnedClaudeReview,
   isWorkbenchTaskMaintenance,
@@ -230,6 +232,35 @@ interface RecordWorkflowDecisionBody {
   decision: WorkflowDecision;
 }
 
+interface CompleteSubtaskActionBody {
+  decision: WorkflowDecision;
+  subtaskPatch?: UpdateSubtaskBody;
+}
+
+interface CompleteWorkflowActionBody {
+  decision: WorkflowDecision;
+}
+
+interface RecordImplementationActionBody {
+  decision: WorkflowDecision;
+  evidence: RecordEvidenceBody;
+  subtaskPatch?: UpdateSubtaskBody;
+}
+
+interface RecordEvaluationResultActionBody {
+  decision?: WorkflowDecision;
+  subtaskId: string;
+  evaluationRunId: string;
+  result: CodexEvaluationResult;
+  subtaskPatch?: UpdateSubtaskBody;
+}
+
+interface RecordQuestionerOutputActionBody {
+  decision?: WorkflowDecision;
+  output: RecordQuestionerOutputBody;
+  subtaskPatch?: UpdateSubtaskBody;
+}
+
 interface PutTaskGraphBody {
   graph: TaskGraph;
 }
@@ -275,7 +306,6 @@ interface CreateAgentInvocationBody {
   evidenceRefs?: string[];
   evaluationRunId?: string;
   readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
-  runtimeAttestation?: AgentInvocationRecord['runtimeAttestation'];
 }
 
 interface UpdateAgentInvocationBody {
@@ -289,11 +319,28 @@ interface UpdateAgentInvocationBody {
   evidenceRefs?: string[];
   evaluationRunId?: string;
   readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
-  runtimeAttestation?: AgentInvocationRecord['runtimeAttestation'];
 }
 
-interface StartAgentInvocationBody {
-  runtimeAttestation?: AgentInvocationRecord['runtimeAttestation'];
+interface StartAgentInvocationBody {}
+
+interface HookStartAgentInvocationBody {
+  attestationToken: string;
+  parentThreadId: string;
+  actualSubagentThreadId: string;
+  role: AgentInvocationRecord['role'];
+  startedAt?: string;
+}
+
+interface HookStopAgentInvocationBody {
+  attestationToken: string;
+  stoppedAt?: string;
+  headSha?: string;
+  evidenceRefs?: string[];
+  evaluationRunId?: string;
+  readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
+  result?: Record<string, unknown>;
+  status?: Extract<AgentInvocationRecord['status'], 'completed' | 'failed' | 'cancelled'>;
+  error?: string;
 }
 
 interface CreateArtifactBody {
@@ -1076,7 +1123,7 @@ export async function createServer(
         if (!bundle) {
           return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
         }
-        return bundle;
+        return sanitizeMultiAgentWorkflowBundle(bundle);
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1154,6 +1201,243 @@ export async function createServer(
           decision: req.body.decision,
           guard,
           workflow: bundle.workflow,
+        };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: CompleteSubtaskActionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/actions/complete-subtask',
+    async (req, reply) => {
+      try {
+        if (req.body.decision.action !== 'complete_subtask' || !req.body.decision.subtaskId) {
+          throw new MultiAgentCoordinationError(
+            'invalid_transition',
+            'complete-subtask action requires a complete_subtask decision with subtaskId.',
+          );
+        }
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        }
+        const guard = evaluateWorkflowDecisionGuard(bundle, req.body.decision);
+        if (!guard.accepted) {
+          reply.code(409);
+          return {
+            decision: req.body.decision,
+            guard,
+            workflow: bundle.workflow,
+            subtask: bundle.subtasks[req.body.decision.subtaskId],
+          };
+        }
+        const decision = await multiAgentStore.recordDecision(req.params.workflowId, req.body.decision);
+        const subtask = await multiAgentStore.updateSubtask(
+          req.params.workflowId,
+          req.body.decision.subtaskId,
+          sanitizeSubtaskPatch({
+            status: 'done',
+            evidenceRefs: req.body.decision.evidenceRefs,
+            ...req.body.subtaskPatch,
+          }),
+        );
+        const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        return {
+          decision,
+          guard,
+          workflow: workflow || bundle.workflow,
+          subtask,
+        };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: RecordImplementationActionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/actions/record-implementation',
+    async (req, reply) => {
+      try {
+        if (req.body.decision.action !== 'record_implementation') {
+          throw new MultiAgentCoordinationError(
+            'invalid_transition',
+            'record-implementation action requires a record_implementation decision.',
+          );
+        }
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        }
+        const now = new Date().toISOString();
+        const plannedEvidence = {
+          id: req.body.evidence.id || `ev_${generateId()}`,
+          workflowId: req.params.workflowId,
+          createdAt: now,
+          ...req.body.evidence,
+        };
+        const guard = evaluateWorkflowDecisionGuard(
+          {
+            ...bundle,
+            evidence: bundle.evidence.concat(plannedEvidence),
+          },
+          {
+            ...req.body.decision,
+            evidenceRefs: req.body.decision.evidenceRefs.length > 0
+              ? req.body.decision.evidenceRefs
+              : [plannedEvidence.id],
+          },
+        );
+        if (!guard.accepted) {
+          reply.code(409);
+          return {
+            decision: req.body.decision,
+            evidence: plannedEvidence,
+            guard,
+            workflow: bundle.workflow,
+            subtask: req.body.decision.subtaskId ? bundle.subtasks[req.body.decision.subtaskId] : undefined,
+          };
+        }
+        const evidence = await multiAgentStore.recordEvidence(req.params.workflowId, {
+          ...req.body.evidence,
+          id: plannedEvidence.id,
+        });
+        const decision = await multiAgentStore.recordDecision(req.params.workflowId, {
+          ...req.body.decision,
+          evidenceRefs: req.body.decision.evidenceRefs.length > 0
+            ? req.body.decision.evidenceRefs
+            : [evidence.id],
+        });
+        const subtask = req.body.decision.subtaskId
+          ? await multiAgentStore.updateSubtask(
+            req.params.workflowId,
+            req.body.decision.subtaskId,
+            sanitizeSubtaskPatch({
+              status: 'implemented',
+              implementationHeadSha: evidence.headSha,
+              evidenceRefs: [evidence.id],
+              ...req.body.subtaskPatch,
+            }),
+          )
+          : undefined;
+        const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        return { decision, evidence, guard, workflow: workflow || bundle.workflow, subtask };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: RecordEvaluationResultActionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/actions/record-evaluation-result',
+    async (req, reply) => {
+      try {
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        }
+        let guard = { accepted: true, code: 'ok' as const };
+        let decision: WorkflowDecision | undefined;
+        if (req.body.decision) {
+          guard = evaluateWorkflowDecisionGuard(bundle, req.body.decision) as typeof guard;
+          if (!guard.accepted) {
+            reply.code(409);
+            return {
+              decision: req.body.decision,
+              guard,
+              workflow: bundle.workflow,
+              subtask: bundle.subtasks[req.body.subtaskId],
+            };
+          }
+          decision = await multiAgentStore.recordDecision(req.params.workflowId, req.body.decision);
+        }
+        const evaluationRun = await multiAgentStore.recordEvaluationResult(
+          req.params.workflowId,
+          req.body.subtaskId,
+          req.body.evaluationRunId,
+          req.body.result,
+        );
+        const subtask = req.body.subtaskPatch
+          ? await multiAgentStore.updateSubtask(
+            req.params.workflowId,
+            req.body.subtaskId,
+            sanitizeSubtaskPatch(req.body.subtaskPatch),
+          )
+          : undefined;
+        return { decision, guard, evaluationRun, subtask };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: RecordQuestionerOutputActionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/actions/record-questioner-output',
+    async (req, reply) => {
+      try {
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        }
+        let guard = { accepted: true, code: 'ok' as const };
+        let decision: WorkflowDecision | undefined;
+        if (req.body.decision) {
+          guard = evaluateWorkflowDecisionGuard(bundle, req.body.decision) as typeof guard;
+          if (!guard.accepted) {
+            reply.code(409);
+            return {
+              decision: req.body.decision,
+              guard,
+              workflow: bundle.workflow,
+              subtask: req.body.output.subtaskId ? bundle.subtasks[req.body.output.subtaskId] : undefined,
+            };
+          }
+          decision = await multiAgentStore.recordDecision(req.params.workflowId, req.body.decision);
+        }
+        const questionerOutput = await multiAgentStore.recordQuestionerOutput(req.params.workflowId, req.body.output);
+        const subtask = req.body.output.subtaskId && req.body.subtaskPatch
+          ? await multiAgentStore.updateSubtask(
+            req.params.workflowId,
+            req.body.output.subtaskId,
+            sanitizeSubtaskPatch(req.body.subtaskPatch),
+          )
+          : undefined;
+        return { decision, guard, questionerOutput, subtask };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: CompleteWorkflowActionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/actions/complete-workflow',
+    async (req, reply) => {
+      try {
+        if (req.body.decision.action !== 'complete_workflow') {
+          throw new MultiAgentCoordinationError(
+            'invalid_transition',
+            'complete-workflow action requires a complete_workflow decision.',
+          );
+        }
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        }
+        const guard = evaluateWorkflowDecisionGuard(bundle, req.body.decision);
+        if (!guard.accepted) {
+          reply.code(409);
+          return {
+            decision: req.body.decision,
+            guard,
+            workflow: bundle.workflow,
+          };
+        }
+        const decision = await multiAgentStore.recordDecision(req.params.workflowId, req.body.decision);
+        const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        return {
+          decision,
+          guard,
+          workflow: workflow || bundle.workflow,
         };
       } catch (error) {
         return sendV1CaughtError(reply, error);
@@ -1408,7 +1692,7 @@ export async function createServer(
         if (!invocation) {
           return sendV1Error(reply, 404, 'invocation_not_found', 'Agent invocation not found');
         }
-        return { invocation };
+        return { invocation: sanitizeAgentInvocation(invocation) };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1421,9 +1705,24 @@ export async function createServer(
       try {
         const invocation = await multiAgentStore.updateInvocation(req.params.workflowId, req.params.invocationId, {
           status: 'started',
-          runtimeAttestation: req.body?.runtimeAttestation,
         });
-        return { invocation };
+        return { invocation: sanitizeAgentInvocation(invocation) };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string; invocationId: string }; Body: HookStartAgentInvocationBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/agent-invocations/:invocationId/hook-start',
+    async (req, reply) => {
+      try {
+        const invocation = await multiAgentStore.attestInvocationStart(
+          req.params.workflowId,
+          req.params.invocationId,
+          req.body,
+        );
+        return { invocation: sanitizeAgentInvocation(invocation) };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1451,16 +1750,31 @@ export async function createServer(
           evidenceRefs: req.body.evidenceRefs,
           evaluationRunId: req.body.evaluationRunId,
           readonlyPolicy: req.body.readonlyPolicy,
-          runtimeAttestation: req.body.runtimeAttestation,
         });
         const taskGraph = invocation.role === 'planner' && invocation.status === 'completed'
           ? extractTaskGraphFromInvocationResult(invocation.result)
           : null;
         if (taskGraph) {
           const stored = await multiAgentStore.putTaskGraph(req.params.workflowId, taskGraph);
-          return { invocation, taskGraph: stored };
+          return { invocation: sanitizeAgentInvocation(invocation), taskGraph: stored };
         }
-        return { invocation };
+        return { invocation: sanitizeAgentInvocation(invocation) };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string; invocationId: string }; Body: HookStopAgentInvocationBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/agent-invocations/:invocationId/hook-stop',
+    async (req, reply) => {
+      try {
+        const invocation = await multiAgentStore.attestInvocationStop(
+          req.params.workflowId,
+          req.params.invocationId,
+          req.body,
+        );
+        return { invocation: sanitizeAgentInvocation(invocation) };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -3320,6 +3634,18 @@ function workflowSummary(workflow: Awaited<ReturnType<typeof loadTrackerWorkflow
     path: workflow.path,
     workflowConfigHash: workflow.workflowConfigHash,
     workflowPromptHash: workflow.workflowPromptHash,
+  };
+}
+
+function sanitizeAgentInvocation(invocation: AgentInvocationRecord): AgentInvocationRecord {
+  const { attestationToken: _attestationToken, ...publicInvocation } = invocation;
+  return publicInvocation;
+}
+
+function sanitizeMultiAgentWorkflowBundle(bundle: MultiAgentWorkflowBundle): MultiAgentWorkflowBundle {
+  return {
+    ...bundle,
+    invocations: bundle.invocations.map(sanitizeAgentInvocation),
   };
 }
 
