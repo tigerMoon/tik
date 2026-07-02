@@ -27,6 +27,9 @@ let reviewTasks = {};
 let rootTask = null;
 let subtaskStatusHistory = [];
 let events = [];
+let contextSnapshots = {};
+let decisionIfMatchLog = [];
+let forceConcurrentDecisionChange = false;
 
 try {
   await initRepo(repo);
@@ -119,6 +122,38 @@ try {
       }
       if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-cli/timeline') {
         sendJson(res, { events });
+        return;
+      }
+      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-cli/context-snapshots/main') {
+        const snapshot = contextSnapshots.main;
+        if (!snapshot) {
+          sendJson(res, { error: { message: 'Context snapshot not found' } }, 404);
+          return;
+        }
+        sendJson(res, { snapshot });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/context-snapshots') {
+        const body = await readRequestJson(req);
+        const snapshot = {
+          ...body.snapshot,
+          createdAt: contextSnapshots[body.snapshot.target]?.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          etag: `sn-${Object.keys(contextSnapshots).length + events.length + 1}`,
+          renderedMarkdown: [
+            '# Workflow Snapshot',
+            '',
+            '## Goal',
+            body.snapshot.objectiveSummary,
+            '',
+            '## Artifact Refs',
+            ...(body.snapshot.artifactRefs || []).map((ref) => `- ${ref}`),
+            '',
+          ].join('\n'),
+        };
+        contextSnapshots[snapshot.target] = snapshot;
+        events.push({ type: 'context_snapshot.recorded', payload: { target: snapshot.target, etag: snapshot.etag } });
+        sendJson(res, { snapshot, guard: { accepted: true, code: 'ok' } });
         return;
       }
       if (req.method === 'PUT' && route === '/api/v1/multi-agent/workflows/wf-cli/task-graph') {
@@ -383,8 +418,37 @@ try {
           || route === '/api/v1/multi-agent/workflows/wf-cli/decisions/preflight')
       ) {
         const body = await readRequestJson(req);
+        const ifMatch = req.headers['if-match'];
+        decisionIfMatchLog.push({ route, ifMatch, decisionId: body.decision?.id });
+        if (forceConcurrentDecisionChange && route.endsWith('/decisions')) {
+          workflow = {
+            ...workflow,
+            lastDecisionId: 'dec-concurrent-server-side',
+          };
+          forceConcurrentDecisionChange = false;
+        }
+        if (ifMatch && ifMatch !== '*' && ifMatch !== workflow.lastDecisionId) {
+          sendJson(res, {
+            decision: body.decision,
+            guard: {
+              accepted: false,
+              code: 'invalid_transition',
+              message: `Decision history changed; expected ${ifMatch}, current ${workflow.lastDecisionId || 'none'}.`,
+              currentState: {
+                expectedLastDecisionId: ifMatch,
+                lastDecisionId: workflow.lastDecisionId,
+              },
+            },
+            workflow,
+          }, route.endsWith('/decisions') ? 409 : 200);
+          return;
+        }
         if (route.endsWith('/decisions')) {
           decisions.push(body.decision);
+          workflow = {
+            ...workflow,
+            lastDecisionId: body.decision.id,
+          };
           events.push({ type: 'decision.recorded', payload: { action: body.decision.action, subtaskId: body.decision.subtaskId } });
           if (body.decision.action === 'complete_workflow') {
             workflow = {
@@ -398,7 +462,7 @@ try {
         sendJson(res, {
           decision: body.decision,
           guard: { accepted: true, code: 'ok' },
-          workflow: { ...workflow, lastDecisionId: body.decision.id },
+          workflow,
         });
         return;
       }
@@ -406,6 +470,7 @@ try {
         const body = await readRequestJson(req);
         assert.equal(body.labels.includes('external-claude-review'), true);
         assert.equal(body.rootTaskId, 'task-root');
+        assert.equal(body.reviewInputSource, 'local_diff');
         const isFinalReview = body.title?.includes('Final');
         const task = {
           id: isFinalReview ? 'task-final-review' : `task-review-${body.round || 1}`,
@@ -520,6 +585,13 @@ try {
   assert.equal(next.decision.action, 'execute_subtask');
   assert.equal(next.decision.subtaskId, 'st-api');
   assert.match(next.instruction, /Implement subtask st-api/);
+  assert.equal(decisionIfMatchLog.at(-1).ifMatch, undefined);
+
+  forceConcurrentDecisionChange = true;
+  const staleNext = await run(['next', '--api-base-url', apiBaseUrl, '--workflow', 'wf-cli']);
+  assert.equal(staleNext.guard.accepted, false);
+  assert.equal(staleNext.guard.code, 'invalid_transition');
+  assert.equal(decisionIfMatchLog.at(-1).ifMatch, next.decision.id);
 
   const builderStarted = await run([
     'start-builder',
@@ -569,6 +641,16 @@ try {
     { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
     { path: 'packages/kernel/src/server.ts', changeType: 'modified' },
   ]);
+
+  const aliasExecution = await run([
+    'record-implementation',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--summary', 'Alias implementation evidence',
+    '--observed-changed-files', 'packages/kernel/src/server.ts',
+  ]);
+  assert.equal(aliasExecution.action, 'execution-recorded');
 
   const validate = await run([
     'validate',
@@ -912,7 +994,7 @@ try {
   };
 
   const questioned = await run([
-    'record-questioner',
+    'ask-claude',
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
@@ -971,6 +1053,11 @@ try {
   assert.equal(v1CompletedWorkflow.decision.action, 'complete_workflow');
   assert.equal(workflow.status, 'completed');
 
+  workflow = {
+    ...workflow,
+    status: 'active',
+    completedAt: undefined,
+  };
   subtasks['st-api'] = {
     ...subtasks['st-api'],
     status: 'validated',
@@ -983,6 +1070,7 @@ try {
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
+    '--review-input-source', 'local_diff',
     '--path', repo,
     '--round', '1',
     '--max-rounds', '2',
@@ -1135,6 +1223,10 @@ try {
   assert.equal(continueToReview.decision.action, 'request_re_review');
   assert.equal(continueToReview.taskId, 'task-review-2');
   assert.equal(subtasks['st-api'].status, 'reviewing');
+  assert.ok(contextSnapshots.main);
+  assert.equal(contextSnapshots.main.target, 'main');
+  assert.equal(contextSnapshots.main.objectiveSummary, workflow.goal);
+  assert.match(await readFile(path.join(repo, '.tik/multi-agent/workflows/wf-cli/context/main.snapshot.md'), 'utf-8'), /Workflow Snapshot/);
 
   reviewTask = {
     ...reviewTask,
@@ -1244,7 +1336,10 @@ try {
   await new Promise((resolve) => server.close(resolve));
   await assertRejectedExecutionDoesNotMutate(repo);
   await assertRejectedReviewDoesNotMutate(repo);
+  await assertReviewCommitUsesPreMutationState(repo);
   await assertRejectedProcessReviewDoesNotMutate(repo);
+  await assertProcessReviewCommitPrecedesEvidenceAndStateMutation(repo);
+  await assertContinueStopsForCurrentSessionActions(repo);
   await assertRejectedProcessFinalReviewDoesNotMutate(repo);
   console.log('tik-multi-agent-workflow helper smoke test passed');
 } finally {
@@ -1294,7 +1389,7 @@ async function assertRejectedExecutionDoesNotMutate(repoPath) {
           decision: body.decision,
           guard: { accepted: false, code: 'invalid_transition', message: 'Rejected by test guard.' },
           workflow: localWorkflow,
-        }, 409);
+        }, route.endsWith('/decisions') ? 409 : 200);
         return;
       }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-reject-execute/evidence') {
@@ -1384,7 +1479,7 @@ async function assertRejectedReviewDoesNotMutate(repoPath) {
           decision: body.decision,
           guard: { accepted: false, code: 'invalid_transition', message: 'Rejected by test guard.' },
           workflow: localWorkflow,
-        }, 409);
+        }, route.endsWith('/decisions') ? 409 : 200);
         return;
       }
       if (req.method === 'POST' && route === '/api/v1/agent-loop/worktree-review-rounds') {
@@ -1417,6 +1512,123 @@ async function assertRejectedReviewDoesNotMutate(repoPath) {
   assert.equal(reviewCreated, false);
   assert.equal(localSubtasks['st-api'].status, 'validated');
   assert.deepEqual(localSubtasks['st-api'].reviewRoundIds, []);
+  await new Promise((resolve) => server.close(resolve));
+}
+
+async function assertReviewCommitUsesPreMutationState(repoPath) {
+  const headSha = gitHead(repoPath);
+  let reviewCreated = false;
+  const operations = [];
+  let decisions = [];
+  let localWorkflow = {
+    id: 'wf-review-commit-order',
+    driver: 'codex-workflow',
+    status: 'active',
+    goal: 'Commit review decision before mutating subtask state',
+    rootTaskId: 'wf-review-commit-order',
+    repo: 'repo',
+    baseRef: 'main',
+    headRef: 'main',
+    currentHeadSha: headSha,
+    maxRounds: 3,
+  };
+  let localSubtasks = {
+    'st-api': {
+      subtaskId: 'st-api',
+      status: 'validated',
+      reviewRoundIds: [],
+      validationRunIds: ['ev-validation'],
+      evidenceRefs: ['ev-validation'],
+      blockerFindingIds: [],
+      fixRound: 0,
+    },
+  };
+  const localEvidence = [{
+    id: 'ev-validation',
+    workflowId: 'wf-review-commit-order',
+    subtaskId: 'st-api',
+    kind: 'validation',
+    title: 'Validation',
+    passed: true,
+    headSha,
+    createdAt: new Date().toISOString(),
+  }];
+  const localGraph = buildGraph('wf-review-commit-order');
+  const server = http.createServer(async (req, res) => {
+    try {
+      const route = req.url || '/';
+      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-review-commit-order') {
+        sendJson(res, { workflow: localWorkflow, taskGraph: localGraph, subtasks: localSubtasks, decisions, evidence: localEvidence });
+        return;
+      }
+      if (
+        req.method === 'POST'
+        && (route === '/api/v1/multi-agent/workflows/wf-review-commit-order/decisions'
+          || route === '/api/v1/multi-agent/workflows/wf-review-commit-order/decisions/preflight')
+      ) {
+        const body = await readRequestJson(req);
+        operations.push(route.endsWith('/preflight') ? 'decision_preflight' : 'decision_commit');
+        const allowed = ['validated', 'approved'].includes(localSubtasks['st-api'].status);
+        if (!allowed) {
+          sendJson(res, {
+            decision: body.decision,
+            guard: {
+              accepted: false,
+              code: 'invalid_transition',
+              message: `request_claude_review rejected from ${localSubtasks['st-api'].status}.`,
+            },
+            workflow: localWorkflow,
+          }, route.endsWith('/decisions') ? 409 : 200);
+          return;
+        }
+        if (route.endsWith('/decisions')) {
+          decisions.push(body.decision);
+          localWorkflow = { ...localWorkflow, lastDecisionId: body.decision.id };
+        }
+        sendJson(res, { decision: body.decision, guard: { accepted: true, code: 'ok' }, workflow: localWorkflow });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/agent-loop/worktree-review-rounds') {
+        operations.push('review_task_created');
+        reviewCreated = true;
+        sendJson(res, { task: { id: 'task-review-order', shortIdentifier: 'TIK-ORDER' } });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/agent-loop/tasks/task-review-order/claude-review-runs') {
+        operations.push('review_started');
+        sendJson(res, { run: { id: 'run-review-order' } });
+        return;
+      }
+      if (req.method === 'PATCH' && route === '/api/v1/multi-agent/workflows/wf-review-commit-order/subtasks/st-api') {
+        operations.push('subtask_patch');
+        const body = await readRequestJson(req);
+        localSubtasks['st-api'] = { ...localSubtasks['st-api'], ...body };
+        sendJson(res, { subtask: localSubtasks['st-api'] });
+        return;
+      }
+      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
+    } catch (error) {
+      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
+    }
+  });
+  await listen(server);
+  const address = server.address();
+  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
+  const reviewed = await run([
+    'review',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-review-commit-order',
+    '--subtask', 'st-api',
+    '--path', repoPath,
+    '--start',
+  ]);
+  assert.equal(reviewed.guard.accepted, true);
+  assert.equal(reviewCreated, true);
+  assert.equal(decisions.length, 1);
+  assert.ok(operations.indexOf('decision_commit') < operations.indexOf('subtask_patch'));
+  assert.ok(operations.indexOf('decision_commit') < operations.indexOf('review_started'));
+  assert.equal(localSubtasks['st-api'].status, 'reviewing');
+  assert.deepEqual(localSubtasks['st-api'].reviewRoundIds, ['task-review-order']);
   await new Promise((resolve) => server.close(resolve));
 }
 
@@ -1489,7 +1701,7 @@ async function assertRejectedProcessReviewDoesNotMutate(repoPath) {
           decision: body.decision,
           guard: { accepted: false, code: 'invalid_transition', message: 'Rejected by test guard.' },
           workflow: localWorkflow,
-        }, 409);
+        }, route.endsWith('/decisions') ? 409 : 200);
         return;
       }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-reject-process-review/evidence') {
@@ -1522,6 +1734,243 @@ async function assertRejectedProcessReviewDoesNotMutate(repoPath) {
   assert.equal(rejected.guard.accepted, false);
   assert.equal(localEvidence.length, 1);
   assert.equal(localSubtasks['st-api'].status, 'reviewing');
+  await new Promise((resolve) => server.close(resolve));
+}
+
+async function assertProcessReviewCommitPrecedesEvidenceAndStateMutation(repoPath) {
+  const headSha = gitHead(repoPath);
+  const operations = [];
+  let decisions = [];
+  let localWorkflow = {
+    id: 'wf-process-review-order',
+    driver: 'codex-workflow',
+    status: 'active',
+    goal: 'Commit process-review decision before evidence and subtask mutations',
+    rootTaskId: 'wf-process-review-order',
+    repo: 'repo',
+    baseRef: 'main',
+    headRef: 'main',
+    currentHeadSha: headSha,
+    maxRounds: 3,
+  };
+  let localSubtasks = {
+    'st-api': {
+      subtaskId: 'st-api',
+      status: 'reviewing',
+      reviewRoundIds: ['task-review'],
+      validationRunIds: ['ev-validation'],
+      evidenceRefs: ['ev-validation'],
+      blockerFindingIds: [],
+      fixRound: 0,
+    },
+  };
+  const localEvidence = [{
+    id: 'ev-validation',
+    workflowId: 'wf-process-review-order',
+    subtaskId: 'st-api',
+    kind: 'validation',
+    title: 'Validation',
+    passed: true,
+    headSha,
+    createdAt: new Date().toISOString(),
+  }];
+  const localGraph = buildGraph('wf-process-review-order');
+  const reviewTask = {
+    id: 'task-review',
+    shortIdentifier: 'TIK-PROCESS-ORDER',
+    agentLoop: {
+      reviewResult: {
+        verdict: 'changes_requested',
+        headShaReviewed: headSha,
+        currentHeadSha: headSha,
+        blockingIssues: [{
+          title: 'Fix API edge case',
+          severity: 'blocker',
+        }],
+      },
+    },
+  };
+  const server = http.createServer(async (req, res) => {
+    try {
+      const route = req.url || '/';
+      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-process-review-order') {
+        sendJson(res, { workflow: localWorkflow, taskGraph: localGraph, subtasks: localSubtasks, decisions, evidence: localEvidence });
+        return;
+      }
+      if (req.method === 'GET' && route === '/api/v1/tasks') {
+        sendJson(res, { tasks: [reviewTask] });
+        return;
+      }
+      if (
+        req.method === 'POST'
+        && (route === '/api/v1/multi-agent/workflows/wf-process-review-order/decisions'
+          || route === '/api/v1/multi-agent/workflows/wf-process-review-order/decisions/preflight')
+      ) {
+        const body = await readRequestJson(req);
+        operations.push(route.endsWith('/preflight') ? 'decision_preflight' : 'decision_commit');
+        const allowed = localSubtasks['st-api'].status === 'reviewing';
+        if (!allowed) {
+          sendJson(res, {
+            decision: body.decision,
+            guard: {
+              accepted: false,
+              code: 'invalid_transition',
+              message: `process-review decision rejected from ${localSubtasks['st-api'].status}.`,
+            },
+            workflow: localWorkflow,
+          }, route.endsWith('/decisions') ? 409 : 200);
+          return;
+        }
+        if (route.endsWith('/decisions')) {
+          decisions.push(body.decision);
+          localWorkflow = { ...localWorkflow, lastDecisionId: body.decision.id };
+        }
+        sendJson(res, { decision: body.decision, guard: { accepted: true, code: 'ok' }, workflow: localWorkflow });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-process-review-order/evidence') {
+        operations.push('evidence_recorded');
+        const body = await readRequestJson(req);
+        localEvidence.push({ id: body.id || 'ev-review', workflowId: localWorkflow.id, ...body });
+        sendJson(res, { evidence: localEvidence.at(-1) });
+        return;
+      }
+      if (req.method === 'PATCH' && route === '/api/v1/multi-agent/workflows/wf-process-review-order/subtasks/st-api') {
+        operations.push('subtask_patch');
+        const body = await readRequestJson(req);
+        localSubtasks['st-api'] = { ...localSubtasks['st-api'], ...body };
+        sendJson(res, { subtask: localSubtasks['st-api'] });
+        return;
+      }
+      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
+    } catch (error) {
+      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
+    }
+  });
+  await listen(server);
+  const address = server.address();
+  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
+  const processed = await run([
+    'process-review',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-process-review-order',
+    '--subtask', 'st-api',
+    '--task', 'task-review',
+  ]);
+  assert.equal(processed.guard.accepted, true);
+  assert.equal(processed.decision.action, 'fix_claude_blockers');
+  assert.equal(decisions.length, 1);
+  assert.ok(operations.indexOf('decision_commit') < operations.indexOf('evidence_recorded'));
+  assert.ok(operations.indexOf('decision_commit') < operations.indexOf('subtask_patch'));
+  assert.equal(localEvidence.length, 2);
+  const reviewEvidence = localEvidence.at(-1);
+  assert.ok(decisions[0].evidenceRefs.includes(reviewEvidence.id));
+  assert.ok(processed.decision.evidenceRefs.includes(reviewEvidence.id));
+  assert.equal(localSubtasks['st-api'].status, 'needs_fix');
+  assert.deepEqual(localSubtasks['st-api'].evidenceRefs, ['ev-validation', reviewEvidence.id]);
+  await new Promise((resolve) => server.close(resolve));
+}
+
+async function assertContinueStopsForCurrentSessionActions(repoPath) {
+  const headSha = gitHead(repoPath);
+  let decisionsPosted = 0;
+  let contextSnapshotsSaved = 0;
+  const localWorkflow = {
+    id: 'wf-continue-manual-action',
+    driver: 'codex-workflow',
+    status: 'active',
+    goal: 'Continue should pause for current Codex work',
+    rootTaskId: 'wf-continue-manual-action',
+    repo: 'repo',
+    baseRef: 'main',
+    headRef: 'main',
+    currentHeadSha: headSha,
+    maxRounds: 3,
+    policy: {
+      loopContract: {
+        budget: { maxRounds: 3 },
+        stop: ['guard_rejected', 'human_required'],
+      },
+    },
+  };
+  const localGraph = buildGraph('wf-continue-manual-action');
+  const localSubtasks = {
+    'st-api': {
+      subtaskId: 'st-api',
+      status: 'ready',
+      reviewRoundIds: [],
+      validationRunIds: [],
+      evidenceRefs: [],
+      blockerFindingIds: [],
+      fixRound: 0,
+    },
+  };
+  const server = http.createServer(async (req, res) => {
+    try {
+      const route = req.url || '/';
+      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-continue-manual-action') {
+        sendJson(res, {
+          workflow: localWorkflow,
+          taskGraph: localGraph,
+          subtasks: localSubtasks,
+          decisions: [],
+          evidence: [],
+          contracts: [],
+          evaluationRuns: [],
+          questionerOutputs: [],
+          invocations: [],
+          events: [],
+        });
+        return;
+      }
+      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-continue-manual-action/context-snapshots/main') {
+        sendJson(res, { error: { message: 'Context snapshot not found' } }, 404);
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-continue-manual-action/context-snapshots') {
+        contextSnapshotsSaved += 1;
+        const body = await readRequestJson(req);
+        sendJson(res, {
+          snapshot: {
+            ...body.snapshot,
+            etag: `sn-${contextSnapshotsSaved}`,
+            renderedMarkdown: '# Workflow Snapshot\n',
+          },
+          guard: { accepted: true, code: 'ok' },
+        });
+        return;
+      }
+      if (
+        req.method === 'POST'
+        && (route === '/api/v1/multi-agent/workflows/wf-continue-manual-action/decisions'
+          || route === '/api/v1/multi-agent/workflows/wf-continue-manual-action/decisions/preflight')
+      ) {
+        const body = await readRequestJson(req);
+        if (route.endsWith('/decisions')) {
+          decisionsPosted += 1;
+        }
+        sendJson(res, { decision: body.decision, guard: { accepted: true, code: 'ok' }, workflow: localWorkflow });
+        return;
+      }
+      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
+    } catch (error) {
+      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
+    }
+  });
+  await listen(server);
+  const address = server.address();
+  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
+  const continued = await run([
+    'continue',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-continue-manual-action',
+    '--path', repoPath,
+  ]);
+  assert.equal(continued.action, 'continue-instruction');
+  assert.equal(continued.decision.action, 'execute_subtask');
+  assert.match(continued.instruction, /Implement subtask st-api/);
+  assert.equal(continued.guard.accepted, true);
+  assert.equal(decisionsPosted, 0);
   await new Promise((resolve) => server.close(resolve));
 }
 
@@ -1585,7 +2034,7 @@ async function assertRejectedProcessFinalReviewDoesNotMutate(repoPath) {
           decision: body.decision,
           guard: { accepted: false, code: 'invalid_transition', message: 'Rejected by test guard.' },
           workflow: localWorkflow,
-        }, 409);
+        }, route.endsWith('/decisions') ? 409 : 200);
         return;
       }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-reject-process-final-review/evidence') {

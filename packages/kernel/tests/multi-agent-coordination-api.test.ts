@@ -586,7 +586,7 @@ describe('multi-agent coordination API', () => {
         }),
       },
     });
-    expect(beforeDependency.statusCode).toBe(409);
+    expect(beforeDependency.statusCode).toBe(200);
     expect(beforeDependency.json().guard).toMatchObject({
       accepted: false,
       code: 'invalid_transition',
@@ -763,7 +763,7 @@ describe('multi-agent coordination API', () => {
         }),
       },
     });
-    expect(reReviewBeforeValidation.statusCode).toBe(409);
+    expect(reReviewBeforeValidation.statusCode).toBe(200);
 
     await server.inject({
       method: 'POST',
@@ -803,6 +803,94 @@ describe('multi-agent coordination API', () => {
     });
     expect(reReviewAfterValidation.statusCode).toBe(200);
     expect(reReviewAfterValidation.json().guard).toMatchObject({
+      accepted: true,
+      code: 'ok',
+    });
+  });
+
+  it('accepts review decisions that reference their planned review evidence id', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-planned-review-evidence',
+        goal: 'Process review with an auditable evidence chain',
+        rootTaskId: 'root-planned-review-evidence',
+        headSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-planned-review-evidence/task-graph',
+      payload: {
+        graph: buildTaskGraph('wf-planned-review-evidence', 1, [
+          { id: 'st-api', dependsOn: [] },
+        ]),
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-planned-review-evidence/subtasks/st-api',
+      payload: { status: 'executing' },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-planned-review-evidence/subtasks/st-api',
+      payload: { status: 'implemented', implementationHeadSha: 'head-1' },
+    });
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-planned-review-evidence/evidence',
+      payload: {
+        id: 'ev-validation',
+        kind: 'validation',
+        title: 'Validation before review',
+        subtaskId: 'st-api',
+        passed: true,
+        headSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-planned-review-evidence/subtasks/st-api',
+      payload: {
+        status: 'reviewing',
+        validationRunIds: ['ev-validation'],
+        evidenceRefs: ['ev-validation'],
+        reviewRoundIds: ['task-review-1'],
+      },
+    });
+
+    const preflight = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-planned-review-evidence/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-planned-review-evidence', {
+          id: 'dec-process-review',
+          action: 'fix_claude_blockers',
+          subtaskId: 'st-api',
+          reason: 'Claude review found blocking issues.',
+          evidenceRefs: ['ev-validation', 'ev_review_task-review-1'],
+          inputs: {
+            currentHeadSha: 'head-1',
+            plannedReviewEvidenceId: 'ev_review_task-review-1',
+            plannedReviewResult: {
+              verdict: 'request_changes',
+              headShaReviewed: 'head-1',
+              blockingIssues: [{ title: 'Missing regression test' }],
+            },
+          },
+        }),
+      },
+    });
+
+    expect(preflight.statusCode).toBe(200);
+    expect(preflight.json().guard).toMatchObject({
       accepted: true,
       code: 'ok',
     });

@@ -38,7 +38,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
       },
     });
 
-    expect(withoutContract.statusCode).toBe(409);
+    expect(withoutContract.statusCode).toBe(200);
     expect(withoutContract.json().guard).toMatchObject({
       accepted: false,
       code: 'missing_contract',
@@ -273,7 +273,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
         }),
       },
     });
-    expect(beforeQuestioner.statusCode).toBe(409);
+    expect(beforeQuestioner.statusCode).toBe(200);
     expect(beforeQuestioner.json().guard).toMatchObject({
       accepted: false,
       code: 'blocking_question_unresolved',
@@ -322,7 +322,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
         }),
       },
     });
-    expect(blockingQuestion.statusCode).toBe(409);
+    expect(blockingQuestion.statusCode).toBe(200);
     expect(blockingQuestion.json().guard).toMatchObject({
       accepted: false,
       code: 'blocking_question_unresolved',
@@ -517,7 +517,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
         }),
       },
     });
-    expect(withoutInvocations.statusCode).toBe(409);
+    expect(withoutInvocations.statusCode).toBe(200);
     expect(withoutInvocations.json().guard).toMatchObject({
       accepted: false,
       code: 'missing_subagent_invocation',
@@ -578,7 +578,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
         }),
       },
     });
-    expect(sameThread.statusCode).toBe(409);
+    expect(sameThread.statusCode).toBe(200);
     expect(sameThread.json().guard).toMatchObject({
       accepted: false,
       code: 'subagent_thread_not_isolated',
@@ -692,7 +692,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
       },
     });
 
-    expect(complete.statusCode).toBe(409);
+    expect(complete.statusCode).toBe(200);
     expect(complete.json().guard).toMatchObject({
       accepted: false,
       code: 'missing_implementation_evidence',
@@ -785,7 +785,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
       },
     });
 
-    expect(complete.statusCode).toBe(409);
+    expect(complete.statusCode).toBe(200);
     expect(complete.json().guard).toMatchObject({
       accepted: false,
       code: 'worktree_out_of_scope',
@@ -896,7 +896,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
       },
     });
 
-    expect(complete.statusCode).toBe(409);
+    expect(complete.statusCode).toBe(200);
     expect(complete.json().guard).toMatchObject({
       accepted: false,
       code: 'evaluation_not_passed',
@@ -1115,7 +1115,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
         }),
       },
     });
-    expect(wrongEvaluation.statusCode).toBe(409);
+    expect(wrongEvaluation.statusCode).toBe(200);
     expect(wrongEvaluation.json().guard).toMatchObject({
       accepted: false,
       code: 'blocking_question_unresolved',
@@ -1265,7 +1265,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
       },
     });
 
-    expect(complete.statusCode).toBe(409);
+    expect(complete.statusCode).toBe(200);
     expect(complete.json().guard).toMatchObject({
       accepted: false,
       code: 'missing_subagent_invocation',
@@ -1409,7 +1409,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
       },
     });
 
-    expect(complete.statusCode).toBe(409);
+    expect(complete.statusCode).toBe(200);
     expect(complete.json().guard).toMatchObject({
       accepted: false,
       code: 'subagent_thread_not_isolated',
@@ -1438,7 +1438,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
         }),
       },
     });
-    expect(evaluatorBeforeImplementation.statusCode).toBe(409);
+    expect(evaluatorBeforeImplementation.statusCode).toBe(200);
     expect(evaluatorBeforeImplementation.json().guard).toMatchObject({
       accepted: false,
       code: 'missing_implementation_evidence',
@@ -1456,7 +1456,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
         }),
       },
     });
-    expect(finalEvaluationBeforeDone.statusCode).toBe(409);
+    expect(finalEvaluationBeforeDone.statusCode).toBe(200);
     expect(finalEvaluationBeforeDone.json().guard).toMatchObject({
       accepted: false,
       code: 'invalid_transition',
@@ -1484,7 +1484,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
         }),
       },
     });
-    expect(withoutFinalEvaluation.statusCode).toBe(409);
+    expect(withoutFinalEvaluation.statusCode).toBe(200);
     expect(withoutFinalEvaluation.json().guard).toMatchObject({
       accepted: false,
       code: 'missing_evaluation_result',
@@ -1546,7 +1546,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
         }),
       },
     });
-    expect(withoutFinalQuestioner.statusCode).toBe(409);
+    expect(withoutFinalQuestioner.statusCode).toBe(200);
     expect(withoutFinalQuestioner.json().guard).toMatchObject({
       accepted: false,
       code: 'blocking_question_unresolved',
@@ -1670,7 +1670,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
       },
     });
 
-    expect(complete.statusCode).toBe(409);
+    expect(complete.statusCode).toBe(200);
     expect(complete.json().guard).toMatchObject({
       accepted: false,
       code: 'evaluation_evidence_insufficient',

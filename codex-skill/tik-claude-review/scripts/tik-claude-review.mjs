@@ -81,6 +81,10 @@ async function createReview(options, behavior = {}) {
     allowedScope: splitList(options.allowedScope),
     acceptanceCriteria: splitList(options.acceptanceCriteria),
     reviewFocus: splitList(options.reviewFocus),
+    reviewInputSource: options.reviewInputSource || (options.mergeRequestUrl || options.mrUrl ? 'merge_request' : 'local_diff'),
+    mergeRequestUrl: options.mergeRequestUrl || options.mrUrl,
+    fetchRemote: options.fetchRemote,
+    fetchRef: options.fetchRef,
     createdBy: 'codex',
     workspaceBinding: {
       workspaceRoot: path.resolve(options.workspaceRoot || findWorkspaceRoot(projectPath)),
@@ -351,6 +355,12 @@ Options:
   --review-focus <csv>       Review focus hints.
   --acceptance-criteria <csv> Acceptance criteria hints.
   --allowed-scope <csv>      Scope hints.
+  --review-input-source <local_diff|merge_request>
+                             Review source. Defaults to local_diff.
+  --merge-request-url <url>   Merge request URL for MR-sourced reviews.
+  --mr-url <url>              Alias for --merge-request-url.
+  --fetch-remote <name>       Remote used by MR fetch instructions. Defaults to origin.
+  --fetch-ref <ref>           Ref used by MR fetch instructions.
   --label <csv>              Extra labels. external-claude-review is always added.
   --task <id>                Task id/identifier for start/wait/process.
   --timeout-ms <n>           Wait timeout. Defaults to 1800000.

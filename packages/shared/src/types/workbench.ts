@@ -79,6 +79,13 @@ export interface ReviewResult {
   reviewerWorkerId?: string;
 }
 
+export interface ReviewInputSource {
+  source: 'local_diff' | 'merge_request';
+  mergeRequestUrl?: string;
+  fetchRemote?: string;
+  fetchRef?: string;
+}
+
 export interface AgentLoopMetadata {
   kind: AgentLoopWorkItemKind;
   phase?: 'needs_claude_review' | 'claude_reviewing' | 'needs_codex_fix' | 'codex_fixing' | 'needs_human_review' | 'stale' | 'complete';
@@ -94,6 +101,7 @@ export interface AgentLoopMetadata {
   allowedScope?: string[];
   acceptanceCriteria?: string[];
   reviewFocus?: string[];
+  reviewInput?: ReviewInputSource;
   blockingIssues?: BlockingIssue[];
   reviewResult?: ReviewResult;
   stale?: {
@@ -114,6 +122,7 @@ export interface AgentLoopPayload {
   allowedScope?: string[];
   acceptanceCriteria?: string[];
   reviewFocus?: string[];
+  reviewInput?: ReviewInputSource;
   blockingIssues?: BlockingIssue[];
   createdBy?: AgentLoopMetadata['createdBy'];
   labels?: string[];

@@ -24,13 +24,16 @@ import type {
   CodexEvaluationResult,
   CreateMultiAgentWorkflowInput,
   EvaluationRun,
+  HumanOverrideRecord,
   MultiAgentWorkflowBundle,
   MultiAgentWorkflowRecord,
   QuestionerOutput,
   SprintContract,
   SubtaskRunState,
   TaskGraph,
+  WorkflowContextSnapshot,
   WorkflowDecision,
+  WorkflowPolicy,
 } from '@tik/shared';
 import {
   canRetryWorkbenchTask,
@@ -159,6 +162,7 @@ interface MultiAgentWorkflowPatchBody {
   status?: MultiAgentWorkflowRecord['status'];
   headSha?: string;
   metadata?: Record<string, unknown>;
+  policy?: Partial<WorkflowPolicy>;
 }
 
 interface CreateSprintContractBody {
@@ -343,6 +347,31 @@ interface HookStopAgentInvocationBody {
   error?: string;
 }
 
+interface SaveContextSnapshotBody {
+  snapshot: Omit<Partial<WorkflowContextSnapshot>, 'workflowId'> & {
+    workflowId?: string;
+    headSha: string;
+    target: WorkflowContextSnapshot['target'];
+    objectiveSummary: string;
+    completedSubtasks?: string[];
+    unresolvedBlockers?: string[];
+    artifactRefs?: string[];
+    maxChars?: number;
+  };
+}
+
+interface ReconcileStalledInvocationsBody {
+  now?: string;
+}
+
+interface HumanOverrideBody {
+  reason: string;
+  approver: string;
+  unblockAction: HumanOverrideRecord['unblockAction'];
+  subtaskId?: string;
+  note?: string;
+}
+
 interface CreateArtifactBody {
   taskId?: string;
   workspaceId?: string;
@@ -413,6 +442,11 @@ interface AgentLoopWorktreeReviewRoundBody extends WorkbenchTaskConfigurationBod
   allowedScope?: string[];
   acceptanceCriteria?: string[];
   reviewFocus?: string[];
+  reviewInput?: AgentLoopPayload['reviewInput'];
+  reviewInputSource?: NonNullable<AgentLoopPayload['reviewInput']>['source'];
+  mergeRequestUrl?: string;
+  fetchRemote?: string;
+  fetchRef?: string;
   createdBy?: AgentLoopPayload['createdBy'];
   labels?: string[];
 }
@@ -668,7 +702,7 @@ export async function createServer(
   fastify.addHook('onRequest', async (req, reply) => {
     reply.header('Access-Control-Allow-Origin', corsOrigin);
     reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, If-Match');
     if (req.method === 'OPTIONS') { return reply.send(); }
     if (apiToken && !isPublicApiRoute(req.method, req.url)) {
       const authorization = req.headers.authorization;
@@ -1147,6 +1181,7 @@ export async function createServer(
         const workflow = await multiAgentStore.updateWorkflow(existing.id, {
           currentHeadSha: req.body.headSha,
           metadata: req.body.metadata,
+          policy: req.body.policy,
         });
         return { workflow };
       } catch (error) {
@@ -1172,12 +1207,23 @@ export async function createServer(
             workflow: bundle.workflow,
           };
         }
-        const decision = await multiAgentStore.recordDecision(req.params.workflowId, req.body.decision);
-        const updated = await multiAgentStore.readWorkflow(req.params.workflowId);
+        const recorded = await multiAgentStore.recordDecisionIfMatch(
+          req.params.workflowId,
+          req.body.decision,
+          readIfMatch(req.headers['if-match']),
+        );
+        if (!recorded.guard.accepted) {
+          reply.code(409);
+          return {
+            decision: req.body.decision,
+            guard: recorded.guard,
+            workflow: recorded.workflow,
+          };
+        }
         return {
-          decision,
+          decision: recorded.decision,
           guard,
-          workflow: updated || bundle.workflow,
+          workflow: recorded.workflow,
         };
       } catch (error) {
         return sendV1CaughtError(reply, error);
@@ -1193,15 +1239,86 @@ export async function createServer(
         if (!bundle) {
           return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
         }
-        const guard = evaluateWorkflowDecisionGuard(bundle, req.body.decision);
-        if (!guard.accepted) {
-          reply.code(409);
+        let guard = evaluateWorkflowDecisionGuard(bundle, req.body.decision);
+        if (guard.accepted) {
+          const expectedLastDecisionId = readIfMatch(req.headers['if-match']);
+          if (!lastDecisionMatchesForPreflight(bundle.workflow.lastDecisionId, expectedLastDecisionId)) {
+            guard = {
+              accepted: false,
+              code: 'invalid_transition',
+              message: `Decision history changed; expected ${expectedLastDecisionId || 'no last decision'}, current ${bundle.workflow.lastDecisionId || 'none'}.`,
+              currentState: {
+                expectedLastDecisionId,
+                lastDecisionId: bundle.workflow.lastDecisionId,
+              },
+            };
+          }
         }
         return {
           decision: req.body.decision,
           guard,
           workflow: bundle.workflow,
         };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: SaveContextSnapshotBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/context-snapshots',
+    async (req, reply) => {
+      try {
+        const result = await multiAgentStore.saveContextSnapshot(
+          req.params.workflowId,
+          req.body.snapshot,
+          readIfMatch(req.headers['if-match']),
+        );
+        if (!result.guard.accepted) {
+          reply.code(409);
+        }
+        return result;
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.get<{ Params: { workflowId: string; target: WorkflowContextSnapshot['target'] } }>(
+    '/api/v1/multi-agent/workflows/:workflowId/context-snapshots/:target',
+    async (req, reply) => {
+      try {
+        const snapshot = await multiAgentStore.readContextSnapshot(req.params.workflowId, req.params.target);
+        if (!snapshot) {
+          return sendV1Error(reply, 404, 'context_snapshot_not_found', 'Context snapshot not found');
+        }
+        return { snapshot };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: ReconcileStalledInvocationsBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/invocations/reconcile-stalled',
+    async (req, reply) => {
+      try {
+        const result = await multiAgentStore.reconcileStalledInvocations(req.params.workflowId, req.body || {});
+        return {
+          ...result,
+          stalled: result.stalled.map(sanitizeAgentInvocation),
+        };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: HumanOverrideBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/human-overrides',
+    async (req, reply) => {
+      try {
+        return await multiAgentStore.recordHumanOverride(req.params.workflowId, req.body);
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1855,6 +1972,7 @@ export async function createServer(
           allowedScope: req.body.allowedScope,
           acceptanceCriteria: req.body.acceptanceCriteria,
           reviewFocus: req.body.reviewFocus,
+          reviewInput: normalizeReviewInput(req.body),
           createdBy: req.body.createdBy || 'human',
           labels: req.body.labels,
         });
@@ -3458,6 +3576,21 @@ function readGitOutput(cwd: string, args: string[]): string {
   return result.stdout.trim();
 }
 
+function normalizeReviewInput(
+  body: Pick<
+    AgentLoopWorktreeReviewRoundBody,
+    'reviewInput' | 'reviewInputSource' | 'mergeRequestUrl' | 'fetchRemote' | 'fetchRef'
+  >,
+): NonNullable<AgentLoopPayload['reviewInput']> {
+  const source = body.reviewInputSource || body.reviewInput?.source || (body.mergeRequestUrl ? 'merge_request' : 'local_diff');
+  return {
+    source,
+    mergeRequestUrl: body.mergeRequestUrl || body.reviewInput?.mergeRequestUrl,
+    fetchRemote: body.fetchRemote || body.reviewInput?.fetchRemote,
+    fetchRef: body.fetchRef || body.reviewInput?.fetchRef,
+  };
+}
+
 function buildWorkbenchTrackerDaemon(input: {
   kernel: ExecutionKernel;
   workbench: NonNullable<Partial<ExecutionKernel>['workbench']>;
@@ -3698,6 +3831,21 @@ function sendV1CaughtError(reply: any, error: unknown) {
   }
 
   return sendV1Error(reply, 500, 'internal_error', error instanceof Error ? error.message : String(error));
+}
+
+function readIfMatch(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) {
+    return value[0];
+  }
+  const trimmed = value?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+function lastDecisionMatchesForPreflight(current: string | undefined, expected: string | undefined): boolean {
+  if (expected === undefined || expected === '*') {
+    return true;
+  }
+  return current === expected;
 }
 
 const ALLOWED_SUBTASK_PATCH_KEYS = new Set([

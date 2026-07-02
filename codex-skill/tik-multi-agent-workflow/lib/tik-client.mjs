@@ -12,6 +12,9 @@ export async function tikFetch(options, route, input = {}) {
   if (token) {
     headers.authorization = `Bearer ${token}`;
   }
+  if (input.ifMatch) {
+    headers['if-match'] = input.ifMatch;
+  }
   const response = await fetch(`${baseUrl}${route}`, {
     method: input.method || 'GET',
     headers,
@@ -33,17 +36,19 @@ export async function readWorkflow(options, workflowId) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}`);
 }
 
-export async function recordDecision(options, workflowId, decision) {
+export async function recordDecision(options, workflowId, decision, input = {}) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions`, {
     method: 'POST',
     body: { decision },
+    ifMatch: input.ifMatch,
   });
 }
 
-export async function preflightDecision(options, workflowId, decision) {
+export async function preflightDecision(options, workflowId, decision, input = {}) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions/preflight`, {
     method: 'POST',
     body: { decision },
+    ifMatch: input.ifMatch,
   });
 }
 
@@ -136,6 +141,18 @@ export async function recordQuestionerOutput(options, workflowId, output) {
     method: 'POST',
     body: output,
   });
+}
+
+export async function saveContextSnapshot(options, workflowId, snapshot, input = {}) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/context-snapshots`, {
+    method: 'POST',
+    body: { snapshot },
+    ifMatch: input.ifMatch,
+  });
+}
+
+export async function readContextSnapshot(options, workflowId, target) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/context-snapshots/${encodeURIComponent(target)}`);
 }
 
 export async function createTask(options, task) {

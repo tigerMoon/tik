@@ -25,7 +25,9 @@ import {
   recordEvidence,
   recordEvaluationResult,
   recordQuestionerOutput,
+  readContextSnapshot,
   preflightDecision,
+  saveContextSnapshot,
   tikFetch,
   transitionTask,
   updateSubtask,
@@ -69,6 +71,7 @@ async function main() {
         await next(options);
         break;
       case 'execute':
+      case 'record-implementation':
         await execute(options);
         break;
       case 'start-builder':
@@ -87,6 +90,7 @@ async function main() {
         await evaluate(options);
         break;
       case 'record-questioner':
+      case 'ask-claude':
         await recordQuestioner(options);
         break;
       case 'complete-subtask':
@@ -243,7 +247,7 @@ async function requestPlan(options) {
       currentHeadSha: workflow.currentHeadSha,
     },
   });
-  const recorded = await safeRecordDecision(options, workflowId, decision);
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
   const invocation = await tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations`, {
     method: 'POST',
     body: {
@@ -290,7 +294,7 @@ async function next(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
   const state = await readWorkflow(options, workflowId);
   const decision = buildDecision(state.workflow, decideNextAction(state));
-  const recorded = await safeRecordDecision(options, workflowId, decision);
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
   printJson({
     action: 'next',
     workflowId,
@@ -359,7 +363,7 @@ async function execute(options) {
     evidenceRefs: [],
     inputs: { currentHeadSha: headSha },
   });
-  const preflight = await safePreflightDecision(options, workflowId, decision);
+  const preflight = await safePreflightDecision(options, workflowId, decision, state);
   if (!preflight.guard?.accepted) {
     printJson({
       action: 'execution-rejected',
@@ -433,7 +437,7 @@ async function execute(options) {
     evidenceRefs: mergeEvidenceRefs(existingEvidenceRefs, [evidence.evidence.id]),
     reason: 'Codex recorded implementation evidence; validation is next.',
   };
-  const recorded = await safeRecordDecision(options, workflowId, finalDecision);
+  const recorded = await safeRecordDecision(options, workflowId, finalDecision, state);
   printJson({
     action: 'execution-recorded',
     workflowId,
@@ -587,7 +591,7 @@ async function validate(options) {
       currentHeadSha: headSha,
     },
   });
-  const preflight = await safePreflightDecision(options, workflowId, preflightDecision);
+  const preflight = await safePreflightDecision(options, workflowId, preflightDecision, state);
   if (!preflight.guard?.accepted) {
     printJson({
       action: 'validation-rejected',
@@ -643,7 +647,7 @@ async function validate(options) {
       fixRecorded: reviewAction === 'request_re_review',
     },
   });
-  const recorded = await safeRecordDecision(options, workflowId, decision);
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
   printJson({
     action: 'validation-recorded',
     workflowId,
@@ -879,7 +883,7 @@ async function completeSubtask(options) {
       questionerOutputId: latestQuestionerOutputId(state, subtaskId, 'question_evaluation'),
     },
   });
-  const preflight = await safePreflightDecision(options, workflowId, decision);
+  const preflight = await safePreflightDecision(options, workflowId, decision, state);
   if (!preflight.guard?.accepted) {
     printJson({
       action: 'subtask-complete-rejected',
@@ -890,7 +894,7 @@ async function completeSubtask(options) {
     });
     return;
   }
-  const recorded = await safeRecordDecision(options, workflowId, decision);
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
   const subtask = await updateSubtask(options, workflowId, subtaskId, {
     status: 'done',
   });
@@ -918,7 +922,7 @@ async function completeWorkflow(options) {
       questionerOutputId: latestQuestionerOutputId(state, undefined, 'question_final_evidence'),
     },
   });
-  const preflight = await safePreflightDecision(options, workflowId, decision);
+  const preflight = await safePreflightDecision(options, workflowId, decision, state);
   if (!preflight.guard?.accepted) {
     printJson({
       action: 'workflow-complete-rejected',
@@ -928,7 +932,7 @@ async function completeWorkflow(options) {
     });
     return;
   }
-  const recorded = await safeRecordDecision(options, workflowId, decision);
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
   printJson({
     action: 'workflow-completed',
     workflowId,
@@ -956,7 +960,7 @@ async function requestReview(options) {
     evidenceRefs: state.subtasks?.[subtaskId]?.evidenceRefs || [],
     inputs: { round, maxRounds, currentHeadSha: headSha, fixRecorded: round > 1 },
   });
-  const preflight = await safePreflightDecision(options, workflowId, decision);
+  const preflight = await safePreflightDecision(options, workflowId, decision, state);
   if (!preflight.guard?.accepted) {
     printJson({
       action: 'review-rejected',
@@ -992,23 +996,40 @@ async function requestReview(options) {
       allowedScope: splitList(options.allowedScope) || subtask?.allowedPaths,
       acceptanceCriteria: splitList(options.acceptanceCriteria) || subtask?.acceptanceCriteria,
       reviewFocus: splitList(options.reviewFocus) || subtask?.reviewFocus,
+      reviewInputSource: reviewInputSourceOption(options),
+      mergeRequestUrl: options.mergeRequestUrl || options.mrUrl,
+      fetchRemote: options.fetchRemote,
+      fetchRef: options.fetchRef,
       createdBy: 'codex',
       workspaceBinding: state.workflow.workspaceBinding || buildWorkspaceBinding(projectPath, options),
     },
   });
   const taskId = response.task?.id;
-  await updateSubtask(options, workflowId, subtaskId, {
-      status: 'reviewing',
-      lastReviewedHeadSha: headSha,
-      reviewRoundIds: taskId ? [taskId] : [],
-  });
   const finalDecision = {
     ...decision,
     reviewRoundId: taskId,
     reason: 'Codex workflow requested a Tik-owned Claude review.',
     inputs: { ...decision.inputs, reviewTaskId: taskId },
   };
-  const recorded = await safeRecordDecision(options, workflowId, finalDecision);
+  const recorded = await safeRecordDecision(options, workflowId, finalDecision, state);
+  if (recorded.guard?.accepted === false) {
+    printJson({
+      action: 'review-rejected',
+      workflowId,
+      subtaskId,
+      round,
+      headSha,
+      taskId,
+      decision: finalDecision,
+      guard: recorded.guard,
+    });
+    return;
+  }
+  await updateSubtask(options, workflowId, subtaskId, {
+      status: 'reviewing',
+      lastReviewedHeadSha: headSha,
+      reviewRoundIds: taskId ? [taskId] : [],
+  });
   let started = null;
   if (options.start) {
     started = await tikFetch(options, `/v1/agent-loop/tasks/${encodeURIComponent(taskId)}/claude-review-runs`, {
@@ -1065,16 +1086,18 @@ async function processReview(options) {
     validationPassed,
     validationEvidence,
   });
+  const reviewEvidenceId = reviewEvidenceIdForTask(task.id);
   const plannedDecision = buildDecision(state.workflow, {
     ...policy,
     reviewRoundId: task.id,
-    evidenceRefs: state.subtasks?.[subtaskId]?.evidenceRefs || [],
+    evidenceRefs: mergeEvidenceRefs(state.subtasks?.[subtaskId]?.evidenceRefs, [reviewEvidenceId]),
     inputs: {
       ...(policy.inputs || {}),
+      plannedReviewEvidenceId: reviewEvidenceId,
       plannedReviewResult: result,
     },
   });
-  const preflight = await safePreflightDecision(options, workflowId, plannedDecision);
+  const preflight = await safePreflightDecision(options, workflowId, plannedDecision, state);
   if (!preflight.guard?.accepted) {
     printJson({
       action: 'review-process-rejected',
@@ -1087,7 +1110,22 @@ async function processReview(options) {
     });
     return;
   }
+  const decision = plannedDecision;
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
+  if (recorded.guard?.accepted === false) {
+    printJson({
+      action: 'review-process-rejected',
+      workflowId,
+      subtaskId,
+      reviewTaskId: task.id,
+      verdict: result.verdict,
+      decision,
+      guard: recorded.guard,
+    });
+    return;
+  }
   const evidence = await recordEvidence(options, workflowId, {
+    id: reviewEvidenceId,
     kind: 'review',
     title: `Claude review ${task.shortIdentifier || task.id}`,
     summary: `${result.verdict} with ${(result.blockingIssues || []).length} blocking issue(s).`,
@@ -1099,20 +1137,6 @@ async function processReview(options) {
     },
   });
   const evidenceRefs = mergeEvidenceRefs(state.subtasks?.[subtaskId]?.evidenceRefs, [evidence.evidence.id]);
-  const decision = buildDecision(state.workflow, {
-    ...policy,
-    reviewRoundId: task.id,
-    evidenceRefs,
-  });
-  if (decision.action === 'validate_subtask') {
-    await updateSubtask(options, workflowId, subtaskId, {
-      status: 'implemented',
-      lastReviewedHeadSha: result.headShaReviewed,
-      evidenceRefs,
-      blockerFindingIds: [],
-    });
-  }
-  const recorded = await safeRecordDecision(options, workflowId, decision);
   const blockerFindingIds = (result.blockingIssues || []).map((issue, index) => `${task.id}:blocking:${index + 1}`);
   const fixRound = decision.action === 'fix_claude_blockers'
     ? (state.subtasks?.[subtaskId]?.fixRound || 0) + 1
@@ -1170,7 +1194,7 @@ async function requestFinalReview(options) {
       taskGraphVersion: state.taskGraph?.version,
     },
   });
-  const preflight = await safePreflightDecision(options, workflowId, decision);
+  const preflight = await safePreflightDecision(options, workflowId, decision, state);
   if (!preflight.guard?.accepted) {
     printJson({
       action: 'final-review-rejected',
@@ -1201,6 +1225,10 @@ async function requestFinalReview(options) {
       allowedScope: collectAllowedPaths(state),
       acceptanceCriteria: state.taskGraph?.globalAcceptanceCriteria || [],
       reviewFocus: ['final workflow integration', 'all subtasks done', 'regression risk'],
+      reviewInputSource: reviewInputSourceOption(options),
+      mergeRequestUrl: options.mergeRequestUrl || options.mrUrl,
+      fetchRemote: options.fetchRemote,
+      fetchRef: options.fetchRef,
       createdBy: 'codex',
       workspaceBinding: state.workflow.workspaceBinding || buildWorkspaceBinding(projectPath, options),
     },
@@ -1212,7 +1240,7 @@ async function requestFinalReview(options) {
     reason: 'Codex workflow requested final Tik-owned Claude review.',
     inputs: { ...decision.inputs, reviewTaskId: taskId },
   };
-  const recorded = await safeRecordDecision(options, workflowId, finalDecision);
+  const recorded = await safeRecordDecision(options, workflowId, finalDecision, state);
   let started = null;
   if (options.start) {
     started = await tikFetch(options, `/v1/agent-loop/tasks/${encodeURIComponent(taskId)}/claude-review-runs`, {
@@ -1266,7 +1294,7 @@ async function processFinalReview(options) {
     },
     risks: (result.blockingIssues || []).map((issue) => issue.title || issue.reason).filter(Boolean),
   });
-  const preflight = await safePreflightDecision(options, workflowId, plannedDecision);
+  const preflight = await safePreflightDecision(options, workflowId, plannedDecision, state);
   if (!preflight.guard?.accepted) {
     printJson({
       action: 'final-review-process-rejected',
@@ -1298,7 +1326,7 @@ async function processFinalReview(options) {
       plannedFinalReviewResult: undefined,
     }),
   };
-  const recorded = await safeRecordDecision(options, workflowId, decision);
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
   printJson({
     action: approved ? 'workflow-completed' : 'final-review-needs-human',
     workflowId,
@@ -1324,7 +1352,7 @@ async function fix(options) {
     evidenceRefs: state.subtasks?.[subtaskId]?.evidenceRefs || [],
     inputs: { currentHeadSha: headSha },
   });
-  const preflight = await safePreflightDecision(options, workflowId, preflightDecision);
+  const preflight = await safePreflightDecision(options, workflowId, preflightDecision, state);
   if (!preflight.guard?.accepted) {
     printJson({
       action: 'fix-rejected',
@@ -1360,7 +1388,7 @@ async function fix(options) {
     evidenceRefs,
     inputs: { currentHeadSha: headSha, fixRecorded: true },
   });
-  const recorded = await safeRecordDecision(options, workflowId, decision);
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
   printJson({
     action: 'fix-recorded',
     workflowId,
@@ -1374,32 +1402,166 @@ async function fix(options) {
 
 async function continueWorkflow(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
-  const state = await readWorkflow(options, workflowId);
-  const decision = buildDecision(state.workflow, decideNextAction(state));
+  const initialState = await readWorkflow(options, workflowId);
+  const maxRounds = loopMaxRounds(initialState.workflow, options);
+  const stopOn = new Set(initialState.workflow?.policy?.loopContract?.stop || ['guard_rejected', 'human_required']);
+  const rounds = [];
+
+  for (let round = 1; round <= maxRounds; round += 1) {
+    const state = await readWorkflow(options, workflowId);
+    await refreshMainSnapshot(options, state, {
+      round,
+      nextActionHint: 'Codex workflow continue round started.',
+    });
+
+    if (state.workflow?.status === 'completed' || state.workflow?.status === 'aborted') {
+      const snapshot = await refreshMainSnapshot(options, state, {
+        round,
+        nextActionHint: `Workflow is ${state.workflow.status}.`,
+      });
+      printJson({
+        action: 'continue',
+        workflowId,
+        status: state.workflow.status,
+        rounds,
+        snapshot,
+      });
+      return;
+    }
+    if (state.workflow?.status === 'blocked' || state.workflow?.status === 'human_review_required') {
+      const snapshot = await refreshMainSnapshot(options, state, {
+        round,
+        nextActionHint: `Workflow is ${state.workflow.status}.`,
+      });
+      printJson({
+        action: 'continue-blocked',
+        workflowId,
+        status: state.workflow.status,
+        rounds,
+        snapshot,
+      });
+      return;
+    }
+
+    const nextAction = decideNextAction(state);
+    const decision = buildDecision(state.workflow, {
+      ...nextAction,
+      inputs: {
+        ...(nextAction.inputs || {}),
+        loopRound: round,
+      },
+    });
+    const terminalActionResult = await executeContinueDecision(options, state, decision);
+    rounds.push({
+      round,
+      decision: decision.action,
+      guard: terminalActionResult?.guard,
+      action: terminalActionResult?.action,
+    });
+
+    const nextState = await readWorkflow(options, workflowId).catch(() => state);
+    await refreshMainSnapshot(options, nextState, {
+      round,
+      latestDecision: decision,
+      nextActionHint: instructionForDecision(decision, nextState),
+    });
+
+    if (terminalActionResult?.directOutput) {
+      printJson({
+        ...terminalActionResult.directOutput,
+        loopRound: round,
+        loopMaxRounds: maxRounds,
+      });
+      return;
+    }
+    if (terminalActionResult?.guard?.accepted === false && stopOn.has('guard_rejected')) {
+      printJson({
+        action: 'continue-blocked',
+        workflowId,
+        decision,
+        guard: terminalActionResult.guard,
+        rounds,
+      });
+      return;
+    }
+    if (decision.action === 'complete_workflow' || nextState.workflow?.status === 'completed') {
+      printJson({
+        action: 'continue',
+        workflowId,
+        status: 'completed',
+        rounds,
+      });
+      return;
+    }
+  }
+
+  printJson({
+    action: 'continue-blocked',
+    workflowId,
+    status: 'blocked',
+    pauseReason: 'max_rounds_reached',
+    rounds,
+    maxRounds,
+  });
+}
+
+async function executeContinueDecision(options, state, decision) {
+  const workflowId = state.workflow.id;
   if (decision.action === 'request_dynamic_plan') {
-    await requestPlan(options);
-    return;
+    const output = await capturePrintedJson(() => requestPlan(options));
+    return { directOutput: output, action: output.action, guard: output.guard };
   }
   if (decision.action === 'validate_subtask') {
-    await validate({ ...options, subtask: decision.subtaskId });
-    return;
+    const output = await capturePrintedJson(() => validate({ ...options, subtask: decision.subtaskId }));
+    return { directOutput: output, action: output.action, guard: output.guard };
   }
   if (decision.action === 'request_claude_review' || decision.action === 'request_re_review') {
-    await requestReview({ ...options, subtask: decision.subtaskId });
-    return;
+    const output = await capturePrintedJson(() => requestReview({ ...options, subtask: decision.subtaskId }));
+    return { directOutput: output, action: output.action, guard: output.guard };
   }
   if (decision.action === 'request_final_review') {
-    await requestFinalReview(options);
-    return;
+    const output = await capturePrintedJson(() => requestFinalReview(options));
+    return { directOutput: output, action: output.action, guard: output.guard };
   }
-  const recorded = await safeRecordDecision(options, workflowId, decision);
-  printJson({
+  if (requiresCurrentCodexSession(decision.action)) {
+    const preflight = await safePreflightDecision(options, workflowId, decision, state);
+    return {
+      action: 'continue-instruction',
+      guard: preflight.guard,
+      directOutput: {
+        action: preflight.guard?.accepted === false ? 'continue-blocked' : 'continue-instruction',
+        workflowId,
+        decision,
+        guard: preflight.guard,
+        instruction: instructionForDecision(decision, state),
+      },
+    };
+  }
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
+  return {
     action: 'continue',
-    workflowId,
-    decision,
     guard: recorded.guard,
-    instruction: instructionForDecision(decision, state),
-  });
+  };
+}
+
+async function capturePrintedJson(fn) {
+  const originalWrite = process.stdout.write;
+  let output = '';
+  process.stdout.write = function patchedWrite(chunk, encoding, callback) {
+    output += Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk);
+    if (typeof encoding === 'function') {
+      encoding();
+    } else if (callback) {
+      callback();
+    }
+    return true;
+  };
+  try {
+    await fn();
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  return JSON.parse(output);
 }
 
 async function status(options) {
@@ -1430,9 +1592,12 @@ function buildDecision(workflow, partial) {
   };
 }
 
-async function safeRecordDecision(options, workflowId, decision) {
+async function safeRecordDecision(options, workflowId, decision, state) {
   try {
-    return await recordDecision(options, workflowId, decision);
+    const currentState = state || await readWorkflow(options, workflowId);
+    return await recordDecision(options, workflowId, decision, {
+      ifMatch: currentState.workflow?.lastDecisionId,
+    });
   } catch (error) {
     if (error?.status === 409 && error.payload?.guard) {
       return error.payload;
@@ -1441,15 +1606,11 @@ async function safeRecordDecision(options, workflowId, decision) {
   }
 }
 
-async function safePreflightDecision(options, workflowId, decision) {
-  try {
-    return await preflightDecision(options, workflowId, decision);
-  } catch (error) {
-    if (error?.status === 409 && error.payload?.guard) {
-      return error.payload;
-    }
-    throw error;
-  }
+async function safePreflightDecision(options, workflowId, decision, state) {
+  const currentState = state || await readWorkflow(options, workflowId);
+  return preflightDecision(options, workflowId, decision, {
+    ifMatch: currentState.workflow?.lastDecisionId,
+  });
 }
 
 async function safeValidateEvaluationReadonly(options, workflowId, subtaskId, evaluationRunId, input) {
@@ -1496,6 +1657,155 @@ function latestQuestionerOutputId(state, subtaskId, intent) {
   return (state.questionerOutputs || [])
     .filter((output) => output.subtaskId === subtaskId && output.intent === intent)
     .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))[0]?.id;
+}
+
+function loopMaxRounds(workflow, options) {
+  return numberOption(options.maxRounds, workflow?.policy?.loopContract?.budget?.maxRounds || workflow?.maxRounds || 3);
+}
+
+function reviewEvidenceIdForTask(taskId) {
+  return `ev_review_${String(taskId).replace(/[^A-Za-z0-9._:-]/g, '_')}`;
+}
+
+function requiresCurrentCodexSession(action) {
+  return [
+    'execute_subtask',
+    'fix_claude_blockers',
+    'fix_evaluation_findings',
+    'draft_contract',
+    'ask_claude_question_contract',
+    'ask_claude_question_evaluation',
+    'ask_claude_question_final_evidence',
+    'run_codex_evaluator',
+    'run_final_evaluation',
+    're_evaluate',
+    'request_human_review',
+  ].includes(action);
+}
+
+async function refreshMainSnapshot(options, state, input = {}) {
+  const workflowId = state.workflow?.id;
+  if (!workflowId) {
+    return null;
+  }
+  const snapshot = buildMainSnapshot(state, input);
+  let current = null;
+  try {
+    current = await readContextSnapshot(options, workflowId, 'main');
+  } catch (error) {
+    if (error?.status !== 404) {
+      throw error;
+    }
+  }
+  try {
+    const saved = await saveContextSnapshot(options, workflowId, snapshot, {
+      ifMatch: current?.snapshot?.etag,
+    });
+    await mirrorLocalSnapshot(options, workflowId, 'main', saved.snapshot?.renderedMarkdown);
+    return saved.snapshot;
+  } catch (error) {
+    if (error?.status === 404 || error?.status === 409) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function buildMainSnapshot(state, input = {}) {
+  const workflow = state.workflow;
+  const activeSubtaskId = input.latestDecision?.subtaskId || selectActiveSubtaskId(state);
+  const activeSubtask = activeSubtaskId ? findSubtask(state.taskGraph, activeSubtaskId) : null;
+  const latestImplementation = latestEvidence(state, activeSubtaskId, ['implementation', 'fix']);
+  const latestEval = activeSubtaskId ? latestEvaluation(state, activeSubtaskId) : latestEvaluation(state, '__final__');
+  const latestQuestioner = activeSubtaskId
+    ? latestQuestionerOutput(state, activeSubtaskId, 'question_evaluation')
+    : latestQuestionerOutput(state, undefined, 'question_final_evidence');
+  const artifactRefs = Array.from(new Set([
+    ...(state.evidence || []).slice(-5).map((item) => item.artifactRef || item.id).filter(Boolean),
+    ...(latestEval?.artifactRefs || []),
+  ]));
+  return {
+    workflowId: workflow.id,
+    headSha: workflow.currentHeadSha || '',
+    activeSubtaskId,
+    target: 'main',
+    objectiveSummary: workflow.goal || '',
+    completedSubtasks: Object.values(state.subtasks || {})
+      .filter((subtask) => subtask.status === 'done')
+      .map((subtask) => subtask.subtaskId),
+    currentContractSummary: activeSubtask
+      ? [
+        `${activeSubtask.id}: ${activeSubtask.title || activeSubtask.goal}`,
+        `Allowed paths: ${(activeSubtask.allowedPaths || []).join(', ') || 'none'}`,
+        `Blocked paths: ${(activeSubtask.blockedPaths || []).join(', ') || 'none'}`,
+      ].join('\n')
+      : undefined,
+    latestImplementationSummary: latestImplementation?.summary || latestImplementation?.title,
+    latestEvaluationSummary: latestEval?.result
+      ? `${latestEval.result.verdict} (${latestEval.status})`
+      : latestEval?.status,
+    latestQuestionerSummary: latestQuestioner
+      ? `${latestQuestioner.verdict} (${latestQuestioner.intent})`
+      : undefined,
+    unresolvedBlockers: collectUnresolvedBlockers(state),
+    nextActionHint: input.nextActionHint,
+    artifactRefs,
+    maxChars: workflow.policy?.snapshotMaxChars?.main || 4000,
+  };
+}
+
+function selectActiveSubtaskId(state) {
+  const activeStatuses = new Set([
+    'ready',
+    'contract_drafting',
+    'contract_questioning',
+    'contract_accepted',
+    'building',
+    'executing',
+    'implemented',
+    'evaluating',
+    'evaluation_failed',
+    'evaluation_passed',
+    'questioning_evidence',
+    'needs_fix',
+    'fixing',
+    'blocked',
+    'human_review_required',
+  ]);
+  const graphOrder = (state.taskGraph?.subtasks || []).map((subtask) => subtask.id);
+  return graphOrder.find((subtaskId) => activeStatuses.has(state.subtasks?.[subtaskId]?.status))
+    || graphOrder[0];
+}
+
+function latestEvidence(state, subtaskId, kinds) {
+  return (state.evidence || [])
+    .filter((item) => (!subtaskId || item.subtaskId === subtaskId) && kinds.includes(item.kind))
+    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))[0];
+}
+
+function latestQuestionerOutput(state, subtaskId, intent) {
+  return (state.questionerOutputs || [])
+    .filter((output) => output.subtaskId === subtaskId && output.intent === intent)
+    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))[0];
+}
+
+function collectUnresolvedBlockers(state) {
+  const blockers = Object.values(state.subtasks || {}).flatMap((subtask) => subtask.blockerFindingIds || []);
+  const guard = state.workflow?.metadata?.lastGuardRejection || state.workflow?.metadata?.guardRejection;
+  if (guard?.message) {
+    blockers.push(String(guard.message));
+  }
+  return blockers;
+}
+
+async function mirrorLocalSnapshot(options, workflowId, target, markdown) {
+  if (!markdown) {
+    return;
+  }
+  const projectPath = resolveProjectPath(options.path);
+  const filePath = path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'context', `${target}.snapshot.md`);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, markdown, 'utf-8');
 }
 
 function codexEvaluatorQuestionerPolicy() {
@@ -2059,6 +2369,10 @@ function appendOptionValue(current, value) {
 
 function mergeLabels(value, required) {
   return Array.from(new Set([...(splitList(value) || []), ...required])).sort();
+}
+
+function reviewInputSourceOption(options) {
+  return options.reviewInputSource || (options.mergeRequestUrl || options.mrUrl ? 'merge_request' : 'local_diff');
 }
 
 function numberOption(value, fallback) {

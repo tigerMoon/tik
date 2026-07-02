@@ -21,6 +21,10 @@ try {
         const body = await readRequestJson(req);
         assert.equal(body.labels.includes('external-claude-review'), true);
         assert.equal(body.workspaceBinding.effectiveProjectPath, repo);
+        assert.equal(body.reviewInputSource, 'merge_request');
+        assert.equal(body.mergeRequestUrl, 'https://gitlab.example.com/group/repo/-/merge_requests/123');
+        assert.equal(body.fetchRemote, 'origin');
+        assert.equal(body.fetchRef, 'refs/merge-requests/123/head');
         const task = {
           id: 'task-review',
           shortIdentifier: 'TIK-REVIEW',
@@ -60,7 +64,16 @@ try {
   const address = server.address();
   const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
 
-  const create = await run(['create', '--api-base-url', apiBaseUrl, '--path', repo, '--root-task', 'TASK-1']);
+  const create = await run([
+    'create',
+    '--api-base-url', apiBaseUrl,
+    '--path', repo,
+    '--root-task', 'TASK-1',
+    '--review-input-source', 'merge_request',
+    '--merge-request-url', 'https://gitlab.example.com/group/repo/-/merge_requests/123',
+    '--fetch-remote', 'origin',
+    '--fetch-ref', 'refs/merge-requests/123/head',
+  ]);
   assert.equal(create.action, 'created');
   assert.equal(create.taskId, 'task-review');
   assert.equal(create.trackerOwned, false);

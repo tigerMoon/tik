@@ -7,6 +7,7 @@ import {
   type CreateMultiAgentWorkflowInput,
   type EvaluationRun,
   type GuardResult,
+  type HumanOverrideRecord,
   type MultiAgentInvocationStatus,
   type MultiAgentWorkflowBundle,
   type MultiAgentWorkflowEvent,
@@ -18,6 +19,7 @@ import {
   type SubtaskRunState,
   type SubtaskRunStatus,
   type TaskGraph,
+  type WorkflowContextSnapshot,
   type WorkflowDecision,
   type WorkflowPolicy,
 } from '@tik/shared';
@@ -58,6 +60,13 @@ export const DEFAULT_WORKFLOW_POLICY: WorkflowPolicy = {
   requireSameHeadShaForEvidence: true,
   allowClaudeFinalReview: true,
   allowHumanOverride: false,
+};
+
+const DEFAULT_SNAPSHOT_MAX_CHARS: Record<WorkflowContextSnapshot['target'], number> = {
+  main: 4000,
+  builder: 6000,
+  evaluator: 8000,
+  questioner: 6000,
 };
 
 const INVOCATION_TRANSITIONS: Record<MultiAgentInvocationStatus, MultiAgentInvocationStatus[]> = {
@@ -166,16 +175,44 @@ export class FileMultiAgentWorkflowStore {
 
   async updateWorkflow(
     workflowId: string,
-    patch: Partial<Pick<MultiAgentWorkflowRecord, 'status' | 'currentHeadSha' | 'metadata'>>,
+    patch: Partial<Pick<MultiAgentWorkflowRecord, 'status' | 'currentHeadSha' | 'metadata' | 'pauseReason'>> & {
+      policy?: Partial<WorkflowPolicy>;
+    },
   ): Promise<MultiAgentWorkflowRecord> {
     const id = this.normalizeId(workflowId);
     const existing = await this.requireWorkflow(id);
+    if (
+      patch.status
+      && (patch.status === 'blocked' || patch.status === 'human_review_required')
+      && existing.status !== patch.status
+    ) {
+      throw new MultiAgentCoordinationError(
+        'invalid_transition',
+        `Workflow status ${patch.status} must be produced by a guard, stalled invocation, or human-review action.`,
+      );
+    }
     const now = new Date().toISOString();
     const workflow: MultiAgentWorkflowRecord = {
       ...existing,
       status: patch.status ?? existing.status,
       currentHeadSha: patch.currentHeadSha ?? existing.currentHeadSha,
+      pauseReason: patch.pauseReason ?? existing.pauseReason,
       metadata: patch.metadata ?? existing.metadata,
+      policy: patch.policy
+        ? {
+          ...(existing.policy || DEFAULT_WORKFLOW_POLICY),
+          ...patch.policy,
+          loopContract: patch.policy.loopContract
+            ? normalizeLoopContract(id, patch.policy.loopContract)
+            : existing.policy?.loopContract,
+          snapshotMaxChars: patch.policy.snapshotMaxChars
+            ? {
+              ...(existing.policy?.snapshotMaxChars || {}),
+              ...patch.policy.snapshotMaxChars,
+            }
+            : existing.policy?.snapshotMaxChars,
+        }
+        : existing.policy,
       updatedAt: now,
       completedAt: patch.status === 'completed' ? now : existing.completedAt,
       abortedAt: patch.status === 'aborted' ? now : existing.abortedAt,
@@ -186,6 +223,12 @@ export class FileMultiAgentWorkflowStore {
       await this.appendEvent(id, 'workflow.completed', 'tik', { workflowId: id });
     } else if (patch.status === 'aborted') {
       await this.appendEvent(id, 'workflow.aborted', 'tik', { workflowId: id });
+    }
+    if (patch.policy) {
+      await this.appendEvent(id, 'workflow.policy.updated', 'tik', {
+        workflowId: id,
+        hasLoopContract: Boolean(workflow.policy?.loopContract),
+      });
     }
     return workflow;
   }
@@ -320,6 +363,35 @@ export class FileMultiAgentWorkflowStore {
       });
     }
     return decision;
+  }
+
+  async recordDecisionIfMatch(
+    workflowId: string,
+    decision: WorkflowDecision,
+    expectedLastDecisionId?: string,
+  ): Promise<{ decision?: WorkflowDecision; workflow: MultiAgentWorkflowRecord; guard: GuardResult }> {
+    const id = this.normalizeId(workflowId);
+    const workflow = await this.requireWorkflow(id);
+    if (!lastDecisionMatches(workflow.lastDecisionId, expectedLastDecisionId)) {
+      return {
+        workflow,
+        guard: {
+          accepted: false,
+          code: 'invalid_transition',
+          message: `Decision history changed; expected ${expectedLastDecisionId || 'no last decision'}, current ${workflow.lastDecisionId || 'none'}.`,
+          currentState: {
+            expectedLastDecisionId,
+            lastDecisionId: workflow.lastDecisionId,
+          },
+        },
+      };
+    }
+    const recorded = await this.recordDecision(id, decision);
+    return {
+      decision: recorded,
+      workflow: await this.requireWorkflow(id),
+      guard: { accepted: true, code: 'ok' },
+    };
   }
 
   async recordEvidence(
@@ -797,6 +869,267 @@ export class FileMultiAgentWorkflowStore {
     return invocation;
   }
 
+  async saveContextSnapshot(
+    workflowId: string,
+    snapshot: Omit<Partial<WorkflowContextSnapshot>, 'workflowId'> & {
+      workflowId?: string;
+      headSha: string;
+      target: WorkflowContextSnapshot['target'];
+      objectiveSummary: string;
+      completedSubtasks?: string[];
+      unresolvedBlockers?: string[];
+      artifactRefs?: string[];
+      maxChars?: number;
+    },
+    expectedEtag?: string,
+  ): Promise<{ snapshot: WorkflowContextSnapshot; guard: GuardResult }> {
+    const id = this.normalizeId(workflowId);
+    const workflow = await this.requireWorkflow(id);
+    if (snapshot.workflowId && snapshot.workflowId !== id) {
+      throw new MultiAgentCoordinationError('invalid_transition', `Snapshot workflowId ${snapshot.workflowId} does not match workflow ${id}.`);
+    }
+    const current = await this.readContextSnapshot(id, snapshot.target);
+    if (expectedEtag && current?.etag && expectedEtag !== current.etag) {
+      return {
+        snapshot: current,
+        guard: {
+          accepted: false,
+          code: 'invalid_transition',
+          message: `Context snapshot ${snapshot.target} changed; expected etag ${expectedEtag}.`,
+          currentState: {
+            expectedEtag,
+            etag: current.etag,
+          },
+        },
+      };
+    }
+
+    const now = new Date().toISOString();
+    const next: WorkflowContextSnapshot = {
+      workflowId: id,
+      headSha: snapshot.headSha,
+      activeSubtaskId: snapshot.activeSubtaskId,
+      target: snapshot.target,
+      objectiveSummary: snapshot.objectiveSummary,
+      completedSubtasks: snapshot.completedSubtasks || [],
+      currentContractSummary: snapshot.currentContractSummary,
+      latestImplementationSummary: snapshot.latestImplementationSummary,
+      latestEvaluationSummary: snapshot.latestEvaluationSummary,
+      latestQuestionerSummary: snapshot.latestQuestionerSummary,
+      unresolvedBlockers: snapshot.unresolvedBlockers || [],
+      nextActionHint: snapshot.nextActionHint,
+      artifactRefs: snapshot.artifactRefs || [],
+      markdownArtifactRef: snapshot.markdownArtifactRef,
+      maxChars: snapshot.maxChars
+        || workflow.policy?.snapshotMaxChars?.[snapshot.target]
+        || DEFAULT_SNAPSHOT_MAX_CHARS[snapshot.target],
+      createdAt: current?.createdAt || now,
+      updatedAt: now,
+      etag: `sn_${Date.now()}_${generateId().slice(0, 8)}`,
+      renderedMarkdown: '',
+    };
+    next.renderedMarkdown = renderContextSnapshotMarkdown(next);
+
+    await this.writeJsonFileAtomic(this.contextSnapshotFile(id, next.target), next);
+    await this.writeLocalContextSnapshotMarkdown(id, next.target, next.renderedMarkdown);
+    if (isSubstantiveSnapshotChange(current, next)) {
+      await this.appendEvent(id, 'context_snapshot.recorded', 'codex-workflow', {
+        target: next.target,
+        etag: next.etag,
+        headSha: next.headSha,
+      });
+    }
+    return {
+      snapshot: next,
+      guard: { accepted: true, code: 'ok' },
+    };
+  }
+
+  async readContextSnapshot(workflowId: string, target: WorkflowContextSnapshot['target']): Promise<WorkflowContextSnapshot | null> {
+    const id = this.normalizeId(workflowId);
+    await this.requireWorkflow(id);
+    return this.readJsonFile<WorkflowContextSnapshot>(this.contextSnapshotFile(id, target));
+  }
+
+  async reconcileStalledInvocations(
+    workflowId: string,
+    input: { now?: string } = {},
+  ): Promise<{
+    workflow: MultiAgentWorkflowRecord;
+    subtasks: Record<string, SubtaskRunState>;
+    stalled: AgentInvocationRecord[];
+  }> {
+    const id = this.normalizeId(workflowId);
+    const workflow = await this.requireWorkflow(id);
+    const timeoutMs = workflow.policy?.stalledInvocationTimeoutMs ?? 30 * 60 * 1000;
+    const nowMs = Date.parse(input.now || new Date().toISOString());
+    const invocations = await this.readJsonLines<AgentInvocationRecord>(this.invocationsFile(id));
+    const stalled: AgentInvocationRecord[] = [];
+    for (const invocation of invocations) {
+      if (invocation.status !== 'started') continue;
+      const startedAt = Date.parse(invocation.startedAt || invocation.updatedAt || invocation.createdAt);
+      if (!Number.isFinite(startedAt) || nowMs - startedAt <= timeoutMs) continue;
+      const updated: AgentInvocationRecord = {
+        ...invocation,
+        status: 'failed',
+        error: 'stalled',
+        updatedAt: new Date(nowMs).toISOString(),
+        completedAt: new Date(nowMs).toISOString(),
+      };
+      await this.upsertInvocation(updated);
+      stalled.push(updated);
+      await this.appendEvent(id, 'invocation.stalled', 'tik', {
+        invocationId: updated.id,
+        subtaskId: updated.subtaskId,
+        role: updated.role,
+      });
+      if (updated.subtaskId) {
+        const subtasks = await this.readSubtasks(id);
+        const existing = subtasks[updated.subtaskId];
+        if (existing) {
+          const nextStatus: SubtaskRunStatus = updated.role === 'evaluator'
+            ? 'human_review_required'
+            : 'needs_fix';
+          subtasks[updated.subtaskId] = {
+            ...existing,
+            status: nextStatus,
+          };
+          await this.writeJsonFileAtomic(this.subtasksFile(id), subtasks);
+          await this.appendEvent(id, 'subtask.updated', 'tik', {
+            subtaskId: updated.subtaskId,
+            status: nextStatus,
+            reason: 'stalled_invocation',
+          });
+        }
+      }
+    }
+
+    let nextWorkflow = await this.requireWorkflow(id);
+    if (stalled.length > 0) {
+      const metadata = {
+        ...(nextWorkflow.metadata || {}),
+        stalledInvocationIds: stalled.map((item) => item.id),
+      };
+      const now = new Date(nowMs).toISOString();
+      nextWorkflow = {
+        ...nextWorkflow,
+        status: 'blocked',
+        pauseReason: 'awaiting_subagent',
+        metadata,
+        updatedAt: now,
+      };
+      await this.writeWorkflow(nextWorkflow);
+    }
+    return {
+      workflow: nextWorkflow,
+      subtasks: await this.readSubtasks(id),
+      stalled,
+    };
+  }
+
+  async recordHumanOverride(
+    workflowId: string,
+    input: {
+      reason: string;
+      approver: string;
+      unblockAction: HumanOverrideRecord['unblockAction'];
+      subtaskId?: string;
+      note?: string;
+    },
+  ): Promise<{ workflow: MultiAgentWorkflowRecord; override: HumanOverrideRecord }> {
+    const id = this.normalizeId(workflowId);
+    const workflow = await this.requireWorkflow(id);
+    if (!input.reason?.trim() || !input.approver?.trim()) {
+      throw new MultiAgentCoordinationError('invalid_transition', 'Human override requires reason and approver.');
+    }
+    if (workflow.status !== 'blocked' && workflow.status !== 'human_review_required') {
+      throw new MultiAgentCoordinationError(
+        'invalid_transition',
+        `Human override requires workflow status blocked or human_review_required; current status is ${workflow.status}.`,
+      );
+    }
+    if (!workflow.policy?.allowHumanOverride) {
+      throw new MultiAgentCoordinationError('requires_human_approval', 'Workflow policy does not allow human overrides.');
+    }
+    const guardRejection = readGuardRejectionFromMetadata(workflow.metadata);
+    if (!guardRejection) {
+      throw new MultiAgentCoordinationError('invalid_transition', 'Human override requires guard rejection audit context.');
+    }
+    let forcedSubtasks: Record<string, SubtaskRunState> | null = null;
+    if (input.unblockAction === 'force_complete_subtask') {
+      if (!input.subtaskId) {
+        throw new MultiAgentCoordinationError('invalid_transition', 'force_complete_subtask requires subtaskId.');
+      }
+      const subtasks = await this.readSubtasks(id);
+      const subtask = subtasks[input.subtaskId];
+      if (!subtask) {
+        throw new MultiAgentCoordinationError('subtask_not_found', `Subtask not found: ${input.subtaskId}.`);
+      }
+      forcedSubtasks = {
+        ...subtasks,
+        [input.subtaskId]: {
+          ...subtask,
+          status: 'done',
+          blockerFindingIds: [],
+        },
+      };
+    }
+    const now = new Date().toISOString();
+    const override: HumanOverrideRecord = {
+      id: `override_${generateId()}`,
+      workflowId: id,
+      reason: input.reason,
+      approver: input.approver,
+      unblockAction: input.unblockAction,
+      subtaskId: input.subtaskId,
+      note: input.note,
+      guardRejection,
+      createdAt: now,
+    };
+    await fs.mkdir(this.humanOverridesDir(id), { recursive: true });
+    await this.writeJsonFileAtomic(this.humanOverrideFile(id, override.id), override);
+
+    let nextStatus: MultiAgentWorkflowRecord['status'] = workflow.status;
+    if (input.unblockAction === 'resume') nextStatus = 'active';
+    if (input.unblockAction === 'abort') nextStatus = 'aborted';
+    if (input.unblockAction === 'force_complete_subtask') nextStatus = 'active';
+    if (input.unblockAction === 'force_complete_workflow') nextStatus = 'completed';
+
+    if (input.unblockAction === 'force_complete_subtask') {
+      await this.writeJsonFileAtomic(this.subtasksFile(id), forcedSubtasks!);
+      await this.appendEvent(id, 'subtask.updated', 'human', {
+        subtaskId: input.subtaskId,
+        status: 'done',
+        reason: 'human_override',
+      });
+    }
+
+    const nextWorkflow: MultiAgentWorkflowRecord = {
+      ...workflow,
+      status: nextStatus,
+      pauseReason: nextStatus === 'active' ? undefined : readPauseReason(workflow),
+      metadata: {
+        ...(workflow.metadata || {}),
+        lastHumanOverrideId: override.id,
+      },
+      updatedAt: now,
+      completedAt: input.unblockAction === 'force_complete_workflow' ? now : workflow.completedAt,
+      abortedAt: input.unblockAction === 'abort' ? now : workflow.abortedAt,
+    };
+    await this.writeWorkflow(nextWorkflow);
+    await this.appendEvent(id, 'workflow.human_override', 'human', {
+      overrideId: override.id,
+      approver: override.approver,
+      unblockAction: override.unblockAction,
+      subtaskId: override.subtaskId,
+      guardRejection: override.guardRejection,
+    });
+    return {
+      workflow: nextWorkflow,
+      override,
+    };
+  }
+
   async readInvocation(workflowId: string, invocationId: string): Promise<AgentInvocationRecord | null> {
     const id = this.normalizeId(workflowId);
     const invocation = this.normalizeId(invocationId);
@@ -1250,6 +1583,35 @@ export class FileMultiAgentWorkflowStore {
     return path.join(this.questionerOutputsDir(workflowId), `${prefix}${output.intent}.${output.id}.json`);
   }
 
+  private contextDir(workflowId: string): string {
+    return path.join(this.workflowDir(workflowId), 'context');
+  }
+
+  private contextSnapshotFile(workflowId: string, target: WorkflowContextSnapshot['target']): string {
+    return path.join(this.contextDir(workflowId), `${target}.snapshot.json`);
+  }
+
+  private localContextSnapshotMarkdownFile(workflowId: string, target: WorkflowContextSnapshot['target']): string {
+    return path.join(this.contextDir(workflowId), `${target}.snapshot.md`);
+  }
+
+  private async writeLocalContextSnapshotMarkdown(
+    workflowId: string,
+    target: WorkflowContextSnapshot['target'],
+    markdown: string,
+  ): Promise<void> {
+    await fs.mkdir(this.contextDir(workflowId), { recursive: true });
+    await fs.writeFile(this.localContextSnapshotMarkdownFile(workflowId, target), markdown, 'utf-8');
+  }
+
+  private humanOverridesDir(workflowId: string): string {
+    return path.join(this.workflowDir(workflowId), 'human-overrides');
+  }
+
+  private humanOverrideFile(workflowId: string, overrideId: string): string {
+    return path.join(this.humanOverridesDir(workflowId), `${overrideId}.json`);
+  }
+
   private async readJsonFile<T>(filePath: string): Promise<T | null> {
     try {
       return JSON.parse(await fs.readFile(filePath, 'utf-8')) as T;
@@ -1418,6 +1780,130 @@ function isStoredQuestionerOutput(item: QuestionerOutput | null): item is Questi
 
 function safeIsoTime(value: string | undefined): string {
   return typeof value === 'string' ? value : '';
+}
+
+function lastDecisionMatches(current: string | undefined, expected: string | undefined): boolean {
+  if (expected === undefined) {
+    return true;
+  }
+  if (expected === '*') {
+    return true;
+  }
+  return current === expected;
+}
+
+function normalizeLoopContract(workflowId: string, value: WorkflowPolicy['loopContract']): WorkflowPolicy['loopContract'] {
+  if (!value) {
+    return undefined;
+  }
+  return {
+    ...value,
+    workflowId,
+    scope: {
+      allowedPaths: value.scope?.allowedPaths || [],
+      blockedPaths: value.scope?.blockedPaths || [],
+    },
+    budget: {
+      maxRounds: value.budget?.maxRounds ?? 3,
+      maxRuntimeMs: value.budget?.maxRuntimeMs ?? 30 * 60 * 1000,
+      maxConsecutiveFailures: value.budget?.maxConsecutiveFailures ?? 3,
+      maxSubagentRuns: value.budget?.maxSubagentRuns,
+      maxEvaluatorRuns: value.budget?.maxEvaluatorRuns,
+    },
+    stop: value.stop || [],
+    refresh: value.refresh || [],
+    report: {
+      destination: value.report?.destination || 'tik_timeline',
+      fields: value.report?.fields || [],
+    },
+  };
+}
+
+function renderContextSnapshotMarkdown(snapshot: WorkflowContextSnapshot): string {
+  const rendered = [
+    '# Workflow Snapshot',
+    '',
+    '## Goal',
+    snapshot.objectiveSummary || '(none)',
+    '',
+    '## Current Head',
+    snapshot.headSha || '(unknown)',
+    '',
+    '## Active Subtask',
+    snapshot.activeSubtaskId || '(none)',
+    '',
+    '## Contract Summary',
+    snapshot.currentContractSummary || '(none)',
+    '',
+    '## Latest Implementation',
+    snapshot.latestImplementationSummary || '(none)',
+    '',
+    '## Latest Evaluation',
+    snapshot.latestEvaluationSummary || '(none)',
+    '',
+    '## Latest Claude Questioner Output',
+    snapshot.latestQuestionerSummary || '(none)',
+    '',
+    '## Unresolved Blockers',
+    ...renderMarkdownList(snapshot.unresolvedBlockers),
+    '',
+    '## Next Action Hint',
+    snapshot.nextActionHint || '(none)',
+    '',
+    '## Artifact Refs',
+    ...renderMarkdownList(snapshot.artifactRefs),
+    '',
+  ].join('\n');
+  return truncateMarkdown(rendered, snapshot.maxChars);
+}
+
+function truncateMarkdown(markdown: string, maxChars: number): string {
+  if (!Number.isFinite(maxChars) || maxChars <= 0 || markdown.length <= maxChars) {
+    return markdown;
+  }
+  const suffix = '\n\n...(truncated, see artifactRefs)';
+  if (maxChars <= suffix.length) {
+    return markdown.slice(0, maxChars);
+  }
+  const limit = maxChars - suffix.length;
+  const lastBreak = markdown.lastIndexOf('\n', limit);
+  const cutAt = lastBreak > 0 ? lastBreak : limit;
+  return `${markdown.slice(0, cutAt)}${suffix}`;
+}
+
+function isSubstantiveSnapshotChange(
+  current: WorkflowContextSnapshot | null,
+  next: WorkflowContextSnapshot,
+): boolean {
+  if (!current) {
+    return true;
+  }
+  return current.headSha !== next.headSha
+    || current.activeSubtaskId !== next.activeSubtaskId
+    || current.objectiveSummary !== next.objectiveSummary;
+}
+
+function readPauseReason(workflow: MultiAgentWorkflowRecord): string | undefined {
+  const value = workflow.pauseReason ?? workflow.metadata?.pauseReason;
+  return typeof value === 'string' ? value : undefined;
+}
+
+function renderMarkdownList(values: string[]): string[] {
+  return values.length > 0 ? values.map((value) => `- ${value}`) : ['- (none)'];
+}
+
+function readGuardRejectionFromMetadata(metadata: Record<string, unknown> | undefined): GuardResult | undefined {
+  const value = metadata?.lastGuardRejection || metadata?.guardRejection;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    accepted: false,
+    code: typeof record.code === 'string' ? record.code as GuardResult['code'] : 'unknown_error',
+    message: typeof record.message === 'string' ? record.message : undefined,
+    currentState: record.currentState,
+  };
 }
 
 function readStringFromRecord(record: Record<string, unknown> | undefined, key: string): string | undefined {

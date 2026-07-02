@@ -40,7 +40,8 @@ export function evaluateWorkflowDecisionGuard(
     return reject('invalid_transition', `Unknown subtask ${decision.subtaskId}.`);
   }
 
-  const missingEvidence = decision.evidenceRefs.filter((ref) => !hasEvidence(bundle.evidence, ref));
+  const plannedEvidenceRefs = plannedEvidenceRefsForDecision(bundle, decision);
+  const missingEvidence = decision.evidenceRefs.filter((ref) => !hasEvidence(bundle.evidence, ref) && !plannedEvidenceRefs.has(ref));
   if (missingEvidence.length > 0) {
     return reject('missing_evidence', `Decision references missing evidence: ${missingEvidence.join(', ')}.`, {
       missingEvidence,
@@ -719,7 +720,7 @@ function plannedReviewEvidenceForDecision(
   decision: WorkflowDecision,
 ): MultiAgentWorkflowEvidence | undefined {
   const result = readRecordInput(decision.inputs, 'plannedReviewResult');
-  if (!result || result.verdict !== 'approve') {
+  if (!result) {
     return undefined;
   }
   const headSha = typeof result.headShaReviewed === 'string'
@@ -727,8 +728,9 @@ function plannedReviewEvidenceForDecision(
     : typeof result.currentHeadSha === 'string'
       ? result.currentHeadSha
       : readStringInput(decision.inputs, 'currentHeadSha') || bundle.workflow.currentHeadSha;
+  const id = readStringInput(decision.inputs, 'plannedReviewEvidenceId') || '__planned_review__';
   return {
-    id: '__planned_review__',
+    id,
     workflowId: bundle.workflow.id,
     subtaskId: decision.subtaskId,
     kind: 'review',
@@ -737,6 +739,22 @@ function plannedReviewEvidenceForDecision(
     payload: { result },
     createdAt: new Date(0).toISOString(),
   };
+}
+
+function plannedEvidenceRefsForDecision(
+  bundle: MultiAgentWorkflowBundle,
+  decision: WorkflowDecision,
+): Set<string> {
+  const refs = new Set<string>();
+  if (
+    ['complete_subtask', 'fix_claude_blockers', 'validate_subtask', 'request_human_review'].includes(decision.action)
+  ) {
+    const plannedReview = plannedReviewEvidenceForDecision(bundle, decision);
+    if (plannedReview && decision.evidenceRefs.includes(plannedReview.id)) {
+      refs.add(plannedReview.id);
+    }
+  }
+  return refs;
 }
 
 function latestEvidenceForSubtask(

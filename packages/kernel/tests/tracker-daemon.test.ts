@@ -1228,6 +1228,162 @@ describe('TrackerDaemon', () => {
     await waitForWorkbenchTask(workbench, reviewTask.id, (candidate) => candidate?.status === 'in_review');
   });
 
+  it('directs Claude review runs to inspect the local worktree diff first', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    await fs.writeFile(path.join(repo, 'feature.ts'), 'export const oldValue = 1;\n', 'utf-8');
+    await runGit(repo, ['init']);
+    await runGit(repo, ['config', 'user.email', 'test@example.com']);
+    await runGit(repo, ['config', 'user.name', 'Tik Test']);
+    await runGit(repo, ['add', 'feature.ts']);
+    await runGit(repo, ['commit', '-m', 'init']);
+    const headSha = await runGit(repo, ['rev-parse', 'HEAD']);
+    await fs.writeFile(path.join(repo, 'feature.ts'), 'export const dirtyValue = 3;\n', 'utf-8');
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const reviewTask = await workbench.createReviewRound({
+      rootTaskId: 'task-root',
+      round: 1,
+      maxRounds: 2,
+      changeRequest: {
+        scm: 'internal',
+        repo: 'repo',
+        id: 'task-root',
+        type: 'internal_review',
+        title: 'Review pinned head with local diff',
+        baseRef: 'HEAD',
+        headRef: 'main',
+        headSha,
+      },
+      idempotencyKey: 'review-local-diff-source',
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    });
+
+    const runtimeRunner = new CompletingRuntimeRunner('claude-code');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({
+        root,
+        runner: 'claude-code',
+        mode: 'claude_print',
+        renderPrompt: (trackedTask) => `Review ${trackedTask.shortIdentifier}.`,
+      }),
+    });
+
+    const trackedTask = (await new WorkflowV2WorkbenchTaskImporter(workbench, repo).fetchTaskStatesByIds?.([reviewTask.id]))![0]!;
+    await daemon.runExplicitTask(trackedTask);
+
+    const prompt = runtimeRunner.preparedInputs[0]?.renderedPrompt || '';
+    expect(prompt).toContain('Review input source: local worktree diff');
+    expect(prompt).toContain('Start from the Tik-generated local diff context below');
+    expect(prompt).toContain('git status --short');
+    expect(prompt).toContain('git diff --stat');
+    expect(prompt).toContain('git diff --');
+    await waitForWorkbenchTask(workbench, reviewTask.id, (candidate) => candidate?.status === 'in_review');
+  });
+
+  it('directs Claude review runs to fetch merge request code when the review input is MR sourced', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
+    tempDirs.push(root);
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    await fs.writeFile(path.join(repo, 'README.md'), '# repo\n', 'utf-8');
+    await runGit(repo, ['init']);
+    await runGit(repo, ['config', 'user.email', 'test@example.com']);
+    await runGit(repo, ['config', 'user.name', 'Tik Test']);
+    await runGit(repo, ['add', 'README.md']);
+    await runGit(repo, ['commit', '-m', 'init']);
+    const headSha = await runGit(repo, ['rev-parse', 'HEAD']);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const reviewTask = await workbench.createReviewRound({
+      rootTaskId: 'task-root',
+      round: 1,
+      maxRounds: 2,
+      changeRequest: {
+        scm: 'gitlab',
+        repo: 'repo',
+        id: '123',
+        type: 'merge_request',
+        url: 'https://gitlab.example.com/group/repo/-/merge_requests/123',
+        title: 'Review MR 123',
+        baseRef: 'main',
+        headRef: 'feature/review-source',
+        headSha,
+      },
+      idempotencyKey: 'review-merge-request-source',
+      reviewInput: {
+        source: 'merge_request',
+        mergeRequestUrl: 'https://gitlab.example.com/group/repo/-/merge_requests/123',
+        fetchRef: 'refs/merge-requests/123/head',
+      },
+      workspaceBinding: {
+        workspaceRoot: root,
+        workspaceName: 'tik',
+        projectName: 'repo',
+        sourceProjectPath: repo,
+        effectiveProjectPath: repo,
+        worktreeKind: 'root',
+      },
+    });
+
+    const runtimeRunner = new CompletingRuntimeRunner('claude-code');
+    const daemon = new TrackerDaemon({
+      importer: new WorkflowV2WorkbenchTaskImporter(workbench, repo),
+      stateStore: new MemoryTrackerStateStore(),
+      launcher: new WorkbenchTrackerLauncher(workbench, {
+        workspaceRoot: root,
+        defaultProjectPath: repo,
+      }),
+      workspaceRoot: root,
+      defaultProjectPath: repo,
+      now: () => 1_000,
+      runtimeRunners: { 'claude-code': runtimeRunner },
+      workflow: workflowV2({
+        root,
+        runner: 'claude-code',
+        mode: 'claude_print',
+        renderPrompt: (trackedTask) => `Review ${trackedTask.shortIdentifier}.`,
+      }),
+    });
+
+    const trackedTask = (await new WorkflowV2WorkbenchTaskImporter(workbench, repo).fetchTaskStatesByIds?.([reviewTask.id]))![0]!;
+    await daemon.runExplicitTask(trackedTask);
+
+    const prompt = runtimeRunner.preparedInputs[0]?.renderedPrompt || '';
+    expect(prompt).toContain('Review input source: merge request');
+    expect(prompt).toContain('https://gitlab.example.com/group/repo/-/merge_requests/123');
+    expect(prompt).toContain('git fetch origin refs/merge-requests/123/head');
+    expect(prompt).toContain('git checkout FETCH_HEAD');
+    await waitForWorkbenchTask(workbench, reviewTask.id, (candidate) => candidate?.status === 'in_review');
+  });
+
   it('limits Claude review context to the agent-loop allowed scope', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-tracker-daemon-'));
     tempDirs.push(root);

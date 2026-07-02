@@ -120,6 +120,7 @@ export interface MultiAgentWorkflowRecord {
   workspaceBinding?: TaskWorkspaceBinding;
   taskGraphVersion?: number;
   lastDecisionId?: string;
+  pauseReason?: 'max_rounds_reached' | 'budget_exceeded' | 'awaiting_subagent' | string;
   metadata?: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
@@ -152,6 +153,7 @@ export interface SubtaskSpec {
   dependsOn: string[];
   allowedPaths: string[];
   blockedPaths?: string[];
+  loopContractOverride?: Partial<LoopContract>;
   acceptanceCriteria: string[] | SubtaskAcceptanceCriterion[];
   validationCommands: string[];
   reviewFocus: string[];
@@ -341,8 +343,11 @@ export interface LoopGateDecision extends WorkflowDecision {
 
 export type MultiAgentWorkflowEventType =
   | 'workflow.created'
+  | 'workflow.policy.updated'
+  | 'workflow.human_override'
   | 'decision.recorded'
   | 'task_graph.created'
+  | 'context_snapshot.recorded'
   | 'contract.created'
   | 'contract.accepted'
   | 'contract.staled'
@@ -357,6 +362,7 @@ export type MultiAgentWorkflowEventType =
   | 'agent_invocation.created'
   | 'agent_invocation.started'
   | 'agent_invocation.completed'
+  | 'invocation.stalled'
   | 'codex.execute.started'
   | 'codex.execute.completed'
   | 'validation.started'
@@ -403,6 +409,83 @@ export interface WorkflowPolicy {
   requireSameHeadShaForEvidence: boolean;
   allowClaudeFinalReview?: boolean;
   allowHumanOverride: boolean;
+  loopContract?: LoopContract;
+  stalledInvocationTimeoutMs?: number;
+  snapshotMaxChars?: Partial<Record<WorkflowContextSnapshotTarget, number>>;
+}
+
+export type LoopStopCondition =
+  | 'guard_rejected'
+  | 'same_failure_repeated'
+  | 'head_sha_changed'
+  | 'human_required'
+  | 'budget_exceeded'
+  | 'evaluation_inconclusive';
+
+export type LoopRefreshAction =
+  | 'read_latest_head_sha'
+  | 'read_observed_git_diff'
+  | 'reload_task_graph'
+  | 'reload_contract'
+  | 'reload_latest_evidence';
+
+export interface LoopContract {
+  id: string;
+  workflowId: string;
+  subtaskId?: string;
+  scope: {
+    allowedPaths: string[];
+    blockedPaths: string[];
+  };
+  budget: {
+    maxRounds: number;
+    maxRuntimeMs: number;
+    maxConsecutiveFailures: number;
+    maxSubagentRuns?: number;
+    maxEvaluatorRuns?: number;
+  };
+  stop: LoopStopCondition[];
+  refresh: LoopRefreshAction[];
+  report: {
+    destination: 'tik_timeline' | 'dashboard' | 'local_file';
+    fields: string[];
+  };
+}
+
+export type WorkflowContextSnapshotTarget = 'main' | 'builder' | 'evaluator' | 'questioner';
+
+export interface WorkflowContextSnapshot {
+  workflowId: string;
+  headSha: string;
+  activeSubtaskId?: string;
+  target: WorkflowContextSnapshotTarget;
+  objectiveSummary: string;
+  completedSubtasks: string[];
+  currentContractSummary?: string;
+  latestImplementationSummary?: string;
+  latestEvaluationSummary?: string;
+  latestQuestionerSummary?: string;
+  unresolvedBlockers: string[];
+  nextActionHint?: string;
+  artifactRefs: string[];
+  renderedMarkdown?: string;
+  markdownArtifactRef?: string;
+  maxChars: number;
+  etag?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HumanOverrideRecord {
+  id: string;
+  workflowId: string;
+  reason: string;
+  approver: string;
+  unblockAction: 'resume' | 'abort' | 'force_complete_subtask' | 'force_complete_workflow';
+  subtaskId?: string;
+  note?: string;
+  guardRejection?: GuardResult;
+  createdAt: string;
 }
 
 export interface SubtaskAcceptanceCriterion {

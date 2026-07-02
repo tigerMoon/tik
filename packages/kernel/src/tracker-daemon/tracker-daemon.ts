@@ -1203,15 +1203,39 @@ function buildTikGeneratedCodexFixPrompt(task: TrackedTask): string {
 function buildTikGeneratedClaudeReviewSubmissionPrompt(task: TrackedTask): string {
   const metadata = task.agentLoop;
   const expectedHeadSha = metadata?.headSha || metadata?.changeRequest.headSha;
+  const reviewInput = metadata?.reviewInput || { source: 'local_diff' as const };
+  const fetchRemote = reviewInput.fetchRemote || 'origin';
+  const fetchRef = reviewInput.fetchRef || metadata?.changeRequest.headRef;
   return [
     '## Tik Claude Code review contract',
     '',
     'You are running inside a Tik-managed Claude Code review workflow.',
     'Review only the recorded change and do not edit files, commit, push, merge, approve externally, or call GitHub/GitLab review APIs.',
+    reviewInput.source === 'merge_request'
+      ? 'Review input source: merge request'
+      : 'Review input source: local worktree diff',
+    reviewInput.source === 'merge_request' && reviewInput.mergeRequestUrl
+      ? `Merge request URL: ${reviewInput.mergeRequestUrl}`
+      : undefined,
     expectedHeadSha ? `Recorded head SHA: ${expectedHeadSha}` : undefined,
     metadata?.changeRequest.baseRef && expectedHeadSha
       ? `Review diff range: ${metadata.changeRequest.baseRef}..${expectedHeadSha}`
       : undefined,
+    reviewInput.source === 'merge_request'
+      ? [
+        '',
+        'Before reviewing, fetch the merge request code into the local repository if it is not already checked out:',
+        '```bash',
+        fetchRef ? `git fetch ${fetchRemote} ${fetchRef}` : `git fetch ${fetchRemote}`,
+        'git checkout FETCH_HEAD',
+        '```',
+        'Then review the fetched MR diff against the recorded base/head refs.',
+      ].join('\n')
+      : [
+        '',
+        'Start from the Tik-generated local diff context below. It is the primary review input and is faster than rediscovering the change with broad repository scans.',
+        'Use `git status --short`, `git diff --stat`, and `git diff --` only to verify or inspect the bounded local diff when needed.',
+      ].join('\n'),
     '',
     'Before reviewing, compare the recorded head SHA with `git rev-parse HEAD` in the repository.',
     `If it differs, POST { "expectedHeadSha": "${expectedHeadSha || '<recorded-head-sha>'}", "actualHeadSha": "<current-head-sha>" } to ${runtimeApiBaseUrl()}/v1/agent-loop/tasks/${task.id}/stale and stop.`,

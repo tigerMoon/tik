@@ -1,0 +1,1572 @@
+/**
+ * Agent Loop (Phase 2 - Session-Based)
+ *
+ * The unified execution loop for both single-agent and multi-agent modes.
+ * Uses AgentSession for multi-turn LLM continuity and agent role collaboration.
+ *
+ * Architecture (from roadmap_2.md):
+ *   Task → Session → AgentLoop → single/multi agent → EventBus
+ *
+ * Key constraints:
+ *   - Task.status is the external lifecycle (driven by ExecutionKernel)
+ *   - Session.loopState is internal control only
+ *   - EventBus remains SSOT
+ *   - Multi-agent roles share one taskId, one sessionId, one event stream
+ *
+ * Execution flow per step:
+ *   1. Build context (SIGHT)
+ *   2. LLM call with message history + context
+ *   3. Record assistant response to messages
+ *   4. Execute tool calls, record results to messages
+ *   5. Evaluate (if appropriate for current agent/mode)
+ *   6. Switch agent (multi mode, after evaluation)
+ */
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import { EventType, PLAN_READ_ONLY_TOOL_POLICY, generateId, now, formatDuration, } from '@tik/shared';
+import { assistantSuggestsNoCodeChangeNeeded, classifyTaskIntent, hasWriteLikeAction, hasSuccessfulValidationAction, dedupeToolCalls, enoughEvidenceToConclude, getToolCallSignature, isRedundantReadBatch, isReadLikeTool, normalizeToolCall, shouldMarkTaskCompleted, shouldForceImplementationAction, sessionMemorySuggestsImplementation, shouldShiftFromExplorationToImplementation, } from './agent/tool-call-policy.js';
+// ─── System Prompts ─────────────────────────────────────────
+const SYSTEM_PROMPTS = {
+    planner: `You are the Planner agent in a multi-agent coding system.
+Your job is to analyze the task, understand the codebase, and create a detailed plan.
+Break down the task into concrete steps. Identify files that need changes.
+Use read tools (read_file, glob, grep) to explore. Prefer structured search tools over shell search.
+If the context includes likely target paths, treat them as high-probability path completions and inspect them before widening the search.
+Do NOT claim a module/path is missing until you have checked the hinted candidates.
+Do NOT write or edit files.
+Output your plan as structured text when done.`,
+    coder: `You are the Coder agent in a coding system.
+Your job is to implement changes according to the plan.
+Use tools to read, write, and edit files. Run commands as needed.
+Prefer read_file, glob, and grep for repository exploration. Use bash for search only when structured tools are insufficient.
+If the context includes likely target paths, start there first and treat them as path completions for vague user phrases.
+Avoid broad repo-wide find/grep loops once you already have likely target paths.
+If a likely target path is a directory, inspect inside it with glob/grep before attempting read_file.
+Follow the plan from the planner. Make precise, minimal changes.
+When all changes are complete, summarize what you did.`,
+    reviewer: `You are the Reviewer agent in a coding system.
+Your job is to review the changes made by the coder.
+Use read tools to inspect modified files. Run tests if available.
+Prefer checking hinted paths and changed files before widening the search.
+Check for correctness, regressions, and code quality.
+Report issues or confirm the changes are acceptable.`,
+};
+export class AgentLoop {
+    eventBus;
+    toolScheduler;
+    contextBuilder;
+    llmProvider;
+    aceEngine;
+    onPhaseChange;
+    contextRenderer;
+    toolResultStore;
+    onStreamChunk;
+    // Control state (mapped to session.loopState)
+    injectedConstraints = [];
+    currentStrategy = null;
+    pendingPlanPatch = null;
+    constructor(eventBus, toolScheduler, contextBuilder, llmProvider, aceEngine, onPhaseChange, contextRenderer, toolResultStore, onStreamChunk) {
+        this.eventBus = eventBus;
+        this.toolScheduler = toolScheduler;
+        this.contextBuilder = contextBuilder;
+        this.llmProvider = llmProvider;
+        this.aceEngine = aceEngine;
+        this.onPhaseChange = onPhaseChange;
+        this.contextRenderer = contextRenderer;
+        this.toolResultStore = toolResultStore;
+        this.onStreamChunk = onStreamChunk;
+    }
+    /**
+     * Run the agent loop.
+     *
+     * If a session is provided, uses session-based multi-turn execution.
+     * If not, falls back to legacy per-iteration mode (Phase 1 compat).
+     */
+    async run(task, session) {
+        if (session) {
+            return this.runSessionBased(task, session);
+        }
+        return this.runLegacy(task);
+    }
+    // ─── Session-Based Execution (Phase 2) ────────────────────
+    async runSessionBased(task, session) {
+        const startTime = now();
+        let stableCount = 0;
+        let lastFitness = 0;
+        let converged = false;
+        let completed = false;
+        let lastEvaluation;
+        let currentIteration = 0;
+        // Accumulate executed actions for the current iteration
+        let iterationActions = [];
+        let likelyTargetPaths = [];
+        // Multi-agent: planner (once) + (coder->reviewer) * iterations
+        // Iteration 1: planner -> coder -> reviewer (3 steps)
+        // Iteration 2+: coder -> reviewer (2 steps each)
+        const maxSteps = session.mode === 'multi'
+            ? 3 + (task.maxIterations - 1) * 2 // planner once, then coder->reviewer loop
+            : task.maxIterations; // single mode: 1 step per iteration
+        try {
+            while (session.loopState !== 'stopped' && session.step < maxSteps) {
+                if (!await this.waitForSessionRunState(session))
+                    break;
+                session.step++;
+                const actingAgent = session.currentAgent;
+                const agent = session.agents[actingAgent];
+                if (!agent) {
+                    // Shouldn't happen, but safety
+                    session.loopState = 'stopped';
+                    break;
+                }
+                // Calculate iteration number based on agent flow
+                // Multi: step 1-3 = iter 1 (planner->coder->reviewer), step 4-5 = iter 2 (coder->reviewer), etc.
+                // Single: step N = iter N
+                const iterationNumber = session.mode === 'multi'
+                    ? (session.step <= 3 ? 1 : Math.floor((session.step - 3) / 2) + 2)
+                    : session.step;
+                // Only increment currentIteration when we start a new iteration
+                if (session.mode === 'single' || session.step === 1 || (session.step > 3 && (session.step - 3) % 2 === 1)) {
+                    currentIteration = iterationNumber;
+                }
+                const strategy = this.currentStrategy || task.strategy;
+                this.emitEvent(EventType.ITERATION_STARTED, task.id, {
+                    iteration: iterationNumber,
+                    step: session.step,
+                    agent: actingAgent,
+                    mode: session.mode,
+                    maxIterations: task.maxIterations,
+                    strategy,
+                });
+                const stepStart = now();
+                // ── 1. Build Context (SIGHT) ──────────────────────
+                // Use session-aware context building if available (Phase 2.8+)
+                let contextStr;
+                if (this.contextBuilder.buildFromSession) {
+                    const envelope = await this.contextBuilder.buildFromSession(task, session, { agent: actingAgent });
+                    likelyTargetPaths = this.extractLikelyTargetPaths(envelope, task.projectPath || process.cwd());
+                    // Use renderer if available, otherwise fallback to JSON
+                    contextStr = this.contextRenderer
+                        ? this.contextRenderer.render(envelope)
+                        : this.buildContextString(task, envelope.execution, strategy);
+                    contextStr = this.appendTaskContextSnapshot(contextStr, task);
+                }
+                else {
+                    likelyTargetPaths = [];
+                    const context = await this.contextBuilder.buildContext(task.id, iterationNumber, {
+                        agent: actingAgent,
+                        environmentPackId: task.environmentPackSnapshot?.id,
+                        environmentPackSelection: task.environmentPackSelection,
+                    });
+                    contextStr = this.buildContextString(task, context, strategy);
+                    contextStr = this.appendTaskContextSnapshot(contextStr, task);
+                }
+                this.emitEvent(EventType.CONTEXT_BUILT, task.id, {
+                    iteration: iterationNumber,
+                    tokensUsed: Math.ceil(contextStr.length / 4),
+                    agent: actingAgent,
+                });
+                if (!await this.waitForSessionRunState(session))
+                    break;
+                // ── 2. LLM Call with inner tool loop ─────────────
+                this.onPhaseChange?.(actingAgent === 'planner' ? 'planning' : 'executing');
+                this.emitEvent(EventType.PLAN_STARTED, task.id, {
+                    iteration: iterationNumber,
+                    agent: actingAgent,
+                });
+                // Get tool definitions (planner gets read-only tools, coder gets all)
+                const toolDefs = this.constrainToolDefsForSession(this.getToolDefs(actingAgent, this.getAgentSpec(agent)), session, actingAgent);
+                // Inner tool loop: LLM → tools → LLM → tools → ... until no more tool calls
+                // This does NOT consume step budget — one step = one complete agent turn
+                const MAX_TOOL_ROUNDS = 20; // Safety limit per step
+                const successfulReadSignatures = new Set();
+                let implementationHintInjected = false;
+                let implementationActionForced = false;
+                let forcedSummaryAttempted = false;
+                let lastResponse = await this.callLLM(agent, session, contextStr, toolDefs, task);
+                this.emitUsageEvent(task.id, session, actingAgent, iterationNumber, lastResponse.usage);
+                for (let toolRound = 0; toolRound < MAX_TOOL_ROUNDS; toolRound++) {
+                    // Record assistant message WITH tool_use blocks preserved
+                    // This is critical for API fidelity — Claude needs to see its own
+                    // tool_use blocks in the history to match with tool_result messages
+                    this.pushMessage(session, {
+                        role: 'assistant',
+                        name: actingAgent,
+                        content: lastResponse.content,
+                        toolCalls: lastResponse.toolCalls,
+                    });
+                    this.emitEvent(EventType.SESSION_MESSAGE, task.id, {
+                        sessionId: session.sessionId,
+                        role: 'assistant',
+                        agent: actingAgent,
+                        contentLength: lastResponse.content.length,
+                        hasToolCalls: !!lastResponse.toolCalls?.length,
+                    });
+                    if (lastResponse.executedActions?.length) {
+                        iterationActions.push(...lastResponse.executedActions.map((action) => ({
+                            tool: action.tool,
+                            input: action.input,
+                            output: action.output,
+                            success: action.success,
+                        })));
+                    }
+                    // No tool calls → agent turn is done
+                    if (!lastResponse.toolCalls?.length)
+                        break;
+                    const normalizedToolCalls = dedupeToolCalls(lastResponse.toolCalls.map((call) => normalizeToolCall(call)));
+                    if (shouldForceImplementationAction(task.description, session.compactMemory || session.contextSummary, normalizedToolCalls)) {
+                        this.enterStrictImplementationMode(session);
+                        this.emitEvent(EventType.WARNING, task.id, {
+                            message: implementationActionForced
+                                ? 'Implementation mode is active and the assistant is still requesting only read-only probes. It must now either edit code or explicitly conclude that no code changes are needed.'
+                                : 'Implementation mode is active. Redirecting the assistant from read-only verification to concrete code changes or an explicit no-change conclusion.',
+                            iteration: iterationNumber,
+                            agent: actingAgent,
+                        });
+                        this.recordPolicyDeniedToolCalls(task, session, normalizedToolCalls, implementationActionForced
+                            ? 'Read-only verification probes are denied in implementation mode because pending work still requires code changes. Use edit_file/write_file next, or stop calling tools and explain why no code changes are needed.'
+                            : 'Read-only verification probes are denied in implementation mode because the relevant implementation files have already been identified. Use edit_file/write_file next, or stop calling tools and explain why no code changes are needed.');
+                        this.pushMessage(session, {
+                            role: 'system',
+                            content: implementationActionForced
+                                ? 'Implementation mode is active and pending work still requires code changes. The previous read-only probes were denied. Your next response must either call edit_file/write_file with a concrete change, or stop calling tools and clearly explain why no code changes are needed.'
+                                : 'Implementation mode is active and pending work still requires code changes. The previous read-only probes were denied. Your next response must either call edit_file/write_file with a concrete change, or stop calling tools and clearly explain why no code changes are needed.',
+                        });
+                        implementationActionForced = true;
+                        const implementationToolDefs = this.getImplementationToolDefs(toolDefs);
+                        lastResponse = await this.callLLM(agent, session, contextStr, implementationToolDefs, task);
+                        this.emitUsageEvent(task.id, session, actingAgent, iterationNumber, lastResponse.usage);
+                        continue;
+                    }
+                    if (enoughEvidenceToConclude(session.compactMemory || session.contextSummary, lastResponse.content, normalizedToolCalls)) {
+                        if (forcedSummaryAttempted) {
+                            completed = true;
+                            this.emitEvent(EventType.WARNING, task.id, {
+                                message: 'Stopping extra verification because the assistant already concluded the implementation status and only proposed more local probes.',
+                                iteration: iterationNumber,
+                                agent: actingAgent,
+                            });
+                            break;
+                        }
+                        forcedSummaryAttempted = true;
+                        this.emitEvent(EventType.WARNING, task.id, {
+                            message: 'Enough evidence has been collected. Forcing a final summary instead of more local verification probes.',
+                            iteration: iterationNumber,
+                            agent: actingAgent,
+                        });
+                        this.pushMessage(session, {
+                            role: 'system',
+                            content: 'You already have enough evidence to conclude the current implementation status. Do not run more local verification probes. Summarize the finding clearly, state whether code changes are needed, and stop calling tools.',
+                        });
+                        lastResponse = await this.callLLM(agent, session, contextStr, toolDefs, task);
+                        this.emitUsageEvent(task.id, session, actingAgent, iterationNumber, lastResponse.usage);
+                        continue;
+                    }
+                    if (isRedundantReadBatch(normalizedToolCalls, successfulReadSignatures)) {
+                        if (classifyTaskIntent(task.description) === 'implementation') {
+                            this.enterStrictImplementationMode(session);
+                            this.emitEvent(EventType.WARNING, task.id, {
+                                message: 'Stopping repeated read-only exploration and switching to implementation mode. The assistant must now edit code or explicitly conclude that no code changes are needed.',
+                                iteration: iterationNumber,
+                                agent: actingAgent,
+                            });
+                            this.pushMessage(session, {
+                                role: 'system',
+                                content: 'You are repeating the same successful read-only exploration on an implementation task. Stop searching. Your next response must either call edit_file/write_file with a concrete change, or stop calling tools and clearly explain why no code changes are needed.',
+                            });
+                            implementationActionForced = true;
+                            const implementationToolDefs = this.getImplementationToolDefs(toolDefs);
+                            lastResponse = await this.callLLM(agent, session, contextStr, implementationToolDefs, task);
+                            this.emitUsageEvent(task.id, session, actingAgent, iterationNumber, lastResponse.usage);
+                            continue;
+                        }
+                        completed = true;
+                        this.emitEvent(EventType.WARNING, task.id, {
+                            message: 'Stopping repeated read-only exploration because the same successful file searches were requested again.',
+                            iteration: iterationNumber,
+                            agent: actingAgent,
+                        });
+                        this.pushMessage(session, {
+                            role: 'system',
+                            content: 'You are repeating the same successful read-only exploration. Stop searching and summarize or take the next concrete action.',
+                        });
+                        break;
+                    }
+                    // Execute tool calls
+                    const actions = await this.handleToolCalls(task, session, normalizedToolCalls, likelyTargetPaths);
+                    iterationActions.push(...actions);
+                    normalizedToolCalls.forEach((call, index) => {
+                        const action = actions[index];
+                        if (!action?.success)
+                            return;
+                        if (!isReadLikeTool(call.name))
+                            return;
+                        successfulReadSignatures.add(getToolCallSignature(call));
+                    });
+                    this.updateContextSummary(session, actingAgent, lastResponse.content, iterationActions);
+                    if (!implementationHintInjected
+                        && (shouldShiftFromExplorationToImplementation(normalizedToolCalls, actions)
+                            || sessionMemorySuggestsImplementation(session.compactMemory || session.contextSummary))) {
+                        implementationHintInjected = true;
+                        this.emitEvent(EventType.WARNING, task.id, {
+                            message: 'Key cache/query implementation files have been identified. Prioritize concrete implementation or verification instead of further broad exploration.',
+                            iteration: iterationNumber,
+                            agent: actingAgent,
+                        });
+                        this.pushMessage(session, {
+                            role: 'system',
+                            content: 'You have already identified the key cache and query/service implementation files. Stop broad exploration. Prioritize concrete implementation, focused verification, or a direct summary of the required code changes.',
+                        });
+                    }
+                    // Check if session was stopped during tool execution
+                    if (session.loopState !== 'running')
+                        break;
+                    // Call LLM again with tool results in message history
+                    lastResponse = await this.callLLM(agent, session, contextStr, toolDefs, task);
+                    this.emitUsageEvent(task.id, session, actingAgent, iterationNumber, lastResponse.usage);
+                }
+                const response = lastResponse;
+                if (!await this.waitForSessionRunState(session))
+                    break;
+                // Agent turn complete — update session memory before completion
+                // evaluation so that explicit no-change conclusions can clear pending
+                // work and participate in completion semantics immediately.
+                this.updateContextSummary(session, actingAgent, response.content, iterationActions);
+                let summary = session.compactMemory || session.contextSummary;
+                if (classifyTaskIntent(task.description) === 'implementation'
+                    && session.compactMemory?.implementationReady
+                    && !session.compactMemory?.implementationStrict
+                    && !hasWriteLikeAction(iterationActions)) {
+                    this.enterStrictImplementationMode(session);
+                    this.emitEvent(EventType.WARNING, task.id, {
+                        message: 'Implementation files are identified but this iteration still made no code changes. The next iteration will require a concrete patch or an explicit no-change conclusion.',
+                        iteration: iterationNumber,
+                        agent: actingAgent,
+                    });
+                }
+                const harnessActions = await this.runProjectHarnessIfNeeded(task, session, iterationActions, likelyTargetPaths, toolDefs);
+                if (harnessActions.length > 0) {
+                    iterationActions.push(...harnessActions);
+                    this.updateContextSummary(session, actingAgent, response.content, iterationActions);
+                    summary = session.compactMemory || session.contextSummary;
+                }
+                const completionEligible = shouldMarkTaskCompleted(task.description, summary, response.content, iterationActions, { validationAvailable: this.hasValidationTool(toolDefs) });
+                if (!completionEligible) {
+                    completed = false;
+                }
+                else if (!response.toolCalls?.length && !converged) {
+                    completed = true;
+                }
+                this.emitEvent(EventType.PLAN_GENERATED, task.id, {
+                    iteration: iterationNumber,
+                    agent: actingAgent,
+                    goals: [response.content.split('\n')[0] || 'Execute step'],
+                    actionCount: iterationActions.length,
+                });
+                // ── 4. Evaluate (if appropriate) ──────────────────
+                if (this.shouldEvaluate(session, actingAgent)) {
+                    if (!await this.waitForSessionRunState(session))
+                        break;
+                    this.onPhaseChange?.('evaluating');
+                    this.emitEvent(EventType.EVALUATION_STARTED, task.id, {
+                        iteration: iterationNumber,
+                    });
+                    const evaluation = await this.aceEngine.evaluateIteration(task.id, iterationNumber);
+                    this.emitEvent(EventType.EVALUATED, task.id, {
+                        iteration: iterationNumber,
+                        fitness: evaluation.fitness,
+                        drift: evaluation.drift,
+                        entropy: evaluation.entropy,
+                    });
+                    // Check convergence
+                    const fitnessDelta = Math.abs(evaluation.fitness - lastFitness);
+                    if (fitnessDelta < 0.02) {
+                        stableCount++;
+                    }
+                    else {
+                        stableCount = 0;
+                    }
+                    converged = this.aceEngine.checkConvergence(evaluation, stableCount, strategy);
+                    lastFitness = evaluation.fitness;
+                    lastEvaluation = evaluation;
+                    session.lastEvaluation = evaluation;
+                    // Record iteration
+                    const iteration = {
+                        number: iterationNumber,
+                        plan: {
+                            goals: [response.content.split('\n')[0] || 'Execute step'],
+                            actions: iterationActions.map(a => ({ tool: a.tool, input: a.input, reason: '' })),
+                            riskLevel: 'medium',
+                            complexity: iterationActions.length,
+                        },
+                        executedActions: iterationActions,
+                        evaluation,
+                        durationMs: now() - stepStart,
+                        timestamp: stepStart,
+                    };
+                    task.iterations.push(iteration);
+                    // Reset actions for next iteration
+                    iterationActions = [];
+                    this.emitEvent(EventType.ITERATION_COMPLETED, task.id, {
+                        iteration: iterationNumber,
+                        converged,
+                        stableCount,
+                        fitness: evaluation.fitness,
+                        durationMs: iteration.durationMs,
+                    });
+                    if (converged) {
+                        this.emitEvent(EventType.CONVERGED, task.id, {
+                            iteration: iterationNumber,
+                            fitness: evaluation.fitness,
+                            totalDuration: formatDuration(now() - startTime),
+                        });
+                        // Inject strategy feedback into messages for context
+                        this.pushMessage(session, {
+                            role: 'system',
+                            content: `Evaluation: Converged. Fitness: ${evaluation.fitness.toFixed(3)}. Task complete.`,
+                        });
+                        session.loopState = 'stopped';
+                        break;
+                    }
+                    if (this.isDelegateProvider()) {
+                        completed = true;
+                        session.loopState = 'stopped';
+                        break;
+                    }
+                    // Inject evaluation feedback into messages
+                    this.pushMessage(session, {
+                        role: 'system',
+                        content: `Evaluation feedback: fitness=${evaluation.fitness.toFixed(3)}, drift=${evaluation.drift.toFixed(2)}, entropy=${evaluation.entropy.toFixed(3)}. Continue improving.`,
+                    });
+                    if (completed) {
+                        session.loopState = 'stopped';
+                        break;
+                    }
+                }
+                // ── 5. Switch agent (multi mode, after evaluation) ──
+                if (session.mode === 'multi') {
+                    const nextRole = this.nextAgent(actingAgent);
+                    if (nextRole !== actingAgent) {
+                        session.currentAgent = nextRole;
+                        this.emitEvent(EventType.AGENT_SWITCHED, task.id, {
+                            sessionId: session.sessionId,
+                            from: actingAgent,
+                            to: nextRole,
+                            step: session.step,
+                        });
+                    }
+                }
+            }
+            const finalStatus = converged
+                ? 'converged'
+                : completed
+                    ? 'completed'
+                    : session.loopState === 'stopped'
+                        ? 'cancelled'
+                        : 'failed';
+            return {
+                taskId: task.id,
+                status: finalStatus,
+                totalIterations: task.iterations.length,
+                evaluation: lastEvaluation || {
+                    fitness: 0, drift: 0, entropy: 0, converged: false, stableCount: 0,
+                },
+                durationMs: now() - startTime,
+                summary: converged
+                    ? `Converged after ${task.iterations.length} iterations (fitness: ${lastFitness.toFixed(3)})`
+                    : completed
+                        ? `Completed ${session.step} steps in ${session.mode} mode with sufficient evidence to conclude`
+                        : `Completed ${session.step} steps in ${session.mode} mode`,
+            };
+        }
+        catch (err) {
+            return {
+                taskId: task.id,
+                status: 'failed',
+                totalIterations: task.iterations.length,
+                evaluation: lastEvaluation || {
+                    fitness: 0, drift: 0, entropy: 0, converged: false, stableCount: 0,
+                },
+                durationMs: now() - startTime,
+                summary: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            };
+        }
+    }
+    // ─── LLM Call (with retry) ─────────────────────────────────
+    static LLM_MAX_RETRIES = 3;
+    static LLM_RETRY_DELAYS = [1000, 3000, 8000]; // ms
+    async callLLM(agent, session, contextStr, toolDefs, task) {
+        let lastError;
+        for (let attempt = 0; attempt <= AgentLoop.LLM_MAX_RETRIES; attempt++) {
+            try {
+                return await this.callLLMOnce(agent, session, contextStr, toolDefs, task);
+            }
+            catch (err) {
+                lastError = err instanceof Error ? err : new Error(String(err));
+                const isRetryable = this.isRetryableError(lastError);
+                if (!isRetryable || attempt >= AgentLoop.LLM_MAX_RETRIES) {
+                    throw lastError;
+                }
+                const delay = AgentLoop.LLM_RETRY_DELAYS[attempt] || 8000;
+                this.emitEvent(EventType.WARNING, session.taskId, {
+                    message: `LLM call failed (attempt ${attempt + 1}/${AgentLoop.LLM_MAX_RETRIES + 1}), retrying in ${delay}ms: ${lastError.message.slice(0, 200)}`,
+                });
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+        throw lastError || new Error('LLM call failed after retries');
+    }
+    async callLLMOnce(agent, session, contextStr, toolDefs, task) {
+        const getProviderToolType = (toolName) => {
+            if (toolName === 'read_file' || toolName === 'grep' || toolName === 'glob' || toolName.startsWith('git_')) {
+                return 'read';
+            }
+            if (toolName === 'write_file' || toolName === 'edit_file') {
+                return 'write';
+            }
+            return 'exec';
+        };
+        const emitProviderRuntimeEvent = (event) => {
+            if (event.type === 'tool.called') {
+                this.emitEvent(EventType.TOOL_CALLED, session.taskId, {
+                    toolName: event.toolName,
+                    toolType: getProviderToolType(event.toolName),
+                    input: event.input,
+                    provider: agent.llm.name,
+                    nativeProviderTool: true,
+                });
+                return;
+            }
+            this.emitEvent(event.success ? EventType.TOOL_RESULT : EventType.TOOL_ERROR, session.taskId, {
+                toolName: event.toolName,
+                output: event.output,
+                durationMs: event.durationMs || 0,
+                success: event.success,
+                error: event.error,
+                provider: agent.llm.name,
+                nativeProviderTool: true,
+            });
+        };
+        // Build streaming options
+        const providerCwd = task.projectPath || process.cwd();
+        const llmOptions = this.onStreamChunk
+            ? {
+                cwd: providerCwd,
+                providerSessionId: `${session.taskId}:${session.sessionId}:${session.currentAgent}`,
+                onTextChunk: (text) => {
+                    this.onStreamChunk(text, { taskId: session.taskId, agent: session.currentAgent });
+                },
+                onProviderEvent: emitProviderRuntimeEvent,
+            }
+            : {
+                cwd: providerCwd,
+                providerSessionId: `${session.taskId}:${session.sessionId}:${session.currentAgent}`,
+                onProviderEvent: emitProviderRuntimeEvent,
+            };
+        // Use AgentRuntime.runTurn() if available (Phase 2.7)
+        if ('runTurn' in agent && typeof agent.runTurn === 'function') {
+            return agent.runTurn({
+                messages: session.messages,
+                context: contextStr,
+                tools: toolDefs.length > 0 ? toolDefs : undefined,
+                options: llmOptions,
+            });
+        }
+        // Fallback for legacy AgentRuntime interface
+        if (agent.llm.chatWithContext) {
+            return agent.llm.chatWithContext(session.messages, agent.systemPrompt, contextStr, toolDefs.length > 0 ? toolDefs : undefined, llmOptions);
+        }
+        const messagesWithSystem = [
+            { role: 'system', content: `${agent.systemPrompt}\n\n${contextStr}` },
+            ...session.messages.filter(m => m.role !== 'system'),
+        ];
+        return agent.llm.chat(messagesWithSystem, toolDefs.length > 0 ? toolDefs : undefined);
+    }
+    emitUsageEvent(taskId, session, agent, iteration, usage) {
+        this.emitEvent('session.usage', taskId, {
+            sessionId: session.sessionId,
+            agent,
+            iteration,
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+            totalTokens: usage.totalTokens,
+            cacheRead: usage.cacheReadTokens || 0,
+            cacheCreate: usage.cacheCreateTokens || 0,
+        });
+    }
+    /** Determine if an LLM error is retryable */
+    isRetryableError(err) {
+        const msg = err.message.toLowerCase();
+        // Retry on: rate limits, server errors, timeouts, overloaded
+        if (msg.includes('429') || msg.includes('rate limit'))
+            return true;
+        if (msg.includes('500') || msg.includes('502') || msg.includes('503'))
+            return true;
+        if (msg.includes('529') || msg.includes('overloaded'))
+            return true;
+        if (msg.includes('timeout') || msg.includes('econnreset'))
+            return true;
+        if (msg.includes('econnrefused') || msg.includes('network'))
+            return true;
+        // Don't retry on: auth errors, bad requests (schema errors), etc.
+        return false;
+    }
+    // ─── Tool Call Handling ───────────────────────────────────
+    async handleToolCalls(task, session, toolCalls, likelyTargetPaths) {
+        const toolContext = {
+            cwd: task.projectPath || process.cwd(),
+            taskId: task.id,
+            likelyTargetPaths,
+            implementationReady: sessionMemorySuggestsImplementation(session.compactMemory || session.contextSummary),
+        };
+        // Classify tools deterministically. Reads before the first side-effecting
+        // tool can run together; after a write/exec, preserve call order.
+        const toolTypes = new Map();
+        const allTools = this.toolScheduler['registry'].list();
+        for (const t of allTools) {
+            toolTypes.set(t.name, t.type);
+        }
+        const groups = [];
+        let readParallelAllowed = true;
+        for (const call of toolCalls) {
+            const toolType = toolTypes.get(call.name) || 'exec';
+            const lastGroup = groups[groups.length - 1];
+            if (readParallelAllowed && toolType === 'read') {
+                if (lastGroup?.parallel) {
+                    lastGroup.calls.push(call);
+                }
+                else {
+                    groups.push({ parallel: true, calls: [call] });
+                }
+            }
+            else {
+                readParallelAllowed = false;
+                if (lastGroup && !lastGroup.parallel) {
+                    lastGroup.calls.push(call);
+                }
+                else {
+                    groups.push({ parallel: false, calls: [call] });
+                }
+            }
+        }
+        const executedActions = [];
+        // Execute each group
+        for (const group of groups) {
+            if (group.parallel && group.calls.length > 1) {
+                // Execute the initial read-only batch in parallel.
+                const results = await Promise.all(group.calls.map(async (call) => {
+                    const start = now();
+                    const result = await this.toolScheduler.execute(call.name, call.arguments, toolContext);
+                    return { call, result, durationMs: now() - start };
+                }));
+                // Record all results in order
+                for (const { call, result, durationMs } of results) {
+                    this.recordToolResult(task, session, call, result, durationMs);
+                    executedActions.push({
+                        tool: call.name, input: call.arguments,
+                        output: result.output, success: result.success,
+                        error: result.error, durationMs,
+                    });
+                }
+            }
+            else {
+                // Execute sequentially (WRITE/EXEC tools, or single READ)
+                for (const call of group.calls) {
+                    const start = now();
+                    const result = await this.toolScheduler.execute(call.name, call.arguments, toolContext);
+                    const durationMs = now() - start;
+                    this.recordToolResult(task, session, call, result, durationMs);
+                    executedActions.push({
+                        tool: call.name, input: call.arguments,
+                        output: result.output, success: result.success,
+                        error: result.error, durationMs,
+                    });
+                }
+            }
+        }
+        return executedActions;
+    }
+    async runProjectHarnessIfNeeded(task, session, actions, likelyTargetPaths, toolDefs) {
+        if (classifyTaskIntent(task.description) !== 'implementation')
+            return [];
+        if (!hasWriteLikeAction(actions))
+            return [];
+        if (!this.hasValidationTool(toolDefs))
+            return [];
+        const projectPath = task.projectPath || process.cwd();
+        const configured = await this.readConfiguredHarnessCommands(projectPath);
+        const commands = configured.length > 0
+            ? configured
+            : await this.resolveInferredProjectHarnessCommands(projectPath, actions);
+        if (commands.length === 0)
+            return [];
+        const executedActions = [];
+        for (const command of commands) {
+            const call = {
+                id: generateId(),
+                name: 'bash',
+                arguments: {
+                    command,
+                    timeout: 120_000,
+                },
+            };
+            const toolContext = {
+                cwd: projectPath,
+                taskId: task.id,
+                likelyTargetPaths,
+                implementationReady: true,
+            };
+            const start = now();
+            const result = await this.toolScheduler.execute(call.name, call.arguments, toolContext);
+            const durationMs = now() - start;
+            await this.recordToolResult(task, session, call, result, durationMs);
+            executedActions.push({
+                tool: call.name,
+                input: call.arguments,
+                output: result.output,
+                success: result.success,
+                error: result.error,
+                durationMs,
+            });
+            if (!result.success)
+                break;
+        }
+        return executedActions;
+    }
+    hasValidationTool(toolDefs) {
+        return toolDefs.some((tool) => tool.name === 'bash' || tool.name === 'frontend_run_script');
+    }
+    async resolveInferredProjectHarnessCommands(projectPath, actions) {
+        if (hasSuccessfulValidationAction(actions))
+            return [];
+        const inferred = await this.inferDefaultHarnessCommand(projectPath);
+        return inferred ? [inferred] : [];
+    }
+    async readConfiguredHarnessCommands(projectPath) {
+        const candidates = [
+            path.join(projectPath, '.tik', 'harness.json'),
+            path.join(projectPath, '.tik', 'harness'),
+        ];
+        for (const candidate of candidates) {
+            const raw = await fs.readFile(candidate, 'utf-8').catch(() => undefined);
+            if (!raw)
+                continue;
+            const commands = candidate.endsWith('.json')
+                ? parseHarnessJson(raw)
+                : raw.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+            if (commands.length > 0)
+                return commands;
+        }
+        return [];
+    }
+    async inferDefaultHarnessCommand(projectPath) {
+        const packageJson = await fs.readFile(path.join(projectPath, 'package.json'), 'utf-8').catch(() => undefined);
+        if (packageJson) {
+            try {
+                const parsed = JSON.parse(packageJson);
+                const scripts = parsed.scripts || {};
+                for (const script of ['test', 'typecheck', 'type-check', 'lint', 'build']) {
+                    if (scripts[script])
+                        return packageScriptCommand(parsed.packageManager, script);
+                }
+            }
+            catch {
+                // Ignore malformed package metadata and keep looking for other harnesses.
+            }
+        }
+        if (await fileExists(path.join(projectPath, 'pom.xml')))
+            return 'mvn test';
+        if (await fileExists(path.join(projectPath, 'gradlew')))
+            return './gradlew test';
+        if (await fileExists(path.join(projectPath, 'build.gradle')) || await fileExists(path.join(projectPath, 'build.gradle.kts')))
+            return 'gradle test';
+        return undefined;
+    }
+    /** Record a single tool result to session messages and events */
+    async recordToolResult(task, session, call, result, _durationMs) {
+        const resultStr = typeof result.output === 'string'
+            ? result.output
+            : JSON.stringify(result.output);
+        let messageContent;
+        if (this.toolResultStore && this.toolResultStore.shouldStore(resultStr)) {
+            const ref = await this.toolResultStore.store(task.id, call.id, call.name, resultStr, !result.success);
+            messageContent = `[Tool output stored: ${ref.byteSize} bytes${ref.truncated ? ', truncated preview' : ''}]\n${ref.preview}`;
+        }
+        else {
+            messageContent = result.success
+                ? resultStr.slice(0, 10000)
+                : `Error: ${result.error || 'Unknown error'}`;
+        }
+        this.pushMessage(session, {
+            role: 'tool',
+            toolCallId: call.id,
+            name: call.name,
+            content: messageContent,
+        });
+        this.emitEvent(EventType.SESSION_MESSAGE, task.id, {
+            sessionId: session.sessionId,
+            role: 'tool',
+            tool: call.name,
+            success: result.success,
+        });
+    }
+    recordPolicyDeniedToolCalls(task, session, toolCalls, reason) {
+        for (const call of toolCalls) {
+            this.emitEvent(EventType.TOOL_ERROR, task.id, {
+                toolName: call.name,
+                output: null,
+                durationMs: 0,
+                success: false,
+                error: reason,
+                policyDenied: true,
+            });
+            this.pushMessage(session, {
+                role: 'tool',
+                toolCallId: call.id,
+                name: call.name,
+                content: `Error: ${reason}`,
+            });
+            this.emitEvent(EventType.SESSION_MESSAGE, task.id, {
+                sessionId: session.sessionId,
+                role: 'tool',
+                tool: call.name,
+                success: false,
+            });
+        }
+    }
+    getImplementationToolDefs(toolDefs) {
+        const writeOnly = toolDefs.filter((tool) => tool.name === 'edit_file' || tool.name === 'write_file');
+        return writeOnly.length > 0 ? writeOnly : toolDefs;
+    }
+    constrainToolDefsForSession(toolDefs, session, role) {
+        if (role !== 'coder')
+            return toolDefs;
+        if (!session.compactMemory?.implementationStrict)
+            return toolDefs;
+        return this.getImplementationToolDefs(toolDefs);
+    }
+    enterStrictImplementationMode(session) {
+        const previous = session.compactMemory;
+        if (!previous)
+            return;
+        if (previous.implementationStrict)
+            return;
+        session.compactMemory = {
+            ...previous,
+            implementationReady: true,
+            implementationStrict: true,
+            currentFocus: 'implementation',
+        };
+        session.contextSummary = this.renderCompactMemory(session.compactMemory);
+    }
+    // ─── Agent Switching ──────────────────────────────────────
+    nextAgent(current) {
+        switch (current) {
+            case 'planner': return 'coder';
+            case 'coder': return 'reviewer';
+            case 'reviewer': return 'coder';
+        }
+    }
+    isDelegateProvider() {
+        return this.llmProvider.name === 'codex-delegate';
+    }
+    shouldEvaluate(session, actingAgent) {
+        if (session.mode === 'single')
+            return true;
+        // In multi mode, evaluate after reviewer
+        return actingAgent === 'reviewer';
+    }
+    // ─── Tool Definitions ─────────────────────────────────────
+    /**
+     * Convert a Zod schema (or raw object) to a valid JSON Schema
+     * that LLM providers (Claude/OpenAI) require.
+     */
+    toJsonSchema(schema) {
+        // If it already looks like a JSON Schema (has "type" field), use it
+        if (schema && typeof schema === 'object' && 'type' in schema) {
+            return schema;
+        }
+        // If it's a Zod schema, extract properties from its shape
+        if (schema && typeof schema === 'object' && '_def' in schema) {
+            try {
+                return this.zodToJsonSchema(schema);
+            }
+            catch {
+                // Fall through to default
+            }
+        }
+        // Fallback: empty object schema
+        return { type: 'object', properties: {} };
+    }
+    zodToJsonSchema(schema) {
+        const def = schema?._def;
+        if (!def?.typeName) {
+            return { type: 'string' };
+        }
+        const description = def.description;
+        const withDescription = (json) => {
+            if (description) {
+                return { ...json, description };
+            }
+            return json;
+        };
+        switch (def.typeName) {
+            case 'ZodString':
+                return withDescription({ type: 'string' });
+            case 'ZodNumber':
+                return withDescription({ type: 'number' });
+            case 'ZodBoolean':
+                return withDescription({ type: 'boolean' });
+            case 'ZodLiteral':
+                return withDescription({ const: def.value, type: typeof def.value });
+            case 'ZodEnum':
+                return withDescription({ type: 'string', enum: def.values });
+            case 'ZodNativeEnum':
+                return withDescription({ enum: Object.values(def.values) });
+            case 'ZodArray':
+                return withDescription({
+                    type: 'array',
+                    items: this.zodToJsonSchema(def.type),
+                });
+            case 'ZodUnion':
+                return withDescription({
+                    anyOf: (def.options || []).map((option) => this.zodToJsonSchema(option)),
+                });
+            case 'ZodDiscriminatedUnion':
+                return withDescription({
+                    anyOf: Array.from(def.options?.values?.() || []).map((option) => this.zodToJsonSchema(option)),
+                });
+            case 'ZodObject': {
+                const shape = typeof def.shape === 'function' ? def.shape() : schema.shape;
+                const properties = {};
+                const required = [];
+                for (const [key, value] of Object.entries(shape || {})) {
+                    properties[key] = this.zodToJsonSchema(value);
+                    if (!this.isOptionalZod(value)) {
+                        required.push(key);
+                    }
+                }
+                const result = {
+                    type: 'object',
+                    properties,
+                };
+                if (required.length > 0)
+                    result.required = required;
+                return withDescription(result);
+            }
+            case 'ZodOptional':
+            case 'ZodNullable':
+            case 'ZodDefault':
+            case 'ZodCatch':
+            case 'ZodEffects':
+                return withDescription(this.zodToJsonSchema(def.innerType || def.schema));
+            case 'ZodRecord':
+                return withDescription({
+                    type: 'object',
+                    additionalProperties: this.zodToJsonSchema(def.valueType),
+                });
+            default:
+                return withDescription({ type: 'string' });
+        }
+    }
+    isOptionalZod(schema) {
+        const typeName = schema?._def?.typeName;
+        return typeName === 'ZodOptional' || typeName === 'ZodDefault' || typeName === 'ZodCatch';
+    }
+    getAgentSpec(agent) {
+        if (!agent || typeof agent !== 'object')
+            return undefined;
+        if (!('spec' in agent))
+            return undefined;
+        return agent.spec;
+    }
+    getToolDefs(role, spec) {
+        const allTools = this.toolScheduler['registry'].list();
+        const filteredTools = spec?.allowedTools?.length
+            ? allTools.filter((tool) => spec.allowedTools.includes(tool.name))
+            : allTools;
+        const preferredOrder = new Map((spec?.preferredTools || []).map((toolName, index) => [toolName, index]));
+        const orderedTools = filteredTools.slice().sort((left, right) => {
+            const leftRank = preferredOrder.has(left.name) ? preferredOrder.get(left.name) : Number.MAX_SAFE_INTEGER;
+            const rightRank = preferredOrder.has(right.name) ? preferredOrder.get(right.name) : Number.MAX_SAFE_INTEGER;
+            if (leftRank !== rightRank)
+                return leftRank - rightRank;
+            return left.name.localeCompare(right.name);
+        });
+        const mapTool = (t) => {
+            let description = t.description;
+            if (t.name === 'bash') {
+                description += ' Use only when structured tools are insufficient. Avoid broad `find` or repo-wide search if likely target paths are already available in context.';
+            }
+            else if (t.name === 'glob') {
+                description += ' Preferred for narrowing candidate files or modules before using shell search.';
+            }
+            else if (t.name === 'grep') {
+                description += ' Preferred for locating symbols or features inside likely target paths.';
+            }
+            else if (t.name === 'read_file') {
+                description += ' Preferred for validating likely target files before widening exploration.';
+            }
+            return {
+                name: t.name,
+                description,
+                inputSchema: this.toJsonSchema(t.inputSchema),
+            };
+        };
+        if (role === 'planner') {
+            return orderedTools.filter(t => t.type === 'read').map(mapTool);
+        }
+        if (role === 'reviewer') {
+            return orderedTools.filter(t => t.type === 'read' || t.type === 'exec').map(mapTool);
+        }
+        return orderedTools.map(mapTool);
+    }
+    // ─── Context Building ─────────────────────────────────────
+    buildContextString(task, context, strategy) {
+        const constraintText = this.injectedConstraints.length > 0
+            ? `\nInjected Constraints:\n${this.injectedConstraints.map(c => `- ${c}`).join('\n')}`
+            : '';
+        return [
+            `Task: ${task.description}`,
+            `Strategy: ${strategy}`,
+            `Project: ${task.projectPath || 'unknown'}`,
+            constraintText,
+            '',
+            `Context:\n${JSON.stringify(context, null, 2).slice(0, 20000)}`,
+        ].join('\n');
+    }
+    appendTaskContextSnapshot(contextStr, task) {
+        const rendered = this.renderTaskContextSnapshot(task);
+        return rendered ? `${contextStr}\n\n---\n\n${rendered}` : contextStr;
+    }
+    renderTaskContextSnapshot(task) {
+        const snapshot = task.taskContextSnapshot;
+        if (!snapshot) {
+            return '';
+        }
+        const lines = [
+            '# Task Restart Context',
+            'This is task-local history from prior runs. Use it to continue the same task; treat newer operator comments as the current direction.',
+            `- Task: ${snapshot.identifier || snapshot.shortIdentifier || snapshot.taskId}`,
+            `- Status before dispatch: ${snapshot.status}`,
+            `- Title: ${snapshot.title}`,
+            `- Goal: ${snapshot.goal}`,
+        ];
+        if (snapshot.latestSummary) {
+            lines.push(`- Latest summary: ${snapshot.latestSummary}`);
+        }
+        if (snapshot.lastAttempt) {
+            const attempt = snapshot.lastAttempt;
+            lines.push([
+                '- Last attempt:',
+                `  - Number: ${attempt.attemptNumber}`,
+                `  - Outcome: ${attempt.outcome || 'unknown'}`,
+                attempt.kernelTaskId ? `  - Kernel task: ${attempt.kernelTaskId}` : undefined,
+                attempt.finishedAt ? `  - Finished at: ${attempt.finishedAt}` : undefined,
+                attempt.error ? `  - Error: ${attempt.error}` : undefined,
+            ].filter(Boolean).join('\n'));
+        }
+        if (snapshot.evidenceSummary) {
+            const evidence = snapshot.evidenceSummary;
+            lines.push([
+                '- Evidence summary:',
+                `  - Raw events: ${evidence.rawEventCount}`,
+                `  - Modified files: ${evidence.modifiedFileCount}`,
+                `  - Previewable artifacts: ${evidence.previewableArtifactCount}`,
+                evidence.latestToolName ? `  - Latest tool: ${evidence.latestToolName}` : undefined,
+                evidence.latestPreviewableArtifactPath ? `  - Latest artifact: ${evidence.latestPreviewableArtifactPath}` : undefined,
+                `  - Has error evidence: ${evidence.hasErrorEvidence ? 'yes' : 'no'}`,
+            ].filter(Boolean).join('\n'));
+        }
+        if (snapshot.timelineSummary?.length) {
+            lines.push('## Recent Timeline');
+            lines.push(...snapshot.timelineSummary.map((item) => `- ${item}`));
+        }
+        if (snapshot.recentComments?.length) {
+            lines.push('## Recent Operator Comments');
+            for (const comment of snapshot.recentComments) {
+                const author = comment.authorId?.trim() || 'human';
+                lines.push(`- ${author} (${comment.createdAt}): ${comment.body}`);
+            }
+        }
+        return lines.join('\n');
+    }
+    extractLikelyTargetPaths(envelope, projectPath) {
+        const candidates = envelope.execution.repo?.candidates || [];
+        const resolved = candidates
+            .map((candidate) => candidate?.path)
+            .filter((candidate) => typeof candidate === 'string' && candidate.length > 0)
+            .map((candidate) => {
+            if (candidate.startsWith('/'))
+                return candidate;
+            return `${projectPath.replace(/\/+$/, '')}/${candidate.replace(/^\/+/, '')}`;
+        });
+        return Array.from(new Set(resolved)).slice(0, 5);
+    }
+    // ─── Message Management ───────────────────────────────────
+    pushMessage(session, message) {
+        session.messages.push(message);
+    }
+    // ─── Session Memory ───────────────────────────────────────
+    /**
+     * Update session.contextSummary with structured session memory.
+     * Rule-based extraction — no LLM calls.
+     * Tracks: goal, key files, recent actions, decisions, blockers.
+     */
+    updateContextSummary(session, agent, responseContent, actions) {
+        const previous = session.compactMemory || {};
+        const prevFiles = previous.keyFiles || [];
+        const prevPending = previous.pendingWork || [];
+        const prevBlockers = previous.blockers || [];
+        const files = actions.flatMap((action) => this.extractRelevantPaths(action));
+        const failures = actions
+            .filter(a => !a.success)
+            .map(a => `${a.tool}: ${a.error || 'failed'}`);
+        const allFiles = [...new Set([...prevFiles, ...files])].slice(-10);
+        const loweredFiles = allFiles.map(f => f.toLowerCase());
+        const hasCacheSignal = loweredFiles.some(f => f.includes('cache'));
+        const hasQueryOrServiceSignal = loweredFiles.some(f => f.includes('query') || f.includes('service'));
+        const implementationReady = hasCacheSignal && hasQueryOrServiceSignal;
+        const wroteCode = hasWriteLikeAction(actions);
+        const explicitNoChange = assistantSuggestsNoCodeChangeNeeded(responseContent);
+        const actionSummary = actions.slice(-5).map(a => `${a.tool}(${a.success ? 'ok' : 'fail'})`).join(', ');
+        const recentActions = actionSummary
+            ? [...(previous.recentActions || []), actionSummary].slice(-5)
+            : (previous.recentActions || []);
+        const pendingWork = [];
+        if (explicitNoChange) {
+            // Clear implementation-style pending work when the assistant has concluded
+            // that existing code already satisfies the requested behavior.
+        }
+        else if (wroteCode) {
+            pendingWork.push('Verify the implemented change and summarize the affected flow');
+        }
+        else if (implementationReady) {
+            pendingWork.push('Implement the missing cache usage in the identified query/service flow');
+        }
+        else if (allFiles.length > 0) {
+            pendingWork.push('Read the most relevant query/service implementation and cache integration points');
+        }
+        if (agent === 'reviewer') {
+            pendingWork.push('Verify correctness and regressions in the changed flow');
+        }
+        const carryPending = wroteCode
+            ? prevPending.filter((item) => isValidationPendingWork(item))
+            : prevPending;
+        const mergedPending = explicitNoChange
+            ? []
+            : [...new Set([...carryPending, ...pendingWork])].slice(-3);
+        const mergedBlockers = [...new Set([...prevBlockers, ...failures])].slice(-3);
+        const currentWork = explicitNoChange
+            ? 'Explain why no code changes are required and cite the supporting implementation files'
+            : wroteCode
+                ? 'Summarize the implemented changes and note any follow-up verification'
+                : implementationReady
+                    ? 'Implement the missing cache usage in the identified query/service flow'
+                    : 'Identify the exact query/service and cache integration points';
+        const goal = agent === 'planner' && responseContent.length > 10
+            ? responseContent.split('\n').find(l => l.trim().length > 10)?.trim().slice(0, 150) || previous.goal
+            : previous.goal;
+        const compactMemory = {
+            goal,
+            currentAgent: agent,
+            step: session.step,
+            keyFiles: allFiles,
+            recentActions,
+            pendingWork: mergedPending,
+            currentWork,
+            blockers: mergedBlockers,
+            implementationReady,
+            implementationStrict: !!previous.implementationStrict,
+            currentFocus: implementationReady
+                ? 'implementation'
+                : 'exploration',
+        };
+        session.compactMemory = compactMemory;
+        session.contextSummary = this.renderCompactMemory(compactMemory);
+    }
+    renderCompactMemory(memory) {
+        const lines = ['Conversation summary:'];
+        if (memory.goal)
+            lines.push(`- Goal: ${memory.goal}`);
+        if (memory.currentAgent)
+            lines.push(`- Current agent: ${memory.currentAgent}`);
+        if (typeof memory.step === 'number')
+            lines.push(`- Step: ${memory.step}`);
+        if (memory.keyFiles?.length)
+            lines.push(`- Key files: ${memory.keyFiles.join(', ')}`);
+        if (memory.recentActions?.length)
+            lines.push(`- Recent actions: ${memory.recentActions.join(', ')}`);
+        if (memory.pendingWork?.length)
+            lines.push(`- Pending work: ${memory.pendingWork.join(' | ')}`);
+        if (memory.currentWork)
+            lines.push(`- Current work: ${memory.currentWork}`);
+        if (memory.blockers?.length)
+            lines.push(`- Blockers: ${memory.blockers.join(' | ')}`);
+        if (typeof memory.implementationReady === 'boolean') {
+            lines.push(`- Implementation ready: ${memory.implementationReady ? 'yes' : 'no'}`);
+        }
+        if (typeof memory.implementationStrict === 'boolean') {
+            lines.push(`- Implementation strict: ${memory.implementationStrict ? 'yes' : 'no'}`);
+        }
+        if (memory.currentFocus)
+            lines.push(`- Current focus: ${memory.currentFocus}`);
+        return lines.join('\n');
+    }
+    extractRelevantPaths(action) {
+        if (!action.success)
+            return [];
+        const directPath = (() => {
+            const input = action.input;
+            const value = input?.path || input?.file_path;
+            return typeof value === 'string' ? [value] : [];
+        })();
+        const fromArrayOutput = Array.isArray(action.output)
+            ? action.output.filter((value) => typeof value === 'string')
+            : [];
+        const fromStructuredStdout = (() => {
+            if (!action.output || typeof action.output !== 'object')
+                return [];
+            const stdout = action.output.stdout;
+            if (typeof stdout !== 'string')
+                return [];
+            return this.extractPathsFromText(stdout);
+        })();
+        const fromStringOutput = typeof action.output === 'string'
+            ? this.extractPathsFromText(action.output)
+            : [];
+        return [...new Set([
+                ...directPath,
+                ...fromArrayOutput,
+                ...fromStructuredStdout,
+                ...fromStringOutput,
+            ])].slice(0, 20);
+    }
+    extractPathsFromText(text) {
+        return text
+            .split('\n')
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0
+            && (line.includes('.java')
+                || line.includes('.kt')
+                || line.includes('.xml')
+                || line.includes('.yml')
+                || line.includes('.yaml'))
+            && (line.includes('/') || line.includes('\\')))
+            .slice(0, 20);
+    }
+    // ─── Control Methods ──────────────────────────────────────
+    handleControl(command, session) {
+        switch (command.type) {
+            case 'stop':
+                if (session)
+                    session.loopState = 'stopped';
+                this.toolScheduler.cancelAll();
+                break;
+            case 'pause':
+                if (session)
+                    session.loopState = 'paused';
+                break;
+            case 'resume':
+                if (session)
+                    session.loopState = 'running';
+                break;
+            case 'inject_constraint':
+                this.injectedConstraints.push(command.constraint);
+                break;
+            case 'change_strategy':
+                this.currentStrategy = command.strategy;
+                break;
+            case 'modify_plan':
+                this.pendingPlanPatch = command.modifications;
+                break;
+        }
+    }
+    async waitForSessionRunState(session) {
+        if (!session) {
+            return true;
+        }
+        while (session.loopState === 'paused') {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        return session.loopState === 'running';
+    }
+    // ─── Legacy Mode (Phase 1 Compatibility) ──────────────────
+    async runLegacy(task) {
+        const startTime = now();
+        let currentIteration = 0;
+        let stableCount = 0;
+        let lastFitness = 0;
+        let converged = false;
+        let lastEvaluation;
+        let aborted = false;
+        let paused = false;
+        // Legacy handleControl bindings
+        const originalHandleControl = this.handleControl.bind(this);
+        this.handleControl = (command) => {
+            switch (command.type) {
+                case 'stop':
+                    aborted = true;
+                    this.toolScheduler.cancelAll();
+                    break;
+                case 'pause':
+                    paused = true;
+                    break;
+                case 'resume':
+                    paused = false;
+                    break;
+                case 'inject_constraint':
+                    this.injectedConstraints.push(command.constraint);
+                    break;
+                case 'change_strategy':
+                    this.currentStrategy = command.strategy;
+                    break;
+                case 'modify_plan':
+                    this.pendingPlanPatch = command.modifications;
+                    break;
+            }
+        };
+        try {
+            while (!converged && currentIteration < task.maxIterations && !aborted) {
+                while (paused && !aborted) {
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+                if (aborted)
+                    break;
+                currentIteration++;
+                const strategy = this.currentStrategy || task.strategy;
+                this.emitEvent(EventType.ITERATION_STARTED, task.id, {
+                    iteration: currentIteration,
+                    maxIterations: task.maxIterations,
+                    strategy,
+                });
+                const iterationStart = now();
+                // Step 1: Build Context
+                const context = await this.contextBuilder.buildContext(task.id, currentIteration, {
+                    agent: 'planner',
+                    environmentPackId: task.environmentPackSnapshot?.id,
+                    environmentPackSelection: task.environmentPackSelection,
+                });
+                this.emitEvent(EventType.CONTEXT_BUILT, task.id, {
+                    iteration: currentIteration,
+                    tokensUsed: context.meta.tokensUsed,
+                });
+                // Step 2: Generate Plan
+                this.onPhaseChange?.('planning');
+                this.emitEvent(EventType.PLAN_STARTED, task.id, { iteration: currentIteration });
+                let plan = await this.generatePlan(task, context, currentIteration);
+                if (this.pendingPlanPatch) {
+                    if (this.pendingPlanPatch.actions)
+                        plan.actions = this.pendingPlanPatch.actions;
+                    if (this.pendingPlanPatch.goals)
+                        plan.goals = this.pendingPlanPatch.goals;
+                    this.pendingPlanPatch = null;
+                    this.emitEvent(EventType.PLAN_UPDATED, task.id, {
+                        iteration: currentIteration,
+                        reason: 'human_modification',
+                    });
+                }
+                this.emitEvent(EventType.PLAN_GENERATED, task.id, {
+                    iteration: currentIteration,
+                    goals: plan.goals,
+                    actionCount: plan.actions.length,
+                });
+                // Step 3: Execute Plan
+                this.onPhaseChange?.('executing');
+                this.emitEvent(EventType.EXECUTION_STARTED, task.id, {
+                    iteration: currentIteration,
+                    actionCount: plan.actions.length,
+                });
+                const executedActions = await this.executePlan(task, plan);
+                const failCount = executedActions.filter(a => !a.success).length;
+                const successCount = executedActions.filter(a => a.success).length;
+                if (executedActions.length > 0 && successCount === 0) {
+                    this.emitEvent(EventType.WARNING, task.id, {
+                        message: `All ${failCount} actions failed in iteration ${currentIteration}`,
+                    });
+                }
+                // Step 4: Evaluate
+                this.onPhaseChange?.('evaluating');
+                this.emitEvent(EventType.EVALUATION_STARTED, task.id, { iteration: currentIteration });
+                const evaluation = await this.aceEngine.evaluateIteration(task.id, currentIteration);
+                this.emitEvent(EventType.EVALUATED, task.id, {
+                    iteration: currentIteration,
+                    fitness: evaluation.fitness,
+                    drift: evaluation.drift,
+                    entropy: evaluation.entropy,
+                });
+                // Step 5: Check Convergence
+                const fitnessDelta = Math.abs(evaluation.fitness - lastFitness);
+                if (fitnessDelta < 0.02)
+                    stableCount++;
+                else
+                    stableCount = 0;
+                converged = this.aceEngine.checkConvergence(evaluation, stableCount, strategy);
+                lastFitness = evaluation.fitness;
+                lastEvaluation = evaluation;
+                const iteration = {
+                    number: currentIteration,
+                    plan,
+                    executedActions,
+                    evaluation,
+                    durationMs: now() - iterationStart,
+                    timestamp: iterationStart,
+                };
+                task.iterations.push(iteration);
+                this.emitEvent(EventType.ITERATION_COMPLETED, task.id, {
+                    iteration: currentIteration,
+                    converged,
+                    stableCount,
+                    fitness: evaluation.fitness,
+                    durationMs: iteration.durationMs,
+                });
+                if (converged) {
+                    this.emitEvent(EventType.CONVERGED, task.id, {
+                        iteration: currentIteration,
+                        fitness: evaluation.fitness,
+                        totalDuration: formatDuration(now() - startTime),
+                    });
+                }
+            }
+            const finalStatus = converged ? 'converged' : aborted ? 'cancelled' : 'failed';
+            return {
+                taskId: task.id,
+                status: finalStatus,
+                totalIterations: currentIteration,
+                evaluation: lastEvaluation || {
+                    fitness: 0, drift: 0, entropy: 0, converged: false, stableCount: 0,
+                },
+                durationMs: now() - startTime,
+                summary: converged
+                    ? `Converged after ${currentIteration} iterations (fitness: ${lastFitness.toFixed(3)})`
+                    : `Failed to converge after ${currentIteration} iterations`,
+            };
+        }
+        catch (err) {
+            return {
+                taskId: task.id,
+                status: 'failed',
+                totalIterations: currentIteration,
+                evaluation: lastEvaluation || {
+                    fitness: 0, drift: 0, entropy: 0, converged: false, stableCount: 0,
+                },
+                durationMs: now() - startTime,
+                summary: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            };
+        }
+        finally {
+            this.handleControl = originalHandleControl;
+        }
+    }
+    // ─── Legacy Plan Generation ───────────────────────────────
+    async generatePlan(task, context, iteration) {
+        const strategy = this.currentStrategy || task.strategy;
+        const constraintText = this.injectedConstraints.length > 0
+            ? `\n\nInjected Constraints:\n${this.injectedConstraints.map(c => `- ${c}`).join('\n')}`
+            : '';
+        const prompt = [
+            `Task: ${task.description}`,
+            `Iteration: ${iteration}/${task.maxIterations}`,
+            `Strategy: ${strategy}`,
+            constraintText,
+            '',
+            'Generate a plan with specific tool actions.',
+        ].join('\n');
+        const contextStr = JSON.stringify(context, null, 2);
+        const response = await this.llmProvider.plan(prompt, contextStr, {
+            cwd: task.projectPath || process.cwd(),
+            allowWrites: false,
+            toolPolicy: PLAN_READ_ONLY_TOOL_POLICY,
+        });
+        return {
+            goals: response.goals,
+            actions: response.actions.map(a => ({
+                tool: a.tool,
+                input: a.input,
+                reason: a.reason,
+            })),
+            riskLevel: 'medium',
+            complexity: response.actions.length,
+        };
+    }
+    async executePlan(task, plan) {
+        const context = {
+            cwd: task.projectPath || process.cwd(),
+            taskId: task.id,
+        };
+        const actions = plan.actions.map((a) => ({
+            toolName: a.tool,
+            input: a.input,
+            dependsOn: a.dependsOn,
+        }));
+        const results = await this.toolScheduler.executeBatch(actions, context);
+        return results.map((r, i) => ({
+            tool: plan.actions[i].tool,
+            input: plan.actions[i].input,
+            output: r.output,
+            success: r.success,
+            error: r.error,
+            durationMs: r.durationMs,
+        }));
+    }
+    // ─── Event Emission ───────────────────────────────────────
+    emitEvent(type, taskId, payload) {
+        this.eventBus.emit({ id: generateId(), type, taskId, payload, timestamp: now() });
+    }
+}
+function parseHarnessJson(raw) {
+    try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed.commands)) {
+            return parsed.commands.map((command) => String(command).trim()).filter(Boolean);
+        }
+        if (typeof parsed.command === 'string' && parsed.command.trim()) {
+            return [parsed.command.trim()];
+        }
+    }
+    catch {
+        return [];
+    }
+    return [];
+}
+async function fileExists(filePath) {
+    try {
+        await fs.access(filePath);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function packageScriptCommand(packageManager, script) {
+    if (typeof packageManager !== 'string')
+        return `pnpm ${script}`;
+    const [name] = packageManager.split('@');
+    if (name === 'pnpm' || name === 'yarn')
+        return `corepack ${name} ${script}`;
+    if (name === 'npm')
+        return `npm run ${script}`;
+    if (name === 'bun')
+        return `bun ${script}`;
+    return `pnpm ${script}`;
+}
+function isValidationPendingWork(item) {
+    const lowered = item.toLowerCase();
+    const hasValidationSignal = (lowered.includes('verify')
+        || lowered.includes('validation')
+        || lowered.includes('test')
+        || lowered.includes('验证')
+        || lowered.includes('测试'));
+    const hasImplementationSignal = (/\bimplement\b/.test(lowered)
+        || lowered.includes('modify')
+        || lowered.includes('edit')
+        || lowered.includes('read ')
+        || lowered.includes('resume')
+        || lowered.includes('continue')
+        || lowered.includes('新增')
+        || lowered.includes('修复')
+        || lowered.includes('修改')
+        || lowered.includes('阅读')
+        || lowered.includes('继续'));
+    return hasValidationSignal && !hasImplementationSignal;
+}
+//# sourceMappingURL=agent-loop.js.map

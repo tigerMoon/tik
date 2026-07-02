@@ -1,0 +1,67 @@
+/**
+ * Shared Utilities
+ */
+/** Generate a unique ID */
+export function generateId() {
+    const cryptoApi = globalThis.crypto;
+    if (cryptoApi?.randomUUID) {
+        return cryptoApi.randomUUID();
+    }
+    return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+/** Generate a short task ID */
+export function generateTaskId() {
+    return `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
+/** Generate a run ID */
+export function generateRunId() {
+    return `run-${String(Date.now()).slice(-6)}-${Math.random().toString(36).slice(2, 5)}`;
+}
+/** Current timestamp in ms */
+export function now() {
+    return Date.now();
+}
+/** Format duration in human-readable form */
+export function formatDuration(ms) {
+    if (ms < 1000)
+        return `${ms}ms`;
+    if (ms < 60_000)
+        return `${(ms / 1000).toFixed(1)}s`;
+    const mins = Math.floor(ms / 60_000);
+    const secs = Math.round((ms % 60_000) / 1000);
+    return `${mins}m ${secs}s`;
+}
+/** Clamp a number between min and max */
+export function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+/** Truncate string with ellipsis */
+export function truncate(str, maxLen) {
+    if (str.length <= maxLen)
+        return str;
+    return str.slice(0, maxLen - 3) + '...';
+}
+/** Sleep for ms */
+export function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+/** Retry with exponential backoff */
+export async function retry(fn, maxRetries = 3, baseDelayMs = 1000) {
+    let lastError;
+    for (let i = 0; i <= maxRetries; i++) {
+        try {
+            return await fn();
+        }
+        catch (err) {
+            lastError = err instanceof Error ? err : new Error(String(err));
+            if (i < maxRetries) {
+                await sleep(baseDelayMs * Math.pow(2, i));
+            }
+        }
+    }
+    throw lastError;
+}
+export { extractModifiedFilesFromEvidenceBody } from './workbench-evidence.js';
+export { getWorkbenchLabelAction, getWorkbenchLabelActionDefinition, getWorkbenchLabelActionTone, getWorkbenchLabelDefinition, getWorkbenchLabelDefinitions, normalizeWorkbenchLabel, WORKBENCH_LABEL_ACTIONS, } from './workbench-labels.js';
+export { isWorkbenchTaskCodexDispatchable, isWorkbenchTaskExternallyOwnedClaudeReview, isWorkbenchTaskWorkflowDispatchable, isWorkbenchTaskMaintenance, } from './workbench-dispatch.js';
+//# sourceMappingURL=index.js.map

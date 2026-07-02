@@ -1697,6 +1697,7 @@ export class WorkbenchService {
       allowedScope: input.allowedScope,
       acceptanceCriteria: input.acceptanceCriteria,
       reviewFocus: input.reviewFocus,
+      reviewInput: input.reviewInput,
       blockingIssues: input.blockingIssues,
     };
   }
@@ -2110,6 +2111,7 @@ export class WorkbenchService {
       `Base ref: ${metadata.changeRequest.baseRef}`,
       `Head ref: ${metadata.changeRequest.headRef}`,
       `Head sha: ${metadata.headSha || metadata.changeRequest.headSha}`,
+      `Review input: ${metadata.reviewInput?.source || 'local_diff'}`,
     ].join('\n');
   }
 
