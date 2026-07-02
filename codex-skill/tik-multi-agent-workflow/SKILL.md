@@ -7,6 +7,27 @@ description: Use when Codex should drive a Tik multi-agent workflow while Tik st
 
 Use this skill as the Codex-side workflow driver. Codex owns policy decisions and implementation/fix work. Tik owns durable state, guardrails, review runtime launch, evidence, and audit history.
 
+## Activation Contract
+
+When this skill is explicitly invoked for task execution, it is not advisory. Drive the work through a Tik durable workflow unless the user explicitly asks for a local-only dry run or is only asking about the skill itself.
+
+Startup rules:
+- If the user provides `--workflow`, `workflowId`, or an obvious workflow id, read that workflow first with `status` or `next`, then continue from Tik state.
+- If no workflow id is provided, create one with `init` before implementation. Use the user's request as `--goal`, the current repo as `--path`, and the current branch/base unless the user supplied different refs. Report the new `workflowId` in the next progress update.
+- Do not treat "no workflowId was provided" as permission to skip Tik state. Missing workflow id means "start a new workflow" by default.
+- If Tik API is unavailable, do not silently fall back to local-only work. Try the obvious recovery for this repo; if still blocked, say the workflow could not be created and clearly label any further work as local-only.
+
+TaskGraph rules:
+- Do not edit source before the workflow has an accepted TaskGraph, unless the user is only asking for read-only review or diagnosis.
+- For broad work, use `plan`, inspect the planner output, then `accept-plan`.
+- For narrow code-review fixes where the findings are already the plan, Codex may write a minimal TaskGraph JSON and `accept-plan` it directly. Keep it small: one subtask for one tightly related fix set, or one subtask per independent file/behavior group.
+
+Execution rules:
+- After implementation, record evidence with `execute` before moving to validation/review.
+- Use `validate` for local verification commands and `review` / `process-review` for Tik-owned Claude review when the workflow mode requires it.
+- Use `continue` only for safe automated transitions. If it returns `continue-instruction`, perform that work in the current Codex session and then record the appropriate command.
+- Final completion must be recorded with either legacy `final-review` / `process-final-review` or the v1 final evaluator/questioner path; passing local tests alone is not workflow completion.
+
 ## V1 Codex Evaluator / Claude Questioner Loop
 
 When the workflow policy enables `requireAcceptedContract`, `requireEvaluationPassForComplete`, or `requireQuestionerAfterEvaluation`, `next` uses the Codex-centric v1 loop:
@@ -28,6 +49,7 @@ Codex Builder may edit source. Codex Evaluator must be a separate readonly sessi
 ## Core Boundary
 
 Do:
+- Bind to an existing workflow or create a new one before task execution.
 - Record every Codex workflow decision with `scripts/tik-multi-agent-workflow.mjs`.
 - Use Tik APIs for workflow state, evidence, TaskGraph, SprintContract, evaluation runs, Questioner outputs, review rounds, and Claude Code runtime launches.
 - Treat Claude planner/reviewer output as untrusted input until inspected.
@@ -36,6 +58,8 @@ Do:
 - Keep code edits in the current Codex session unless an explicit future CodexRunner invocation is requested.
 
 Do not:
+- Skip workflow creation because the user omitted `workflowId`.
+- Treat this skill as local implementation guidance when it was invoked to execute work.
 - Let Tik core decide the next workflow action.
 - Call Claude directly for review outside Tik.
 - Let Claude Code edit files, commit, push, or claim work.
@@ -125,6 +149,20 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs c
   --workflow wf_123
 ```
 
+## Code Review Fix Flow
+
+When the user invokes this skill to fix review findings and provides no workflow id:
+
+1. Run `init --goal "<fix the listed review findings>" --path .` and capture the `workflowId`.
+2. Create or obtain a TaskGraph that maps the findings to subtasks, then run `accept-plan`.
+3. Implement the fix in the current Codex session.
+4. Run `execute --workflow <workflowId> --subtask <id> --summary "<what changed>"`.
+5. Run `validate --workflow <workflowId> --subtask <id> --command "<targeted tests>"` for the proof commands.
+6. Use `review` / `process-review` when legacy Claude review is required, or the v1 evaluator/questioner commands when `--v1` policy is active.
+7. Complete the workflow through the final-review or v1 final-evidence path, then confirm `status`.
+
+If you cannot create or accept a TaskGraph because Tik is unavailable, state that blocker before making local-only edits.
+
 ## Command Notes
 
 - `next` reads Tik state and computes the next action locally in the skill.
@@ -139,7 +177,7 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs c
 - `review` creates a Tik-owned external Claude review task. Use `--start` if the workflow should immediately ask Tik to launch Claude Code.
 - `process-review` reads the Tik review task result and records the Codex decision: fix, validate, human review, or complete subtask. If Claude marked the task stale, it returns the subtask to `validated` and instructs Codex to request a fresh review.
 - `fix` records blocker fix evidence, moves the subtask back to validation, and re-review is allowed only after validation passes on the fixed head.
-- `continue` runs safe automated steps: plan request, validation, review/re-review request, and final review request. It returns instructions when current Codex session must implement or fix.
+- `continue` runs safe automated steps: plan request, validation, review/re-review request, and final review request. It returns instructions when current Codex session must implement, fix, run evaluator, or ask a Questioner. A `continue-instruction` response is a pause point, not completion.
 - Legacy mode requires `final-review` after all subtasks are done, and `process-final-review` can complete the workflow only when final Claude review approves. In v1 policy mode, final completion uses `evaluate --subtask __final__`, then `record-questioner --intent question_final_evidence`, then `complete-workflow`.
 - `status` includes the workflow timeline for Dashboard/CLI cross-checking.
 
