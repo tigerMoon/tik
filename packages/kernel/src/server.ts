@@ -213,9 +213,10 @@ interface RecordQuestionerOutputBody {
   subtaskId?: string;
   intent: QuestionerOutput['intent'];
   actor: QuestionerOutput['actor'];
-  source?: QuestionerOutput['source'];
-  headSha?: string;
+  source: QuestionerOutput['source'];
+  headSha: string;
   evaluationRunId?: string;
+  finalEvaluationRunId?: string;
   contractId?: string;
   artifactRef?: string;
   verdict: QuestionerOutput['verdict'];

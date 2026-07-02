@@ -535,11 +535,12 @@ export class FileMultiAgentWorkflowStore {
     ) {
       throw new MultiAgentCoordinationError('invalid_evaluation_result', 'Evaluation result identity does not match the evaluation run.');
     }
-    const resultStatus: EvaluationRun['status'] = result.verdict === 'pass'
+    const normalizedResult = await this.normalizeEvaluationResultEvidence(id, subtaskId, existing, result);
+    const resultStatus: EvaluationRun['status'] = normalizedResult.verdict === 'pass'
       ? 'passed'
-      : result.verdict === 'fail'
+      : normalizedResult.verdict === 'fail'
         ? 'failed'
-        : result.verdict === 'inconclusive'
+        : normalizedResult.verdict === 'inconclusive'
           ? 'inconclusive'
           : 'failed';
     const status: EvaluationRun['status'] = existing.status === 'invalidated'
@@ -548,15 +549,79 @@ export class FileMultiAgentWorkflowStore {
       : resultStatus;
     const updated = await this.updateEvaluationRun(id, subtaskId, evaluationRunId, {
       status,
-      result,
-      headSha: result.headSha,
+      result: normalizedResult,
+      headSha: normalizedResult.headSha,
     });
     await this.appendEvent(id, 'evaluation.result.recorded', 'codex-workflow', {
       evaluationRunId,
       subtaskId,
-      verdict: result.verdict,
+      verdict: normalizedResult.verdict,
     });
     return updated;
+  }
+
+  private async normalizeEvaluationResultEvidence(
+    workflowId: string,
+    subtaskId: string,
+    run: EvaluationRun,
+    result: CodexEvaluationResult,
+  ): Promise<CodexEvaluationResult> {
+    const contract = isFinalEvaluationSubtask(subtaskId)
+      ? null
+      : await this.readJsonFile<SprintContract>(this.contractFile(workflowId, subtaskId, run.contractId));
+    const mustCriteria = contract?.acceptanceCriteria.filter((criterion) => criterion.priority === 'must') || [];
+    const criteriaResults = Array.isArray(result.criteriaResults) ? result.criteriaResults : [];
+    const commandResults = Array.isArray(result.commandResults) ? result.commandResults : [];
+    const runtimeFindings = Array.isArray(result.runtimeFindings) ? result.runtimeFindings : [];
+    const coverageGaps = Array.isArray(result.coverageGaps) ? result.coverageGaps : [];
+    const hasCommandEvidence = commandResults.some((command) => command.status !== 'skipped');
+    const hasStructuredCriteriaEvidence = criteriaResults.some((criterion) =>
+      criterion.status === 'pass'
+        || criterion.status === 'fail'
+        || (criterion.artifactRefs?.length || 0) > 0
+        || (criterion.reproductionSteps?.length || 0) > 0
+    );
+    const hasArtifactEvidence = run.artifactRefs.length > 0
+      || criteriaResults.some((criterion) => (criterion.artifactRefs?.length || 0) > 0)
+      || commandResults.some((command) => Boolean(command.stdoutArtifactId || command.stderrArtifactId));
+    const hasReproductionEvidence = criteriaResults.some((criterion) => (criterion.reproductionSteps?.length || 0) > 0)
+      || runtimeFindings.some((finding) => finding.reproductionSteps.length > 0);
+    const resultsByCriterion = new Map(criteriaResults.map((criterionResult) => [criterionResult.criterionId, criterionResult]));
+    const missingMustCriteria = mustCriteria
+      .filter((criterion) => resultsByCriterion.get(criterion.id)?.status !== 'pass')
+      .map((criterion) => criterion.id);
+    const insufficient = !hasCommandEvidence && !hasStructuredCriteriaEvidence && !hasArtifactEvidence && !hasReproductionEvidence;
+    const missingEvidence = insufficient
+      ? [{
+        criterionId: 'all',
+        description: 'Evaluator did not provide command, criteria, artifact, or reproduction evidence.',
+        reason: 'No evaluator command, criteria result, or artifact evidence was provided.',
+      }]
+      : [];
+    const missingCriteriaGaps = missingMustCriteria.map((criterionId) => ({
+      criterionId,
+      description: `Must acceptance criterion ${criterionId} was not proven by the evaluator.`,
+      reason: 'Missing passing criteriaResult for a must acceptance criterion.',
+    }));
+    const nextCoverageGaps = mergeCoverageGaps(coverageGaps, [...missingEvidence, ...missingCriteriaGaps]);
+    if (result.verdict === 'pass' && (nextCoverageGaps.length > 0 || missingMustCriteria.length > 0)) {
+      return {
+        ...result,
+        verdict: 'inconclusive',
+        criteriaResults,
+        commandResults,
+        runtimeFindings,
+        coverageGaps: nextCoverageGaps,
+        confidence: Math.min(result.confidence, 0.25),
+      };
+    }
+    return {
+      ...result,
+      criteriaResults,
+      commandResults,
+      runtimeFindings,
+      coverageGaps: nextCoverageGaps,
+    };
   }
 
   async validateEvaluationReadonly(
@@ -617,9 +682,10 @@ export class FileMultiAgentWorkflowStore {
     input: Omit<Partial<QuestionerOutput>, 'workflowId' | 'createdAt'> & {
       intent: QuestionerOutput['intent'];
       actor: QuestionerOutput['actor'];
-      source?: QuestionerOutput['source'];
-      headSha?: string;
+      source: QuestionerOutput['source'];
+      headSha: string;
       evaluationRunId?: string;
+      finalEvaluationRunId?: string;
       contractId?: string;
       artifactRef?: string;
       verdict: QuestionerOutput['verdict'];
@@ -644,6 +710,7 @@ export class FileMultiAgentWorkflowStore {
       source: input.source,
       headSha: input.headSha,
       evaluationRunId: input.evaluationRunId,
+      finalEvaluationRunId: input.finalEvaluationRunId,
       contractId: input.contractId,
       artifactRef: input.artifactRef,
       verdict: input.verdict,
@@ -921,8 +988,8 @@ export class FileMultiAgentWorkflowStore {
         .filter((entry) => entry.endsWith('.json'))
         .map((entry) => this.readJsonFile<QuestionerOutput>(path.join(this.questionerOutputsDir(workflowId), entry))));
       return records
-        .filter((item): item is QuestionerOutput => Boolean(item))
-        .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+        .filter(isStoredQuestionerOutput)
+        .sort((left, right) => safeIsoTime(left.createdAt).localeCompare(safeIsoTime(right.createdAt)));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return [];
@@ -1172,9 +1239,10 @@ function assertValidRuntimeAttestation(
 function assertQuestionerRuntimeSource(input: {
   intent: QuestionerOutput['intent'];
   actor: QuestionerOutput['actor'];
-  source?: QuestionerOutput['source'];
-  headSha?: string;
+  source: QuestionerOutput['source'];
+  headSha: string;
   evaluationRunId?: string;
+  finalEvaluationRunId?: string;
   contractId?: string;
   artifactRef?: string;
 }): void {
@@ -1209,6 +1277,36 @@ function findDuplicate(values: string[]): string | null {
 
 function mergeUnique<T>(left: T[] | undefined, right: T[] | undefined): T[] {
   return Array.from(new Set([...(left || []), ...(right || [])]));
+}
+
+function mergeCoverageGaps(
+  left: CodexEvaluationResult['coverageGaps'],
+  right: CodexEvaluationResult['coverageGaps'],
+): CodexEvaluationResult['coverageGaps'] {
+  const seen = new Set<string>();
+  const merged: CodexEvaluationResult['coverageGaps'] = [];
+  for (const gap of [...left, ...right]) {
+    const key = `${gap.criterionId || ''}:${gap.reason}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(gap);
+  }
+  return merged;
+}
+
+function isStoredQuestionerOutput(item: QuestionerOutput | null): item is QuestionerOutput {
+  return Boolean(
+    item
+      && typeof item.id === 'string'
+      && typeof item.workflowId === 'string'
+      && typeof item.intent === 'string'
+      && typeof item.createdAt === 'string'
+      && Array.isArray(item.questions),
+  );
+}
+
+function safeIsoTime(value: string | undefined): string {
+  return typeof value === 'string' ? value : '';
 }
 
 function readStringFromRecord(record: Record<string, unknown> | undefined, key: string): string | undefined {

@@ -416,7 +416,9 @@ describe('codex evaluator and Claude questioner workflow', () => {
       },
     });
     await recordPassingEvaluation(server, 'wf-glob-scope', 'eval-glob-pass');
-    await recordClearQuestioner(server, 'wf-glob-scope', 'q-glob-clear');
+    await recordClearQuestioner(server, 'wf-glob-scope', 'q-glob-clear', {
+      evaluationRunId: 'eval-glob-pass',
+    });
     await createCompletedInvocation(server, 'wf-glob-scope', {
       id: 'inv-builder-glob',
       subtaskId: 'st-api',
@@ -697,6 +699,99 @@ describe('codex evaluator and Claude questioner workflow', () => {
     });
   });
 
+  it('rejects implementation scope using Tik observed changed files instead of declared files', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-observed-scope', root);
+    await putSingleSubtaskGraph(server, 'wf-observed-scope');
+    await createAcceptedContract(server, 'wf-observed-scope', {
+      allowedPaths: ['packages/kernel/src/multi-agent/**'],
+    });
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-observed-scope/evidence',
+      payload: {
+        id: 'ev-observed-impl',
+        kind: 'implementation',
+        title: 'Implementation evidence with conflicting declared and observed files',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+          ],
+          declaredChangedFiles: [
+            { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+          ],
+          observedChangedFiles: [
+            { path: 'README.md', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    await moveSubtaskToQuestioningEvidence(server, 'wf-observed-scope', 'st-api', 'ev-observed-impl');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-observed-scope/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-observed-pass',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-observed-pass' },
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-observed-scope', 'eval-observed-pass');
+    await recordClearQuestioner(server, 'wf-observed-scope', 'q-observed-clear', {
+      evaluationRunId: 'eval-observed-pass',
+    });
+    await createCompletedInvocation(server, 'wf-observed-scope', {
+      id: 'inv-builder-observed',
+      subtaskId: 'st-api',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+      threadId: 'builder-thread-observed',
+      headSha: 'head-1',
+      evidenceRefs: ['ev-observed-impl'],
+    });
+    await createCompletedInvocation(server, 'wf-observed-scope', {
+      id: 'inv-evaluator-observed',
+      subtaskId: 'st-api',
+      role: 'evaluator',
+      runner: 'codex-evaluator',
+      promptContract: 'codex-evaluator.v1',
+      threadId: 'evaluator-thread-observed',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-observed-pass',
+      readonlyPolicy: { enforced: true, violations: [] },
+    });
+
+    const complete = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-observed-scope/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-observed-scope', {
+          id: 'dec-complete-observed-scope',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Observed changed files must drive contract scope validation.',
+          evidenceRefs: ['ev-observed-impl'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+
+    expect(complete.statusCode).toBe(409);
+    expect(complete.json().guard).toMatchObject({
+      accepted: false,
+      code: 'worktree_out_of_scope',
+    });
+  });
+
   it('rejects v1 subtask completion when a passing evaluation lacks must-criteria coverage and real evidence', async () => {
     const root = await makeTempWorkspace();
     const server = await createTestServer(root);
@@ -754,6 +849,12 @@ describe('codex evaluator and Claude questioner workflow', () => {
       },
     });
     expect(thinResult.statusCode).toBe(200);
+    expect(thinResult.json().evaluationRun).toMatchObject({
+      status: 'inconclusive',
+      result: {
+        verdict: 'inconclusive',
+      },
+    });
 
     await recordClearQuestioner(server, 'wf-thin-evaluation', 'q-thin-clear', {
       evaluationRunId: 'eval-thin-pass',
@@ -798,7 +899,281 @@ describe('codex evaluator and Claude questioner workflow', () => {
     expect(complete.statusCode).toBe(409);
     expect(complete.json().guard).toMatchObject({
       accepted: false,
-      code: 'evaluation_evidence_insufficient',
+      code: 'evaluation_not_passed',
+    });
+  });
+
+  it('downgrades thin pass evaluation results before they can become passed runs', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-thin-result-downgrade', root);
+    await putSingleSubtaskGraph(server, 'wf-thin-result-downgrade');
+    await createAcceptedContract(server, 'wf-thin-result-downgrade');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-thin-result-downgrade/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-thin-result',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-thin-result' },
+      },
+    });
+
+    const recorded = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-thin-result-downgrade/subtasks/st-api/evaluations/eval-thin-result/result',
+      payload: {
+        result: {
+          workflowId: 'wf-thin-result-downgrade',
+          subtaskId: 'st-api',
+          contractId: 'contract-st-api-v1',
+          evaluatorRunId: 'eval-thin-result',
+          headSha: 'head-1',
+          verdict: 'pass',
+          criteriaResults: [],
+          commandResults: [],
+          runtimeFindings: [],
+          coverageGaps: [],
+          confidence: 0.99,
+        },
+      },
+    });
+
+    expect(recorded.statusCode).toBe(200);
+    expect(recorded.json().evaluationRun).toMatchObject({
+      id: 'eval-thin-result',
+      status: 'inconclusive',
+      result: {
+        verdict: 'inconclusive',
+      },
+    });
+    expect(recorded.json().evaluationRun.result.coverageGaps).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        criterionId: 'all',
+        reason: 'No evaluator command, criteria result, or artifact evidence was provided.',
+      }),
+    ]));
+  });
+
+  it('does not treat not_tested placeholder criteria as real evaluator evidence', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-placeholder-criteria', root);
+    await putSingleSubtaskGraph(server, 'wf-placeholder-criteria');
+    await createAcceptedContract(server, 'wf-placeholder-criteria');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-placeholder-criteria/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-placeholder-criteria',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-placeholder-criteria' },
+      },
+    });
+
+    const recorded = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-placeholder-criteria/subtasks/st-api/evaluations/eval-placeholder-criteria/result',
+      payload: {
+        result: {
+          workflowId: 'wf-placeholder-criteria',
+          subtaskId: 'st-api',
+          contractId: 'contract-st-api-v1',
+          evaluatorRunId: 'eval-placeholder-criteria',
+          headSha: 'head-1',
+          verdict: 'pass',
+          criteriaResults: [
+            { criterionId: 'ac-1', status: 'not_tested', evidence: 'No evaluator command was provided.' },
+          ],
+          commandResults: [],
+          runtimeFindings: [],
+          coverageGaps: [],
+          confidence: 0.8,
+        },
+      },
+    });
+
+    expect(recorded.statusCode).toBe(200);
+    expect(recorded.json().evaluationRun).toMatchObject({
+      status: 'inconclusive',
+      result: {
+        verdict: 'inconclusive',
+      },
+    });
+    expect(recorded.json().evaluationRun.result.coverageGaps).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        criterionId: 'all',
+        reason: 'No evaluator command, criteria result, or artifact evidence was provided.',
+      }),
+      expect.objectContaining({
+        criterionId: 'ac-1',
+        reason: 'Missing passing criteriaResult for a must acceptance criterion.',
+      }),
+    ]));
+  });
+
+  it('requires Claude Questioner output to match the latest evaluation provenance', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-questioner-provenance', root);
+    await putSingleSubtaskGraph(server, 'wf-questioner-provenance');
+    await createAcceptedContract(server, 'wf-questioner-provenance');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-provenance/evidence',
+      payload: {
+        id: 'ev-questioner-impl',
+        kind: 'implementation',
+        title: 'Implementation evidence',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    await moveSubtaskToQuestioningEvidence(server, 'wf-questioner-provenance', 'st-api', 'ev-questioner-impl');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-provenance/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-provenance',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-provenance' },
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-questioner-provenance', 'eval-provenance');
+    await createCompletedInvocation(server, 'wf-questioner-provenance', {
+      id: 'inv-builder-provenance',
+      subtaskId: 'st-api',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+      threadId: 'builder-thread-provenance',
+      headSha: 'head-1',
+      evidenceRefs: ['ev-questioner-impl'],
+    });
+    await createCompletedInvocation(server, 'wf-questioner-provenance', {
+      id: 'inv-evaluator-provenance',
+      subtaskId: 'st-api',
+      role: 'evaluator',
+      runner: 'codex-evaluator',
+      promptContract: 'codex-evaluator.v1',
+      threadId: 'evaluator-thread-provenance',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-provenance',
+      readonlyPolicy: { enforced: true, violations: [] },
+    });
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-provenance/questioner-outputs',
+      payload: {
+        id: 'q-wrong-eval',
+        subtaskId: 'st-api',
+        intent: 'question_evaluation',
+        actor: { kind: 'claude-code-questioner', invocationId: 'claude-q-wrong-eval' },
+        source: 'claude-plugin',
+        headSha: 'head-1',
+        evaluationRunId: 'eval-other',
+        contractId: 'contract-st-api-v1',
+        artifactRef: 'questioner://wrong-eval',
+        verdict: 'evidence_sufficient',
+        questions: [],
+        risks: [],
+        missingTests: [],
+        suggestedContractChanges: [],
+      },
+    });
+
+    const wrongEvaluation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-provenance/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-questioner-provenance', {
+          id: 'dec-complete-wrong-questioner-eval',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Questioner must bind to the latest evaluation run.',
+          evidenceRefs: ['ev-questioner-impl'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(wrongEvaluation.statusCode).toBe(409);
+    expect(wrongEvaluation.json().guard).toMatchObject({
+      accepted: false,
+      code: 'blocking_question_unresolved',
+    });
+
+    await recordClearQuestioner(server, 'wf-questioner-provenance', 'q-provenance-clear', {
+      evaluationRunId: 'eval-provenance',
+    });
+
+    const complete = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-provenance/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-questioner-provenance', {
+          id: 'dec-complete-questioner-provenance',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Questioner provenance matches current evaluation.',
+          evidenceRefs: ['ev-questioner-impl'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(complete.statusCode).toBe(200);
+  });
+
+  it('ignores non-record artifact json files in the Questioner storage directory', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-questioner-artifact-noise', root);
+    await putSingleSubtaskGraph(server, 'wf-questioner-artifact-noise');
+    await createAcceptedContract(server, 'wf-questioner-artifact-noise');
+    await recordClearQuestioner(server, 'wf-questioner-artifact-noise', 'q-artifact-noise');
+
+    const noisyDir = path.join(root, '.tik', 'multi-agent', 'workflows', 'wf-questioner-artifact-noise', 'questioner');
+    await fs.writeFile(
+      path.join(noisyDir, 'q-artifact-copy.json'),
+      JSON.stringify({
+        id: 'q-artifact-copy',
+        source: 'claude-plugin',
+        intent: 'question_evaluation',
+        // No workflowId/createdAt: this is an artifact copy, not a Tik store record.
+      }),
+      'utf-8',
+    );
+
+    const bundle = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-artifact-noise',
+    });
+
+    expect(bundle.statusCode).toBe(200);
+    expect(bundle.json().questionerOutputs).toHaveLength(1);
+    expect(bundle.json().questionerOutputs[0]).toMatchObject({
+      id: 'q-artifact-noise',
+      workflowId: 'wf-questioner-artifact-noise',
     });
   });
 
@@ -894,6 +1269,93 @@ describe('codex evaluator and Claude questioner workflow', () => {
     expect(complete.json().guard).toMatchObject({
       accepted: false,
       code: 'missing_subagent_invocation',
+    });
+  });
+
+  it('rejects runtime-attested subagents whose parent thread does not match the workflow thread', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-parent-thread', root);
+    await putSingleSubtaskGraph(server, 'wf-parent-thread');
+    await createAcceptedContract(server, 'wf-parent-thread');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-parent-thread/evidence',
+      payload: {
+        id: 'ev-parent-thread-impl',
+        kind: 'implementation',
+        title: 'Implementation evidence',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    await moveSubtaskToQuestioningEvidence(server, 'wf-parent-thread', 'st-api', 'ev-parent-thread-impl');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-parent-thread/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-parent-thread',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-parent-thread' },
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-parent-thread', 'eval-parent-thread');
+    await recordClearQuestioner(server, 'wf-parent-thread', 'q-parent-thread-clear', {
+      evaluationRunId: 'eval-parent-thread',
+    });
+    await createCompletedInvocation(server, 'wf-parent-thread', {
+      id: 'inv-builder-parent-thread',
+      subtaskId: 'st-api',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+      threadId: 'builder-thread-parent',
+      headSha: 'head-1',
+      evidenceRefs: ['ev-parent-thread-impl'],
+      parentThreadId: 'workflow-parent-thread',
+    });
+    await createCompletedInvocation(server, 'wf-parent-thread', {
+      id: 'inv-evaluator-parent-thread',
+      subtaskId: 'st-api',
+      role: 'evaluator',
+      runner: 'codex-evaluator',
+      promptContract: 'codex-evaluator.v1',
+      threadId: 'evaluator-thread-parent',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-parent-thread',
+      readonlyPolicy: { enforced: true, violations: [] },
+      parentThreadId: 'other-parent-thread',
+    });
+
+    const complete = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-parent-thread/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-parent-thread', {
+          id: 'dec-complete-wrong-parent-thread',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Runtime attestation parent must match workflow parent thread.',
+          evidenceRefs: ['ev-parent-thread-impl'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+
+    expect(complete.statusCode).toBe(409);
+    expect(complete.json().guard).toMatchObject({
+      accepted: false,
+      code: 'subagent_thread_not_isolated',
     });
   });
 
@@ -1113,6 +1575,9 @@ async function createV1Workflow(
       goal: 'Exercise Codex evaluator and Claude questioner gates',
       rootTaskId: `root-${workflowId}`,
       headSha: 'head-1',
+      metadata: {
+        parentCodexThreadId: 'workflow-parent-thread',
+      },
       policy: {
         requireAcceptedContract: true,
         requireQuestionerAfterEvaluation: true,
@@ -1334,13 +1799,14 @@ async function createCompletedInvocation(
       violations: string[];
     };
     runtimeAttested?: boolean;
+    parentThreadId?: string;
   },
 ) {
   const runtimeAttestation = input.runtimeAttested === false
     ? undefined
     : {
       source: 'codex-subagent-runtime',
-      parentThreadId: `parent-${workflowId}`,
+      parentThreadId: input.parentThreadId || 'workflow-parent-thread',
       actualSubagentThreadId: input.threadId,
       role: input.role,
       startedAt: '2026-07-01T00:00:00.000Z',

@@ -2,6 +2,7 @@ import * as path from 'node:path';
 import type {
   EvaluationRun,
   GuardResult,
+  ImplementationEvidencePayload,
   MultiAgentWorkflowBundle,
   MultiAgentWorkflowEvidence,
   MultiAgentWorkflowRecord,
@@ -168,6 +169,13 @@ function validateActionTransition(
       const evaluation = latestEvaluationRun(bundle, '__final__');
       if (!evaluation?.result) {
         return reject('missing_evaluation_result', 'Final evidence questioning requires a final Codex evaluation result.');
+      }
+      if (evaluation.status !== 'passed' || evaluation.result.verdict !== 'pass') {
+        return reject('evaluation_not_passed', 'Final evidence questioning requires a passing final Codex evaluation result.', {
+          evaluationRunId: evaluation.id,
+          status: evaluation.status,
+          verdict: evaluation.result.verdict,
+        });
       }
       return accept();
     }
@@ -418,6 +426,8 @@ function guardCompleteSubtaskV1(
     if (!questioner) {
       return reject('blocking_question_unresolved', 'Claude Questioner must inspect evaluation evidence before completion.');
     }
+    const questionerGuard = requireQuestionerMatchesEvaluation(questioner, evaluation, contract);
+    if (!questionerGuard.accepted) return questionerGuard;
     if (hasBlockingQuestions(questioner)) {
       return reject('blocking_question_unresolved', 'Claude Questioner has unresolved blocking questions.', {
         questionerOutputId: questioner.id,
@@ -478,6 +488,29 @@ function requireIsolatedCodexSubagents(
       builderInvocationId: builder.id,
       evaluatorInvocationId: evaluator.id,
       threadId: builderThreadId,
+    });
+  }
+
+  const builderParentThreadId = builder.parentThreadId || builder.runtimeAttestation?.parentThreadId;
+  const evaluatorParentThreadId = evaluator.parentThreadId || evaluator.runtimeAttestation?.parentThreadId;
+  const expectedParentThreadId = readWorkflowParentCodexThreadId(bundle.workflow);
+  if (!builderParentThreadId || !evaluatorParentThreadId) {
+    return reject('missing_subagent_invocation', 'Builder and Evaluator invocations must record Codex parent thread ids.', {
+      builderInvocationId: builder.id,
+      evaluatorInvocationId: evaluator.id,
+    });
+  }
+  if (expectedParentThreadId && (builderParentThreadId !== expectedParentThreadId || evaluatorParentThreadId !== expectedParentThreadId)) {
+    return reject('subagent_thread_not_isolated', 'Builder and Evaluator parent threads must match the workflow Codex parent thread.', {
+      expectedParentThreadId,
+      builderParentThreadId,
+      evaluatorParentThreadId,
+    });
+  }
+  if (!expectedParentThreadId && builderParentThreadId !== evaluatorParentThreadId) {
+    return reject('subagent_thread_not_isolated', 'Builder and Evaluator must be spawned by the same Codex workflow parent thread.', {
+      builderParentThreadId,
+      evaluatorParentThreadId,
     });
   }
 
@@ -542,6 +575,8 @@ function guardCompleteWorkflowV1(
     if (!questioner) {
       return reject('blocking_question_unresolved', 'Claude Questioner must inspect final evidence before workflow completion.');
     }
+    const questionerGuard = requireQuestionerMatchesFinalEvaluation(questioner, evaluation);
+    if (!questionerGuard.accepted) return questionerGuard;
     if (hasBlockingQuestions(questioner)) {
       return reject('blocking_question_unresolved', 'Claude Questioner has unresolved final blocking questions.', {
         questionerOutputId: questioner.id,
@@ -768,13 +803,108 @@ function latestQuestionerOutput(
 }
 
 function hasBlockingQuestions(output: QuestionerOutput): boolean {
-  return output.questions.some((question) => question.priority === 'blocking');
+  return output.verdict === 'questions_blocking'
+    || output.verdict === 'need_clarification'
+    || output.questions.some((question) => question.priority === 'blocking');
+}
+
+function requireQuestionerMatchesEvaluation(
+  output: QuestionerOutput,
+  evaluation: EvaluationRun,
+  contract: SprintContract,
+): GuardResult {
+  if (output.source !== 'claude-plugin') {
+    return reject('blocking_question_unresolved', 'Questioner output must come from the Claude plugin.', {
+      questionerOutputId: output.id,
+      source: output.source,
+    });
+  }
+  if (output.verdict !== 'evidence_sufficient' && output.verdict !== 'no_blocking_questions') {
+    return reject('blocking_question_unresolved', 'Questioner output must explicitly mark evidence sufficient.', {
+      questionerOutputId: output.id,
+      verdict: output.verdict,
+    });
+  }
+  if (output.evaluationRunId !== evaluation.id) {
+    return reject('blocking_question_unresolved', 'Questioner output does not match the latest evaluation run.', {
+      questionerOutputId: output.id,
+      expectedEvaluationRunId: evaluation.id,
+      actualEvaluationRunId: output.evaluationRunId,
+    });
+  }
+  if (output.contractId !== contract.id) {
+    return reject('blocking_question_unresolved', 'Questioner output does not match the accepted SprintContract.', {
+      questionerOutputId: output.id,
+      expectedContractId: contract.id,
+      actualContractId: output.contractId,
+    });
+  }
+  if (output.headSha !== evaluation.headSha || output.headSha !== evaluation.result?.headSha) {
+    return reject('head_sha_mismatch', 'Questioner output head does not match the evaluation head.', {
+      questionerOutputId: output.id,
+      questionerHeadSha: output.headSha,
+      evaluationHeadSha: evaluation.headSha,
+      resultHeadSha: evaluation.result?.headSha,
+    });
+  }
+  if (!output.actor.invocationId || !output.artifactRef) {
+    return reject('missing_evidence', 'Questioner output must include Claude invocation id and artifact ref.', {
+      questionerOutputId: output.id,
+    });
+  }
+  return accept();
+}
+
+function requireQuestionerMatchesFinalEvaluation(
+  output: QuestionerOutput,
+  evaluation: EvaluationRun,
+): GuardResult {
+  if (output.source !== 'claude-plugin') {
+    return reject('blocking_question_unresolved', 'Final Questioner output must come from the Claude plugin.', {
+      questionerOutputId: output.id,
+      source: output.source,
+    });
+  }
+  if (output.verdict !== 'evidence_sufficient' && output.verdict !== 'no_blocking_questions') {
+    return reject('blocking_question_unresolved', 'Final Questioner output must explicitly mark evidence sufficient.', {
+      questionerOutputId: output.id,
+      verdict: output.verdict,
+    });
+  }
+  const questionerEvaluationId = output.finalEvaluationRunId || output.evaluationRunId;
+  if (questionerEvaluationId !== evaluation.id) {
+    return reject('blocking_question_unresolved', 'Final Questioner output does not match the final evaluation run.', {
+      questionerOutputId: output.id,
+      expectedEvaluationRunId: evaluation.id,
+      actualEvaluationRunId: questionerEvaluationId,
+    });
+  }
+  if (output.headSha !== evaluation.headSha || output.headSha !== evaluation.result?.headSha) {
+    return reject('head_sha_mismatch', 'Final Questioner output head does not match the final evaluation head.', {
+      questionerOutputId: output.id,
+      questionerHeadSha: output.headSha,
+      evaluationHeadSha: evaluation.headSha,
+      resultHeadSha: evaluation.result?.headSha,
+    });
+  }
+  if (!output.actor.invocationId || !output.artifactRef) {
+    return reject('missing_evidence', 'Final Questioner output must include Claude invocation id and artifact ref.', {
+      questionerOutputId: output.id,
+    });
+  }
+  return accept();
 }
 
 function requireImplementationWithinContractScope(
   evidence: MultiAgentWorkflowEvidence,
   contract: SprintContract,
 ): GuardResult {
+  const scopeCheck = readImplementationScopeCheck(evidence);
+  if (scopeCheck && !scopeCheck.allowed) {
+    return reject('worktree_out_of_scope', 'Tik observed implementation changes outside the contract scope.', {
+      violations: scopeCheck.violations,
+    });
+  }
   const changedFiles = readChangedFiles(evidence);
   if (changedFiles.length === 0) {
     return reject('missing_implementation_evidence', 'Implementation evidence must include Tik-derived changed files for contract scope validation.');
@@ -859,8 +989,16 @@ function isRuntimeAttestedInvocation(
   );
 }
 
+function readWorkflowParentCodexThreadId(workflow: MultiAgentWorkflowRecord): string | undefined {
+  const value = workflow.metadata?.parentCodexThreadId;
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
 function readChangedFiles(evidence: MultiAgentWorkflowEvidence): string[] {
-  const changedFiles = evidence.payload?.changedFiles;
+  const payload = evidence.payload as ImplementationEvidencePayload | undefined;
+  const changedFiles = Array.isArray(payload?.observedChangedFiles)
+    ? payload.observedChangedFiles
+    : payload?.changedFiles;
   if (!Array.isArray(changedFiles)) {
     return [];
   }
@@ -874,6 +1012,17 @@ function readChangedFiles(evidence: MultiAgentWorkflowEvidence): string[] {
     })
     .filter((entry): entry is string => Boolean(entry))
     .map((entry) => entry.replace(/\\/g, '/').replace(/^\.\/+/, ''));
+}
+
+function readImplementationScopeCheck(evidence: MultiAgentWorkflowEvidence): ImplementationEvidencePayload['scopeCheck'] | undefined {
+  const scopeCheck = (evidence.payload as ImplementationEvidencePayload | undefined)?.scopeCheck;
+  if (!scopeCheck || typeof scopeCheck !== 'object') return undefined;
+  return {
+    allowed: scopeCheck.allowed === true,
+    violations: Array.isArray(scopeCheck.violations)
+      ? scopeCheck.violations.filter((entry): entry is string => typeof entry === 'string')
+      : [],
+  };
 }
 
 function matchesAnyPath(filePath: string, patterns: string[]): boolean {

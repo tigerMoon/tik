@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { decideNextAction } from '../lib/loop-gate.mjs';
@@ -46,6 +46,7 @@ try {
           currentHeadSha: body.headSha,
           maxRounds: body.maxRounds || 3,
           policy: body.policy,
+          metadata: body.metadata,
         };
         events.push({ type: 'workflow.created', payload: { workflowId: workflow.id } });
         sendJson(res, { workflow });
@@ -214,9 +215,10 @@ try {
         sendJson(res, { evaluationRun });
         return;
       }
-      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/st-api/evaluations/eval-st-api-v1/validate-readonly') {
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/subtasks\/st-api\/evaluations\/[^/]+\/validate-readonly$/)) {
+        const evaluationRunId = route.split('/').at(-2);
         const body = await readRequestJson(req);
-        evaluationRuns = evaluationRuns.map((run) => run.id === 'eval-st-api-v1'
+        evaluationRuns = evaluationRuns.map((run) => run.id === evaluationRunId
           ? {
             ...run,
             readonlyPolicy: {
@@ -227,21 +229,22 @@ try {
             },
           }
           : run);
-        sendJson(res, { evaluationRun: evaluationRuns.find((run) => run.id === 'eval-st-api-v1'), guard: { accepted: true, code: 'ok' } });
+        sendJson(res, { evaluationRun: evaluationRuns.find((run) => run.id === evaluationRunId), guard: { accepted: true, code: 'ok' } });
         return;
       }
-      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/st-api/evaluations/eval-st-api-v1/result') {
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/subtasks\/st-api\/evaluations\/[^/]+\/result$/)) {
+        const evaluationRunId = route.split('/').at(-2);
         const body = await readRequestJson(req);
-        evaluationRuns = evaluationRuns.map((run) => run.id === 'eval-st-api-v1'
+        evaluationRuns = evaluationRuns.map((run) => run.id === evaluationRunId
           ? {
             ...run,
-            status: body.result.verdict === 'pass' ? 'passed' : 'failed',
+            status: evaluationStatusForVerdict(body.result.verdict),
             result: body.result,
             completedAt: new Date().toISOString(),
           }
           : run);
-        events.push({ type: 'evaluation.result.recorded', payload: { evaluationRunId: 'eval-st-api-v1', subtaskId: 'st-api' } });
-        sendJson(res, { evaluationRun: evaluationRuns.find((run) => run.id === 'eval-st-api-v1') });
+        events.push({ type: 'evaluation.result.recorded', payload: { evaluationRunId, subtaskId: 'st-api' } });
+        sendJson(res, { evaluationRun: evaluationRuns.find((run) => run.id === evaluationRunId) });
         return;
       }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/__final__/evaluations') {
@@ -282,7 +285,7 @@ try {
         evaluationRuns = evaluationRuns.map((run) => run.id === 'eval-final-v1'
           ? {
             ...run,
-            status: body.result.verdict === 'pass' ? 'passed' : 'failed',
+            status: evaluationStatusForVerdict(body.result.verdict),
             result: body.result,
             completedAt: new Date().toISOString(),
           }
@@ -446,11 +449,13 @@ try {
     '--goal', 'Implement auth workflow',
     '--root-task', 'task-root',
     '--workflow', 'wf-cli',
+    '--parent-thread', 'workflow-thread-cli',
     '--base', 'main',
   ]);
   assert.equal(init.action, 'initialized');
   assert.equal(init.workflowId, 'wf-cli');
   assert.equal(init.rootTaskId, 'task-root');
+  assert.equal(workflow.metadata.parentCodexThreadId, 'workflow-thread-cli');
 
   const putGraph = await run([
     'accept-plan',
@@ -506,6 +511,7 @@ try {
     '--subtask', 'st-api',
     '--summary', 'Implemented API',
     '--changed-files', 'packages/kernel/src/multi-agent/guard.ts,packages/kernel/src/server.ts',
+    '--observed-changed-files', 'packages/kernel/src/multi-agent/guard.ts,packages/kernel/src/server.ts',
     '--invocation', 'inv-builder-cli',
     '--runtime-attested',
     '--parent-thread', 'workflow-thread-cli',
@@ -519,16 +525,26 @@ try {
     { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
     { path: 'packages/kernel/src/server.ts', changeType: 'modified' },
   ]);
+  assert.deepEqual(evidence[0].payload.declaredChangedFiles, [
+    { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+    { path: 'packages/kernel/src/server.ts', changeType: 'modified' },
+  ]);
+  assert.deepEqual(evidence[0].payload.observedChangedFiles, [
+    { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+    { path: 'packages/kernel/src/server.ts', changeType: 'modified' },
+  ]);
 
   const validate = await run([
     'validate',
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
-    '--command', `${process.execPath} -e "process.exit(0)"`,
+    '--command', `${process.execPath} -e "console.log('validation ok')"`,
   ]);
   assert.equal(validate.action, 'validation-recorded');
   assert.equal(validate.passed, true);
+  assert.equal(validate.evidence.artifactRef, '.tik/multi-agent/workflows/wf-cli/validation/st-api/validation.stdout.log');
+  assert.match(await readFile(path.join(repo, validate.evidence.artifactRef), 'utf-8'), /validation ok/);
   assert.equal(subtasks['st-api'].status, 'validated');
 
   const nextAfterValidation = await run(['next', '--api-base-url', apiBaseUrl, '--workflow', 'wf-cli']);
@@ -807,7 +823,7 @@ try {
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
     '--evaluation', 'eval-st-api-v1',
-    '--command', `${process.execPath} -e "process.exit(0)"`,
+    '--command', `${process.execPath} -e "console.log('evaluation ok')"`,
     '--invocation', 'inv-evaluator-cli',
     '--runtime-attested',
     '--parent-thread', 'workflow-thread-cli',
@@ -819,7 +835,40 @@ try {
   assert.equal(evaluated.invocation.evaluationRunId, 'eval-st-api-v1');
   assert.equal(evaluated.invocation.threadId, 'evaluator-thread-cli');
   assert.equal(evaluationRuns[0].status, 'passed');
+  assert.equal(
+    evaluated.evaluationRun.result.commandResults[0].stdoutArtifactId,
+    '.tik/multi-agent/workflows/wf-cli/evaluations/eval-st-api-v1/stdout.log',
+  );
+  assert.match(
+    await readFile(path.join(repo, evaluated.evaluationRun.result.commandResults[0].stdoutArtifactId), 'utf-8'),
+    /evaluation ok/,
+  );
   assert.equal(subtasks['st-api'].status, 'evaluation_passed');
+
+  const thinEvaluated = await run([
+    'evaluate',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--evaluation', 'eval-thin-cli',
+    '--infer-command', 'false',
+    '--result-json', JSON.stringify({ verdict: 'pass' }),
+  ]);
+  assert.equal(thinEvaluated.action, 'evaluation-recorded');
+  assert.equal(thinEvaluated.passed, false);
+  assert.equal(thinEvaluated.evaluationRun.status, 'inconclusive');
+  assert.equal(thinEvaluated.evaluationRun.result.verdict, 'inconclusive');
+  assert.equal(
+    thinEvaluated.evaluationRun.result.coverageGaps[0].reason,
+    'No evaluator command, criteria result, or artifact evidence was provided.',
+  );
+
+  evaluationRuns = evaluationRuns.filter((run) => run.id !== 'eval-thin-cli');
+  subtasks['st-api'] = {
+    ...subtasks['st-api'],
+    status: 'evaluation_passed',
+    validationRunIds: ['eval-st-api-v1'],
+  };
 
   const questioned = await run([
     'record-questioner',
@@ -1505,6 +1554,12 @@ function runCommand(command, args, cwd) {
 
 function gitHead(repoPath) {
   return spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repoPath, encoding: 'utf-8' }).stdout.trim();
+}
+
+function evaluationStatusForVerdict(verdict) {
+  if (verdict === 'pass') return 'passed';
+  if (verdict === 'inconclusive') return 'inconclusive';
+  return 'failed';
 }
 
 function buildGraph(workflowId) {

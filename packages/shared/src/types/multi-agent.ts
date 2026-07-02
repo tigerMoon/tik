@@ -224,6 +224,25 @@ export interface MultiAgentWorkflowEvidence {
   createdAt: string;
 }
 
+export interface ImplementationChangedFile {
+  path: string;
+  changeType?: 'added' | 'modified' | 'deleted' | 'renamed' | 'unknown';
+}
+
+export interface ImplementationScopeCheck {
+  allowed: boolean;
+  violations: string[];
+}
+
+export interface ImplementationEvidencePayload extends Record<string, unknown> {
+  changedFiles?: Array<string | ImplementationChangedFile>;
+  declaredChangedFiles?: Array<string | ImplementationChangedFile>;
+  observedChangedFiles?: Array<string | ImplementationChangedFile>;
+  headShaBefore?: string;
+  headShaAfter?: string;
+  scopeCheck?: ImplementationScopeCheck;
+}
+
 export type MultiAgentInvocationRole = 'planner' | 'reviewer' | 'final-reviewer' | 'executor' | 'questioner' | 'evaluator';
 export type MultiAgentInvocationRunner = 'claude-code' | 'codex' | 'codex-evaluator';
 export type MultiAgentInvocationStatus = 'created' | 'started' | 'completed' | 'failed' | 'cancelled';
@@ -529,6 +548,12 @@ export interface QuestionerOutput {
   id: string;
   workflowId: string;
   subtaskId?: string;
+  source: 'claude-plugin' | 'manual' | 'codex-workflow';
+  headSha: string;
+  contractId?: string;
+  evaluationRunId?: string;
+  finalEvaluationRunId?: string;
+  artifactRef?: string;
   intent:
     | 'question_requirement'
     | 'question_task_graph'
@@ -539,18 +564,17 @@ export interface QuestionerOutput {
   actor: {
     kind: 'claude-code-questioner';
     invocationId?: string;
+    model?: string;
   };
-  source?: 'claude-plugin';
-  headSha?: string;
-  evaluationRunId?: string;
-  contractId?: string;
-  artifactRef?: string;
   verdict:
     | 'need_clarification'
     | 'contract_ready'
     | 'evidence_sufficient'
     | 'risk_found'
-    | 'no_blocking_questions';
+    | 'no_blocking_questions'
+    | 'questions_blocking'
+    | 'questions_non_blocking'
+    | 'human_review_required';
   questions: Array<{
     id: string;
     priority: 'blocking' | 'important' | 'optional';

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { createWriteStream } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -148,6 +149,9 @@ async function initWorkflow(options) {
     headSha,
     maxRounds: numberOption(options.maxRounds, 3),
     workspaceBinding: buildWorkspaceBinding(projectPath, options),
+    metadata: omitUndefined({
+      parentCodexThreadId: stringOption(options.parentThread),
+    }),
     policy: options.v1 || options.codexEvaluatorQuestioner
       ? codexEvaluatorQuestionerPolicy()
       : undefined,
@@ -370,10 +374,16 @@ async function execute(options) {
     await updateSubtask(options, workflowId, subtaskId, { status: 'ready' });
   }
   await updateSubtask(options, workflowId, subtaskId, { status: 'executing' });
-  const changedFiles = deriveChangedFiles(projectPath, state, subtaskId, options).map((file) => ({
+  const declaredChangedFiles = (splitList(options.changedFiles) || []).map((file) => ({
     path: file,
     changeType: 'modified',
   }));
+  const observedChangedFiles = deriveObservedChangedFiles(projectPath, state, subtaskId, options).map((file) => ({
+    path: file,
+    changeType: 'modified',
+  }));
+  const changedFiles = observedChangedFiles;
+  const scopeCheck = buildImplementationScopeCheck(state, subtaskId, observedChangedFiles.map((file) => file.path));
   const invocationId = stringOption(options.invocation);
   const threadId = stringOption(options.thread);
   const evidence = await recordEvidence(options, workflowId, {
@@ -385,6 +395,9 @@ async function execute(options) {
     headSha,
     payload: omitUndefined({
       changedFiles,
+      declaredChangedFiles,
+      observedChangedFiles,
+      scopeCheck,
       builderInvocationId: invocationId,
       builderThreadId: threadId,
     }),
@@ -412,6 +425,9 @@ async function execute(options) {
         headSha,
         evidenceRefs: [evidence.evidence.id],
         changedFiles,
+        declaredChangedFiles,
+        observedChangedFiles,
+        scopeCheck,
         runtimeAttestation,
       }),
     });
@@ -592,13 +608,17 @@ async function validate(options) {
   if (!command) {
     throw new Error('--command is required when subtask has no validationCommands');
   }
-  const result = spawnSync(command, {
+  const commandResult = await runCommandWithArtifacts({
+    command,
     cwd: projectPath,
-    encoding: 'utf-8',
-    shell: true,
+    hardTimeoutMs: numberOption(options.timeoutMs, 120000),
+    idleTimeoutMs: numberOption(options.idleTimeoutMs, 0),
+    maxOutputBytes: numberOption(options.maxOutputBytes, 20000),
+    stdoutArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'validation', subtaskId, `${stringOption(options.evidenceId) || 'validation'}.stdout.log`),
+    stderrArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'validation', subtaskId, `${stringOption(options.evidenceId) || 'validation'}.stderr.log`),
   });
-  const passed = result.status === 0;
-  const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
+  const passed = commandResult.status === 'passed';
+  const output = [commandResult.stdout, commandResult.stderr].filter(Boolean).join('\n');
   const headSha = git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
   const preflightDecision = buildDecision(state.workflow, {
     action: 'validate_subtask',
@@ -616,7 +636,7 @@ async function validate(options) {
       workflowId,
       subtaskId,
       passed,
-      exitCode: result.status,
+      exitCode: commandResult.exitCode,
       decision: preflightDecision,
       guard: preflight.guard,
     });
@@ -630,9 +650,13 @@ async function validate(options) {
     subtaskId,
     command,
     passed,
+    artifactRef: commandResult.stdoutArtifactId || commandResult.stderrArtifactId,
     payload: {
-      exitCode: result.status,
+      status: commandResult.status,
+      exitCode: commandResult.exitCode,
       output: output.slice(0, 20_000),
+      stdoutArtifactId: commandResult.stdoutArtifactId,
+      stderrArtifactId: commandResult.stderrArtifactId,
     },
     headSha,
   });
@@ -666,14 +690,14 @@ async function validate(options) {
     workflowId,
     subtaskId,
     passed,
-    exitCode: result.status,
+    exitCode: commandResult.exitCode,
     evidence: evidence.evidence,
     subtask: subtask.subtask,
     decision,
     guard: recorded.guard,
   });
   if (!passed && options.failOnValidationError) {
-    process.exitCode = result.status || 1;
+    process.exitCode = commandResult.exitCode || 1;
   }
 }
 
@@ -706,37 +730,26 @@ async function evaluate(options) {
     : options.result
       ? await readJsonFile(options.result)
       : null;
-  const command = options.command || inferEvaluationCommand(state, subtaskId);
+  const command = options.command || (options.inferCommand === 'false' ? null : inferEvaluationCommand(state, subtaskId));
   let commandResult = null;
   if (command) {
-    const result = spawnSync(command, {
-      cwd: projectPath,
-      encoding: 'utf-8',
-      shell: true,
-      timeout: numberOption(options.timeoutMs, 120000),
-    });
-    commandResult = {
-      commandId: stringOption(options.commandId) || 'cmd-evaluate',
+    commandResult = await runCommandWithArtifacts({
       command,
-      status: result.error?.code === 'ETIMEDOUT'
-        ? 'timeout'
-        : result.status === 0
-          ? 'passed'
-          : 'failed',
-      exitCode: result.status,
-      summary: result.error?.code === 'ETIMEDOUT'
-        ? 'Evaluation command timed out.'
-        : result.status === 0 ? 'Evaluation command passed.' : 'Evaluation command failed.',
-      stdout: result.stdout,
-      stderr: result.stderr,
-    };
+      cwd: projectPath,
+      hardTimeoutMs: numberOption(options.timeoutMs, 120000),
+      idleTimeoutMs: numberOption(options.idleTimeoutMs, 0),
+      maxOutputBytes: numberOption(options.maxOutputBytes, 20000),
+      stdoutArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'evaluations', evaluationRun.evaluationRun.id, 'stdout.log'),
+      stderrArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'evaluations', evaluationRun.evaluationRun.id, 'stderr.log'),
+    });
+    commandResult.commandId = stringOption(options.commandId) || 'cmd-evaluate';
   }
   const gitStatusAfter = git(projectPath, ['status', '--porcelain=v1'], { optional: true }) || '';
   const readonly = await safeValidateEvaluationReadonly(options, workflowId, subtaskId, evaluationRun.evaluationRun.id, {
     gitStatusBefore,
     gitStatusAfter,
   });
-  const verdict = readonly.guard?.accepted === false
+  let verdict = readonly.guard?.accepted === false
     ? 'fail'
     : structuredResult?.verdict
       ? structuredResult.verdict
@@ -750,13 +763,45 @@ async function evaluate(options) {
     : !commandResult
       ? [{
         criterionId: 'all',
-        description: 'Evaluator did not run a command or provide a structured result.',
-        reason: 'No evaluator command or structured result was provided.',
+        description: 'Evaluator did not provide command, criteria, artifact, or reproduction evidence.',
+        reason: 'No evaluator command, criteria result, or artifact evidence was provided.',
       }]
       : [];
   const criteriaResults = Array.isArray(structuredResult?.criteriaResults)
     ? structuredResult.criteriaResults
     : buildCriteriaResultsFromCommand(state, subtaskId, commandResult, coverageGaps);
+  const runtimeFindings = Array.isArray(structuredResult?.runtimeFindings)
+    ? structuredResult.runtimeFindings
+    : verdict === 'pass'
+    ? []
+    : [{
+      id: 'evaluation_failed',
+      severity: 'blocker',
+      title: 'Evaluation failed',
+      observed: commandResult?.summary || readonly.guard?.message || 'Evaluation did not pass.',
+      expected: 'Evaluation passes without readonly violations.',
+      reproductionSteps: command ? [command] : ['Inspect evaluator artifacts and readonly guard output.'],
+    }];
+  const hasCommandEvidence = Boolean(commandResult);
+  const hasStructuredCriteriaEvidence = Array.isArray(structuredResult?.criteriaResults)
+    && structuredResult.criteriaResults.length > 0;
+  const hasArtifactEvidence = Array.isArray(structuredResult?.artifacts) && structuredResult.artifacts.length > 0;
+  const hasReproductionEvidence = criteriaResults.some((criterion) => (criterion.reproductionSteps?.length || 0) > 0)
+    || runtimeFindings.some((finding) => (finding.reproductionSteps?.length || 0) > 0);
+  if (
+    verdict === 'pass'
+    && !hasCommandEvidence
+    && !hasStructuredCriteriaEvidence
+    && !hasArtifactEvidence
+    && !hasReproductionEvidence
+  ) {
+    verdict = 'inconclusive';
+    coverageGaps.push({
+      criterionId: 'all',
+      description: 'Evaluator did not provide command, criteria, artifact, or reproduction evidence.',
+      reason: 'No evaluator command, criteria result, or artifact evidence was provided.',
+    });
+  }
   const result = {
     workflowId,
     subtaskId,
@@ -771,21 +816,12 @@ async function evaluate(options) {
         command: commandResult.command,
         status: commandResult.status,
         exitCode: commandResult.exitCode,
+        stdoutArtifactId: commandResult.stdoutArtifactId,
+        stderrArtifactId: commandResult.stderrArtifactId,
         summary: commandResult.summary,
       }]
       : [],
-    runtimeFindings: Array.isArray(structuredResult?.runtimeFindings)
-      ? structuredResult.runtimeFindings
-      : verdict === 'pass'
-      ? []
-      : [{
-        id: 'evaluation_failed',
-        severity: 'blocker',
-        title: 'Evaluation failed',
-        observed: commandResult?.summary || readonly.guard?.message || 'Evaluation did not pass.',
-        expected: 'Evaluation passes without readonly violations.',
-        reproductionSteps: command ? [command] : ['Inspect evaluator artifacts and readonly guard output.'],
-      }],
+    runtimeFindings,
     coverageGaps,
     confidence: verdict === 'pass' ? 0.85 : 0.25,
   };
@@ -1637,10 +1673,10 @@ function collectSubtaskValidationCommands(state, subtaskId) {
   return findSubtask(state.taskGraph, subtaskId)?.validationCommands || [];
 }
 
-function deriveChangedFiles(projectPath, state, subtaskId, options) {
-  const explicit = splitList(options.changedFiles);
-  if (explicit?.length) {
-    return explicit;
+function deriveObservedChangedFiles(projectPath, state, subtaskId, options) {
+  const explicitObserved = splitList(options.observedChangedFiles);
+  if (explicitObserved?.length) {
+    return explicitObserved;
   }
   const contract = latestAcceptedContract(state, subtaskId);
   const base = contract?.headShaAtAcceptance || state.workflow.currentHeadSha || state.workflow.baseRef;
@@ -1651,6 +1687,62 @@ function deriveChangedFiles(projectPath, state, subtaskId, options) {
     return fromGit;
   }
   return splitLines(git(projectPath, ['diff', '--name-only'], { optional: true }));
+}
+
+function buildImplementationScopeCheck(state, subtaskId, observedChangedFiles) {
+  const contract = latestAcceptedContract(state, subtaskId);
+  if (!contract) {
+    return undefined;
+  }
+  const allowedPaths = contract.scope?.allowedPaths || [];
+  const blockedPaths = contract.scope?.blockedPaths || [];
+  const blocked = observedChangedFiles.filter((file) => matchesAnyPath(file, blockedPaths));
+  const outside = allowedPaths.length > 0
+    ? observedChangedFiles.filter((file) => !matchesAnyPath(file, allowedPaths))
+    : [];
+  const violations = [
+    ...blocked.map((file) => `blocked:${file}`),
+    ...outside.map((file) => `outside:${file}`),
+  ];
+  return {
+    allowed: violations.length === 0,
+    violations,
+  };
+}
+
+function matchesAnyPath(filePath, patterns) {
+  const normalizedFile = normalizeEvidencePath(filePath);
+  return (patterns || []).some((pattern) => {
+    const normalizedPattern = normalizeEvidencePath(pattern);
+    if (normalizedPattern.includes('*')) {
+      return globPathToRegExp(normalizedPattern).test(normalizedFile);
+    }
+    return normalizedPattern.endsWith('/')
+      ? normalizedFile === normalizedPattern.slice(0, -1) || normalizedFile.startsWith(normalizedPattern)
+      : normalizedFile === normalizedPattern || normalizedFile.startsWith(`${normalizedPattern}/`);
+  });
+}
+
+function normalizeEvidencePath(value) {
+  return String(value || '').replace(/\\/g, '/').replace(/^\.\/+/, '');
+}
+
+function globPathToRegExp(pattern) {
+  const source = pattern
+    .split(/(\*\*)/g)
+    .map((part) => {
+      if (part === '**') return '.*';
+      return part
+        .split('*')
+        .map(escapeRegExp)
+        .join('[^/]*');
+    })
+    .join('');
+  return new RegExp(`^${source}$`);
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
 }
 
 function buildCriteriaResultsFromCommand(state, subtaskId, commandResult, coverageGaps) {
@@ -1669,6 +1761,118 @@ function buildCriteriaResultsFromCommand(state, subtaskId, commandResult, covera
     evidence: commandResult.summary,
     reproductionSteps: [commandResult.command],
   }));
+}
+
+async function runCommandWithArtifacts(input) {
+  const hardTimeoutMs = Math.max(1, input.hardTimeoutMs || 120000);
+  const idleTimeoutMs = Math.max(0, input.idleTimeoutMs || 0);
+  const maxOutputBytes = Math.max(1, input.maxOutputBytes || 20000);
+  await mkdir(path.dirname(input.stdoutArtifactPath), { recursive: true });
+  await mkdir(path.dirname(input.stderrArtifactPath), { recursive: true });
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(input.command, {
+      cwd: input.cwd,
+      shell: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const stdoutStream = createWriteStream(input.stdoutArtifactPath, { encoding: 'utf-8' });
+    const stderrStream = createWriteStream(input.stderrArtifactPath, { encoding: 'utf-8' });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timedOut = false;
+    let idleTimedOut = false;
+
+    const hardTimer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      setTimeout(() => {
+        if (!settled) child.kill('SIGKILL');
+      }, 5000).unref();
+    }, hardTimeoutMs);
+    hardTimer.unref();
+
+    let idleTimer;
+    const resetIdleTimer = () => {
+      if (!idleTimeoutMs) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleTimedOut = true;
+        child.kill('SIGTERM');
+        setTimeout(() => {
+          if (!settled) child.kill('SIGKILL');
+        }, 5000).unref();
+      }, idleTimeoutMs);
+      idleTimer.unref();
+    };
+    resetIdleTimer();
+
+    const collect = (chunk, stream, target) => {
+      resetIdleTimer();
+      const text = chunk.toString('utf-8');
+      stream.write(text);
+      if (target === 'stdout') {
+        stdout = appendBounded(stdout, text, maxOutputBytes);
+      } else {
+        stderr = appendBounded(stderr, text, maxOutputBytes);
+      }
+    };
+
+    child.stdout.on('data', (chunk) => collect(chunk, stdoutStream, 'stdout'));
+    child.stderr.on('data', (chunk) => collect(chunk, stderrStream, 'stderr'));
+    child.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimer);
+      if (idleTimer) clearTimeout(idleTimer);
+      finishStreams(stdoutStream, stderrStream).finally(() => reject(error));
+    });
+    child.on('close', (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimer);
+      if (idleTimer) clearTimeout(idleTimer);
+      const timeout = timedOut || idleTimedOut;
+      const status = timeout
+        ? 'timeout'
+        : code === 0
+          ? 'passed'
+          : 'failed';
+      finishStreams(stdoutStream, stderrStream).then(() => resolve({
+        command: input.command,
+        status,
+        exitCode: code,
+        signal,
+        stdout,
+        stderr,
+        stdoutArtifactId: toProjectRelative(input.cwd, input.stdoutArtifactPath),
+        stderrArtifactId: toProjectRelative(input.cwd, input.stderrArtifactPath),
+        summary: timeout
+          ? (idleTimedOut ? 'Command timed out after idle timeout.' : 'Command timed out.')
+          : code === 0 ? 'Command passed.' : 'Command failed.',
+      })).catch(reject);
+    });
+  });
+}
+
+function finishStreams(...streams) {
+  return Promise.all(streams.map((stream) => new Promise((resolve, reject) => {
+    stream.once('error', reject);
+    stream.end(resolve);
+  })));
+}
+
+function appendBounded(current, chunk, maxBytes) {
+  const next = current + chunk;
+  if (Buffer.byteLength(next, 'utf-8') <= maxBytes) {
+    return next;
+  }
+  return next.slice(Math.max(0, next.length - maxBytes));
+}
+
+function toProjectRelative(projectPath, artifactPath) {
+  return path.relative(projectPath, artifactPath).replace(/\\/g, '/');
 }
 
 function buildRuntimeAttestation(options, input) {
