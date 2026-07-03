@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import type { EnvironmentPackManifest } from '@tik/shared';
+import type { MultiAgentWorkflowBundle } from '@tik/shared';
 import { canRetryWorkbenchTask } from '@tik/shared';
 import type {
   UpdateWorkbenchTaskBriefResult,
@@ -21,6 +22,7 @@ import { TaskStatusBanner } from './TaskStatusBanner';
 import { TaskDecisionBlock } from './TaskDecisionBlock';
 import { TaskBriefBlock } from './TaskBriefBlock';
 import { TaskActivityBlock } from './TaskActivityBlock';
+import { TaskWorkflowEvidencePanel } from './TaskWorkflowEvidencePanel';
 import { TaskAcceptanceBlock } from './TaskAcceptanceBlock';
 import { TaskRunProofPanel } from './TaskRunProofPanel';
 import { TaskExecutionSetupBlock } from './TaskExecutionSetupBlock';
@@ -35,6 +37,7 @@ interface TaskDetailPanelProps {
   timeline: WorkbenchTimelineResponseItem[];
   decisions: WorkbenchDecisionResponse[];
   artifacts?: WorkbenchArtifactRecord[];
+  workflowBundle?: MultiAgentWorkflowBundle | null;
   resolvingDecisionId?: string | null;
   retrying: boolean;
   archiving: boolean;
@@ -80,6 +83,7 @@ export function TaskDetailPanel(props: TaskDetailPanelProps) {
     timeline,
     decisions,
     artifacts = [],
+    workflowBundle = null,
     resolvingDecisionId,
     retrying,
     archiving,
@@ -200,6 +204,8 @@ export function TaskDetailPanel(props: TaskDetailPanelProps) {
         />
 
         <TaskActivityBlock task={task} timeline={timeline} />
+
+        <TaskWorkflowEvidencePanel bundle={workflowBundle} />
 
         <TaskRunProofPanel
           task={task}

@@ -24,6 +24,7 @@ import {
   fetchSkillManifestRegistry,
   fetchTrackerState,
   fetchWorkbenchTaskArtifacts,
+  fetchWorkbenchTaskMultiAgentWorkflow,
   fetchWorkbenchDecisions,
   fetchWorkbenchTasks,
   fetchWorkbenchTimeline,
@@ -53,6 +54,7 @@ import {
   type WorkbenchArtifactVersion,
   type WorkbenchTaskResponse,
   type WorkbenchTaskRunRecord,
+  type MultiAgentWorkflowBundle,
 } from './api/client';
 import { ArtifactDetail } from './components/ArtifactDetail';
 import { ArtifactGallery } from './components/ArtifactGallery';
@@ -168,6 +170,7 @@ export function App() {
   const [workflowFile, setWorkflowFile] = useState<WorkflowFileResponse | null>(null);
   const [artifacts, setArtifacts] = useState<WorkbenchArtifactRecord[]>([]);
   const [taskArtifacts, setTaskArtifacts] = useState<WorkbenchArtifactRecord[]>([]);
+  const [taskWorkflowBundle, setTaskWorkflowBundle] = useState<MultiAgentWorkflowBundle | null>(null);
   const [activeArtifactId, setActiveArtifactId] = useState<string | null>(null);
   const [activeArtifact, setActiveArtifact] = useState<WorkbenchArtifactRecord | null>(null);
   const [artifactVersions, setArtifactVersions] = useState<WorkbenchArtifactVersion[]>([]);
@@ -282,16 +285,19 @@ export function App() {
       if (!resolvedActiveTaskId) {
         setTimeline([]);
         setDecisions([]);
+        setTaskWorkflowBundle(null);
         setTimelineError(null);
         return;
       }
 
-      const [nextTimeline, nextDecisions] = await Promise.all([
+      const [nextTimeline, nextDecisions, nextWorkflowBundle] = await Promise.all([
         fetchWorkbenchTimeline(resolvedActiveTaskId),
         fetchWorkbenchDecisions(resolvedActiveTaskId),
+        fetchWorkbenchTaskMultiAgentWorkflow(resolvedActiveTaskId),
       ]);
       setTimeline(nextTimeline);
       setDecisions(nextDecisions);
+      setTaskWorkflowBundle(nextWorkflowBundle);
       setTimelineError(null);
     } catch (error) {
       setTimelineError((error as Error).message);
@@ -323,16 +329,18 @@ export function App() {
   };
 
   const reloadTaskDetails = async (taskId: string) => {
-    const [nextTasks, nextTimeline, nextDecisions, nextTaskArtifacts] = await Promise.all([
+    const [nextTasks, nextTimeline, nextDecisions, nextTaskArtifacts, nextWorkflowBundle] = await Promise.all([
       fetchWorkbenchTasks(),
       fetchWorkbenchTimeline(taskId),
       fetchWorkbenchDecisions(taskId),
       fetchWorkbenchTaskArtifacts(taskId).catch(() => []),
+      fetchWorkbenchTaskMultiAgentWorkflow(taskId),
     ]);
     setTasks(nextTasks);
     setTimeline(nextTimeline);
     setDecisions(nextDecisions);
     setTaskArtifacts(nextTaskArtifacts);
+    setTaskWorkflowBundle(nextWorkflowBundle);
     setTimelineError(null);
   };
 
@@ -674,6 +682,7 @@ export function App() {
       setTimeline([]);
       setDecisions([]);
       setTaskArtifacts([]);
+      setTaskWorkflowBundle(null);
       setTimelineError(null);
       return () => {
         cancelled = true;
@@ -682,10 +691,11 @@ export function App() {
 
     const loadTaskDetails = async () => {
       try {
-        const [nextTimeline, nextDecisions, nextTaskArtifacts] = await Promise.all([
+        const [nextTimeline, nextDecisions, nextTaskArtifacts, nextWorkflowBundle] = await Promise.all([
           fetchWorkbenchTimeline(activeTaskId),
           fetchWorkbenchDecisions(activeTaskId),
           fetchWorkbenchTaskArtifacts(activeTaskId).catch(() => []),
+          fetchWorkbenchTaskMultiAgentWorkflow(activeTaskId),
         ]);
         if (cancelled) {
           return;
@@ -693,6 +703,7 @@ export function App() {
         setTimeline(nextTimeline);
         setDecisions(nextDecisions);
         setTaskArtifacts(nextTaskArtifacts);
+        setTaskWorkflowBundle(nextWorkflowBundle);
         setTimelineError(null);
       } catch (error) {
         if (!cancelled) {
@@ -1210,6 +1221,7 @@ export function App() {
                   timeline={timeline}
                   decisions={decisions}
                   artifacts={taskArtifacts}
+                  workflowBundle={taskWorkflowBundle}
                   resolvingDecisionId={resolvingDecisionId}
                   retrying={activeTask ? retryingTaskId === activeTask.id : false}
                   archiving={activeTask ? archivingTaskId === activeTask.id : false}

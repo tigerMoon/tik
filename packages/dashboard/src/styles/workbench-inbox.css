@@ -5181,6 +5181,7 @@ body {
 .task-detail-brief,
 .task-detail-activity,
 .task-detail-acceptance,
+.task-detail-workflow,
 .task-run-proof-panel,
 .task-detail-setup {
   padding: 14px 16px;
@@ -5265,6 +5266,94 @@ body {
   max-height: 320px;
   min-height: 160px;
   overflow-y: auto;
+}
+
+.task-detail-workflow {
+  display: grid;
+  gap: 10px;
+}
+
+.task-detail-workflow-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 0.45fr);
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--wb-line);
+  border-radius: 10px;
+  background: var(--wb-panel-soft);
+  font-size: 12px;
+}
+
+.task-detail-workflow-summary > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.task-detail-workflow-summary strong {
+  color: var(--wb-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-detail-workflow-summary span {
+  color: var(--wb-muted);
+  word-break: break-word;
+}
+
+.task-detail-workflow-metrics {
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  margin-bottom: 0;
+}
+
+.task-detail-workflow-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.task-detail-workflow-section {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.task-detail-workflow-empty {
+  padding: 8px 10px;
+  color: var(--wb-muted);
+  font-size: 12px;
+  border: 1px dashed var(--wb-line);
+  border-radius: 8px;
+}
+
+.workflow-row {
+  border-left: 3px solid var(--wb-line);
+}
+
+.workflow-row.tone-green {
+  border-left-color: rgba(85, 168, 116, 0.85);
+}
+
+.workflow-row.tone-yellow {
+  border-left-color: rgba(220, 175, 80, 0.85);
+}
+
+.workflow-row.tone-red {
+  border-left-color: rgba(239, 68, 68, 0.85);
+}
+
+.workflow-row.tone-blue {
+  border-left-color: rgba(99, 152, 232, 0.85);
+}
+
+@media (max-width: 760px) {
+  .task-detail-workflow-summary,
+  .task-detail-workflow-grid,
+  .task-detail-workflow-metrics {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .task-detail-acceptance-summary {
@@ -5388,6 +5477,13 @@ body {
   word-break: break-all;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
+}
+
+.task-detail-acceptance-list-row em {
+  color: var(--wb-muted);
+  font-size: 11px;
+  font-style: normal;
+  word-break: break-all;
 }
 
 .task-detail-acceptance-output,

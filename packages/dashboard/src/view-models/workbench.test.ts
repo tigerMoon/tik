@@ -11,6 +11,7 @@ import {
   buildWorkbenchEvidenceDigest,
   buildWorkbenchLiveRunEntries,
   buildWorkbenchAgentLoopSummary,
+  buildTaskWorkflowPanelModel,
   buildWorkbenchLatestCommentSummary,
   buildWorkbenchOperatorNoteSummary,
   buildWorkbenchQueueSignal,
@@ -43,6 +44,247 @@ import {
 } from './workbench.js';
 
 describe('workbench view models', () => {
+  it('summarizes multi-agent workflow evidence for task detail', () => {
+    const model = buildTaskWorkflowPanelModel({
+      workflow: {
+        id: 'wf-task-detail',
+        driver: 'codex-workflow',
+        status: 'active',
+        goal: 'Expose workflow evidence on task detail',
+        rootTaskId: 'task-root',
+        repo: 'tik',
+        baseRef: 'main',
+        headRef: 'codex/workflow-evidence',
+        currentHeadSha: 'abcdef1234567890',
+        maxRounds: 3,
+        createdAt: '2026-07-03T00:00:00.000Z',
+        updatedAt: '2026-07-03T00:05:00.000Z',
+        lastDecisionId: 'dec-complete-api',
+      },
+      taskGraph: {
+        workflowId: 'wf-task-detail',
+        version: 1,
+        createdBy: 'codex-workflow',
+        risks: [],
+        globalAcceptanceCriteria: ['Task detail shows workflow proof.'],
+        finalValidationCommands: ['pnpm test'],
+        subtasks: [
+          {
+            id: 'st-ui',
+            title: 'Render workflow panel',
+            goal: 'Show workflow evidence.',
+            dependsOn: [],
+            allowedPaths: ['packages/dashboard/src/**'],
+            acceptanceCriteria: ['Panel renders.'],
+            validationCommands: ['pnpm --filter @tik/dashboard test'],
+            reviewFocus: ['evidence completeness'],
+            assignedExecutor: 'codex',
+            assignedReviewer: 'claude-code',
+          },
+        ],
+      },
+      subtasks: {
+        'st-ui': {
+          subtaskId: 'st-ui',
+          status: 'done',
+          reviewRoundIds: ['rr-1'],
+          validationRunIds: ['ev-validation'],
+          evidenceRefs: ['ev-validation', 'ev-review'],
+          blockerFindingIds: [],
+          fixRound: 0,
+          implementationHeadSha: 'abcdef1234567890',
+        },
+      },
+      contracts: [
+        {
+          id: 'contract-ui',
+          workflowId: 'wf-task-detail',
+          subtaskId: 'st-ui',
+          version: 1,
+          status: 'accepted',
+          goal: 'Render workflow evidence.',
+          scope: {
+            allowedPaths: ['packages/dashboard/src/**'],
+            blockedPaths: [],
+          },
+          deliverables: [
+            {
+              id: 'deliver-ui',
+              description: 'Task detail workflow evidence panel',
+            },
+          ],
+          acceptanceCriteria: [
+            {
+              id: 'criteria-ui',
+              statement: 'Panel renders workflow proof.',
+              priority: 'must',
+              verificationMethod: 'command',
+            },
+          ],
+          verificationPlan: {
+            commands: [
+              {
+                id: 'dashboard-test',
+                command: 'pnpm --filter @tik/dashboard test',
+                hardTimeoutMs: 120000,
+                required: true,
+              },
+            ],
+          },
+          questionerOutputRefs: [],
+          acceptedBy: 'codex-workflow',
+          acceptedAt: '2026-07-03T00:01:30.000Z',
+          headShaAtAcceptance: 'abcdef1234567890',
+        },
+      ],
+      evaluationRuns: [
+        {
+          id: 'eval-ui',
+          workflowId: 'wf-task-detail',
+          subtaskId: 'st-ui',
+          contractId: 'contract-ui',
+          evaluator: { kind: 'codex-evaluator' },
+          status: 'passed',
+          headSha: 'abcdef1234567890',
+          readonlyPolicy: { enforced: true, allowedWritePaths: [], forbiddenWritePaths: [] },
+          result: {
+            workflowId: 'wf-task-detail',
+            subtaskId: 'st-ui',
+            contractId: 'contract-ui',
+            evaluatorRunId: 'eval-ui',
+            headSha: 'abcdef1234567890',
+            verdict: 'pass',
+            criteriaResults: [],
+            commandResults: [],
+            runtimeFindings: [],
+            coverageGaps: [],
+            confidence: 0.9,
+          },
+          artifactRefs: [],
+          startedAt: '2026-07-03T00:02:00.000Z',
+          completedAt: '2026-07-03T00:03:00.000Z',
+        },
+      ],
+      questionerOutputs: [
+        {
+          id: 'q-final',
+          workflowId: 'wf-task-detail',
+          source: 'claude-plugin',
+          headSha: 'abcdef1234567890',
+          intent: 'question_final_evidence',
+          actor: { kind: 'claude-code-questioner', invocationId: 'inv-q' },
+          verdict: 'no_blocking_questions',
+          questions: [],
+          risks: [],
+          missingTests: [],
+          suggestedContractChanges: [],
+          createdAt: '2026-07-03T00:04:00.000Z',
+        },
+      ],
+      decisions: [
+        {
+          id: 'dec-complete-api',
+          workflowId: 'wf-task-detail',
+          rootTaskId: 'task-root',
+          subtaskId: 'st-ui',
+          decidedBy: 'codex-workflow',
+          decidedAt: '2026-07-03T00:04:30.000Z',
+          action: 'complete_subtask',
+          reason: 'Validation and review passed.',
+          evidenceRefs: ['ev-validation', 'ev-review'],
+          confidence: 0.94,
+        },
+      ],
+      evidence: [
+        {
+          id: 'ev-validation',
+          workflowId: 'wf-task-detail',
+          subtaskId: 'st-ui',
+          kind: 'validation',
+          title: 'Dashboard tests',
+          summary: 'Tests passed.',
+          command: 'pnpm --filter @tik/dashboard test',
+          passed: true,
+          headSha: 'abcdef1234567890',
+          createdAt: '2026-07-03T00:01:00.000Z',
+        },
+        {
+          id: 'ev-review',
+          workflowId: 'wf-task-detail',
+          subtaskId: 'st-ui',
+          kind: 'review',
+          title: 'Claude approved',
+          passed: true,
+          headSha: 'abcdef1234567890',
+          payload: {
+            result: {
+              verdict: 'approve',
+              blockingIssues: [],
+            },
+          },
+          createdAt: '2026-07-03T00:02:00.000Z',
+        },
+      ],
+      invocations: [
+        {
+          id: 'inv-evaluator',
+          workflowId: 'wf-task-detail',
+          subtaskId: 'st-ui',
+          role: 'evaluator',
+          runner: 'codex-evaluator',
+          promptContract: 'readonly evaluation',
+          status: 'completed',
+          hookAttested: true,
+          createdAt: '2026-07-03T00:02:00.000Z',
+          updatedAt: '2026-07-03T00:03:00.000Z',
+        },
+      ],
+      events: [],
+    });
+
+    expect(model).toMatchObject({
+      workflowId: 'wf-task-detail',
+      statusLabel: 'Active',
+      rootTaskLabel: 'task-root',
+      refLabel: 'tik · main -> codex/workflow-evidence',
+      headLabel: 'abcdef123456',
+      lastDecisionLabel: 'dec-complete-api',
+      metrics: [
+        { label: 'Subtasks', value: '1' },
+        { label: 'Evidence', value: '2' },
+        { label: 'Decisions', value: '1' },
+        { label: 'Contracts', value: '1' },
+        { label: 'Runtime', value: '3' },
+      ],
+    });
+    expect(model?.plan.map((row) => row.title)).toEqual([
+      'TaskGraph v1',
+      'Global acceptance',
+      'Final validation',
+    ]);
+    expect(model?.contracts[0]).toMatchObject({
+      title: 'Contract contract-ui',
+      detail: 'Accepted · v1 · 1 criteria · 1 deliverables · 1 commands',
+      tone: 'green',
+    });
+    expect(model?.subtasks[0]).toMatchObject({
+      title: 'Render workflow panel',
+      detail: 'Done · 2 evidence · 1 validation · 1 review',
+      tone: 'green',
+    });
+    expect(model?.evidence[0]).toMatchObject({
+      title: 'Claude approved',
+      detail: 'review · passed · verdict approve · 0 blocking',
+      tone: 'green',
+    });
+    expect(model?.decisions[0]?.detail).toContain('2 evidence refs');
+    expect(model?.runtime.map((row) => row.title)).toEqual([
+      'Evaluation eval-ui',
+      'Questioner Question final evidence',
+      'Evaluator invocation',
+    ]);
+  });
+
   it('sorts tasks by last progress time before created time', () => {
     const tasks: WorkbenchTaskSummary[] = [
       { id: 'a', title: 'older', status: 'running', latestSummary: 'old', lastProgressAt: '2026-04-09T00:00:00.000Z' },

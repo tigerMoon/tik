@@ -10,6 +10,7 @@ import type {
   EnvironmentPackManifest,
   EnvironmentPackSelection,
   EnvironmentPackSnapshot,
+  MultiAgentWorkflowBundle,
   SkillManifestMutationInput,
   SkillManifestRegistryEntry,
   TaskWorkspaceBinding,
@@ -28,6 +29,7 @@ export type {
   WorkbenchArtifactRecord,
   WorkbenchArtifactVersion,
   WorkbenchTaskAttemptRecord,
+  MultiAgentWorkflowBundle,
   WorkbenchTaskRunRecord,
 } from '@tik/shared';
 
@@ -701,6 +703,14 @@ export async function fetchWorkbenchArtifacts(input: FetchWorkbenchArtifactsInpu
 export async function fetchWorkbenchTaskArtifacts(taskId: string): Promise<WorkbenchArtifactRecord[]> {
   const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/artifacts`);
   return (await readJsonOrThrow<{ artifacts: WorkbenchArtifactRecord[] }>(res)).artifacts;
+}
+
+export async function fetchWorkbenchTaskMultiAgentWorkflow(taskId: string): Promise<MultiAgentWorkflowBundle | null> {
+  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/multi-agent-workflow`);
+  if (res.status === 404) {
+    return null;
+  }
+  return readJsonOrThrow<MultiAgentWorkflowBundle>(res);
 }
 
 export async function fetchWorkbenchArtifact(artifactId: string): Promise<WorkbenchArtifactRecord> {

@@ -1,6 +1,12 @@
 import { canArchiveWorkbenchTask, extractModifiedFilesFromEvidenceBody, isWorkbenchTerminalStatus } from '@tik/shared';
 import type {
   AgentLoopMetadata,
+  MultiAgentWorkflowBundle,
+  MultiAgentWorkflowEvidence,
+  QuestionerOutput,
+  SprintContract,
+  SubtaskRunState,
+  WorkflowDecision,
   WorkbenchArtifactRecord as SharedWorkbenchArtifactRecord,
   TaskWorkspaceBinding,
   WorkbenchTaskAdjustmentRecord,
@@ -126,6 +132,37 @@ export interface RunProofPanelModel {
     transcript?: RunProofArtifactLink;
     validation?: RunProofArtifactLink;
   };
+}
+
+export interface TaskWorkflowMetric {
+  label: string;
+  value: string;
+}
+
+export interface TaskWorkflowRow {
+  id: string;
+  title: string;
+  detail: string;
+  meta?: string;
+  tone?: 'neutral' | 'green' | 'yellow' | 'red' | 'blue';
+}
+
+export interface TaskWorkflowPanelModel {
+  workflowId: string;
+  title: string;
+  statusLabel: string;
+  rootTaskLabel: string;
+  refLabel: string;
+  headLabel: string;
+  lastDecisionLabel: string;
+  metrics: TaskWorkflowMetric[];
+  plan: TaskWorkflowRow[];
+  contracts: TaskWorkflowRow[];
+  subtasks: TaskWorkflowRow[];
+  evidence: TaskWorkflowRow[];
+  decisions: TaskWorkflowRow[];
+  runtime: TaskWorkflowRow[];
+  hasDetails: boolean;
 }
 
 export interface WorkbenchQueueSignal {
@@ -1079,6 +1116,321 @@ function toRunProofArtifactLink(artifact: SharedWorkbenchArtifactRecord): RunPro
 function formatArtifactStatusLabel(status: SharedWorkbenchArtifactRecord['status']): string {
   const label = status.replace(/_/g, ' ');
   return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+function compareByTaskGraphOrder(bundle: MultiAgentWorkflowBundle, leftId: string, rightId: string): number {
+  const order = new Map((bundle.taskGraph?.subtasks || []).map((subtask, index) => [subtask.id, index]));
+  return (order.get(leftId) ?? Number.MAX_SAFE_INTEGER) - (order.get(rightId) ?? Number.MAX_SAFE_INTEGER)
+    || leftId.localeCompare(rightId);
+}
+
+function buildPlanWorkflowRows(bundle: MultiAgentWorkflowBundle): TaskWorkflowRow[] {
+  const graph = bundle.taskGraph;
+  if (!graph) {
+    return [];
+  }
+
+  const rows: TaskWorkflowRow[] = [{
+    id: `task-graph:v${graph.version}`,
+    title: `TaskGraph v${graph.version}`,
+    detail: [
+      `${graph.subtasks.length} subtasks`,
+      `${graph.globalAcceptanceCriteria.length} global acceptance`,
+      `${graph.finalValidationCommands.length} final checks`,
+    ].join(' · '),
+    meta: [
+      `created by ${graph.createdBy}`,
+      graph.risks.length ? `${graph.risks.length} risks` : 'no risks recorded',
+    ].join(' · '),
+    tone: graph.risks.length ? 'yellow' : 'blue',
+  }];
+
+  if (graph.globalAcceptanceCriteria.length > 0) {
+    rows.push({
+      id: 'task-graph:global-acceptance',
+      title: 'Global acceptance',
+      detail: formatWorkflowListPreview(graph.globalAcceptanceCriteria),
+      meta: `${graph.globalAcceptanceCriteria.length} criteria`,
+      tone: 'green',
+    });
+  }
+
+  if (graph.finalValidationCommands.length > 0) {
+    rows.push({
+      id: 'task-graph:final-validation',
+      title: 'Final validation',
+      detail: formatWorkflowListPreview(graph.finalValidationCommands),
+      meta: `${graph.finalValidationCommands.length} commands`,
+      tone: 'blue',
+    });
+  }
+
+  if (graph.risks.length > 0) {
+    rows.push({
+      id: 'task-graph:risks',
+      title: 'Plan risks',
+      detail: formatWorkflowListPreview(graph.risks),
+      meta: `${graph.risks.length} risks`,
+      tone: 'yellow',
+    });
+  }
+
+  return rows;
+}
+
+function buildSubtaskWorkflowRow(bundle: MultiAgentWorkflowBundle, subtask: SubtaskRunState): TaskWorkflowRow {
+  const spec = bundle.taskGraph?.subtasks.find((item) => item.id === subtask.subtaskId);
+  const evidenceCount = subtask.evidenceRefs.length;
+  const validationCount = subtask.validationRunIds.length;
+  const reviewCount = subtask.reviewRoundIds.length;
+  return {
+    id: subtask.subtaskId,
+    title: spec?.title || subtask.subtaskId,
+    detail: [
+      humanizeWorkflowStatus(subtask.status),
+      evidenceCount ? `${evidenceCount} evidence` : 'no evidence',
+      validationCount ? `${validationCount} validation` : undefined,
+      reviewCount ? `${reviewCount} review` : undefined,
+    ].filter(Boolean).join(' · '),
+    meta: [
+      spec?.allowedPaths.slice(0, 2).join(', '),
+      compactSha(subtask.implementationHeadSha || subtask.lastValidatedHeadSha || subtask.lastReviewedHeadSha),
+    ].filter(Boolean).join(' · '),
+    tone: toneForSubtaskStatus(subtask.status),
+  };
+}
+
+function buildContractWorkflowRow(contract: SprintContract): TaskWorkflowRow {
+  const commandCount = contract.verificationPlan.commands.length;
+  return {
+    id: contract.id,
+    title: `Contract ${contract.id}`,
+    detail: [
+      humanizeWorkflowStatus(contract.status),
+      `v${contract.version}`,
+      `${contract.acceptanceCriteria.length} criteria`,
+      `${contract.deliverables.length} deliverables`,
+      commandCount ? `${commandCount} commands` : 'no commands',
+    ].join(' · '),
+    meta: [
+      contract.subtaskId,
+      compactSha(contract.headShaAtAcceptance),
+      contract.acceptedAt,
+      contract.scope.allowedPaths.slice(0, 2).join(', '),
+    ].filter(Boolean).join(' · '),
+    tone: toneForContractStatus(contract.status),
+  };
+}
+
+function buildEvidenceWorkflowRow(evidence: MultiAgentWorkflowEvidence): TaskWorkflowRow {
+  const reviewSummary = summarizeReviewEvidence(evidence);
+  return {
+    id: evidence.id,
+    title: evidence.title || evidence.id,
+    detail: [
+      evidence.kind,
+      evidence.passed === undefined ? undefined : evidence.passed ? 'passed' : 'failed',
+      evidence.command,
+      reviewSummary,
+    ].filter(Boolean).join(' · '),
+    meta: [
+      evidence.subtaskId || 'final workflow',
+      compactSha(evidence.headSha),
+      evidence.artifactRef,
+      evidence.createdAt,
+    ].filter(Boolean).join(' · '),
+    tone: evidence.passed === undefined ? 'neutral' : toneForPassed(evidence.passed),
+  };
+}
+
+function buildDecisionWorkflowRow(decision: WorkflowDecision): TaskWorkflowRow {
+  return {
+    id: decision.id,
+    title: humanizeWorkflowStatus(decision.action),
+    detail: [
+      decision.reason,
+      decision.evidenceRefs.length ? `${decision.evidenceRefs.length} evidence refs` : undefined,
+      decision.confidence === undefined ? undefined : `${Math.round(decision.confidence * 100)}% confidence`,
+    ].filter(Boolean).join(' · '),
+    meta: [
+      decision.subtaskId || 'workflow',
+      decision.expectedTikMutation?.taskStatus ? `status ${decision.expectedTikMutation.taskStatus}` : undefined,
+      decision.decidedAt,
+    ].filter(Boolean).join(' · '),
+    tone: decision.action.includes('fix') || decision.action.includes('human') ? 'yellow' : decision.action.includes('complete') ? 'green' : 'blue',
+  };
+}
+
+function buildQuestionerWorkflowRow(output: QuestionerOutput): TaskWorkflowRow {
+  return {
+    id: `questioner:${output.id}`,
+    title: `Questioner ${humanizeWorkflowStatus(output.intent)}`,
+    detail: [
+      humanizeWorkflowStatus(output.verdict),
+      output.questions.length ? `${output.questions.length} questions` : undefined,
+      output.risks.length ? `${output.risks.length} risks` : undefined,
+      output.missingTests.length ? `${output.missingTests.length} missing tests` : undefined,
+    ].filter(Boolean).join(' · '),
+    meta: [
+      output.subtaskId || 'workflow',
+      output.actor.invocationId,
+      compactSha(output.headSha),
+      output.artifactRef,
+    ].filter(Boolean).join(' · '),
+    tone: output.verdict.includes('blocking') || output.verdict === 'risk_found' ? 'yellow' : 'blue',
+  };
+}
+
+function summarizeReviewEvidence(evidence: MultiAgentWorkflowEvidence): string | undefined {
+  const result = evidence.payload?.result;
+  if (!result || typeof result !== 'object') {
+    return undefined;
+  }
+  const review = result as { verdict?: unknown; blockingIssues?: unknown };
+  const verdict = typeof review.verdict === 'string' ? review.verdict : undefined;
+  const blocking = Array.isArray(review.blockingIssues) ? review.blockingIssues.length : undefined;
+  return [
+    verdict ? `verdict ${verdict}` : undefined,
+    blocking === undefined ? undefined : `${blocking} blocking`,
+  ].filter(Boolean).join(' · ') || undefined;
+}
+
+function toneForSubtaskStatus(status: SubtaskRunState['status']): TaskWorkflowRow['tone'] {
+  if (status === 'done' || status === 'approved' || status === 'review_approved' || status === 'validated' || status === 'evaluation_passed') {
+    return 'green';
+  }
+  if (status === 'blocked' || status === 'needs_fix' || status === 'validation_failed' || status === 'evaluation_failed' || status === 'human_review_required') {
+    return 'yellow';
+  }
+  return 'blue';
+}
+
+function toneForRuntimeStatus(status: string): TaskWorkflowRow['tone'] {
+  if (status === 'completed' || status === 'passed') {
+    return 'green';
+  }
+  if (status === 'failed' || status === 'cancelled') {
+    return 'red';
+  }
+  if (status === 'inconclusive' || status === 'invalidated') {
+    return 'yellow';
+  }
+  return 'blue';
+}
+
+function toneForContractStatus(status: SprintContract['status']): TaskWorkflowRow['tone'] {
+  if (status === 'accepted') {
+    return 'green';
+  }
+  if (status === 'rejected' || status === 'stale') {
+    return 'yellow';
+  }
+  return 'blue';
+}
+
+function toneForPassed(passed: boolean): TaskWorkflowRow['tone'] {
+  return passed ? 'green' : 'red';
+}
+
+function formatWorkflowListPreview(items: string[], maxItems = 3): string {
+  const visible = items.slice(0, maxItems);
+  const suffix = items.length > visible.length ? `; +${items.length - visible.length} more` : '';
+  return `${visible.join('; ')}${suffix}`;
+}
+
+function compactSha(value?: string): string {
+  return value ? value.slice(0, 12) : '';
+}
+
+function humanizeWorkflowStatus(value: string): string {
+  const label = value.replace(/[_-]/g, ' ');
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+export function buildTaskWorkflowPanelModel(bundle: MultiAgentWorkflowBundle | null): TaskWorkflowPanelModel | null {
+  if (!bundle) {
+    return null;
+  }
+
+  const workflow = bundle.workflow;
+  const planRows = buildPlanWorkflowRows(bundle);
+  const contractRows = bundle.contracts
+    .slice()
+    .sort((left, right) => right.version - left.version || left.subtaskId.localeCompare(right.subtaskId))
+    .slice(0, 6)
+    .map(buildContractWorkflowRow);
+  const subtaskRows = Object.values(bundle.subtasks)
+    .sort((left, right) => compareByTaskGraphOrder(bundle, left.subtaskId, right.subtaskId))
+    .map((subtask) => buildSubtaskWorkflowRow(bundle, subtask));
+  const evidenceRows = bundle.evidence
+    .slice()
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .slice(0, 6)
+    .map(buildEvidenceWorkflowRow);
+  const decisionRows = bundle.decisions
+    .slice()
+    .sort((left, right) => right.decidedAt.localeCompare(left.decidedAt))
+    .slice(0, 6)
+    .map(buildDecisionWorkflowRow);
+  const runtimeRows = [
+    ...bundle.evaluationRuns
+      .slice()
+      .sort((left, right) => (right.completedAt || right.startedAt).localeCompare(left.completedAt || left.startedAt))
+      .slice(0, 3)
+      .map((run) => ({
+        id: `evaluation:${run.id}`,
+        title: `Evaluation ${run.id}`,
+        detail: `${humanizeWorkflowStatus(run.status)} · ${run.result?.verdict || 'no verdict'} · ${run.result?.runtimeFindings.length ?? 0} findings`,
+        meta: [run.subtaskId, compactSha(run.headSha), run.completedAt || run.startedAt].filter(Boolean).join(' · '),
+        tone: toneForPassed(run.status === 'passed'),
+      }) satisfies TaskWorkflowRow),
+    ...bundle.questionerOutputs
+      .slice()
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, 3)
+      .map(buildQuestionerWorkflowRow),
+    ...bundle.invocations
+      .slice()
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, 3)
+      .map((invocation) => ({
+        id: `invocation:${invocation.id}`,
+        title: `${humanizeWorkflowStatus(invocation.role)} invocation`,
+        detail: `${invocation.runner} · ${humanizeWorkflowStatus(invocation.status)}${invocation.hookAttested ? ' · hook attested' : ''}`,
+        meta: [
+          invocation.subtaskId,
+          invocation.threadId || invocation.actualSubagentThreadId,
+          invocation.error,
+        ].filter(Boolean).join(' · '),
+        tone: toneForRuntimeStatus(invocation.status),
+      }) satisfies TaskWorkflowRow),
+  ].slice(0, 8);
+
+  return {
+    workflowId: workflow.id,
+    title: workflow.goal,
+    statusLabel: humanizeWorkflowStatus(workflow.status),
+    rootTaskLabel: workflow.rootTaskId,
+    refLabel: [workflow.repo, workflow.baseRef && workflow.headRef ? `${workflow.baseRef} -> ${workflow.headRef}` : workflow.headRef || workflow.baseRef]
+      .filter(Boolean)
+      .join(' · ') || 'No ref recorded',
+    headLabel: compactSha(workflow.currentHeadSha),
+    lastDecisionLabel: workflow.lastDecisionId || 'No decision yet',
+    metrics: [
+      { label: 'Subtasks', value: String(Object.keys(bundle.subtasks).length) },
+      { label: 'Evidence', value: String(bundle.evidence.length) },
+      { label: 'Decisions', value: String(bundle.decisions.length) },
+      { label: 'Contracts', value: String(bundle.contracts.length) },
+      { label: 'Runtime', value: String(bundle.evaluationRuns.length + bundle.questionerOutputs.length + bundle.invocations.length) },
+    ],
+    plan: planRows,
+    contracts: contractRows,
+    subtasks: subtaskRows,
+    evidence: evidenceRows,
+    decisions: decisionRows,
+    runtime: runtimeRows,
+    hasDetails: planRows.length + contractRows.length + subtaskRows.length + evidenceRows.length + decisionRows.length + runtimeRows.length > 0,
+  };
 }
 
 export function buildWorkbenchQueueSignal(

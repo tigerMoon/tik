@@ -174,6 +174,25 @@ export class FileMultiAgentWorkflowStore {
     return this.readJsonFile<MultiAgentWorkflowRecord>(this.workflowFile(this.normalizeId(workflowId)));
   }
 
+  async findBundleByRootTaskId(rootTaskId: string): Promise<MultiAgentWorkflowBundle | null> {
+    const workflows = await this.listWorkflows();
+    const candidates = workflows
+      .filter((workflow) => workflow.rootTaskId === rootTaskId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    const latest = candidates[0];
+    return latest ? this.readBundle(latest.id) : null;
+  }
+
+  async findBundleByWorkflowOrRootTaskId(id: string): Promise<MultiAgentWorkflowBundle | null> {
+    const direct = await this.readBundle(id).catch((error) => {
+      if (error instanceof MultiAgentCoordinationError && error.code === 'invalid_id') {
+        return null;
+      }
+      throw error;
+    });
+    return direct ?? this.findBundleByRootTaskId(id);
+  }
+
   async updateWorkflow(
     workflowId: string,
     patch: Partial<Pick<MultiAgentWorkflowRecord, 'status' | 'currentHeadSha' | 'metadata' | 'pauseReason'>> & {
@@ -1464,6 +1483,23 @@ export class FileMultiAgentWorkflowStore {
       throw new MultiAgentCoordinationError('workflow_not_found', `Multi-agent workflow not found: ${workflowId}.`);
     }
     return workflow;
+  }
+
+  private async listWorkflows(): Promise<MultiAgentWorkflowRecord[]> {
+    try {
+      const entries = await fs.readdir(this.rootDir(), { withFileTypes: true });
+      const workflows = await Promise.all(entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => this.readJsonFile<MultiAgentWorkflowRecord>(this.workflowFile(entry.name))));
+      return workflows
+        .filter((workflow): workflow is MultiAgentWorkflowRecord => Boolean(workflow))
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return [];
+      }
+      throw error;
+    }
   }
 
   private async readTaskGraphForWorkflow(workflow: MultiAgentWorkflowRecord): Promise<TaskGraph | null> {

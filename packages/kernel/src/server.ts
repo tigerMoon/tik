@@ -1104,6 +1104,23 @@ export async function createServer(
     }
   });
 
+  fastify.get<{ Params: { id: string } }>('/api/v1/tasks/:id/multi-agent-workflow', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+    }
+
+    try {
+      const bundle = await resolveTaskMultiAgentWorkflowBundle(workbench, multiAgentStore, req.params.id);
+      if (!bundle) {
+        return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found for task');
+      }
+      return sanitizeMultiAgentWorkflowBundle(bundle);
+    } catch (error) {
+      return sendV1CaughtError(reply, error);
+    }
+  });
+
   fastify.post<{ Params: { id: string } }>('/api/v1/tasks/:id/run', async (req, reply) => {
     const workbench = (kernel as Partial<ExecutionKernel>).workbench;
     if (!workbench) {
@@ -2442,6 +2459,24 @@ export async function createServer(
     }
   });
 
+  fastify.get<{ Params: { id: string } }>('/api/workbench/tasks/:id/multi-agent-workflow', async (req, reply) => {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      reply.code(500);
+      return { error: 'Workbench service is unavailable' };
+    }
+
+    try {
+      const bundle = await resolveTaskMultiAgentWorkflowBundle(workbench, multiAgentStore, req.params.id);
+      if (!bundle) {
+        return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found for task');
+      }
+      return sanitizeMultiAgentWorkflowBundle(bundle);
+    } catch (error) {
+      return sendV1CaughtError(reply, error);
+    }
+  });
+
   fastify.get<{
     Querystring: {
       taskId?: string;
@@ -3771,16 +3806,86 @@ function workflowSummary(workflow: Awaited<ReturnType<typeof loadTrackerWorkflow
   };
 }
 
+const SENSITIVE_PAYLOAD_KEY_PARTS = new Set(['token', 'secret', 'password', 'passwd', 'credential']);
+
 function sanitizeAgentInvocation(invocation: AgentInvocationRecord): AgentInvocationRecord {
   const { attestationToken: _attestationToken, ...publicInvocation } = invocation;
-  return publicInvocation;
+  return redactSensitiveObject(publicInvocation) as AgentInvocationRecord;
+}
+
+async function resolveTaskMultiAgentWorkflowBundle(
+  workbench: { listTasks(): Promise<WorkbenchTaskRecord[]> },
+  multiAgentStore: FileMultiAgentWorkflowStore,
+  taskRef: string,
+): Promise<MultiAgentWorkflowBundle | null> {
+  const direct = await multiAgentStore.findBundleByWorkflowOrRootTaskId(taskRef);
+  if (direct) {
+    return direct;
+  }
+
+  const tasks = await workbench.listTasks();
+  const task = tasks.find((item) =>
+    item.id === taskRef
+    || item.identifier === taskRef
+    || item.shortIdentifier === taskRef
+  );
+  if (!task) {
+    return null;
+  }
+
+  const candidates = [
+    task.id,
+    task.identifier,
+    task.shortIdentifier,
+    task.agentLoop?.rootTaskId,
+  ].filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index);
+
+  for (const candidate of candidates) {
+    const bundle = await multiAgentStore.findBundleByWorkflowOrRootTaskId(candidate);
+    if (bundle) {
+      return bundle;
+    }
+  }
+
+  return null;
 }
 
 function sanitizeMultiAgentWorkflowBundle(bundle: MultiAgentWorkflowBundle): MultiAgentWorkflowBundle {
   return {
     ...bundle,
+    workflow: redactSensitiveObject(bundle.workflow) as MultiAgentWorkflowBundle['workflow'],
+    taskGraph: redactSensitiveObject(bundle.taskGraph) as MultiAgentWorkflowBundle['taskGraph'],
+    contracts: redactSensitiveObject(bundle.contracts) as MultiAgentWorkflowBundle['contracts'],
+    decisions: redactSensitiveObject(bundle.decisions) as MultiAgentWorkflowBundle['decisions'],
+    evidence: redactSensitiveObject(bundle.evidence) as MultiAgentWorkflowBundle['evidence'],
+    questionerOutputs: redactSensitiveObject(bundle.questionerOutputs) as MultiAgentWorkflowBundle['questionerOutputs'],
     invocations: bundle.invocations.map(sanitizeAgentInvocation),
+    events: redactSensitiveObject(bundle.events) as MultiAgentWorkflowBundle['events'],
   };
+}
+
+function redactSensitiveObject(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(redactSensitiveObject);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+    key,
+    isSensitivePayloadKey(key) ? '[redacted]' : redactSensitiveObject(entry),
+  ]));
+}
+
+function isSensitivePayloadKey(key: string): boolean {
+  const normalized = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .toLowerCase();
+  const parts = normalized.split('_').filter(Boolean);
+  return parts.some((part) => SENSITIVE_PAYLOAD_KEY_PARTS.has(part))
+    || normalized.includes('api_key')
+    || normalized.includes('private_key');
 }
 
 function sendV1Error(reply: any, statusCode: number, code: string, message: string) {

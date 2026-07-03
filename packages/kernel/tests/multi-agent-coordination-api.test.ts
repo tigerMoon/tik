@@ -16,6 +16,174 @@ afterEach(async () => {
 });
 
 describe('multi-agent coordination API', () => {
+  it('serves a workflow bundle from root and review workbench task references', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    await fs.mkdir(path.join(root, 'repo'), { recursive: true });
+    tempDirs.push(root);
+    const { server, workbench } = await createTestServerWithWorkbench(root);
+    servers.push(server);
+
+    const rootTask = await workbench.createTask({
+      title: 'Workflow root task',
+      goal: 'Show workflow evidence from the task page.',
+      status: 'in_progress',
+      identifier: 'TIK-ROOT',
+      labels: ['multi-agent'],
+    }, 'task-root');
+    const reviewTask = await workbench.createTask({
+      title: 'Workflow review task',
+      goal: 'Review workflow evidence.',
+      status: 'in_review',
+      identifier: 'TIK-REVIEW',
+      labels: ['external-claude-review'],
+      agentLoop: {
+        kind: 'human_review',
+        phase: 'needs_human_review',
+        rootTaskId: 'wf-task-detail',
+        round: 1,
+        maxRounds: 3,
+        idempotencyKey: 'review:wf-task-detail:r1',
+        changeRequest: {
+          scm: 'internal',
+          repo: 'repo',
+          id: 'wf-task-detail:abc123',
+          type: 'internal_review',
+          title: 'Review workflow evidence',
+          baseRef: 'main',
+          headRef: 'codex/workflow-evidence',
+          headSha: 'abc123',
+        },
+      },
+    }, 'task-review');
+
+    const created = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-task-detail',
+        goal: 'Expose workflow evidence on task detail',
+        rootTaskId: rootTask.id,
+        repo: 'repo',
+        baseRef: 'main',
+        headRef: 'codex/workflow-evidence',
+        headSha: 'abc123',
+        metadata: {
+          deployToken: 'workflow-secret',
+          safeLabel: 'workflow-visible',
+        },
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: 'tik',
+          projectName: 'repo',
+          effectiveProjectPath: path.join(root, 'repo'),
+          sourceProjectPath: path.join(root, 'repo'),
+          worktreeKind: 'root',
+        },
+      },
+    });
+    expect(created.statusCode).toBe(200);
+
+    const taskGraph = buildTaskGraph('wf-task-detail', 1, [{ id: 'st-api', dependsOn: [] }]);
+    taskGraph.risks = ['credential should-not-leak in task graph risk'];
+    const putGraph = await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-task-detail/task-graph',
+      payload: { graph: taskGraph },
+    });
+    expect(putGraph.statusCode).toBe(200);
+
+    const evidence = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-task-detail/evidence',
+      payload: {
+        id: 'ev-task-detail',
+        kind: 'validation',
+        title: 'Task detail API tests',
+        summary: 'The workflow bundle is available from task detail.',
+        subtaskId: 'st-api',
+        command: 'pnpm --filter @tik/kernel test -- multi-agent-coordination-api.test.ts',
+        passed: true,
+        headSha: 'abc123',
+        payload: {
+          details: {
+            apiKey: 'should-not-leak',
+            safeNote: 'visible evidence detail',
+          },
+        },
+      },
+    });
+    expect(evidence.statusCode).toBe(200);
+
+    const invocation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-task-detail/agent-invocations',
+      payload: {
+        id: 'inv-evaluator',
+        role: 'evaluator',
+        provider: 'codex',
+        status: 'pending',
+        createdBy: 'codex-workflow',
+        promptSummary: 'Verify task detail workflow evidence.',
+        attestationToken: 'secret-token',
+      },
+    });
+    expect(invocation.statusCode).toBe(200);
+
+    const fromRootId = await server.inject({
+      method: 'GET',
+      url: `/api/v1/tasks/${rootTask.id}/multi-agent-workflow`,
+    });
+    expect(fromRootId.statusCode).toBe(200);
+    expect(fromRootId.json()).toMatchObject({
+      workflow: {
+        id: 'wf-task-detail',
+        rootTaskId: rootTask.id,
+      },
+      taskGraph,
+      subtasks: {
+        'st-api': { status: 'ready' },
+      },
+      evidence: [
+        {
+          id: 'ev-task-detail',
+          kind: 'validation',
+          subtaskId: 'st-api',
+        },
+      ],
+    });
+    expect(fromRootId.json().invocations[0]).not.toHaveProperty('attestationToken');
+    expect(fromRootId.json().workflow.metadata).toEqual({
+      deployToken: '[redacted]',
+      safeLabel: 'workflow-visible',
+    });
+    expect(fromRootId.json().taskGraph.risks).toEqual(['credential should-not-leak in task graph risk']);
+    expect(fromRootId.json().evidence[0].payload.details).toEqual({
+      apiKey: '[redacted]',
+      safeNote: 'visible evidence detail',
+    });
+
+    const fromRootIdentifier = await server.inject({
+      method: 'GET',
+      url: '/api/v1/tasks/TIK-ROOT/multi-agent-workflow',
+    });
+    expect(fromRootIdentifier.statusCode).toBe(200);
+    expect(fromRootIdentifier.json().workflow.id).toBe('wf-task-detail');
+
+    const fromReviewTask = await server.inject({
+      method: 'GET',
+      url: `/api/workbench/tasks/${reviewTask.id}/multi-agent-workflow`,
+    });
+    expect(fromReviewTask.statusCode).toBe(200);
+    expect(fromReviewTask.json().workflow.id).toBe('wf-task-detail');
+
+    const missing = await server.inject({
+      method: 'GET',
+      url: '/api/v1/tasks/no-workflow/multi-agent-workflow',
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json().error.code).toBe('workflow_not_found');
+  });
+
   it('persists workflow state, task graph, decisions, evidence, and timeline without choosing policy actions', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
     await fs.mkdir(path.join(root, 'repo'), { recursive: true });
@@ -1530,6 +1698,10 @@ describe('multi-agent coordination API', () => {
 });
 
 async function createTestServer(root: string) {
+  return (await createTestServerWithWorkbench(root)).server;
+}
+
+async function createTestServerWithWorkbench(root: string) {
   const workbench = new WorkbenchService({
     rootPath: root,
     eventBus: new EventBus(),
@@ -1548,11 +1720,12 @@ async function createTestServer(root: string) {
     streamEvents: async function* streamEvents() {},
     workbench,
   };
-  return createServer(
+  const server = await createServer(
     mockKernel as any,
     { port: 0, host: '127.0.0.1' },
     { workspaceRoot: root },
   );
+  return { server, workbench };
 }
 
 function buildTaskGraph(

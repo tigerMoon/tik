@@ -547,6 +547,8 @@ export class WorkbenchService {
           ...(rootTask.agentLoop || {}),
           ...metadata,
           phase,
+          reviewResult: undefined,
+          stale: undefined,
         },
       };
       await this.store.appendTimelineItem({

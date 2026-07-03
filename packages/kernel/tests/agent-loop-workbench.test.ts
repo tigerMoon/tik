@@ -345,6 +345,52 @@ describe('WorkbenchService agent loop work items', () => {
       },
     });
     expect(await service.listTasks()).toHaveLength(1);
+    expect(nextReview.agentLoop?.reviewResult).toBeUndefined();
+    expect(nextReview.agentLoop?.blockingIssues).toBeUndefined();
+    expect(nextReview.agentLoop?.previousHeadSha).toBeUndefined();
+    expect(nextReview.agentLoop?.nextReviewRound).toBeUndefined();
+    expect(nextReview.agentLoop?.stale).toBeUndefined();
+  });
+
+  it('clears stale metadata when a root task is reused for a fresh Claude review', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-stale-reset',
+    });
+    await service.markAgentLoopStale(reviewTask.id, {
+      expectedHeadSha: 'abc123',
+      actualHeadSha: 'def456',
+    });
+
+    const freshReview = await service.createReviewRound({
+      rootTaskId: reviewTask.id,
+      round: 1,
+      maxRounds: 3,
+      changeRequest: {
+        ...changeRequestRef,
+        headSha: 'def456',
+      },
+      idempotencyKey: 'review-stale-reset:def456',
+    });
+
+    expect(freshReview.id).toBe(reviewTask.id);
+    expect(freshReview).toMatchObject({
+      status: 'todo',
+      labels: ['agent-loop', 'claude-review', 'needs-claude-review'],
+      agentLoop: {
+        kind: 'claude_review',
+        phase: 'needs_claude_review',
+        round: 1,
+        headSha: 'def456',
+      },
+    });
+    expect(freshReview.agentLoop?.stale).toBeUndefined();
+    expect(freshReview.agentLoop?.reviewResult).toBeUndefined();
+    expect(freshReview.agentLoop?.blockingIssues).toBeUndefined();
   });
 
   it('moves the same task to human review when review has no blocking issues', async () => {
