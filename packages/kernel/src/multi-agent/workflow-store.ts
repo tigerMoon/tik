@@ -20,6 +20,7 @@ import {
   type QuestionerIntent,
   type QuestionerOutput,
   type QuestionerOutputV2,
+  type QuestionResolution,
   type QuestionerRun,
   type SprintContract,
   type SubtaskRunState,
@@ -130,12 +131,22 @@ interface CreateQuestionerRunInput {
   headSha: string;
   start?: boolean;
   tokenTtlMs?: number;
+  runtimeAudit?: {
+    gitStatusBefore?: string;
+    allowedWritePaths?: string[];
+    forbiddenWritePaths?: string[];
+  };
 }
 
 interface SubmitQuestionerRunOutputInput {
   token?: string;
   output: QuestionerOutputV2;
   now?: string;
+  runtimeAudit?: {
+    gitStatusAfter?: string;
+    allowedWritePaths?: string[];
+    forbiddenWritePaths?: string[];
+  };
 }
 
 interface HookStartInvocationInput {
@@ -300,6 +311,7 @@ export class FileMultiAgentWorkflowStore {
       evaluationRuns: await this.readEvaluationRuns(id),
       questionerRuns: await this.readQuestionerRuns(id),
       questionerOutputs: await this.readQuestionerOutputs(id),
+      questionResolutions: await this.readQuestionResolutions(id),
       decisions: await this.readJsonLines<WorkflowDecision>(this.decisionsFile(id)),
       evidence: await this.readEvidence(id),
       invocations: await this.readJsonLines<AgentInvocationRecord>(this.invocationsFile(id)),
@@ -566,8 +578,30 @@ export class FileMultiAgentWorkflowStore {
     } = {},
   ): Promise<SprintContract> {
     const id = this.normalizeId(workflowId);
-    await this.requireWorkflow(id);
+    const workflow = await this.requireWorkflow(id);
     const contract = await this.requireContract(id, subtaskId, contractId);
+    if (workflow.policy?.requireQuestionerBeforeBuild) {
+      const bundle = await this.requireBundle(id);
+      const headShaAtAcceptance = input.headShaAtAcceptance || contract.headShaAtAcceptance || workflow.currentHeadSha || '';
+      const questioner = latestMatchingStrictQuestionerOutput(bundle, {
+        subtaskId,
+        intent: 'question_contract',
+        contractId: contract.id,
+        headSha: headShaAtAcceptance,
+      });
+      if (!questioner) {
+        throw new MultiAgentCoordinationError(
+          'missing_evidence',
+          'Contract requires a validated Claude Questioner challenge before acceptance.',
+        );
+      }
+      if (hasBlockingQuestionerQuestions(bundle, questioner)) {
+        throw new MultiAgentCoordinationError(
+          'blocking_question_unresolved',
+          'Contract Questioner still has unresolved blocking or evidence-needed questions.',
+        );
+      }
+    }
     const now = new Date().toISOString();
     const accepted: SprintContract = {
       ...contract,
@@ -885,12 +919,13 @@ export class FileMultiAgentWorkflowStore {
       evaluationRunId: input.evaluationRunId || input.finalEvaluationRunId,
       readonlyPolicy: {
         enforced: true,
-        allowedWritePaths: ['.tik/multi-agent/'],
-        forbiddenWritePaths: ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
+        allowedWritePaths: input.runtimeAudit?.allowedWritePaths || defaultQuestionerReadonlyPolicy().allowedWritePaths,
+        forbiddenWritePaths: input.runtimeAudit?.forbiddenWritePaths || defaultQuestionerReadonlyPolicy().forbiddenWritePaths,
         violations: [],
+        gitStatusBefore: input.runtimeAudit?.gitStatusBefore,
       },
     });
-    const context = buildQuestionerContext(await this.requireBundle(id), {
+    const context = await buildQuestionerContext(await this.requireBundle(id), {
       workflowId: id,
       questionerRunId: runId,
       invocationId: invocation.id,
@@ -922,6 +957,13 @@ export class FileMultiAgentWorkflowStore {
       tokenHash: hashQuestionerToken(token),
       tokenExpiresAt,
       runtimePolicy: defaultQuestionerRuntimePolicy(),
+      readonlyAudit: {
+        enforced: true,
+        allowedWritePaths: input.runtimeAudit?.allowedWritePaths || defaultQuestionerReadonlyPolicy().allowedWritePaths,
+        forbiddenWritePaths: input.runtimeAudit?.forbiddenWritePaths || defaultQuestionerReadonlyPolicy().forbiddenWritePaths,
+        violations: [],
+        gitStatusBefore: input.runtimeAudit?.gitStatusBefore,
+      },
       createdAt: now,
       startedAt: input.start === false ? undefined : now,
     };
@@ -1009,6 +1051,18 @@ export class FileMultiAgentWorkflowStore {
       throw new MultiAgentCoordinationError(validation.code || 'missing_evidence', validation.message || 'Questioner output rejected.');
     }
 
+    const readonlyGuard = validateQuestionerReadonlyAudit(run, input.runtimeAudit);
+    if (!readonlyGuard.accepted) {
+      await this.rejectQuestionerRun(id, {
+        ...run,
+        readonlyAudit: readonlyGuard.audit,
+      }, readonlyGuard.message || 'Questioner readonly audit failed.');
+      throw new MultiAgentCoordinationError(
+        readonlyGuard.code || 'readonly_policy_violated',
+        readonlyGuard.message || 'Questioner readonly audit failed.',
+      );
+    }
+
     await this.writeJsonFileAtomic(this.questionerRunOutputFile(id, run.id), input.output);
     const normalizedOutput = normalizeQuestionerOutputV2(input.output);
     const now = new Date().toISOString();
@@ -1017,6 +1071,7 @@ export class FileMultiAgentWorkflowStore {
       status: 'validated',
       outputHash: input.output.attestation.outputHash,
       outputArtifactRef: input.output.attestation.outputArtifactRef,
+      readonlyAudit: readonlyGuard.audit,
       completedAt: now,
     };
     await this.writeJsonFileAtomic(this.questionerRunFile(id, run.id), updatedRun);
@@ -1026,9 +1081,11 @@ export class FileMultiAgentWorkflowStore {
       evaluationRunId: run.evaluationRunId || run.finalEvaluationRunId,
       readonlyPolicy: {
         enforced: true,
-        allowedWritePaths: ['.tik/multi-agent/'],
-        forbiddenWritePaths: ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
-        violations: [],
+        allowedWritePaths: readonlyGuard.audit.allowedWritePaths,
+        forbiddenWritePaths: readonlyGuard.audit.forbiddenWritePaths,
+        violations: readonlyGuard.audit.violations,
+        gitStatusBefore: readonlyGuard.audit.gitStatusBefore,
+        gitStatusAfter: readonlyGuard.audit.gitStatusAfter,
       },
       result: {
         questionerRunId: run.id,
@@ -1232,6 +1289,61 @@ export class FileMultiAgentWorkflowStore {
       .filter((output) => input.subtaskId === undefined || output.subtaskId === input.subtaskId)
       .filter((output) => input.intent === undefined || output.intent === input.intent)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ?? null;
+  }
+
+  async recordQuestionResolution(
+    workflowId: string,
+    input: Omit<Partial<QuestionResolution>, 'workflowId' | 'createdAt'> & {
+      questionerOutputId: string;
+      questionId: string;
+      status: QuestionResolution['status'];
+      evidenceRefs: string[];
+      explanation: string;
+    },
+  ): Promise<QuestionResolution> {
+    const id = this.normalizeId(workflowId);
+    await this.requireWorkflow(id);
+    const output = (await this.readQuestionerOutputs(id)).find((candidate) => candidate.id === input.questionerOutputId);
+    if (!output) {
+      throw new MultiAgentCoordinationError('missing_evidence', `QuestionerOutput not found: ${input.questionerOutputId}.`);
+    }
+    const question = output.questions.find((candidate) => candidate.id === input.questionId);
+    if (!question) {
+      throw new MultiAgentCoordinationError('missing_evidence', `Question not found in QuestionerOutput: ${input.questionId}.`);
+    }
+    if (question.priority === 'blocking' && input.status !== 'resolved' && !input.resolvedByHuman) {
+      throw new MultiAgentCoordinationError(
+        'blocking_question_unresolved',
+        'Blocking Questioner questions require status=resolved unless a human resolver is recorded.',
+      );
+    }
+    if (!input.explanation.trim()) {
+      throw new MultiAgentCoordinationError('missing_evidence', 'QuestionResolution explanation is required.');
+    }
+    if (!input.resolvedByInvocationId && !input.resolvedByHuman) {
+      throw new MultiAgentCoordinationError('missing_evidence', 'QuestionResolution must record resolvedByInvocationId or resolvedByHuman.');
+    }
+    const resolution: QuestionResolution = {
+      id: this.normalizeId(input.id || `qres_${generateId().slice(0, 10)}`),
+      workflowId: id,
+      questionerOutputId: output.id,
+      questionId: question.id,
+      status: input.status,
+      resolvedByInvocationId: input.resolvedByInvocationId,
+      resolvedByHuman: input.resolvedByHuman,
+      evidenceRefs: input.evidenceRefs || [],
+      explanation: input.explanation,
+      createdAt: new Date().toISOString(),
+    };
+    await fs.mkdir(this.questionResolutionsDir(id), { recursive: true });
+    await this.writeJsonFileAtomic(this.questionResolutionFile(id, resolution.id), resolution);
+    await this.appendEvent(id, 'question.resolution.recorded', 'codex-workflow', {
+      questionResolutionId: resolution.id,
+      questionerOutputId: resolution.questionerOutputId,
+      questionId: resolution.questionId,
+      status: resolution.status,
+    });
+    return resolution;
   }
 
   async createInvocation(workflowId: string, input: CreateAgentInvocationInput): Promise<AgentInvocationRecord> {
@@ -1916,6 +2028,23 @@ export class FileMultiAgentWorkflowStore {
     }
   }
 
+  private async readQuestionResolutions(workflowId: string): Promise<QuestionResolution[]> {
+    try {
+      const entries = await fs.readdir(this.questionResolutionsDir(workflowId));
+      const records = await Promise.all(entries
+        .filter((entry) => entry.endsWith('.json'))
+        .map((entry) => this.readJsonFile<QuestionResolution>(path.join(this.questionResolutionsDir(workflowId), entry))));
+      return records
+        .filter((item): item is QuestionResolution => Boolean(item?.id && item.workflowId && item.questionerOutputId && item.questionId))
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return [];
+      }
+      throw error;
+    }
+  }
+
   private async requireQuestionerRun(workflowId: string, runId: string): Promise<QuestionerRun> {
     const run = await this.readQuestionerRun(workflowId, runId);
     if (!run) {
@@ -2054,6 +2183,14 @@ export class FileMultiAgentWorkflowStore {
   private questionerOutputFile(workflowId: string, output: Pick<QuestionerOutput, 'id' | 'subtaskId' | 'intent'>): string {
     const prefix = output.subtaskId ? `${output.subtaskId}.` : '';
     return path.join(this.questionerOutputsDir(workflowId), `${prefix}${output.intent}.${output.id}.json`);
+  }
+
+  private questionResolutionsDir(workflowId: string): string {
+    return path.join(this.workflowDir(workflowId), 'question-resolutions');
+  }
+
+  private questionResolutionFile(workflowId: string, resolutionId: string): string {
+    return path.join(this.questionResolutionsDir(workflowId), `${resolutionId}.json`);
   }
 
   private questionerRunsDir(workflowId: string): string {
@@ -2510,6 +2647,119 @@ function defaultQuestionerRuntimePolicy(): AgentRuntimePolicy {
     shell: 'read-only',
     permissionMode: 'dontAsk',
   };
+}
+
+function latestMatchingStrictQuestionerOutput(
+  bundle: MultiAgentWorkflowBundle,
+  input: {
+    subtaskId?: string;
+    intent: QuestionerIntent;
+    contractId?: string;
+    evaluationRunId?: string;
+    finalEvaluationRunId?: string;
+    headSha?: string;
+  },
+): QuestionerOutput | undefined {
+  return (bundle.questionerOutputs || [])
+    .filter((output) => output.subtaskId === input.subtaskId && output.intent === input.intent)
+    .filter((output) => output.schemaVersion === 'questioner-output.v2')
+    .filter((output) => input.contractId === undefined || output.references?.contractId === input.contractId || output.contractId === input.contractId)
+    .filter((output) => input.evaluationRunId === undefined || output.references?.evaluationRunId === input.evaluationRunId || output.evaluationRunId === input.evaluationRunId)
+    .filter((output) => input.finalEvaluationRunId === undefined || output.references?.finalEvaluationRunId === input.finalEvaluationRunId || output.finalEvaluationRunId === input.finalEvaluationRunId)
+    .filter((output) => input.headSha === undefined || output.attestation?.headSha === input.headSha || output.headSha === input.headSha)
+    .filter((output) => !hasBlockingQuestionerQuestions(bundle, output))
+    .filter((output) => hasSufficientQuestionerCoverage(output))
+    .filter((output) => {
+      const invocation = output.actor.invocationId
+        ? bundle.invocations.find((candidate) => candidate.id === output.actor.invocationId)
+        : undefined;
+      if (!invocation || invocation.status !== 'completed') return false;
+      const run = output.questionerRunId
+        ? bundle.questionerRuns.find((candidate) => candidate.id === output.questionerRunId)
+        : undefined;
+      if (!run || run.status !== 'validated') return false;
+      if (run.invocationId !== invocation.id) return false;
+      if (run.contextHash !== output.attestation?.contextHash) return false;
+      if (run.contextArtifactRef !== output.attestation?.contextArtifactRef) return false;
+      if (run.outputHash && run.outputHash !== output.attestation?.outputHash) return false;
+      const readonly = run.readonlyAudit || invocation.readonlyPolicy;
+      if (!readonly?.enforced || (readonly.violations || []).length > 0) return false;
+      return true;
+    })
+    .sort((left, right) => safeIsoTime(right.createdAt).localeCompare(safeIsoTime(left.createdAt)))[0];
+}
+
+function hasBlockingQuestionerQuestions(bundle: MultiAgentWorkflowBundle, output: QuestionerOutput): boolean {
+  const resolvedQuestionIds = new Set(
+    (bundle.questionResolutions || [])
+      .filter((resolution) => resolution.questionerOutputId === output.id)
+      .filter((resolution) => resolution.status === 'resolved' || resolution.status === 'accepted_risk')
+      .map((resolution) => resolution.questionId),
+  );
+  const unresolvedBlocking = (output.questions || [])
+    .filter((question) => !resolvedQuestionIds.has(question.id))
+    .filter((question) => question.priority === 'blocking' || question.priority === 'evidence_needed');
+  if (unresolvedBlocking.length > 0) return true;
+  if (
+    output.verdict === 'questions_blocking'
+    || output.verdict === 'need_clarification'
+    || output.verdict === 'evidence_needed'
+  ) {
+    return (output.questions || []).length === 0;
+  }
+  return false;
+}
+
+function hasSufficientQuestionerCoverage(output: QuestionerOutput): boolean {
+  if (!Array.isArray(output.coverageMatrix) || output.coverageMatrix.length === 0) return false;
+  return output.coverageMatrix
+    .filter((entry) => entry.required)
+    .every((entry) => entry.status === 'covered' && entry.evidenceRefs.length > 0 && entry.comment.trim().length > 0);
+}
+
+function defaultQuestionerReadonlyPolicy(): NonNullable<QuestionerRun['readonlyAudit']> {
+  return {
+    enforced: true,
+    allowedWritePaths: ['.tik/multi-agent/'],
+    forbiddenWritePaths: ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
+    violations: [],
+  };
+}
+
+function validateQuestionerReadonlyAudit(
+  run: QuestionerRun,
+  input: SubmitQuestionerRunOutputInput['runtimeAudit'],
+): { accepted: boolean; code?: string; message?: string; audit: NonNullable<QuestionerRun['readonlyAudit']> } {
+  const base = run.readonlyAudit || defaultQuestionerReadonlyPolicy();
+  const allowedWritePaths = input?.allowedWritePaths || base.allowedWritePaths || defaultQuestionerReadonlyPolicy().allowedWritePaths;
+  const forbiddenWritePaths = input?.forbiddenWritePaths || base.forbiddenWritePaths || defaultQuestionerReadonlyPolicy().forbiddenWritePaths;
+  const audit: NonNullable<QuestionerRun['readonlyAudit']> = {
+    ...base,
+    enforced: true,
+    allowedWritePaths,
+    forbiddenWritePaths,
+    violations: [],
+    gitStatusBefore: base.gitStatusBefore,
+    gitStatusAfter: input?.gitStatusAfter,
+  };
+  if (audit.gitStatusBefore === undefined || audit.gitStatusAfter === undefined) {
+    return {
+      accepted: false,
+      code: 'missing_evidence',
+      message: 'QuestionerRun requires gitStatusBefore and gitStatusAfter readonly audit evidence.',
+      audit,
+    };
+  }
+  audit.violations = detectReadonlyViolations(audit.gitStatusBefore, audit.gitStatusAfter, allowedWritePaths, forbiddenWritePaths);
+  if (audit.violations.length > 0) {
+    return {
+      accepted: false,
+      code: 'readonly_policy_violated',
+      message: `Questioner wrote forbidden paths: ${audit.violations.join(', ')}`,
+      audit,
+    };
+  }
+  return { accepted: true, audit };
 }
 
 function detectReadonlyViolations(

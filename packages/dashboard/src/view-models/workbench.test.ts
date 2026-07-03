@@ -182,6 +182,7 @@ describe('workbench view models', () => {
           createdAt: '2026-07-03T00:04:00.000Z',
         },
       ],
+      questionResolutions: [],
       decisions: [
         {
           id: 'dec-complete-api',
@@ -304,6 +305,7 @@ describe('workbench view models', () => {
       contracts: [],
       evaluationRuns: [],
       questionerOutputs: [],
+      questionResolutions: [],
       decisions: [],
       evidence: [
         {

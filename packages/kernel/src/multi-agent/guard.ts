@@ -136,8 +136,36 @@ function validateActionTransition(
       if (!contract) {
         return reject('missing_contract', 'Accepting a contract requires a drafted SprintContract.');
       }
+      if (bundle.workflow.policy?.requireQuestionerBeforeBuild) {
+        const headSha = readStringInput(decision.inputs, 'currentHeadSha')
+          || readStringInput(decision.inputs, 'headSha')
+          || contract.headShaAtAcceptance
+          || bundle.workflow.currentHeadSha;
+        const strictQuestioner = latestMatchingQuestionerOutput(bundle, {
+          subtaskId: decision.subtaskId,
+          intent: 'question_contract',
+          contractId: contract.id,
+          headSha,
+        });
+        if (!strictQuestioner) {
+          return reject('missing_evidence', 'Contract requires a validated Claude Questioner challenge before acceptance.', {
+            contractId: contract.id,
+            subtaskId: decision.subtaskId,
+          });
+        }
+        const strictGuard = requireStrictQuestionerOutput(bundle, strictQuestioner, {
+          contractId: contract.id,
+          headSha: headSha || strictQuestioner.headSha,
+        });
+        if (!strictGuard.accepted) return strictGuard;
+        if (hasBlockingQuestions(bundle, strictQuestioner)) {
+          return reject('blocking_question_unresolved', 'Contract Questioner still has unresolved blocking or evidence-needed questions.', {
+            questionerOutputId: strictQuestioner.id,
+          });
+        }
+      }
       const questioner = latestQuestionerOutput(bundle, decision.subtaskId, 'question_contract');
-      if (questioner && hasBlockingQuestions(questioner) && !bundle.workflow.policy?.allowHumanOverride) {
+      if (questioner && hasBlockingQuestions(bundle, questioner) && !bundle.workflow.policy?.allowHumanOverride) {
         return reject('blocking_question_unresolved', 'Contract has unresolved blocking Questioner output.', {
           questionerOutputId: questioner.id,
         });
@@ -436,7 +464,7 @@ function guardCompleteSubtaskV1(
     }
     const questionerGuard = requireQuestionerMatchesEvaluation(bundle, questioner, evaluation, contract);
     if (!questionerGuard.accepted) return questionerGuard;
-    if (hasBlockingQuestions(questioner)) {
+    if (hasBlockingQuestions(bundle, questioner)) {
       return reject('blocking_question_unresolved', 'Claude Questioner has unresolved blocking questions.', {
         questionerOutputId: questioner.id,
       });
@@ -593,7 +621,7 @@ function guardCompleteWorkflowV1(
     }
     const questionerGuard = requireQuestionerMatchesFinalEvaluation(bundle, questioner, evaluation);
     if (!questionerGuard.accepted) return questionerGuard;
-    if (hasBlockingQuestions(questioner)) {
+    if (hasBlockingQuestions(bundle, questioner)) {
       return reject('blocking_question_unresolved', 'Claude Questioner has unresolved final blocking questions.', {
         questionerOutputId: questioner.id,
       });
@@ -858,7 +886,7 @@ function guardCanFixEvaluationFindings(
   if (!statusGuard.accepted) return statusGuard;
   const evaluation = failedEvaluationRunForDecision(bundle, decision);
   const questioner = latestQuestionerOutput(bundle, decision.subtaskId, 'question_evaluation');
-  const hasBlockingQuestion = questioner ? hasBlockingQuestions(questioner) : false;
+  const hasBlockingQuestion = questioner ? hasBlockingQuestions(bundle, questioner) : false;
   if (!evaluation && !hasBlockingQuestion) {
     return reject('invalid_transition', 'Fixing evaluation findings requires failed evaluation evidence or blocking Questioner output.');
   }
@@ -963,7 +991,7 @@ function latestMatchingQuestionerOutput(
       const run = output.questionerRunId
         ? bundle.questionerRuns.find((candidate) => candidate.id === output.questionerRunId)
         : undefined;
-      if (!run || (run.status !== 'output_received' && run.status !== 'validated')) {
+      if (!run || run.status !== 'validated') {
         return false;
       }
       return run.invocationId === invocation.id
@@ -974,11 +1002,27 @@ function latestMatchingQuestionerOutput(
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
 }
 
-function hasBlockingQuestions(output: QuestionerOutput): boolean {
-  return output.verdict === 'questions_blocking'
+function hasBlockingQuestions(bundle: MultiAgentWorkflowBundle, output: QuestionerOutput): boolean {
+  const resolvedQuestionIds = new Set(
+    (bundle.questionResolutions || [])
+      .filter((resolution) => resolution.questionerOutputId === output.id)
+      .filter((resolution) => resolution.status === 'resolved' || resolution.status === 'accepted_risk')
+      .map((resolution) => resolution.questionId),
+  );
+  const unresolvedBlocking = output.questions
+    .filter((question) => !resolvedQuestionIds.has(question.id))
+    .filter((question) => question.priority === 'blocking' || question.priority === 'evidence_needed');
+  if (unresolvedBlocking.length > 0) {
+    return true;
+  }
+  if (
+    output.verdict === 'questions_blocking'
     || output.verdict === 'need_clarification'
     || output.verdict === 'evidence_needed'
-    || output.questions.some((question) => question.priority === 'blocking' || question.priority === 'evidence_needed');
+  ) {
+    return output.questions.length === 0;
+  }
+  return false;
 }
 
 function requireQuestionerMatchesEvaluation(
@@ -1109,8 +1153,8 @@ function requireStrictQuestionerOutput(
       questionerRunId: output.questionerRunId,
     });
   }
-  if (run.status !== 'output_received' && run.status !== 'validated') {
-    return reject('missing_evidence', 'QuestionerRun must be output_received or validated before satisfying a guard.', {
+  if (run.status !== 'validated') {
+    return reject('missing_evidence', 'QuestionerRun must be validated before satisfying a guard.', {
       questionerOutputId: output.id,
       questionerRunId: run.id,
       status: run.status,
@@ -1138,6 +1182,21 @@ function requireStrictQuestionerOutput(
     return reject('missing_evidence', 'QuestionerOutputV2 output hash does not match its QuestionerRun.', {
       questionerOutputId: output.id,
       questionerRunId: run.id,
+    });
+  }
+  const invocation = bundle.invocations.find((candidate) => candidate.id === output.actor.invocationId);
+  const readonlyAudit = run.readonlyAudit || invocation?.readonlyPolicy;
+  if (!readonlyAudit?.enforced) {
+    return reject('readonly_policy_violated', 'QuestionerRun must include server-validated readonly audit evidence.', {
+      questionerOutputId: output.id,
+      questionerRunId: run.id,
+    });
+  }
+  if ((readonlyAudit.violations || []).length > 0) {
+    return reject('readonly_policy_violated', 'Questioner readonly audit recorded forbidden writes.', {
+      questionerOutputId: output.id,
+      questionerRunId: run.id,
+      violations: readonlyAudit.violations,
     });
   }
   if (input.contractId && output.references.contractId !== input.contractId) {

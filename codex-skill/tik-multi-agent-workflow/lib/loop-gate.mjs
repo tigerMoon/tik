@@ -240,6 +240,39 @@ function decideNextV1Action(state, graph, subtasks) {
   }
 
   if (contract.status !== 'accepted') {
+    const questionedContract = latestMatchingQuestionerOutput(state, {
+      subtaskId,
+      intent: 'question_contract',
+      contractId: contract.id,
+      headSha: contract.headShaAtAcceptance || state.workflow?.currentHeadSha,
+    });
+    if (state.workflow?.policy?.requireQuestionerBeforeBuild && !questionedContract) {
+      return {
+        action: 'ask_claude_question_contract',
+        subtaskId,
+        reason: `SprintContract ${contract.id} is ${contract.status}; Claude Questioner must challenge it before acceptance.`,
+        evidenceRefs: subtaskState.evidenceRefs || [],
+        inputs: { contractId: contract.id },
+      };
+    }
+    if (hasBlockingQuestionerFindings(questionedContract)) {
+      return {
+        action: 'draft_contract',
+        subtaskId,
+        reason: `Contract Questioner output ${questionedContract.id} contains blocking questions; revise the SprintContract.`,
+        evidenceRefs: subtaskState.evidenceRefs || [],
+        inputs: { contractId: contract.id, questionerOutputId: questionedContract.id },
+      };
+    }
+    if (state.workflow?.policy?.requireQuestionerBeforeBuild && questionedContract) {
+      return {
+        action: 'accept_contract',
+        subtaskId,
+        reason: `SprintContract ${contract.id} has a validated Questioner challenge and can be accepted.`,
+        evidenceRefs: subtaskState.evidenceRefs || [],
+        inputs: { contractId: contract.id, questionerOutputId: questionedContract.id },
+      };
+    }
     return {
       action: 'ask_claude_question_contract',
       subtaskId,
@@ -403,7 +436,7 @@ function latestMatchingQuestionerOutput(state, input) {
       const run = output.questionerRunId
         ? (state.questionerRuns || []).find((candidate) => candidate.id === output.questionerRunId)
         : undefined;
-      if (!run || !['output_received', 'validated'].includes(run.status)) return false;
+      if (!run || run.status !== 'validated') return false;
       if (run.invocationId !== invocation.id) return false;
       if (run.contextHash !== output.attestation?.contextHash) return false;
       if (run.contextArtifactRef !== output.attestation?.contextArtifactRef) return false;

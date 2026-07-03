@@ -360,6 +360,13 @@ try {
           },
           headSha: body.headSha,
           evaluationRunId: body.evaluationRunId || body.finalEvaluationRunId,
+          readonlyPolicy: {
+            enforced: true,
+            allowedWritePaths: ['.tik/multi-agent/'],
+            forbiddenWritePaths: ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
+            violations: [],
+            gitStatusBefore: body.runtimeAudit?.gitStatusBefore,
+          },
           status: body.start === false ? 'created' : 'started',
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
@@ -386,6 +393,13 @@ try {
           tokenHash: `sha256:${runId}-token`,
           tokenExpiresAt: new Date(Date.now() + 3600000).toISOString(),
           runtimePolicy: { filesystem: 'read-only', network: 'tik-api-only', shell: 'read-only', permissionMode: 'dontAsk' },
+          readonlyAudit: {
+            enforced: true,
+            allowedWritePaths: body.runtimeAudit?.allowedWritePaths || ['.tik/multi-agent/'],
+            forbiddenWritePaths: body.runtimeAudit?.forbiddenWritePaths || ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
+            violations: [],
+            gitStatusBefore: body.runtimeAudit?.gitStatusBefore,
+          },
           createdAt: new Date().toISOString(),
           startedAt: body.start === false ? undefined : new Date().toISOString(),
         };
@@ -432,6 +446,144 @@ try {
         questionerOutputs.push(questionerOutput);
         events.push({ type: 'questioner.output.recorded', payload: { questionerOutputId: questionerOutput.id } });
         sendJson(res, { questionerOutput });
+        return;
+      }
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/questioner-runs\/[^/]+\/output$/)) {
+        const runId = route.split('/').at(-2);
+        const body = await readRequestJson(req);
+        const run = questionerRuns.find((item) => item.id === runId);
+        if (!run || req.headers.authorization !== `Bearer token-${run.id}`) {
+          sendJson(res, {
+            error: {
+              code: 'missing_evidence',
+              message: 'Questioner run token is missing or invalid.',
+            },
+          }, 409);
+          return;
+        }
+        const output = body.output;
+        const questionerOutput = {
+          id: output.id,
+          workflowId: 'wf-cli',
+          createdAt: new Date().toISOString(),
+          ...output,
+        };
+        questionerRuns = questionerRuns.map((item) => item.id === runId
+          ? {
+            ...item,
+            status: 'validated',
+            outputHash: output.attestation?.outputHash,
+            outputArtifactRef: output.attestation?.outputArtifactRef,
+            readonlyAudit: {
+              ...(item.readonlyAudit || {}),
+              enforced: true,
+              violations: [],
+              gitStatusAfter: body.runtimeAudit?.gitStatusAfter,
+            },
+            completedAt: new Date().toISOString(),
+          }
+          : item);
+        invocations = invocations.map((item) => item.id === run.invocationId
+          ? {
+            ...item,
+            status: 'completed',
+            readonlyPolicy: {
+              ...(item.readonlyPolicy || {}),
+              enforced: true,
+              violations: [],
+              gitStatusAfter: body.runtimeAudit?.gitStatusAfter,
+            },
+            result: {
+              questionerRunId: run.id,
+              questionerOutput,
+            },
+            completedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }
+          : item);
+        questionerOutputs.push(questionerOutput);
+        events.push({ type: 'questioner.run.validated', payload: { questionerRunId: run.id, questionerOutputId: questionerOutput.id } });
+        sendJson(res, {
+          questionerRun: questionerRuns.find((item) => item.id === runId),
+          questionerOutput,
+          invocation: invocations.find((item) => item.id === run.invocationId),
+        });
+        return;
+      }
+      if (req.method === 'GET' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/questioner-runs\/[^/]+\/context$/)) {
+        const runId = route.split('/').at(-2);
+        const run = questionerRuns.find((item) => item.id === runId);
+        if (!run || req.headers.authorization !== `Bearer token-${run.id}`) {
+          sendJson(res, {
+            error: {
+              code: 'missing_evidence',
+              message: 'Questioner run token is missing or invalid.',
+            },
+          }, 409);
+          return;
+        }
+        sendJson(res, {
+          questionerRun: run,
+          context: {
+            schemaVersion: 'questioner-context.v1',
+            run: {
+              questionerRunId: run.id,
+              invocationId: run.invocationId,
+              workflowId: 'wf-cli',
+              intent: run.intent,
+              headSha: run.headSha,
+              contextHash: run.contextHash,
+              submitUrl: `/v1/multi-agent/workflows/wf-cli/questioner-runs/${run.id}/output`,
+              contextArtifactRef: run.contextArtifactRef,
+            },
+            workflow: {
+              goal: workflow.goal,
+              policy: workflow.policy || {},
+              globalAcceptanceCriteria: graph?.globalAcceptanceCriteria || [],
+            },
+            subtask: run.subtaskId ? {
+              id: run.subtaskId,
+              title: graph?.subtasks?.find((item) => item.id === run.subtaskId)?.title || run.subtaskId,
+              status: subtasks[run.subtaskId]?.status || 'pending',
+              dependencies: [],
+            } : undefined,
+            contract: run.contractId ? {
+              id: run.contractId,
+              status: 'accepted',
+              mustCriteria: [{ id: 'ac-1', statement: 'Accepted contract gates execution.', verificationMethod: 'command' }],
+              shouldCriteria: [],
+              outOfScope: [],
+              requiredEvidence: ['cmd-test'],
+            } : undefined,
+            evaluation: run.evaluationRunId ? {
+              id: run.evaluationRunId,
+              readonly: true,
+              headSha: run.headSha,
+              verdict: 'pass',
+              commands: [],
+              artifacts: [],
+              coverage: [],
+              coverageGaps: [],
+              logs: [],
+            } : undefined,
+            finalEvaluation: run.finalEvaluationRunId ? {
+              id: run.finalEvaluationRunId,
+              headSha: run.headSha,
+              verdict: 'pass',
+              globalCriteriaCoverage: [{ criterionId: 'global-ac-1', status: 'pass', evidence: 'Final evidence passed.' }],
+              requiredEvidence: [],
+              coverageGaps: [],
+            } : undefined,
+            diff: { headSha: run.headSha, files: [], excerpts: [] },
+            relevantFiles: [],
+            previousQuestionerOutputs: [],
+            outputContract: {
+              schemaVersion: 'questioner-output.v2',
+              requiredFields: ['coverageMatrix'],
+              allowedVerdicts: ['questions_blocking', 'evidence_needed', 'risk_found', 'no_blocking_questions', 'evidence_sufficient'],
+            },
+          },
+        });
         return;
       }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/agent-invocations') {
@@ -1249,18 +1401,46 @@ try {
   assert.equal(questionerStarted.action, 'questioner-run-started');
   assert.equal(questionerStarted.invocation.status, 'started');
 
+  await assert.rejects(
+    run([
+      'complete-questioner',
+      '--api-base-url', apiBaseUrl,
+      '--workflow', 'wf-cli',
+      '--subtask', 'st-api',
+      '--intent', 'question_evaluation',
+      '--invocation', 'claude-questioner-cli',
+      '--head-sha', 'head-v1',
+      '--contract', 'contract-st-api-v1',
+      '--evaluation', 'eval-st-api-v1',
+      '--artifact-ref', '.tik/multi-agent/workflows/wf-cli/questioner/q-cli.json',
+      '--verdict', 'evidence_sufficient',
+    ]),
+    /complete-questioner is legacy/,
+  );
+
+  const questionerOutputPath = path.join(tempRoot, 'questioner-output-cli.json');
+  await writeFile(questionerOutputPath, `${JSON.stringify({
+    id: 'q-cli',
+    subtaskId: 'st-api',
+    intent: 'question_evaluation',
+    headSha: 'head-v1',
+    evaluationRunId: 'eval-st-api-v1',
+    contractId: 'contract-st-api-v1',
+    artifactRef: '.tik/multi-agent/workflows/wf-cli/questioner/q-cli.json',
+    verdict: 'evidence_sufficient',
+    questions: [],
+    risks: [],
+    missingTests: [],
+    suggestedContractChanges: [],
+  }, null, 2)}\n`, 'utf-8');
+
   const questioned = await run([
     'complete-questioner',
+    '--unsafe-legacy',
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-    '--intent', 'question_evaluation',
     '--invocation', 'claude-questioner-cli',
-    '--head-sha', 'head-v1',
-    '--contract', 'contract-st-api-v1',
-    '--evaluation', 'eval-st-api-v1',
-    '--artifact-ref', '.tik/multi-agent/workflows/wf-cli/questioner/q-cli.json',
-    '--verdict', 'evidence_sufficient',
+    '--output', questionerOutputPath,
   ]);
   assert.equal(questioned.action, 'questioner-output-recorded');
   assert.equal(questionerOutputs[0].intent, 'question_evaluation');
@@ -1324,16 +1504,27 @@ try {
   assert.equal(finalQuestionerStarted.invocation.input.finalEvaluationRunId, 'eval-final-v1');
   assert.equal(finalQuestionerStarted.invocation.input.evaluationRunId, undefined);
 
+  const finalQuestionerOutputPath = path.join(tempRoot, 'final-questioner-output-cli.json');
+  await writeFile(finalQuestionerOutputPath, `${JSON.stringify({
+    id: 'q-final-cli',
+    intent: 'question_final_evidence',
+    headSha: 'head-v1',
+    finalEvaluationRunId: 'eval-final-v1',
+    artifactRef: '.tik/multi-agent/workflows/wf-cli/questioner/q-final-cli.json',
+    verdict: 'evidence_sufficient',
+    questions: [],
+    risks: [],
+    missingTests: [],
+    suggestedContractChanges: [],
+  }, null, 2)}\n`, 'utf-8');
+
   const finalQuestioned = await run([
     'complete-questioner',
+    '--unsafe-legacy',
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
-    '--intent', 'question_final_evidence',
     '--invocation', 'claude-final-questioner-cli',
-    '--head-sha', 'head-v1',
-    '--evaluation', 'eval-final-v1',
-    '--artifact-ref', '.tik/multi-agent/workflows/wf-cli/questioner/q-final-cli.json',
-    '--verdict', 'evidence_sufficient',
+    '--output', finalQuestionerOutputPath,
   ]);
   assert.equal(finalQuestioned.action, 'questioner-output-recorded');
   assert.equal(finalQuestioned.questionerOutput.finalEvaluationRunId, 'eval-final-v1');

@@ -78,7 +78,7 @@ structured result.
 | --- | --- | --- | --- |
 | `plan-tik-agent-loop` | Produce a bounded `TaskGraph` for a multi-agent workflow. | Multi-agent workflow id, goal, refs, workspace binding, constraints. | TaskGraph JSON. Tik may store a draft from the planner invocation, but Codex must explicitly accept the reviewed graph with `PUT /v1/multi-agent/workflows/:id/task-graph`. |
 | `review-tik-agent-loop` | Review the exact pinned worktree head for a Tik Claude review task. | Workbench task with `agentLoop.kind=claude_review`, `headSha`, allowed scope, acceptance criteria, review focus. Tik adds labels such as `external-claude-review` and, for final reviews, `final-claude-review`. | `ReviewResult` posted to `POST /v1/agent-loop/tasks/:id/review-result`, or stale-head notice posted to `/stale`. |
-| `question-tik-agent-loop` | Challenge requirements, TaskGraph drafts, SprintContracts, Codex Evaluator evidence, or final v1 evidence. | Multi-agent workflow bundle, requested `intent`, head SHA, artifact output path, and relevant contract/evaluation ids. | `QuestionerOutput` posted to `POST /v1/multi-agent/workflows/:id/questioner-outputs`. `question_requirement` and `question_task_graph` are informational hookpoints today; v1 loop gates actively consume `question_contract`, `question_evaluation`, and `question_final_evidence`. |
+| `question-tik-agent-loop` | Challenge requirements, TaskGraph drafts, SprintContracts, Codex Evaluator evidence, or final v1 evidence. | Token-scoped `QuestionerRun`, `QuestionerContextV1`, expected HEAD, submit URL, and relevant contract/evaluation ids. | `QuestionerOutputV2` posted to `POST /v1/multi-agent/workflows/:id/questioner-runs/:runId/output` with context/output hashes, coverage matrix, and readonly audit evidence. `question_requirement` and `question_task_graph` are informational hookpoints today; v1 loop gates actively consume `question_contract`, `question_evaluation`, and `question_final_evidence`. |
 | `final-review-tik-agent-loop` | Perform a read-only final workflow review across subtasks and recorded evidence. | Multi-agent workflow bundle, final diff context, evidence, subtask states. | FinalReviewResult JSON for the Codex workflow driver to inspect before completion. |
 
 ### ReviewResult Handling
@@ -106,3 +106,9 @@ After Tik ingests a review result, Tik owns the state transition:
 The plugin does not edit files, run Codex fixes, commit, push, merge, claim
 unselected tasks, or choose the next workflow action. Those decisions stay in the
 Codex workflow skill and Tik guardrails.
+
+`question-tik-agent-loop` must submit through `scripts/post-questioner-output.mjs`.
+The helper verifies the fetched context hash, canonicalizes the output hash,
+turns HEAD mismatches into auditable blocking `QuestionerOutputV2`, and submits
+`git status --porcelain=v1` as the readonly audit proof. Tik rejects the run if
+forbidden repository writes are observed.

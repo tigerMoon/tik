@@ -86,6 +86,7 @@ async function main() {
         await startQuestioner(options);
         break;
       case 'complete-questioner':
+      case 'import-questioner-output':
         await completeQuestioner(options);
         break;
       case 'complete-invocation':
@@ -537,6 +538,7 @@ async function startQuestioner(options) {
   const subtaskId = stringOption(options.subtask);
   const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
   const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
+  const gitStatusBefore = git(projectPath, ['status', '--porcelain=v1'], { optional: true }) || '';
   const evaluationRunId = stringOption(options.evaluation) || (
     intent === 'question_final_evidence'
       ? latestEvaluationId(state, '__final__')
@@ -560,6 +562,9 @@ async function startQuestioner(options) {
     finalEvaluationRunId,
     headSha,
     start: options.start === false || options.start === 'false' ? false : true,
+    runtimeAudit: {
+      gitStatusBefore,
+    },
   });
   printJson({
     action: run.invocation.status === 'started' ? 'questioner-run-started' : 'questioner-run-created',
@@ -582,18 +587,23 @@ async function startQuestioner(options) {
       TIK_QUESTIONER_TOKEN: run.token,
       TIK_EXPECTED_HEAD_SHA: headSha,
       TIK_QUESTIONER_OUTPUT_PATH: run.expectedOutputArtifactRef,
+      TIK_QUESTIONER_GIT_STATUS_BEFORE: gitStatusBefore,
     },
   });
 }
 
 async function completeQuestioner(options) {
+  if (!options.unsafeLegacy) {
+    throw new Error('complete-questioner is legacy. Use the QuestionerRun submit API, or pass --unsafe-legacy to import an explicit legacy output.');
+  }
+  if (!options.outputJson && !options.output) {
+    throw new Error('--output or --output-json is required; default QuestionerOutput is not allowed.');
+  }
   const workflowId = requireOption(options.workflow, '--workflow is required');
   const invocationId = requireOption(options.invocation, '--invocation is required');
   const output = options.outputJson
     ? JSON.parse(String(options.outputJson))
-    : options.output
-      ? await readJsonFile(options.output)
-      : buildDefaultQuestionerOutput(options);
+    : await readJsonFile(options.output);
   output.actor = {
     ...(output.actor || {}),
     kind: 'claude-code-questioner',
@@ -616,10 +626,10 @@ async function completeQuestioner(options) {
   });
   const recorded = await recordQuestionerOutput(options, workflowId, output);
   if (output.subtaskId && output.intent === 'question_evaluation') {
+    const blockingQuestions = blockingQuestionerQuestions(output);
     await updateSubtask(options, workflowId, output.subtaskId, {
-      status: output.questions?.some((question) => question.priority === 'blocking') ? 'needs_fix' : 'questioning_evidence',
-      blockerFindingIds: (output.questions || [])
-        .filter((question) => question.priority === 'blocking')
+      status: blockingQuestions.length > 0 ? 'needs_fix' : 'questioning_evidence',
+      blockerFindingIds: blockingQuestions
         .map((question) => `${output.id || recorded.questionerOutput.id}:${question.id}`),
     });
   }
@@ -1010,10 +1020,10 @@ async function recordQuestioner(options) {
       : buildDefaultQuestionerOutput(options);
   const response = await recordQuestionerOutput(options, workflowId, output);
   if (output.subtaskId && output.intent === 'question_evaluation') {
+    const blockingQuestions = blockingQuestionerQuestions(output);
     await updateSubtask(options, workflowId, output.subtaskId, {
-      status: output.questions?.some((question) => question.priority === 'blocking') ? 'needs_fix' : 'questioning_evidence',
-      blockerFindingIds: (output.questions || [])
-        .filter((question) => question.priority === 'blocking')
+      status: blockingQuestions.length > 0 ? 'needs_fix' : 'questioning_evidence',
+      blockerFindingIds: blockingQuestions
         .map((question) => `${output.id || response.questionerOutput.id}:${question.id}`),
     });
   }
@@ -2136,6 +2146,12 @@ function buildDefaultQuestionerOutput(options) {
   };
 }
 
+function blockingQuestionerQuestions(output) {
+  return (output.questions || []).filter((question) =>
+    question.priority === 'blocking' || question.priority === 'evidence_needed'
+  );
+}
+
 function nextReviewRound(subtask) {
   return (subtask?.reviewRoundIds?.length || 0) + 1;
 }
@@ -2688,7 +2704,8 @@ Usage:
   node ${script} validate --workflow <workflow-id> --subtask <id> --command <cmd>
   node ${script} evaluate --workflow <workflow-id> --subtask <id> --command <cmd>
   node ${script} start-questioner --workflow <workflow-id> --intent <intent> [--subtask <id>]
-  node ${script} complete-questioner --workflow <workflow-id> --invocation <id> --intent <intent>
+  node ${script} complete-questioner --unsafe-legacy --workflow <workflow-id> --invocation <id> --output <file>
+  node ${script} import-questioner-output --unsafe-legacy --workflow <workflow-id> --invocation <id> --output <file>
   node ${script} complete-invocation --workflow <workflow-id> --invocation <id> [--status started|completed]
   node ${script} record-questioner --workflow <workflow-id> --intent <intent> [--subtask <id>]
   node ${script} complete-subtask --workflow <workflow-id> --subtask <id>

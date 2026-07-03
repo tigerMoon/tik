@@ -16,29 +16,46 @@ async function main() {
   const token = requireEnv('TIK_QUESTIONER_TOKEN');
   const expectedHeadSha = process.env.TIK_EXPECTED_HEAD_SHA;
   const artifactPath = process.env.TIK_QUESTIONER_OUTPUT_PATH;
+  const gitStatusAfter = gitStatus();
+  const contextResponse = await fetchJson(contextUrl, token);
+  const context = contextResponse.context || contextResponse;
 
   if (expectedHeadSha) {
     const actualHeadSha = gitHead();
     if (actualHeadSha && actualHeadSha !== expectedHeadSha) {
-      throw new Error(`HEAD mismatch: expected ${expectedHeadSha}, actual ${actualHeadSha}`);
+      const output = buildBlockingHeadMismatchOutput(contextResponse, {
+        expectedHeadSha,
+        actualHeadSha,
+        artifactPath,
+      });
+      output.attestation.outputHash = canonicalOutputHash(output);
+      await writeArtifactIfNeeded(output, artifactPath);
+      const submitted = await postJson(submitUrl, token, { output, runtimeAudit: { gitStatusAfter } });
+      console.log(JSON.stringify({
+        action: 'questioner-output-submitted',
+        questionerRunId: output.questionerRunId,
+        questionerOutputId: output.id,
+        verdict: output.verdict,
+        outputHash: output.attestation.outputHash,
+        headMismatch: {
+          expectedHeadSha,
+          actualHeadSha,
+        },
+        response: submitted,
+      }, null, 2));
+      return;
     }
   }
 
-  const contextResponse = await fetchJson(contextUrl, token);
-  const context = contextResponse.context || contextResponse;
   const rawOutput = JSON.parse(await readFile(resolve(outputPath), 'utf-8'));
   const output = normalizeOutput(rawOutput, contextResponse, artifactPath);
   const contextForValidation = contextResponse.context || contextResponse;
   validateOutput(output, contextForValidation);
   output.attestation.outputHash = canonicalOutputHash(output);
 
-  if (artifactPath) {
-    const resolvedArtifact = resolve(artifactPath);
-    await mkdir(dirname(resolvedArtifact), { recursive: true });
-    await writeFile(resolvedArtifact, `${JSON.stringify(output, null, 2)}\n`, 'utf-8');
-  }
+  await writeArtifactIfNeeded(output, artifactPath);
 
-  const submitted = await postJson(submitUrl, token, { output });
+  const submitted = await postJson(submitUrl, token, { output, runtimeAudit: { gitStatusAfter } });
   console.log(JSON.stringify({
     action: 'questioner-output-submitted',
     questionerRunId: output.questionerRunId,
@@ -47,6 +64,66 @@ async function main() {
     outputHash: output.attestation.outputHash,
     response: submitted,
   }, null, 2));
+}
+
+function buildBlockingHeadMismatchOutput(response, input) {
+  const context = response.context || response;
+  const runRecord = response.questionerRun || {};
+  const run = context.run || {};
+  const now = new Date().toISOString();
+  const requiredCriteria = requiredCoverageEntries(context);
+  const outputArtifactRef = runRecord.expectedOutputArtifactRef || input.artifactPath || '';
+  return {
+    schemaVersion: 'questioner-output.v2',
+    id: `q_head_mismatch_${Date.now()}`,
+    questionerRunId: run.questionerRunId,
+    workflowId: run.workflowId,
+    subtaskId: context.subtask?.id,
+    intent: run.intent,
+    source: 'claude-plugin',
+    actor: {
+      kind: 'claude-code-questioner',
+      invocationId: run.invocationId,
+      pluginName: 'agent-loop-claude-review',
+      skillName: 'question-tik-agent-loop',
+    },
+    attestation: {
+      headSha: run.headSha,
+      contextArtifactRef: runRecord.contextArtifactRef || contextResponseRef(context),
+      contextHash: run.contextHash,
+      outputArtifactRef,
+      outputHash: '',
+      generatedAt: now,
+    },
+    references: {
+      contractId: context.contract?.id,
+      evaluationRunId: context.evaluation?.id,
+      finalEvaluationRunId: context.finalEvaluation?.id,
+    },
+    verdict: 'questions_blocking',
+    coverageMatrix: requiredCriteria.map((criterion) => ({
+      criterionId: criterion.id,
+      criterionText: criterion.text,
+      required: true,
+      status: 'missing',
+      evidenceRefs: [],
+      comment: `HEAD mismatch: Tik expected ${input.expectedHeadSha}, but Claude Code is running at ${input.actualHeadSha}.`,
+    })),
+    questions: [
+      {
+        id: 'q-head-mismatch',
+        priority: 'blocking',
+        category: 'head_mismatch',
+        claim: `Claude Code is running at HEAD ${input.actualHeadSha}, but Tik expected ${input.expectedHeadSha}.`,
+        evidenceRefs: [],
+        requestedFix: 'Restart the Questioner on the expected Tik head before reviewing evidence.',
+        status: 'open',
+      },
+    ],
+    risks: [],
+    missingTests: [],
+    advisoryNotes: [],
+  };
 }
 
 function normalizeOutput(output, response, artifactPath) {
@@ -123,6 +200,32 @@ function validateOutput(output, context) {
   }
 }
 
+async function writeArtifactIfNeeded(output, artifactPath) {
+  if (!artifactPath) return;
+  const resolvedArtifact = resolve(artifactPath);
+  await mkdir(dirname(resolvedArtifact), { recursive: true });
+  await writeFile(resolvedArtifact, `${JSON.stringify(output, null, 2)}\n`, 'utf-8');
+}
+
+function requiredCoverageEntries(context) {
+  if (context.contract?.mustCriteria?.length) {
+    return context.contract.mustCriteria.map((criterion) => ({
+      id: criterion.id,
+      text: criterion.statement,
+    }));
+  }
+  if (context.finalEvaluation?.globalCriteriaCoverage?.length) {
+    return context.finalEvaluation.globalCriteriaCoverage.map((criterion) => ({
+      id: criterion.criterionId,
+      text: criterion.evidence || criterion.criterionId,
+    }));
+  }
+  return (context.workflow?.globalAcceptanceCriteria || []).map((criterion, index) => ({
+    id: `global-ac-${index + 1}`,
+    text: criterion,
+  }));
+}
+
 function canonicalOutputHash(output) {
   return `sha256:${createHash('sha256').update(stableStringify({
     ...output,
@@ -155,6 +258,11 @@ function contextResponseRef(context) {
 function gitHead() {
   const result = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf-8' });
   return result.status === 0 ? result.stdout.trim() : '';
+}
+
+function gitStatus() {
+  const result = spawnSync('git', ['status', '--porcelain=v1'], { encoding: 'utf-8' });
+  return result.status === 0 ? result.stdout : '';
 }
 
 async function fetchJson(url, token) {

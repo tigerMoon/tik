@@ -30,6 +30,7 @@ import type {
   QuestionerIntent,
   QuestionerOutput,
   QuestionerOutputV2,
+  QuestionResolution,
   SprintContract,
   SubtaskRunState,
   TaskGraph,
@@ -234,6 +235,17 @@ interface RecordQuestionerOutputBody {
   suggestedContractChanges?: QuestionerOutput['suggestedContractChanges'];
 }
 
+interface RecordQuestionResolutionBody {
+  id?: string;
+  questionerOutputId: string;
+  questionId: string;
+  status: QuestionResolution['status'];
+  resolvedByInvocationId?: string;
+  resolvedByHuman?: string;
+  evidenceRefs?: string[];
+  explanation: string;
+}
+
 interface CreateQuestionerRunBody {
   id?: string;
   invocationId?: string;
@@ -245,10 +257,20 @@ interface CreateQuestionerRunBody {
   headSha: string;
   start?: boolean;
   tokenTtlMs?: number;
+  runtimeAudit?: {
+    gitStatusBefore?: string;
+    allowedWritePaths?: string[];
+    forbiddenWritePaths?: string[];
+  };
 }
 
 interface SubmitQuestionerRunOutputBody {
   output: QuestionerOutputV2;
+  runtimeAudit?: {
+    gitStatusAfter?: string;
+    allowedWritePaths?: string[];
+    forbiddenWritePaths?: string[];
+  };
 }
 
 interface RecordWorkflowDecisionBody {
@@ -1832,6 +1854,7 @@ export async function createServer(
         const result = await multiAgentStore.submitQuestionerRunOutput(req.params.workflowId, req.params.runId, {
           token,
           output: req.body.output,
+          runtimeAudit: req.body.runtimeAudit,
         });
         return {
           questionerRun: redactSensitiveObject(result.run),
@@ -1850,6 +1873,21 @@ export async function createServer(
       try {
         const questionerOutput = await multiAgentStore.recordQuestionerOutput(req.params.workflowId, req.body);
         return { questionerOutput };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: RecordQuestionResolutionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/question-resolutions',
+    async (req, reply) => {
+      try {
+        const questionResolution = await multiAgentStore.recordQuestionResolution(req.params.workflowId, {
+          ...req.body,
+          evidenceRefs: req.body.evidenceRefs || [],
+        });
+        return { questionResolution };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -3951,6 +3989,7 @@ function sanitizeMultiAgentWorkflowBundle(bundle: MultiAgentWorkflowBundle): Mul
   const invocations = Array.isArray(bundle.invocations) ? bundle.invocations : [];
   const questionerOutputs = Array.isArray(bundle.questionerOutputs) ? bundle.questionerOutputs : [];
   const questionerRuns = Array.isArray(bundle.questionerRuns) ? bundle.questionerRuns : [];
+  const questionResolutions = Array.isArray(bundle.questionResolutions) ? bundle.questionResolutions : [];
   const events = Array.isArray(bundle.events) ? bundle.events : [];
 
   return {
@@ -3963,6 +4002,7 @@ function sanitizeMultiAgentWorkflowBundle(bundle: MultiAgentWorkflowBundle): Mul
     evaluationRuns: redactSensitiveObject(evaluationRuns) as MultiAgentWorkflowBundle['evaluationRuns'],
     questionerRuns: redactSensitiveObject(questionerRuns) as MultiAgentWorkflowBundle['questionerRuns'],
     questionerOutputs: redactSensitiveObject(questionerOutputs) as MultiAgentWorkflowBundle['questionerOutputs'],
+    questionResolutions: redactSensitiveObject(questionResolutions) as MultiAgentWorkflowBundle['questionResolutions'],
     invocations: invocations.map(sanitizeAgentInvocation),
     events: redactSensitiveObject(events) as MultiAgentWorkflowBundle['events'],
   };

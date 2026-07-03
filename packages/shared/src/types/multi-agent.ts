@@ -278,6 +278,8 @@ export interface AgentInvocationRecord {
     allowedWritePaths?: string[];
     forbiddenWritePaths?: string[];
     violations?: string[];
+    gitStatusBefore?: string;
+    gitStatusAfter?: string;
   };
   attestationToken?: string;
   hookAttested?: boolean;
@@ -372,6 +374,7 @@ export type MultiAgentWorkflowEventType =
   | 'questioner.run.validated'
   | 'questioner.run.rejected'
   | 'questioner.output.recorded'
+  | 'question.resolution.recorded'
   | 'agent_invocation.created'
   | 'agent_invocation.started'
   | 'agent_invocation.completed'
@@ -407,6 +410,7 @@ export interface MultiAgentWorkflowBundle {
   evaluationRuns: EvaluationRun[];
   questionerRuns: QuestionerRun[];
   questionerOutputs: QuestionerOutput[];
+  questionResolutions: QuestionResolution[];
   decisions: WorkflowDecision[];
   evidence: MultiAgentWorkflowEvidence[];
   invocations: AgentInvocationRecord[];
@@ -465,6 +469,14 @@ export interface QuestionerRun {
   tokenHash: string;
   tokenExpiresAt: string;
   runtimePolicy: AgentRuntimePolicy;
+  readonlyAudit?: {
+    enforced: boolean;
+    allowedWritePaths: string[];
+    forbiddenWritePaths: string[];
+    violations: string[];
+    gitStatusBefore?: string;
+    gitStatusAfter?: string;
+  };
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
@@ -1009,9 +1021,13 @@ export interface QuestionerOutputV2 {
 }
 
 export interface QuestionResolution {
+  id: string;
+  workflowId: string;
+  questionerOutputId: string;
   questionId: string;
   status: 'resolved' | 'accepted_risk' | 'wont_fix';
-  resolvedByInvocationId: string;
+  resolvedByInvocationId?: string;
+  resolvedByHuman?: string;
   evidenceRefs: string[];
   explanation: string;
   createdAt: string;
