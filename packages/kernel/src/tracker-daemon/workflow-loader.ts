@@ -282,7 +282,7 @@ function resolveWorkflowPhaseRouting(
     return undefined;
   }
 
-  if (phase === 'needs_claude_review' || phase === 'claude_reviewing' || kind === 'claude_review') {
+  if (phase === 'needs_claude_review' || phase === 'claude_reviewing' || kind === 'claude_review' || kind === 'final_claude_review') {
     return {
       runner: 'claude-code',
       mode: configuredModeForRunner(routing, 'claude-code'),

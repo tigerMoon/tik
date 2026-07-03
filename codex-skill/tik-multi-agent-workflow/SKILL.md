@@ -34,7 +34,7 @@ When the workflow policy enables `requireAcceptedContract`, `requireEvaluationPa
 
 ```text
 draft_contract
-  -> ask_claude_question_contract
+  -> accept_contract (or ask_claude_question_contract when policy requires a pre-build challenge)
   -> execute_subtask
   -> run_codex_evaluator
   -> ask_claude_question_evaluation
@@ -44,7 +44,7 @@ draft_contract
   -> complete_workflow
 ```
 
-Codex Builder may edit source. Codex Evaluator must be a separate readonly session and runs in a throwaway worktree by default. Builder and Evaluator invocations must be attested by Tik server-verified Codex hook facts: Tik issues a one-time `attestationToken`, the hook calls `hook-start` / `hook-stop`, and hand-filled thread ids or CLI runtime-attestation payloads are audit metadata only. Claude Code acts as Questioner through the Claude plugin: it raises ambiguity, missing tests, weak evidence, and blocking questions; it is not the final judge.
+Codex Builder may edit source. Codex Evaluator must be a separate readonly session and runs in a throwaway worktree by default. Builder and Evaluator invocations must be attested by Tik server-verified Codex hook facts: Tik issues a one-time `attestationToken`, the hook calls `hook-start` / `hook-stop`, and hand-filled thread ids or CLI runtime-attestation payloads are audit metadata only. Claude Code acts as Questioner through the Claude plugin: it raises ambiguity, missing tests, weak evidence, and blocking questions; it is not the final judge. Tik server, not the helper script, is authoritative for QuestionerOutputV2 hash/context/head/reference/coverage validation.
 
 ## Core Boundary
 
@@ -158,7 +158,7 @@ When the user invokes this skill to fix review findings and provides no workflow
 3. Implement the fix in the current Codex session.
 4. Run `execute --workflow <workflowId> --subtask <id> --summary "<what changed>"`.
 5. Run `validate --workflow <workflowId> --subtask <id> --command "<targeted tests>"` for the proof commands.
-6. Use `review` / `process-review` when legacy Claude review is required, or the v1 evaluator/questioner commands when `--v1` policy is active.
+6. Use `review` / `process-review` only for legacy compatibility workflows. For `--v1` policy workflows, use the v1 evaluator/questioner commands.
 7. Complete the workflow through the final-review or v1 final-evidence path, then confirm `status`.
 
 If you cannot create or accept a TaskGraph because Tik is unavailable, state that blocker before making local-only edits.
@@ -179,8 +179,8 @@ If you cannot create or accept a TaskGraph because Tik is unavailable, state tha
 - `review` creates a Tik-owned external Claude review task. Use `--start` if the workflow should immediately ask Tik to launch Claude Code.
 - `process-review` reads the Tik review task result and records the Codex decision: fix, validate, human review, or complete subtask. If Claude marked the task stale, it returns the subtask to `validated` and instructs Codex to request a fresh review.
 - `fix` records blocker fix evidence, moves the subtask back to validation, and re-review is allowed only after validation passes on the fixed head.
-- `continue` runs safe automated steps: plan request, validation, review/re-review request, and final review request. It returns instructions when current Codex session must implement, fix, run evaluator, or ask a Questioner. A `continue-instruction` response is a pause point, not completion.
-- Legacy mode requires `final-review` after all subtasks are done, and `process-final-review` can complete the workflow only when final Claude review approves. In v1 policy mode, final completion uses `evaluate --subtask __final__`, then `record-questioner --intent question_final_evidence`, then `complete-workflow`.
+- `continue` runs safe automated steps: plan request, contract draft/accept, validation, legacy review/re-review request, final review request, and v1 Builder/Evaluator/Questioner launch preparation. It returns `continue-instruction` when a Builder, Evaluator, Questioner, fix, or human evidence-producing step must finish before Tik can advance. A `continue-instruction` response is a pause point, not completion.
+- Legacy mode exists only for workflows without v1 policy flags and is deprecated for v1.1 removal. Legacy `review`, `process-review`, `fix`, `final-review`, and `process-final-review` commands are disabled for v1 policy workflows. In v1 policy mode, final completion uses `evaluate --subtask __final__`, then `record-questioner --intent question_final_evidence`, then `complete-workflow`.
 - `status` includes the workflow timeline for Dashboard/CLI cross-checking.
 
 Tik guard rejection means the requested action is unsafe or illegal. The skill must inspect the guard and choose the next Codex policy action.

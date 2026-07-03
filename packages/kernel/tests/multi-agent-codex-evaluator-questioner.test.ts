@@ -716,6 +716,102 @@ describe('codex evaluator and Claude questioner workflow', () => {
     ]);
   });
 
+  it('rejects direct QuestionerOutputV2 POSTs with forged attestation hashes', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-questioner-run-attestation', root);
+    await putSingleSubtaskGraph(server, 'wf-questioner-run-attestation');
+    await createAcceptedContract(server, 'wf-questioner-run-attestation');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-attestation/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-pass',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-questioner-run-attestation', 'eval-pass');
+
+    const createRun = async (id: string) => {
+      const run = await server.inject({
+        method: 'POST',
+        url: '/api/v1/multi-agent/workflows/wf-questioner-run-attestation/questioner-runs',
+        payload: {
+          id,
+          invocationId: `inv-${id}`,
+          subtaskId: 'st-api',
+          intent: 'question_evaluation',
+          contractId: 'contract-st-api-v1',
+          evaluationRunId: 'eval-pass',
+          headSha: 'head-1',
+          start: true,
+          runtimeAudit: { gitStatusBefore: '' },
+        },
+      });
+      expect(run.statusCode).toBe(200);
+      return run;
+    };
+    const buildOutput = (run: Awaited<ReturnType<typeof createRun>>, id: string) => buildQuestionerOutputV2({
+      id,
+      runResponse: run.json(),
+      workflowId: 'wf-questioner-run-attestation',
+      subtaskId: 'st-api',
+      intent: 'question_evaluation',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-pass',
+      contractId: 'contract-st-api-v1',
+      verdict: 'evidence_sufficient',
+      coverageMatrix: [
+        {
+          criterionId: 'ac-1',
+          criterionText: 'API responds with expected payload.',
+          required: true,
+          status: 'covered',
+          evidenceRefs: ['eval-pass:criteria:ac-1', 'cmd-test'],
+          comment: 'Evaluator criterion and command evidence cover the contract must criterion.',
+        },
+      ],
+    });
+
+    const badOutputHashRun = await createRun('qr-bad-output-hash');
+    const badOutputHash = buildOutput(badOutputHashRun, 'q-bad-output-hash');
+    badOutputHash.attestation.outputHash = 'sha256:forged-output-hash';
+    const rejectedOutputHash = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-attestation/questioner-runs/qr-bad-output-hash/output',
+      headers: {
+        authorization: `Bearer ${badOutputHashRun.json().token}`,
+      },
+      payload: { output: badOutputHash, runtimeAudit: { gitStatusAfter: '' } },
+    });
+    expect(rejectedOutputHash.statusCode).toBe(409);
+    expect(rejectedOutputHash.json().error).toMatchObject({
+      code: 'missing_evidence',
+      message: expect.stringContaining('canonical JSON payload'),
+    });
+
+    const badContextHashRun = await createRun('qr-bad-context-hash');
+    const badContextHash = buildOutput(badContextHashRun, 'q-bad-context-hash');
+    badContextHash.attestation.contextHash = 'sha256:forged-context-hash';
+    badContextHash.attestation.outputHash = canonicalQuestionerOutputHash(badContextHash);
+    const rejectedContextHash = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-attestation/questioner-runs/qr-bad-context-hash/output',
+      headers: {
+        authorization: `Bearer ${badContextHashRun.json().token}`,
+      },
+      payload: { output: badContextHash, runtimeAudit: { gitStatusAfter: '' } },
+    });
+    expect(rejectedContextHash.statusCode).toBe(409);
+    expect(rejectedContextHash.json().error).toMatchObject({
+      code: 'missing_evidence',
+      message: expect.stringContaining('context attestation'),
+    });
+  });
+
   it('requires a validated contract QuestionerRun before accepting a contract when policy demands it', async () => {
     const root = await makeTempWorkspace();
     const server = await createTestServer(root);

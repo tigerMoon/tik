@@ -910,6 +910,108 @@ describe('workbench API routes', () => {
     });
   });
 
+  it('validates review-result schema against subtask and final review task semantics', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
+    tempDirs.push(root);
+
+    const workbench = new WorkbenchService({
+      rootPath: root,
+      eventBus: new EventBus(),
+      store: new WorkbenchStore(root),
+    });
+    const mockKernel = {
+      projectPath: root,
+      environmentPacks: { getActivePack: async () => null, listPacks: async () => [] },
+      taskManager: { create: () => ({ id: 'unused' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+      workbench,
+    };
+    const server = await createServer(
+      mockKernel as any,
+      { port: 0, host: '127.0.0.1' },
+      { workspaceRoot: root },
+    );
+    servers.push(server);
+
+    const subtaskReview = await workbench.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      idempotencyKey: 'review-result-subtask-schema',
+      changeRequest: {
+        scm: 'gitlab',
+        repo: 'group/project',
+        id: '456',
+        type: 'merge_request',
+        baseRef: 'main',
+        headRef: 'agent/TASK-123-codex',
+        headSha: 'abc123',
+      },
+    });
+    const finalReview = await workbench.createReviewRound({
+      rootTaskId: 'wf-123',
+      round: 1,
+      maxRounds: 1,
+      idempotencyKey: 'multi_agent_final_claude_review:group/project:wf-123:abc123',
+      labels: ['external-claude-review', 'final-claude-review'],
+      changeRequest: {
+        scm: 'internal',
+        repo: 'group/project',
+        id: 'wf-123:abc123',
+        type: 'internal_review',
+        baseRef: 'main',
+        headRef: 'agent/TASK-123-codex',
+        headSha: 'abc123',
+      },
+    });
+
+    const subtaskWithFinalSchema = await server.inject({
+      method: 'POST',
+      url: `/api/v1/agent-loop/tasks/${subtaskReview.id}/review-result`,
+      payload: {
+        verdict: 'approve',
+        headShaReviewed: 'abc123',
+        blockingIssues: [],
+        subtaskCoverage: [{
+          subtaskId: 'st-api',
+          status: 'covered',
+        }],
+        markdown: 'Wrong schema.',
+      },
+    });
+    expect(subtaskWithFinalSchema.statusCode).toBe(409);
+    expect(subtaskWithFinalSchema.json()).toEqual({
+      error: {
+        code: 'invalid_review_result',
+        message: expect.stringContaining('must not include'),
+      },
+    });
+
+    const finalWithoutCoverage = await server.inject({
+      method: 'POST',
+      url: `/api/v1/agent-loop/tasks/${finalReview.id}/review-result`,
+      payload: {
+        verdict: 'approve',
+        workflowId: 'wf-123',
+        headShaReviewed: 'abc123',
+        blockingIssues: [],
+        markdown: 'Missing coverage.',
+      },
+    });
+    expect(finalWithoutCoverage.statusCode).toBe(409);
+    expect(finalWithoutCoverage.json()).toEqual({
+      error: {
+        code: 'invalid_review_result',
+        message: expect.stringContaining('subtaskCoverage'),
+      },
+    });
+  });
+
   it('creates tasks and serves timeline and decision data', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-workbench-api-'));
     tempDirs.push(root);

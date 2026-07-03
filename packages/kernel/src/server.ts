@@ -2331,7 +2331,7 @@ export async function createServer(
         if (!task) {
           return sendV1Error(reply, 404, 'task_not_found', 'Workbench task not found');
         }
-        if (task.agentLoop?.kind !== 'claude_review') {
+        if (task.agentLoop?.kind !== 'claude_review' && task.agentLoop?.kind !== 'final_claude_review') {
           return sendV1Error(reply, 400, 'not_claude_review_task', 'Workbench task is not a Claude review task');
         }
         const tracked = workbenchTaskToTrackedTaskForWorkflow(task, kernel.projectPath, {

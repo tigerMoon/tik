@@ -161,10 +161,20 @@ function planSubtaskV1Action(ctx: WorkflowDecisionContext, subtaskId: string, ti
         inputs: { contractId: contract.id, questionerOutputId: questionedContract?.id },
       });
     }
-    return planned('ask_claude_question_contract', {
+    if (ctx.policy?.requireQuestionerBeforeBuild) {
+      return planned('ask_claude_question_contract', {
+        subtaskId,
+        reason: `SprintContract ${contract.id} is ${contract.status}; Claude Questioner should challenge it before acceptance.`,
+        reasonCode: 'contract_not_accepted',
+        evidenceRefs: subtaskState.evidenceRefs || [],
+        refs: [{ kind: 'contract', id: contract.id }],
+        inputs: { contractId: contract.id },
+      });
+    }
+    return planned('accept_contract', {
       subtaskId,
-      reason: `SprintContract ${contract.id} is ${contract.status}; Claude Questioner should challenge it before acceptance.`,
-      reasonCode: 'contract_not_accepted',
+      reason: `SprintContract ${contract.id} is drafted and the workflow does not require a pre-build Questioner challenge.`,
+      reasonCode: 'contract_questioner_not_required',
       evidenceRefs: subtaskState.evidenceRefs || [],
       refs: [{ kind: 'contract', id: contract.id }],
       inputs: { contractId: contract.id },

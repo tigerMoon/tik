@@ -41,12 +41,12 @@ try {
       const route = req.url || '/';
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows') {
         const body = await readRequestJson(req);
-        workflow = {
-          id: 'wf-cli',
+        const createdWorkflow = {
+          id: body.id || 'wf-cli',
           driver: 'codex-workflow',
           status: 'active',
           goal: body.goal,
-          rootTaskId: body.rootTaskId || 'wf-cli',
+          rootTaskId: body.rootTaskId || body.id || 'wf-cli',
           repo: body.repo,
           baseRef: body.baseRef,
           headRef: body.headRef,
@@ -55,8 +55,11 @@ try {
           policy: body.policy,
           metadata: body.metadata,
         };
-        events.push({ type: 'workflow.created', payload: { workflowId: workflow.id } });
-        sendJson(res, { workflow });
+        if (createdWorkflow.id === 'wf-cli') {
+          workflow = createdWorkflow;
+        }
+        events.push({ type: 'workflow.created', payload: { workflowId: createdWorkflow.id } });
+        sendJson(res, { workflow: createdWorkflow });
         return;
       }
       if (req.method === 'POST' && route === '/api/v1/tasks') {
@@ -828,6 +831,8 @@ try {
   assert.equal(init.workflowId, 'wf-cli');
   assert.equal(init.rootTaskId, 'task-root');
   assert.equal(workflow.metadata.parentCodexThreadId, 'workflow-thread-cli');
+  assert.equal(init.mode, 'legacy');
+  assert.match(init.deprecation, /Legacy compatibility mode is deprecated/);
 
   const putGraph = await run([
     'accept-plan',
@@ -1001,6 +1006,28 @@ try {
   });
   assert.equal(v1DraftContractNext.action, 'draft_contract');
   assert.equal(v1DraftContractNext.subtaskId, 'st-api');
+
+  const v1AcceptContractNext = decideNextAction({
+    workflow: { ...workflow, policy: v1Policy },
+    taskGraph: graph,
+    subtasks: {
+      'st-api': {
+        subtaskId: 'st-api',
+        status: 'contract_drafting',
+        evidenceRefs: [],
+      },
+    },
+    contracts: [{
+      id: 'contract-st-api-v1',
+      subtaskId: 'st-api',
+      status: 'draft',
+      version: 1,
+    }],
+    evaluationRuns: [],
+    questionerOutputs: [],
+  });
+  assert.equal(v1AcceptContractNext.action, 'accept_contract');
+  assert.equal(v1AcceptContractNext.subtaskId, 'st-api');
 
   const v1EvaluateNext = decideNextAction({
     workflow: { ...workflow, policy: v1Policy },
@@ -1265,6 +1292,28 @@ try {
     currentHeadSha: 'head-v1',
     policy: v1Policy,
   };
+
+  const v1Init = await run([
+    'init',
+    '--api-base-url', apiBaseUrl,
+    '--path', repo,
+    '--goal', 'Implement v1 workflow',
+    '--workflow', 'wf-cli-v1-init',
+    '--v1',
+  ]);
+  assert.equal(v1Init.mode, 'v1');
+  assert.match(v1Init.deprecation, /Legacy review\/process\/fix\/final-review commands are disabled/);
+
+  await assert.rejects(
+    run([
+      'review',
+      '--api-base-url', apiBaseUrl,
+      '--workflow', 'wf-cli',
+      '--subtask', 'st-api',
+      '--path', repo,
+    ]),
+    /disabled for v1 workflows/,
+  );
 
   const draftedContract = await run([
     'draft-contract',
@@ -2436,7 +2485,9 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
     {
       suffix: 'execute',
       expectedAction: 'execute_subtask',
-      expectedInstruction: /Implement subtask st-api/,
+      expectedOutputAction: 'continue-instruction',
+      expectedPendingAction: 'builder-pending',
+      expectedInstruction: /After the Builder produces code changes/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, loopOnlyPolicy),
         taskGraph: buildGraph(workflowId),
@@ -2456,7 +2507,10 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
     {
       suffix: 'draft-contract',
       expectedAction: 'draft_contract',
-      expectedInstruction: /Draft a SprintContract/,
+      expectedOutputAction: 'continue-instruction',
+      expectedPendingAction: 'builder-pending',
+      expectedInstruction: /After the Builder produces code changes/,
+      expectedDecisionsPosted: 2,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
         taskGraph: buildGraph(workflowId),
@@ -2476,8 +2530,11 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
     },
     {
       suffix: 'question-contract',
-      expectedAction: 'ask_claude_question_contract',
-      expectedInstruction: /Ask Claude Questioner/,
+      expectedAction: 'accept_contract',
+      expectedOutputAction: 'continue-instruction',
+      expectedPendingAction: 'builder-pending',
+      expectedInstruction: /After the Builder produces code changes/,
+      expectedDecisionsPosted: 1,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
         taskGraph: buildGraph(workflowId),
@@ -2501,7 +2558,9 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
     {
       suffix: 'run-evaluator',
       expectedAction: 'run_codex_evaluator',
-      expectedInstruction: /isolated read-only Codex Evaluator/,
+      expectedOutputAction: 'continue-instruction',
+      expectedPendingAction: 'evaluator-pending',
+      expectedInstruction: /After the Evaluator finishes/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
         taskGraph: buildGraph(workflowId),
@@ -2527,6 +2586,7 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
     {
       suffix: 'fix-evaluation-findings',
       expectedAction: 'fix_evaluation_findings',
+      expectedOutputAction: 'continue-instruction',
       expectedInstruction: /Fix Codex Evaluator or Claude Questioner findings/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
@@ -2565,7 +2625,9 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
     {
       suffix: 'question-evaluation',
       expectedAction: 'ask_claude_question_evaluation',
-      expectedInstruction: /challenge the evaluation evidence/,
+      expectedOutputAction: 'continue-instruction',
+      expectedPendingAction: 'questioner-run-started',
+      expectedInstruction: /After Claude submits QuestionerOutputV2/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
         taskGraph: buildGraph(workflowId),
@@ -2592,7 +2654,9 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
     {
       suffix: 'run-final-evaluation',
       expectedAction: 'run_final_evaluation',
-      expectedInstruction: /isolated read-only Codex Evaluator/,
+      expectedOutputAction: 'continue-instruction',
+      expectedPendingAction: 'evaluator-pending',
+      expectedInstruction: /After the final Evaluator finishes/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
         taskGraph: buildGraph(workflowId),
@@ -2614,7 +2678,9 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
     {
       suffix: 'question-final-evidence',
       expectedAction: 'ask_claude_question_final_evidence',
-      expectedInstruction: /challenge final evidence/,
+      expectedOutputAction: 'continue-instruction',
+      expectedPendingAction: 'questioner-run-started',
+      expectedInstruction: /After Claude submits QuestionerOutputV2/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
         taskGraph: buildGraph(workflowId),
@@ -2654,6 +2720,7 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
       ...testCase.build(workflowId),
     };
     let decisionsPosted = 0;
+    const preflightActions = [];
     let contextSnapshotsSaved = 0;
     const server = http.createServer(async (req, res) => {
       try {
@@ -2683,6 +2750,105 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           });
           return;
         }
+        if (req.method === 'POST' && route === `/api/v1/multi-agent/workflows/${workflowId}/subtasks/st-api/contracts`) {
+          const body = await readRequestJson(req);
+          const contract = {
+            id: body.id || 'contract-st-api-v1',
+            workflowId,
+            subtaskId: 'st-api',
+            ...body,
+          };
+          localState.contracts = (localState.contracts || []).filter((item) => item.id !== contract.id).concat(contract);
+          sendJson(res, { contract });
+          return;
+        }
+        if (req.method === 'POST' && route === `/api/v1/multi-agent/workflows/${workflowId}/subtasks/st-api/contracts/contract-st-api-v1/accept`) {
+          const body = await readRequestJson(req);
+          const contract = {
+            ...(localState.contracts || []).find((item) => item.id === 'contract-st-api-v1'),
+            id: 'contract-st-api-v1',
+            workflowId,
+            subtaskId: 'st-api',
+            status: 'accepted',
+            acceptedBy: body.acceptedBy,
+            acceptedAt: new Date().toISOString(),
+            headShaAtAcceptance: body.headShaAtAcceptance,
+          };
+          localState.contracts = (localState.contracts || []).filter((item) => item.id !== contract.id).concat(contract);
+          sendJson(res, { contract });
+          return;
+        }
+        if (req.method === 'PATCH' && route === `/api/v1/multi-agent/workflows/${workflowId}/subtasks/st-api`) {
+          const body = await readRequestJson(req);
+          localState.subtasks['st-api'] = {
+            ...localState.subtasks['st-api'],
+            ...body,
+          };
+          sendJson(res, { subtask: localState.subtasks['st-api'] });
+          return;
+        }
+        if (req.method === 'POST' && route === `/api/v1/multi-agent/workflows/${workflowId}/agent-invocations`) {
+          const body = await readRequestJson(req);
+          const invocation = {
+            id: body.id || `inv-${localState.invocations.length + 1}`,
+            workflowId,
+            status: 'created',
+            attestationToken: `att-${body.id || localState.invocations.length + 1}`,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            ...body,
+          };
+          localState.invocations.push(invocation);
+          sendJson(res, { invocation });
+          return;
+        }
+        if (req.method === 'POST' && route === `/api/v1/multi-agent/workflows/${workflowId}/questioner-runs`) {
+          const body = await readRequestJson(req);
+          const runId = body.id || `qr-${localState.questionerRuns?.length || 0}`;
+          const invocationId = body.invocationId || `inv-${runId}`;
+          const run = {
+            id: runId,
+            workflowId,
+            subtaskId: body.subtaskId,
+            intent: body.intent,
+            status: body.start === false ? 'created' : 'started',
+            invocationId,
+            contractId: body.contractId,
+            evaluationRunId: body.evaluationRunId,
+            finalEvaluationRunId: body.finalEvaluationRunId,
+            headSha: body.headSha,
+            contextArtifactRef: `.tik/multi-agent/workflows/${workflowId}/questioner-runs/${runId}/context.json`,
+            contextHash: `sha256:${runId}`,
+            expectedOutputArtifactRef: `.tik/multi-agent/workflows/${workflowId}/questioner-runs/${runId}/output.json`,
+            tokenExpiresAt: new Date(Date.now() + 3600000).toISOString(),
+          };
+          const invocation = {
+            id: invocationId,
+            workflowId,
+            subtaskId: body.subtaskId,
+            role: 'questioner',
+            runner: 'claude-code',
+            status: body.start === false ? 'created' : 'started',
+            input: body,
+            headSha: body.headSha,
+          };
+          localState.questionerRuns = [...(localState.questionerRuns || []), run];
+          localState.invocations.push(invocation);
+          sendJson(res, {
+            questionerRunId: run.id,
+            invocationId,
+            contextArtifactRef: run.contextArtifactRef,
+            contextHash: run.contextHash,
+            expectedOutputArtifactRef: run.expectedOutputArtifactRef,
+            submitUrl: `/v1/multi-agent/workflows/${workflowId}/questioner-runs/${run.id}/output`,
+            contextUrl: `/v1/multi-agent/workflows/${workflowId}/questioner-runs/${run.id}/context`,
+            token: `token-${run.id}`,
+            tokenExpiresAt: run.tokenExpiresAt,
+            questionerRun: run,
+            invocation,
+          });
+          return;
+        }
         if (
           req.method === 'POST'
           && (route === `/api/v1/multi-agent/workflows/${workflowId}/decisions`
@@ -2691,6 +2857,8 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           const body = await readRequestJson(req);
           if (route.endsWith('/decisions')) {
             decisionsPosted += 1;
+          } else {
+            preflightActions.push(body.decision?.action);
           }
           sendJson(res, { decision: body.decision, guard: { accepted: true, code: 'ok' }, workflow: localState.workflow });
           return;
@@ -2709,14 +2877,19 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
       '--workflow', workflowId,
       '--path', repoPath,
     ]);
-    assert.equal(continued.action, 'continue-instruction', testCase.suffix);
-    assert.equal(continued.decision.action, testCase.expectedAction, testCase.suffix);
+    assert.equal(continued.action, testCase.expectedOutputAction || 'continue-instruction', testCase.suffix);
+    assert.ok(preflightActions.includes(testCase.expectedAction), `${testCase.suffix}: expected preflight for ${testCase.expectedAction}, got ${preflightActions.join(',')}`);
+    if (testCase.expectedPendingAction) {
+      assert.equal(continued.pendingAction, testCase.expectedPendingAction, testCase.suffix);
+    } else {
+      assert.equal(continued.decision.action, testCase.expectedAction, testCase.suffix);
+    }
     assert.match(continued.instruction, testCase.expectedInstruction, testCase.suffix);
     assert.equal(continued.guard.accepted, true, testCase.suffix);
     if (testCase.suffix === 'fix-evaluation-findings') {
       assert.equal(continued.decision.inputs.evaluationRunId, 'eval-fail');
     }
-    assert.equal(decisionsPosted, 0, testCase.suffix);
+    assert.equal(decisionsPosted, testCase.expectedDecisionsPosted || 0, testCase.suffix);
     await new Promise((resolve) => server.close(resolve));
   }
 }

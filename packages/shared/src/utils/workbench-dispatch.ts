@@ -62,6 +62,7 @@ export function isWorkbenchTaskCodexDispatchable(task: WorkbenchDispatchEnvironm
 
   const phase = task.agentLoop?.phase;
   return task.agentLoop?.kind !== 'claude_review'
+    && task.agentLoop?.kind !== 'final_claude_review'
     && task.agentLoop?.kind !== 'human_review'
     && phase !== 'needs_claude_review'
     && phase !== 'claude_reviewing'

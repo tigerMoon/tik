@@ -736,4 +736,73 @@ describe('WorkbenchService agent loop work items', () => {
       code: 'head_sha_mismatch',
     } satisfies Partial<WorkbenchTaskError>);
   });
+
+  it('rejects final-review coverage fields on subtask review results', async () => {
+    const { service } = await makeService();
+    const reviewTask = await service.createReviewRound({
+      rootTaskId: 'TASK-123',
+      round: 1,
+      maxRounds: 3,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'review-subtask-with-final-coverage',
+    });
+
+    await expect(service.completeAgentLoopReview(reviewTask.id, {
+      verdict: 'approve',
+      headShaReviewed: 'abc123',
+      blockingIssues: [],
+      subtaskCoverage: [{
+        subtaskId: 'st-api',
+        status: 'covered',
+      }],
+      markdown: 'Subtask review accidentally used final schema.',
+    })).rejects.toMatchObject({
+      code: 'invalid_review_result',
+      message: expect.stringContaining('must not include'),
+    } satisfies Partial<WorkbenchTaskError>);
+  });
+
+  it('requires subtaskCoverage on final Claude review results', async () => {
+    const { service } = await makeService();
+    const finalReviewTask = await service.createReviewRound({
+      rootTaskId: 'wf-123',
+      round: 1,
+      maxRounds: 1,
+      changeRequest: changeRequestRef,
+      idempotencyKey: 'multi_agent_final_claude_review:group/project:wf-123:abc123',
+      labels: ['external-claude-review', 'final-claude-review'],
+    });
+
+    await expect(service.completeAgentLoopReview(finalReviewTask.id, {
+      verdict: 'approve',
+      workflowId: 'wf-123',
+      headShaReviewed: 'abc123',
+      blockingIssues: [],
+      markdown: 'Final review without coverage.',
+    })).rejects.toMatchObject({
+      code: 'invalid_review_result',
+      message: expect.stringContaining('subtaskCoverage'),
+    } satisfies Partial<WorkbenchTaskError>);
+
+    const completed = await service.completeAgentLoopReview(finalReviewTask.id, {
+      verdict: 'approve',
+      workflowId: 'wf-123',
+      headShaReviewed: 'abc123',
+      blockingIssues: [],
+      subtaskCoverage: [{
+        subtaskId: 'st-api',
+        status: 'covered',
+        notes: 'Evidence satisfies acceptance criteria.',
+      }],
+      markdown: 'Final review approved.',
+    });
+
+    expect(completed.task.agentLoop?.reviewResult).toMatchObject({
+      workflowId: 'wf-123',
+      subtaskCoverage: [{
+        subtaskId: 'st-api',
+        status: 'covered',
+      }],
+    });
+  });
 });

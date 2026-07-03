@@ -33,6 +33,7 @@ export type AgentLoopWorkItemKind =
   | 'codex_implement'
   | 'codex_fix'
   | 'claude_review'
+  | 'final_claude_review'
   | 'human_review';
 
 export type ChangeRequestScm = 'github' | 'gitlab' | 'internal';
@@ -72,9 +73,15 @@ export interface ReviewResult {
   verdict: 'request_changes' | 'comment' | 'approve';
   headShaReviewed: string;
   currentHeadSha?: string;
+  workflowId?: string;
   blockingIssues: BlockingIssue[];
   nonBlockingSuggestions?: NonBlockingSuggestion[];
   testsNeeded?: string[];
+  subtaskCoverage?: Array<{
+    subtaskId: string;
+    status: 'covered' | 'partial' | 'missing';
+    notes?: string;
+  }>;
   markdown: string;
   reviewerWorkerId?: string;
 }

@@ -117,18 +117,23 @@ async function main() {
         await completeWorkflow(options);
         break;
       case 'review':
+        await assertLegacyReviewCommandAllowed(options, 'review');
         await requestReview(options);
         break;
       case 'process-review':
+        await assertLegacyReviewCommandAllowed(options, 'process-review');
         await processReview(options);
         break;
       case 'final-review':
+        await assertLegacyReviewCommandAllowed(options, 'final-review');
         await requestFinalReview(options);
         break;
       case 'process-final-review':
+        await assertLegacyReviewCommandAllowed(options, 'process-final-review');
         await processFinalReview(options);
         break;
       case 'fix':
+        await assertLegacyReviewCommandAllowed(options, 'fix');
         await fix(options);
         break;
       case 'continue':
@@ -191,6 +196,10 @@ async function initWorkflow(options) {
     driver: response.workflow?.driver,
     headSha: response.workflow?.currentHeadSha,
     policy: response.workflow?.policy,
+    mode: usesCodexEvaluatorQuestionerGate(response.workflow) ? 'v1' : 'legacy',
+    deprecation: usesCodexEvaluatorQuestionerGate(response.workflow)
+      ? 'Legacy review/process/fix/final-review commands are disabled for v1 workflows; legacy compatibility is scheduled for v1.1 removal.'
+      : 'Legacy compatibility mode is deprecated; create new workflows with --v1. Legacy review/process/fix/final-review compatibility is scheduled for v1.1 removal.',
     nextCommand: `node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs next --workflow ${response.workflow?.id}`,
   });
 }
@@ -1787,6 +1796,35 @@ async function executeContinueDecision(options, state, decision) {
     const output = await capturePrintedJson(() => requestPlan(options));
     return { directOutput: output, action: output.action, guard: output.guard };
   }
+  if (decision.action === 'draft_contract') {
+    const preflight = await safePreflightDecision(options, workflowId, decision, state);
+    if (!preflight.guard?.accepted) {
+      return continueBlockedOutput(workflowId, decision, state, preflight.guard);
+    }
+    const recorded = await safeRecordDecision(options, workflowId, decision, state);
+    if (recorded.guard?.accepted === false) {
+      return continueBlockedOutput(workflowId, decision, state, recorded.guard);
+    }
+    const output = await capturePrintedJson(() => draftContract({ ...options, subtask: decision.subtaskId }));
+    return { action: output.action, guard: recorded.guard };
+  }
+  if (decision.action === 'accept_contract') {
+    const preflight = await safePreflightDecision(options, workflowId, decision, state);
+    if (!preflight.guard?.accepted) {
+      return continueBlockedOutput(workflowId, decision, state, preflight.guard);
+    }
+    const recorded = await safeRecordDecision(options, workflowId, decision, state);
+    if (recorded.guard?.accepted === false) {
+      return continueBlockedOutput(workflowId, decision, state, recorded.guard);
+    }
+    const contractId = stringOption(options.contract) || stringOption(decision.inputs?.contractId);
+    const output = await capturePrintedJson(() => acceptSprintContract({
+      ...options,
+      subtask: decision.subtaskId,
+      contract: contractId,
+    }));
+    return { action: output.action, guard: recorded.guard };
+  }
   if (decision.action === 'validate_subtask') {
     const output = await capturePrintedJson(() => validate({ ...options, subtask: decision.subtaskId }));
     return { directOutput: output, action: output.action, guard: output.guard };
@@ -1798,6 +1836,100 @@ async function executeContinueDecision(options, state, decision) {
   if (decision.action === 'request_final_review') {
     const output = await capturePrintedJson(() => requestFinalReview(options));
     return { directOutput: output, action: output.action, guard: output.guard };
+  }
+  if (decision.action === 'execute_subtask') {
+    const preflight = await safePreflightDecision(options, workflowId, decision, state);
+    if (!preflight.guard?.accepted) {
+      return continueBlockedOutput(workflowId, decision, state, preflight.guard);
+    }
+    const output = await capturePrintedJson(() => startBuilder({ ...options, subtask: decision.subtaskId }));
+    return {
+      directOutput: {
+        ...output,
+        action: 'continue-instruction',
+        decision,
+        guard: { accepted: true, code: 'ok' },
+        pendingAction: output.action,
+        instruction: [
+          output.instruction,
+          'After the Builder produces code changes, record evidence with execute.',
+        ].filter(Boolean).join(' '),
+      },
+      action: output.action,
+      guard: preflight.guard,
+    };
+  }
+  if (decision.action === 'run_codex_evaluator' || decision.action === 're_evaluate') {
+    const preflight = await safePreflightDecision(options, workflowId, decision, state);
+    if (!preflight.guard?.accepted) {
+      return continueBlockedOutput(workflowId, decision, state, preflight.guard);
+    }
+    const output = await capturePrintedJson(() => startEvaluator({ ...options, subtask: decision.subtaskId }));
+    return {
+      directOutput: {
+        ...output,
+        action: 'continue-instruction',
+        decision,
+        guard: { accepted: true, code: 'ok' },
+        pendingAction: output.action,
+        instruction: [
+          output.instruction,
+          'After the Evaluator finishes, record its result with evaluate.',
+        ].filter(Boolean).join(' '),
+      },
+      action: output.action,
+      guard: preflight.guard,
+    };
+  }
+  if (decision.action === 'run_final_evaluation') {
+    const preflight = await safePreflightDecision(options, workflowId, decision, state);
+    if (!preflight.guard?.accepted) {
+      return continueBlockedOutput(workflowId, decision, state, preflight.guard);
+    }
+    const output = await capturePrintedJson(() => startEvaluator({ ...options, subtask: '__final__' }));
+    return {
+      directOutput: {
+        ...output,
+        action: 'continue-instruction',
+        decision,
+        guard: { accepted: true, code: 'ok' },
+        pendingAction: output.action,
+        instruction: [
+          output.instruction,
+          'After the final Evaluator finishes, record its result with evaluate --subtask __final__.',
+        ].filter(Boolean).join(' '),
+      },
+      action: output.action,
+      guard: preflight.guard,
+    };
+  }
+  if (isQuestionerDecision(decision.action)) {
+    const preflight = await safePreflightDecision(options, workflowId, decision, state);
+    if (!preflight.guard?.accepted) {
+      return continueBlockedOutput(workflowId, decision, state, preflight.guard);
+    }
+    const output = await capturePrintedJson(() => startQuestioner({
+      ...options,
+      subtask: decision.action === 'ask_claude_question_final_evidence' ? undefined : decision.subtaskId,
+      intent: intentForQuestionerDecision(decision.action),
+      contract: stringOption(options.contract) || stringOption(decision.inputs?.contractId),
+      evaluation: stringOption(options.evaluation) || stringOption(decision.inputs?.evaluationRunId),
+    }));
+    return {
+      directOutput: {
+        ...output,
+        action: 'continue-instruction',
+        decision,
+        guard: { accepted: true, code: 'ok' },
+        pendingAction: output.action,
+        instruction: [
+          output.instruction,
+          'After Claude submits QuestionerOutputV2, continue the workflow.',
+        ].filter(Boolean).join(' '),
+      },
+      action: output.action,
+      guard: preflight.guard,
+    };
   }
   if (requiresCurrentCodexSession(decision.action)) {
     const preflight = await safePreflightDecision(options, workflowId, decision, state);
@@ -1867,6 +1999,20 @@ async function capturePrintedJson(fn) {
     process.stdout.write = originalWrite;
   }
   return JSON.parse(output);
+}
+
+function continueBlockedOutput(workflowId, decision, state, guard) {
+  return {
+    action: 'continue-blocked',
+    guard,
+    directOutput: {
+      action: 'continue-blocked',
+      workflowId,
+      decision,
+      guard,
+      instruction: instructionForDecision(decision, state),
+    },
+  };
 }
 
 async function status(options) {
@@ -1997,18 +2143,56 @@ function reviewEvidenceIdForTask(taskId) {
 
 function requiresCurrentCodexSession(action) {
   return [
-    'execute_subtask',
     'fix_claude_blockers',
     'fix_evaluation_findings',
-    'draft_contract',
+    'request_human_review',
+  ].includes(action);
+}
+
+function isQuestionerDecision(action) {
+  return [
     'ask_claude_question_contract',
     'ask_claude_question_evaluation',
     'ask_claude_question_final_evidence',
-    'run_codex_evaluator',
-    'run_final_evaluation',
-    're_evaluate',
-    'request_human_review',
   ].includes(action);
+}
+
+function intentForQuestionerDecision(action) {
+  switch (action) {
+    case 'ask_claude_question_contract':
+      return 'question_contract';
+    case 'ask_claude_question_final_evidence':
+      return 'question_final_evidence';
+    case 'ask_claude_question_evaluation':
+      return 'question_evaluation';
+    default:
+      throw new Error(`Unsupported Questioner decision: ${action}`);
+  }
+}
+
+function usesCodexEvaluatorQuestionerGate(workflow) {
+  const policy = workflow?.policy;
+  return Boolean(
+    policy?.requireAcceptedContract
+      || policy?.requireEvaluationPassForComplete
+      || policy?.requireQuestionerAfterEvaluation,
+  );
+}
+
+async function assertLegacyReviewCommandAllowed(options, command) {
+  const workflowId = stringOption(options.workflow);
+  if (!workflowId) {
+    return;
+  }
+  const state = await readWorkflow(options, workflowId);
+  if (!usesCodexEvaluatorQuestionerGate(state.workflow)) {
+    return;
+  }
+  throw new Error(
+    `${command} is a legacy Claude-review command and is disabled for v1 workflows. `
+      + 'Use the v1 Codex Evaluator / Claude Questioner loop: start-evaluator/evaluate, start-questioner, complete-subtask, and complete-workflow. '
+      + 'Legacy compatibility is scheduled for v1.1 removal.',
+  );
 }
 
 async function refreshMainSnapshot(options, state, input = {}) {

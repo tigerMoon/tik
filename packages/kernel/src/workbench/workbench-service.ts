@@ -656,11 +656,13 @@ export class WorkbenchService {
       throw new WorkbenchTaskError('task_not_found', `Workbench task not found: ${taskId}`);
     }
     const metadata = bundle.task.agentLoop;
-    if (!metadata || metadata.kind !== 'claude_review') {
+    if (!metadata || (metadata.kind !== 'claude_review' && metadata.kind !== 'final_claude_review')) {
       throw new WorkbenchTaskError('not_review_task', `Workbench task is not a Claude review task: ${taskId}`);
     }
 
+    const isFinalReview = this.isFinalClaudeReviewTask(bundle.task);
     const normalizedReview = this.normalizeReviewResult(reviewResult);
+    this.assertReviewResultMatchesTaskKind(normalizedReview, isFinalReview);
     if (metadata.headSha && normalizedReview.headShaReviewed !== metadata.headSha) {
       throw new WorkbenchTaskError(
         'head_sha_mismatch',
@@ -1875,7 +1877,7 @@ export class WorkbenchService {
     if (!task) {
       return null;
     }
-    if (task.agentLoop?.kind && task.agentLoop.kind !== 'claude_review') {
+    if (task.agentLoop?.kind && task.agentLoop.kind !== 'claude_review' && task.agentLoop.kind !== 'final_claude_review') {
       return this.projectTaskState(task, bundle.timeline);
     }
     if (task.agentLoop?.reviewResult) {
@@ -2161,16 +2163,60 @@ export class WorkbenchService {
     if (!reviewResult.headShaReviewed?.trim()) {
       throw new WorkbenchTaskError('invalid_review_result', 'Review result must include headShaReviewed.');
     }
-    return {
+    const normalized: ReviewResult = {
       verdict,
       headShaReviewed: reviewResult.headShaReviewed.trim(),
       currentHeadSha: reviewResult.currentHeadSha?.trim(),
+      workflowId: reviewResult.workflowId?.trim(),
       blockingIssues: reviewResult.blockingIssues || [],
       nonBlockingSuggestions: reviewResult.nonBlockingSuggestions || [],
       testsNeeded: reviewResult.testsNeeded || [],
       markdown: reviewResult.markdown || '',
       reviewerWorkerId: reviewResult.reviewerWorkerId,
     };
+    if (Object.hasOwn(reviewResult, 'subtaskCoverage')) {
+      normalized.subtaskCoverage = reviewResult.subtaskCoverage;
+    }
+    return normalized;
+  }
+
+  private isFinalClaudeReviewTask(task: WorkbenchTaskRecord): boolean {
+    return task.agentLoop?.kind === 'final_claude_review'
+      || (normalizeLabels(task.labels) || []).includes('final-claude-review')
+      || String(task.agentLoop?.idempotencyKey || '').startsWith('multi_agent_final_claude_review:');
+  }
+
+  private assertReviewResultMatchesTaskKind(reviewResult: ReviewResult, isFinalReview: boolean): void {
+    const hasSubtaskCoverage = Object.hasOwn(reviewResult, 'subtaskCoverage');
+    if (!isFinalReview && hasSubtaskCoverage) {
+      throw new WorkbenchTaskError(
+        'invalid_review_result',
+        'Subtask Claude review results must not include final-review subtaskCoverage.',
+      );
+    }
+    if (!isFinalReview) {
+      return;
+    }
+    if (!reviewResult.workflowId?.trim()) {
+      throw new WorkbenchTaskError('invalid_review_result', 'Final Claude review results must include workflowId.');
+    }
+    if (!Array.isArray(reviewResult.subtaskCoverage) || reviewResult.subtaskCoverage.length === 0) {
+      throw new WorkbenchTaskError(
+        'invalid_review_result',
+        'Final Claude review results must include a non-empty subtaskCoverage array.',
+      );
+    }
+    for (const [index, entry] of reviewResult.subtaskCoverage.entries()) {
+      if (!entry?.subtaskId?.trim()) {
+        throw new WorkbenchTaskError('invalid_review_result', `Final review subtaskCoverage[${index}] must include subtaskId.`);
+      }
+      if (entry.status !== 'covered' && entry.status !== 'partial' && entry.status !== 'missing') {
+        throw new WorkbenchTaskError(
+          'invalid_review_result',
+          `Final review subtaskCoverage[${index}] has invalid status: ${String(entry.status)}.`,
+        );
+      }
+    }
   }
 
   private buildReviewTimelineBody(reviewResult: ReviewResult): string {

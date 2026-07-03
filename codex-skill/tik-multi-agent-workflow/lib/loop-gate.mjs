@@ -273,15 +273,23 @@ function decideNextV1Action(state, graph, subtasks) {
         inputs: { contractId: contract.id, questionerOutputId: questionedContract.id },
       };
     }
+    if (state.workflow?.policy?.requireQuestionerBeforeBuild) {
+      return {
+        action: 'ask_claude_question_contract',
+        subtaskId,
+        reason: `SprintContract ${contract.id} is ${contract.status}; Claude Questioner should challenge it before acceptance.`,
+        evidenceRefs: subtaskState.evidenceRefs || [],
+        inputs: { contractId: contract.id },
+      };
+    }
     return {
-      action: 'ask_claude_question_contract',
+      action: 'accept_contract',
       subtaskId,
-      reason: `SprintContract ${contract.id} is ${contract.status}; Claude Questioner should challenge it before acceptance.`,
+      reason: `SprintContract ${contract.id} is drafted and the workflow does not require a pre-build Questioner challenge.`,
       evidenceRefs: subtaskState.evidenceRefs || [],
       inputs: { contractId: contract.id },
     };
   }
-
   const implementation = latestEvidence(state.evidence, subtaskId, ['implementation', 'fix']);
   if (!implementation) {
     return {
