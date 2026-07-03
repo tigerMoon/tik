@@ -424,7 +424,13 @@ function guardCompleteSubtaskV1(
   if (!subagentGuard.accepted) return subagentGuard;
 
   if (bundle.workflow.policy?.requireQuestionerAfterEvaluation) {
-    const questioner = latestQuestionerOutput(bundle, subtaskId, 'question_evaluation');
+    const questioner = latestMatchingQuestionerOutput(bundle, {
+      subtaskId,
+      intent: 'question_evaluation',
+      contractId: contract.id,
+      evaluationRunId: evaluation.id,
+      headSha: evaluation.result.headSha || evaluation.headSha,
+    });
     if (!questioner) {
       return reject('blocking_question_unresolved', 'Claude Questioner must inspect evaluation evidence before completion.');
     }
@@ -572,8 +578,16 @@ function guardCompleteWorkflowV1(
     });
   }
 
+  const finalCoverageGuard = requireFinalEvaluationCoversWorkflowContract(evaluation, bundle);
+  if (!finalCoverageGuard.accepted) return finalCoverageGuard;
+
   if (bundle.workflow.policy?.requireQuestionerAfterEvaluation) {
-    const questioner = latestQuestionerOutput(bundle, undefined, 'question_final_evidence');
+    const questioner = latestMatchingQuestionerOutput(bundle, {
+      subtaskId: undefined,
+      intent: 'question_final_evidence',
+      finalEvaluationRunId: evaluation.id,
+      headSha: evaluation.result.headSha || evaluation.headSha,
+    });
     if (!questioner) {
       return reject('blocking_question_unresolved', 'Claude Questioner must inspect final evidence before workflow completion.');
     }
@@ -585,9 +599,6 @@ function guardCompleteWorkflowV1(
       });
     }
   }
-
-  const finalCoverageGuard = requireFinalEvaluationCoversWorkflowContract(evaluation, bundle);
-  if (!finalCoverageGuard.accepted) return finalCoverageGuard;
 
   return accept();
 }
@@ -632,7 +643,7 @@ function requireFinalEvaluationCoversWorkflowContract(
         || evaluation.artifactRefs.length > 0;
     }
     if (kind === 'questioner') {
-      return latestQuestionerOutput(bundle, undefined, 'question_final_evidence') !== undefined;
+      return true;
     }
     return true;
   });
@@ -924,10 +935,50 @@ function latestQuestionerOutput(
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
 }
 
+function latestMatchingQuestionerOutput(
+  bundle: MultiAgentWorkflowBundle,
+  input: {
+    subtaskId?: string;
+    intent: QuestionerOutput['intent'];
+    contractId?: string;
+    evaluationRunId?: string;
+    finalEvaluationRunId?: string;
+    headSha?: string;
+  },
+): QuestionerOutput | undefined {
+  return bundle.questionerOutputs
+    .filter((output) => output.subtaskId === input.subtaskId && output.intent === input.intent)
+    .filter((output) => output.schemaVersion === 'questioner-output.v2')
+    .filter((output) => input.contractId === undefined || output.references?.contractId === input.contractId || output.contractId === input.contractId)
+    .filter((output) => input.evaluationRunId === undefined || output.references?.evaluationRunId === input.evaluationRunId || output.evaluationRunId === input.evaluationRunId)
+    .filter((output) => input.finalEvaluationRunId === undefined || output.references?.finalEvaluationRunId === input.finalEvaluationRunId || output.finalEvaluationRunId === input.finalEvaluationRunId)
+    .filter((output) => input.headSha === undefined || output.attestation?.headSha === input.headSha || output.headSha === input.headSha)
+    .filter((output) => {
+      const invocation = output.actor.invocationId
+        ? bundle.invocations.find((candidate) => candidate.id === output.actor.invocationId)
+        : undefined;
+      if (!invocation || invocation.status !== 'completed') {
+        return false;
+      }
+      const run = output.questionerRunId
+        ? bundle.questionerRuns.find((candidate) => candidate.id === output.questionerRunId)
+        : undefined;
+      if (!run || (run.status !== 'output_received' && run.status !== 'validated')) {
+        return false;
+      }
+      return run.invocationId === invocation.id
+        && run.contextHash === output.attestation?.contextHash
+        && run.contextArtifactRef === output.attestation?.contextArtifactRef
+        && (!run.outputHash || run.outputHash === output.attestation?.outputHash);
+    })
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+}
+
 function hasBlockingQuestions(output: QuestionerOutput): boolean {
   return output.verdict === 'questions_blocking'
     || output.verdict === 'need_clarification'
-    || output.questions.some((question) => question.priority === 'blocking');
+    || output.verdict === 'evidence_needed'
+    || output.questions.some((question) => question.priority === 'blocking' || question.priority === 'evidence_needed');
 }
 
 function requireQuestionerMatchesEvaluation(
@@ -936,6 +987,12 @@ function requireQuestionerMatchesEvaluation(
   evaluation: EvaluationRun,
   contract: SprintContract,
 ): GuardResult {
+  const strictGuard = requireStrictQuestionerOutput(bundle, output, {
+    contractId: contract.id,
+    evaluationRunId: evaluation.id,
+    headSha: evaluation.headSha,
+  });
+  if (!strictGuard.accepted) return strictGuard;
   if (output.source !== 'claude-plugin') {
     return reject('blocking_question_unresolved', 'Questioner output must come from the Claude plugin.', {
       questionerOutputId: output.id,
@@ -983,6 +1040,11 @@ function requireQuestionerMatchesFinalEvaluation(
   output: QuestionerOutput,
   evaluation: EvaluationRun,
 ): GuardResult {
+  const strictGuard = requireStrictQuestionerOutput(bundle, output, {
+    finalEvaluationRunId: evaluation.id,
+    headSha: evaluation.headSha,
+  });
+  if (!strictGuard.accepted) return strictGuard;
   if (output.source !== 'claude-plugin') {
     return reject('blocking_question_unresolved', 'Final Questioner output must come from the Claude plugin.', {
       questionerOutputId: output.id,
@@ -1017,6 +1079,125 @@ function requireQuestionerMatchesFinalEvaluation(
     });
   }
   return requireCompletedQuestionerInvocation(bundle, output);
+}
+
+function requireStrictQuestionerOutput(
+  bundle: MultiAgentWorkflowBundle,
+  output: QuestionerOutput,
+  input: {
+    contractId?: string;
+    evaluationRunId?: string;
+    finalEvaluationRunId?: string;
+    headSha: string;
+  },
+): GuardResult {
+  if (output.schemaVersion !== 'questioner-output.v2') {
+    return reject('missing_evidence', 'Questioner output must use strict schemaVersion=questioner-output.v2.', {
+      questionerOutputId: output.id,
+      schemaVersion: output.schemaVersion,
+    });
+  }
+  if (!output.questionerRunId || !output.attestation || !output.references) {
+    return reject('missing_evidence', 'QuestionerOutputV2 must include questionerRunId, attestation, and references.', {
+      questionerOutputId: output.id,
+    });
+  }
+  const run = bundle.questionerRuns.find((candidate) => candidate.id === output.questionerRunId);
+  if (!run) {
+    return reject('missing_evidence', 'QuestionerOutputV2 must reference a stored QuestionerRun.', {
+      questionerOutputId: output.id,
+      questionerRunId: output.questionerRunId,
+    });
+  }
+  if (run.status !== 'output_received' && run.status !== 'validated') {
+    return reject('missing_evidence', 'QuestionerRun must be output_received or validated before satisfying a guard.', {
+      questionerOutputId: output.id,
+      questionerRunId: run.id,
+      status: run.status,
+    });
+  }
+  if (run.invocationId !== output.actor.invocationId) {
+    return reject('missing_subagent_invocation', 'QuestionerRun invocation does not match output actor.', {
+      questionerOutputId: output.id,
+      questionerRunId: run.id,
+      runInvocationId: run.invocationId,
+      outputInvocationId: output.actor.invocationId,
+    });
+  }
+  if (
+    run.contextHash !== output.attestation.contextHash
+    || run.contextArtifactRef !== output.attestation.contextArtifactRef
+    || run.headSha !== output.attestation.headSha
+  ) {
+    return reject('missing_evidence', 'QuestionerOutputV2 attestation does not match its QuestionerRun.', {
+      questionerOutputId: output.id,
+      questionerRunId: run.id,
+    });
+  }
+  if (run.outputHash && run.outputHash !== output.attestation.outputHash) {
+    return reject('missing_evidence', 'QuestionerOutputV2 output hash does not match its QuestionerRun.', {
+      questionerOutputId: output.id,
+      questionerRunId: run.id,
+    });
+  }
+  if (input.contractId && output.references.contractId !== input.contractId) {
+    return reject('blocking_question_unresolved', 'QuestionerOutputV2 contract reference does not match the accepted SprintContract.', {
+      questionerOutputId: output.id,
+      expectedContractId: input.contractId,
+      actualContractId: output.references.contractId,
+    });
+  }
+  if (input.evaluationRunId && output.references.evaluationRunId !== input.evaluationRunId) {
+    return reject('blocking_question_unresolved', 'QuestionerOutputV2 evaluation reference does not match the latest evaluation run.', {
+      questionerOutputId: output.id,
+      expectedEvaluationRunId: input.evaluationRunId,
+      actualEvaluationRunId: output.references.evaluationRunId,
+    });
+  }
+  if (input.finalEvaluationRunId && output.references.finalEvaluationRunId !== input.finalEvaluationRunId) {
+    return reject('blocking_question_unresolved', 'QuestionerOutputV2 final evaluation reference does not match the latest final evaluation run.', {
+      questionerOutputId: output.id,
+      expectedFinalEvaluationRunId: input.finalEvaluationRunId,
+      actualFinalEvaluationRunId: output.references.finalEvaluationRunId,
+    });
+  }
+  if (output.attestation.headSha !== input.headSha) {
+    return reject('head_sha_mismatch', 'QuestionerOutputV2 head does not match the evaluation head.', {
+      questionerOutputId: output.id,
+      questionerHeadSha: output.attestation.headSha,
+      evaluationHeadSha: input.headSha,
+    });
+  }
+  const coverageGuard = requireQuestionerCoverage(output);
+  if (!coverageGuard.accepted) return coverageGuard;
+  return accept();
+}
+
+function requireQuestionerCoverage(output: QuestionerOutput): GuardResult {
+  if (!Array.isArray(output.coverageMatrix) || output.coverageMatrix.length === 0) {
+    return reject('evaluation_evidence_insufficient', 'QuestionerOutputV2 must include a coverage matrix.', {
+      questionerOutputId: output.id,
+    });
+  }
+  const uncovered = output.coverageMatrix
+    .filter((entry) => entry.required)
+    .filter((entry) => entry.status !== 'covered' && entry.status !== 'not_applicable');
+  if (uncovered.length > 0) {
+    return reject('evaluation_evidence_insufficient', 'QuestionerOutputV2 has uncovered required criteria.', {
+      questionerOutputId: output.id,
+      uncovered: uncovered.map((entry) => entry.criterionId),
+    });
+  }
+  const weakCovered = output.coverageMatrix
+    .filter((entry) => entry.required && entry.status === 'covered')
+    .filter((entry) => entry.evidenceRefs.length === 0 || !entry.comment.trim());
+  if (weakCovered.length > 0) {
+    return reject('evaluation_evidence_insufficient', 'QuestionerOutputV2 covered criteria must cite evidence.', {
+      questionerOutputId: output.id,
+      weakCovered: weakCovered.map((entry) => entry.criterionId),
+    });
+  }
+  return accept();
 }
 
 function requireCompletedQuestionerInvocation(

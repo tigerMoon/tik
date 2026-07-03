@@ -161,7 +161,12 @@ function decideNextV1Action(state, graph, subtasks) {
         inputs: { taskGraphVersion: graph.version, evaluationRunId: finalEvaluation.id },
       };
     }
-    const finalQuestioner = latestQuestionerOutput(state.questionerOutputs, undefined, 'question_final_evidence');
+    const finalQuestioner = latestMatchingQuestionerOutput(state, {
+      subtaskId: undefined,
+      intent: 'question_final_evidence',
+      finalEvaluationRunId: finalEvaluation.id,
+      headSha: finalEvaluation.result?.headSha || finalEvaluation.headSha,
+    });
     if (state.workflow?.policy?.requireQuestionerAfterEvaluation && !finalQuestioner) {
       return {
         action: 'ask_claude_question_final_evidence',
@@ -170,7 +175,7 @@ function decideNextV1Action(state, graph, subtasks) {
         inputs: { taskGraphVersion: graph.version, evaluationRunId: finalEvaluation.id },
       };
     }
-    if (finalQuestioner?.questions?.some((question) => question.priority === 'blocking')) {
+    if (hasBlockingQuestionerFindings(finalQuestioner)) {
       return {
         action: 'request_human_review',
         reason: `Final Claude Questioner output ${finalQuestioner.id} contains blocking questions.`,
@@ -296,7 +301,13 @@ function decideNextV1Action(state, graph, subtasks) {
     };
   }
 
-  const questioned = latestQuestionerOutput(state.questionerOutputs, subtaskId, 'question_evaluation');
+  const questioned = latestMatchingQuestionerOutput(state, {
+    subtaskId,
+    intent: 'question_evaluation',
+    contractId: contract.id,
+    evaluationRunId: evaluation.id,
+    headSha: evaluation.result?.headSha || evaluation.headSha,
+  });
   if (state.workflow?.policy?.requireQuestionerAfterEvaluation && !questioned) {
     return {
       action: 'ask_claude_question_evaluation',
@@ -307,7 +318,7 @@ function decideNextV1Action(state, graph, subtasks) {
     };
   }
 
-  if (questioned?.questions?.some((question) => question.priority === 'blocking')) {
+  if (hasBlockingQuestionerFindings(questioned)) {
     return {
       action: 'fix_evaluation_findings',
       subtaskId,
@@ -374,6 +385,51 @@ function latestQuestionerOutput(outputs = [], subtaskId, intent) {
   return outputs
     .filter((output) => output.subtaskId === subtaskId && output.intent === intent)
     .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))[0];
+}
+
+function latestMatchingQuestionerOutput(state, input) {
+  return (state.questionerOutputs || [])
+    .filter((output) => output.subtaskId === input.subtaskId && output.intent === input.intent)
+    .filter((output) => output.schemaVersion === 'questioner-output.v2')
+    .filter((output) => input.contractId === undefined || output.references?.contractId === input.contractId || output.contractId === input.contractId)
+    .filter((output) => input.evaluationRunId === undefined || output.references?.evaluationRunId === input.evaluationRunId || output.evaluationRunId === input.evaluationRunId)
+    .filter((output) => input.finalEvaluationRunId === undefined || output.references?.finalEvaluationRunId === input.finalEvaluationRunId || output.finalEvaluationRunId === input.finalEvaluationRunId)
+    .filter((output) => input.headSha === undefined || output.attestation?.headSha === input.headSha || output.headSha === input.headSha)
+    .filter((output) => {
+      const invocation = output.actor?.invocationId
+        ? (state.invocations || []).find((candidate) => candidate.id === output.actor.invocationId)
+        : undefined;
+      if (!invocation || invocation.status !== 'completed') return false;
+      const run = output.questionerRunId
+        ? (state.questionerRuns || []).find((candidate) => candidate.id === output.questionerRunId)
+        : undefined;
+      if (!run || !['output_received', 'validated'].includes(run.status)) return false;
+      if (run.invocationId !== invocation.id) return false;
+      if (run.contextHash !== output.attestation?.contextHash) return false;
+      if (run.contextArtifactRef !== output.attestation?.contextArtifactRef) return false;
+      if (run.outputHash && run.outputHash !== output.attestation?.outputHash) return false;
+      return hasSufficientQuestionerCoverage(output);
+    })
+    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))[0];
+}
+
+function hasSufficientQuestionerCoverage(output) {
+  if (!Array.isArray(output.coverageMatrix) || output.coverageMatrix.length === 0) return false;
+  return output.coverageMatrix
+    .filter((entry) => entry.required)
+    .every((entry) => entry.status === 'covered' && entry.evidenceRefs?.length > 0 && String(entry.comment || '').trim().length > 0);
+}
+
+function hasBlockingQuestionerFindings(output) {
+  return Boolean(
+    output
+      && (
+        output.verdict === 'questions_blocking'
+        || output.verdict === 'need_clarification'
+        || output.verdict === 'evidence_needed'
+        || (output.questions || []).some((question) => question.priority === 'blocking' || question.priority === 'evidence_needed')
+      ),
+  );
 }
 
 function latestEvidence(evidence = [], subtaskId, kinds) {

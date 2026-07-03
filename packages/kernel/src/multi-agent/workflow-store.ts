@@ -1,8 +1,10 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { randomBytes } from 'node:crypto';
 import {
   generateId,
   type AgentInvocationRecord,
+  type AgentRuntimePolicy,
   type CodexEvaluationResult,
   type CreateMultiAgentWorkflowInput,
   type EvaluationRun,
@@ -14,7 +16,11 @@ import {
   type MultiAgentWorkflowEventType,
   type MultiAgentWorkflowEvidence,
   type MultiAgentWorkflowRecord,
+  type QuestionerContextV1,
+  type QuestionerIntent,
   type QuestionerOutput,
+  type QuestionerOutputV2,
+  type QuestionerRun,
   type SprintContract,
   type SubtaskRunState,
   type SubtaskRunStatus,
@@ -23,6 +29,13 @@ import {
   type WorkflowDecision,
   type WorkflowPolicy,
 } from '@tik/shared';
+import { buildQuestionerContext } from './questioner-context.js';
+import {
+  hashQuestionerToken,
+  normalizeQuestionerOutputV2,
+  validateQuestionerOutputV2,
+  validateQuestionerRunToken,
+} from './questioner-validation.js';
 
 const SUBTASK_TRANSITIONS: Record<SubtaskRunStatus, SubtaskRunStatus[]> = {
   pending: ['ready', 'blocked', 'human_review_required'],
@@ -104,6 +117,25 @@ interface CreateAgentInvocationInput {
   evidenceRefs?: string[];
   evaluationRunId?: string;
   readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
+}
+
+interface CreateQuestionerRunInput {
+  id?: string;
+  invocationId?: string;
+  intent: QuestionerIntent;
+  subtaskId?: string;
+  contractId?: string;
+  evaluationRunId?: string;
+  finalEvaluationRunId?: string;
+  headSha: string;
+  start?: boolean;
+  tokenTtlMs?: number;
+}
+
+interface SubmitQuestionerRunOutputInput {
+  token?: string;
+  output: QuestionerOutputV2;
+  now?: string;
 }
 
 interface HookStartInvocationInput {
@@ -266,6 +298,7 @@ export class FileMultiAgentWorkflowStore {
       subtasks: await this.readSubtasks(id),
       contracts: await this.readContracts(id),
       evaluationRuns: await this.readEvaluationRuns(id),
+      questionerRuns: await this.readQuestionerRuns(id),
       questionerOutputs: await this.readQuestionerOutputs(id),
       decisions: await this.readJsonLines<WorkflowDecision>(this.decisionsFile(id)),
       evidence: await this.readEvidence(id),
@@ -802,9 +835,227 @@ export class FileMultiAgentWorkflowStore {
     return runs.sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0] ?? null;
   }
 
+  async createQuestionerRun(
+    workflowId: string,
+    input: CreateQuestionerRunInput,
+  ): Promise<{ run: QuestionerRun; invocation: AgentInvocationRecord; context: QuestionerContextV1; token: string }> {
+    const id = this.normalizeId(workflowId);
+    const workflow = await this.requireWorkflow(id);
+    if (input.subtaskId) {
+      await this.requireSubtask(id, input.subtaskId);
+    }
+    const runId = this.normalizeId(input.id || `qr_${generateId().slice(0, 10)}`);
+    const invocationId = this.normalizeId(input.invocationId || `inv_questioner_${generateId().slice(0, 10)}`);
+    const token = `tqr_${randomBytes(24).toString('base64url')}`;
+    const now = new Date().toISOString();
+    const tokenExpiresAt = new Date(Date.parse(now) + (input.tokenTtlMs ?? 60 * 60 * 1000)).toISOString();
+    const contextArtifactRef = `.tik/multi-agent/workflows/${id}/questioner-runs/${runId}/context.json`;
+    const expectedOutputArtifactRef = `.tik/multi-agent/workflows/${id}/questioner-runs/${runId}/output.json`;
+    const submitUrl = `/v1/multi-agent/workflows/${encodeURIComponent(id)}/questioner-runs/${encodeURIComponent(runId)}/output`;
+    const invocation = await this.createInvocation(id, {
+      id: invocationId,
+      workflowId: id,
+      subtaskId: input.subtaskId,
+      role: 'questioner',
+      runner: 'claude-code',
+      promptContract: 'claude-questioner.v2',
+      input: {
+        goal: workflow.goal,
+        intent: input.intent,
+        subtaskId: input.subtaskId,
+        contractId: input.contractId,
+        evaluationRunId: input.finalEvaluationRunId ? undefined : input.evaluationRunId,
+        finalEvaluationRunId: input.finalEvaluationRunId,
+        headSha: input.headSha,
+        questionerRunId: runId,
+        contextArtifactRef,
+        expectedOutputArtifactRef,
+        contextUrl: `/v1/multi-agent/workflows/${encodeURIComponent(id)}/questioner-runs/${encodeURIComponent(runId)}/context`,
+        submitUrl,
+        runtimeEnv: {
+          TIK_QUESTIONER_RUN_ID: runId,
+          TIK_QUESTIONER_CONTEXT_URL: `/api${submitUrl.replace(/\/output$/, '/context')}`,
+          TIK_QUESTIONER_SUBMIT_URL: `/api${submitUrl}`,
+          TIK_EXPECTED_HEAD_SHA: input.headSha,
+          TIK_QUESTIONER_OUTPUT_PATH: expectedOutputArtifactRef,
+        },
+        runtimePolicy: defaultQuestionerRuntimePolicy(),
+      },
+      headSha: input.headSha,
+      evaluationRunId: input.evaluationRunId || input.finalEvaluationRunId,
+      readonlyPolicy: {
+        enforced: true,
+        allowedWritePaths: ['.tik/multi-agent/'],
+        forbiddenWritePaths: ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
+        violations: [],
+      },
+    });
+    const context = buildQuestionerContext(await this.requireBundle(id), {
+      workflowId: id,
+      questionerRunId: runId,
+      invocationId: invocation.id,
+      intent: input.intent,
+      subtaskId: input.subtaskId,
+      contractId: input.contractId,
+      evaluationRunId: input.evaluationRunId,
+      finalEvaluationRunId: input.finalEvaluationRunId,
+      headSha: input.headSha,
+      submitUrl,
+    });
+    const run: QuestionerRun = {
+      id: runId,
+      workflowId: id,
+      subtaskId: input.subtaskId,
+      intent: input.intent,
+      status: input.start === false ? 'created' : 'started',
+      invocationId: invocation.id,
+      runner: 'claude-code',
+      pluginSkill: 'question-tik-agent-loop',
+      contractId: input.contractId,
+      evaluationRunId: input.evaluationRunId,
+      finalEvaluationRunId: input.finalEvaluationRunId,
+      headSha: input.headSha,
+      contextArtifactRef,
+      contextHash: context.run.contextHash,
+      expectedOutputArtifactRef,
+      tokenId: `tok_${generateId().slice(0, 10)}`,
+      tokenHash: hashQuestionerToken(token),
+      tokenExpiresAt,
+      runtimePolicy: defaultQuestionerRuntimePolicy(),
+      createdAt: now,
+      startedAt: input.start === false ? undefined : now,
+    };
+    await this.writeJsonFileAtomic(this.questionerRunFile(id, run.id), run);
+    await this.writeJsonFileAtomic(this.questionerRunContextFile(id, run.id), context);
+    await this.appendEvent(id, 'questioner.run.created', 'tik', {
+      questionerRunId: run.id,
+      invocationId: invocation.id,
+      intent: run.intent,
+      subtaskId: run.subtaskId,
+      contextHash: run.contextHash,
+    });
+    if (input.start !== false) {
+      await this.updateInvocation(id, invocation.id, { status: 'started' });
+      await this.appendEvent(id, 'questioner.run.started', 'tik', {
+        questionerRunId: run.id,
+        invocationId: invocation.id,
+      });
+      const startedInvocation = await this.readInvocation(id, invocation.id);
+      return { run, invocation: startedInvocation || invocation, context, token };
+    }
+    return { run, invocation, context, token };
+  }
+
+  async readQuestionerRun(workflowId: string, runId: string): Promise<QuestionerRun | null> {
+    const id = this.normalizeId(workflowId);
+    return this.readJsonFile<QuestionerRun>(this.questionerRunFile(id, this.normalizeId(runId)));
+  }
+
+  async readQuestionerRunContext(
+    workflowId: string,
+    runId: string,
+    token?: string,
+  ): Promise<{ run: QuestionerRun; context: QuestionerContextV1 }> {
+    const id = this.normalizeId(workflowId);
+    const run = await this.requireQuestionerRun(id, runId);
+    const tokenGuard = validateQuestionerRunToken(run, token);
+    if (!tokenGuard.accepted) {
+      throw new MultiAgentCoordinationError(tokenGuard.code || 'missing_evidence', tokenGuard.message || 'Invalid Questioner run token.');
+    }
+    const context = await this.readJsonFile<QuestionerContextV1>(this.questionerRunContextFile(id, run.id));
+    if (!context) {
+      throw new MultiAgentCoordinationError('missing_evidence', `QuestionerRun context not found: ${run.id}.`);
+    }
+    return { run, context };
+  }
+
+  async submitQuestionerRunOutput(
+    workflowId: string,
+    runId: string,
+    input: SubmitQuestionerRunOutputInput,
+  ): Promise<{ run: QuestionerRun; questionerOutput: QuestionerOutput; invocation: AgentInvocationRecord }> {
+    const id = this.normalizeId(workflowId);
+    const run = await this.requireQuestionerRun(id, runId);
+    const tokenGuard = validateQuestionerRunToken(run, input.token, input.now);
+    if (!tokenGuard.accepted) {
+      await this.rejectQuestionerRun(id, run, tokenGuard.message || 'Invalid Questioner run token.');
+      throw new MultiAgentCoordinationError(tokenGuard.code || 'missing_evidence', tokenGuard.message || 'Invalid Questioner run token.');
+    }
+    if (run.status !== 'created' && run.status !== 'started') {
+      throw new MultiAgentCoordinationError(
+        'invalid_transition',
+        `QuestionerRun ${run.id} is ${run.status} and cannot accept another output.`,
+      );
+    }
+    const context = await this.readJsonFile<QuestionerContextV1>(this.questionerRunContextFile(id, run.id));
+    if (!context) {
+      throw new MultiAgentCoordinationError('missing_evidence', `QuestionerRun context not found: ${run.id}.`);
+    }
+    const contract = run.contractId && run.subtaskId ? await this.requireContract(id, run.subtaskId, run.contractId) : undefined;
+    const evaluation = run.evaluationRunId && run.subtaskId ? await this.requireEvaluationRun(id, run.subtaskId, run.evaluationRunId) : undefined;
+    const finalEvaluation = run.finalEvaluationRunId
+      ? await this.requireEvaluationRun(id, '__final__', run.finalEvaluationRunId)
+      : undefined;
+    const validation = validateQuestionerOutputV2({
+      run,
+      output: input.output,
+      context,
+      contract,
+      evaluation,
+      finalEvaluation,
+    });
+    if (!validation.accepted) {
+      await this.rejectQuestionerRun(id, run, validation.message || 'Questioner output rejected.');
+      throw new MultiAgentCoordinationError(validation.code || 'missing_evidence', validation.message || 'Questioner output rejected.');
+    }
+
+    await this.writeJsonFileAtomic(this.questionerRunOutputFile(id, run.id), input.output);
+    const normalizedOutput = normalizeQuestionerOutputV2(input.output);
+    const now = new Date().toISOString();
+    const updatedRun: QuestionerRun = {
+      ...run,
+      status: 'validated',
+      outputHash: input.output.attestation.outputHash,
+      outputArtifactRef: input.output.attestation.outputArtifactRef,
+      completedAt: now,
+    };
+    await this.writeJsonFileAtomic(this.questionerRunFile(id, run.id), updatedRun);
+    const invocation = await this.updateInvocation(id, run.invocationId, {
+      status: 'completed',
+      headSha: input.output.attestation.headSha,
+      evaluationRunId: run.evaluationRunId || run.finalEvaluationRunId,
+      readonlyPolicy: {
+        enforced: true,
+        allowedWritePaths: ['.tik/multi-agent/'],
+        forbiddenWritePaths: ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
+        violations: [],
+      },
+      result: {
+        questionerRunId: run.id,
+        evaluationRunId: run.evaluationRunId || run.finalEvaluationRunId,
+        finalEvaluationRunId: run.finalEvaluationRunId,
+        headSha: input.output.attestation.headSha,
+        questionerOutput: normalizedOutput,
+      },
+    });
+    const questionerOutput = await this.recordQuestionerOutput(id, normalizedOutput);
+    await this.appendEvent(id, 'questioner.run.output_received', 'claude-code', {
+      questionerRunId: run.id,
+      questionerOutputId: questionerOutput.id,
+      outputHash: updatedRun.outputHash,
+    });
+    await this.appendEvent(id, 'questioner.run.validated', 'tik', {
+      questionerRunId: run.id,
+      questionerOutputId: questionerOutput.id,
+    });
+    return { run: updatedRun, questionerOutput, invocation };
+  }
+
   async recordQuestionerOutput(
     workflowId: string,
     input: Omit<Partial<QuestionerOutput>, 'workflowId' | 'createdAt'> & {
+      schemaVersion?: QuestionerOutput['schemaVersion'];
+      questionerRunId?: string;
       intent: QuestionerOutput['intent'];
       actor: QuestionerOutput['actor'];
       source: QuestionerOutput['source'];
@@ -813,11 +1064,15 @@ export class FileMultiAgentWorkflowStore {
       finalEvaluationRunId?: string;
       contractId?: string;
       artifactRef?: string;
+      attestation?: QuestionerOutput['attestation'];
+      references?: QuestionerOutput['references'];
+      coverageMatrix?: QuestionerOutput['coverageMatrix'];
       verdict: QuestionerOutput['verdict'];
       questions?: QuestionerOutput['questions'];
       risks?: QuestionerOutput['risks'];
       missingTests?: QuestionerOutput['missingTests'];
       suggestedContractChanges?: QuestionerOutput['suggestedContractChanges'];
+      advisoryNotes?: string[];
     },
   ): Promise<QuestionerOutput> {
     const id = this.normalizeId(workflowId);
@@ -850,7 +1105,9 @@ export class FileMultiAgentWorkflowStore {
     };
     await this.assertQuestionerInvocationProvesOutput(id, inputWithId);
     const output: QuestionerOutput = {
+      schemaVersion: input.schemaVersion,
       id: outputId,
+      questionerRunId: input.questionerRunId,
       workflowId: id,
       subtaskId: input.subtaskId,
       intent: input.intent,
@@ -861,11 +1118,15 @@ export class FileMultiAgentWorkflowStore {
       finalEvaluationRunId: input.finalEvaluationRunId,
       contractId: input.contractId,
       artifactRef: input.artifactRef,
+      attestation: input.attestation,
+      references: input.references,
+      coverageMatrix: input.coverageMatrix,
       verdict: input.verdict,
       questions: input.questions || [],
       risks: input.risks || [],
       missingTests: input.missingTests || [],
       suggestedContractChanges: input.suggestedContractChanges || [],
+      advisoryNotes: input.advisoryNotes || [],
       createdAt: new Date().toISOString(),
     };
     await this.writeJsonFileAtomic(this.questionerOutputFile(id, output), output);
@@ -1485,6 +1746,14 @@ export class FileMultiAgentWorkflowStore {
     return workflow;
   }
 
+  private async requireBundle(workflowId: string): Promise<MultiAgentWorkflowBundle> {
+    const bundle = await this.readBundle(workflowId);
+    if (!bundle) {
+      throw new MultiAgentCoordinationError('workflow_not_found', `Multi-agent workflow not found: ${workflowId}.`);
+    }
+    return bundle;
+  }
+
   private async listWorkflows(): Promise<MultiAgentWorkflowRecord[]> {
     try {
       const entries = await fs.readdir(this.rootDir(), { withFileTypes: true });
@@ -1630,6 +1899,46 @@ export class FileMultiAgentWorkflowStore {
     }
   }
 
+  private async readQuestionerRuns(workflowId: string): Promise<QuestionerRun[]> {
+    try {
+      const entries = await fs.readdir(this.questionerRunsDir(workflowId), { withFileTypes: true });
+      const records = await Promise.all(entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => this.readJsonFile<QuestionerRun>(this.questionerRunFile(workflowId, entry.name))));
+      return records
+        .filter((item): item is QuestionerRun => Boolean(item?.id && item.workflowId && item.contextHash))
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  private async requireQuestionerRun(workflowId: string, runId: string): Promise<QuestionerRun> {
+    const run = await this.readQuestionerRun(workflowId, runId);
+    if (!run) {
+      throw new MultiAgentCoordinationError('questioner_run_not_found', `QuestionerRun not found: ${runId}.`);
+    }
+    return run;
+  }
+
+  private async rejectQuestionerRun(workflowId: string, run: QuestionerRun, reason: string): Promise<QuestionerRun> {
+    const rejected: QuestionerRun = {
+      ...run,
+      status: 'rejected',
+      rejectionReason: reason,
+      completedAt: new Date().toISOString(),
+    };
+    await this.writeJsonFileAtomic(this.questionerRunFile(workflowId, run.id), rejected);
+    await this.appendEvent(workflowId, 'questioner.run.rejected', 'tik', {
+      questionerRunId: run.id,
+      reason,
+    });
+    return rejected;
+  }
+
   private async upsertInvocation(invocation: AgentInvocationRecord): Promise<void> {
     const invocations = await this.readJsonLines<AgentInvocationRecord>(this.invocationsFile(invocation.workflowId));
     const next = [
@@ -1745,6 +2054,26 @@ export class FileMultiAgentWorkflowStore {
   private questionerOutputFile(workflowId: string, output: Pick<QuestionerOutput, 'id' | 'subtaskId' | 'intent'>): string {
     const prefix = output.subtaskId ? `${output.subtaskId}.` : '';
     return path.join(this.questionerOutputsDir(workflowId), `${prefix}${output.intent}.${output.id}.json`);
+  }
+
+  private questionerRunsDir(workflowId: string): string {
+    return path.join(this.workflowDir(workflowId), 'questioner-runs');
+  }
+
+  private questionerRunDir(workflowId: string, runId: string): string {
+    return path.join(this.questionerRunsDir(workflowId), runId);
+  }
+
+  private questionerRunFile(workflowId: string, runId: string): string {
+    return path.join(this.questionerRunDir(workflowId, runId), 'run.json');
+  }
+
+  private questionerRunContextFile(workflowId: string, runId: string): string {
+    return path.join(this.questionerRunDir(workflowId, runId), 'context.json');
+  }
+
+  private questionerRunOutputFile(workflowId: string, runId: string): string {
+    return path.join(this.questionerRunDir(workflowId, runId), 'output.json');
   }
 
   private contextDir(workflowId: string): string {
@@ -2171,6 +2500,15 @@ function defaultReadonlyPolicy(): EvaluationRun['readonlyPolicy'] {
       'package.json',
       'pnpm-lock.yaml',
     ],
+  };
+}
+
+function defaultQuestionerRuntimePolicy(): AgentRuntimePolicy {
+  return {
+    filesystem: 'read-only',
+    network: 'tik-api-only',
+    shell: 'read-only',
+    permissionMode: 'dontAsk',
   };
 }
 

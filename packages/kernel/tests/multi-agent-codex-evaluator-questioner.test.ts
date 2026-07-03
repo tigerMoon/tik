@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/event-bus.js';
 import { createServer } from '../src/server.js';
@@ -310,53 +311,60 @@ describe('codex evaluator and Claude questioner workflow', () => {
     expect(manualQuestioner.statusCode).toBe(409);
     expect(manualQuestioner.json().error.code).toBe('missing_subagent_invocation');
 
-    await createCompletedQuestionerInvocation(server, 'wf-complete-v1', {
-      id: 'claude-q-1',
+    const blockingRun = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-complete-v1/questioner-runs',
+      payload: {
+        id: 'qr-blocking',
+        invocationId: 'claude-q-1',
+        subtaskId: 'st-api',
+        intent: 'question_evaluation',
+        contractId: 'contract-st-api-v1',
+        evaluationRunId: 'eval-pass',
+        headSha: 'head-1',
+        start: true,
+      },
+    });
+    expect(blockingRun.statusCode).toBe(200);
+    const blockingV2 = buildQuestionerOutputV2({
+      id: 'q-blocking',
+      runResponse: blockingRun.json(),
+      workflowId: 'wf-complete-v1',
       subtaskId: 'st-api',
       intent: 'question_evaluation',
       headSha: 'head-1',
       evaluationRunId: 'eval-pass',
       contractId: 'contract-st-api-v1',
-      artifactRef: 'questioner://claude-q-1',
-      outputId: 'q-blocking',
-      verdict: 'need_clarification',
+      verdict: 'questions_blocking',
+      coverageMatrix: [
+        {
+          criterionId: 'ac-1',
+          criterionText: 'API responds with expected payload.',
+          required: true,
+          status: 'covered',
+          evidenceRefs: ['eval-pass:criteria:ac-1'],
+          comment: 'Evidence exists, but the failure path is still unchallenged.',
+        },
+      ],
       questions: [
         {
           id: 'q1',
           priority: 'blocking',
-          question: 'Was the failure path evaluated?',
-          whyItMatters: 'The contract includes an error path.',
-          expectedAnswerType: 'test_case',
+          category: 'missing_test',
+          claim: 'Was the failure path evaluated?',
+          evidenceRefs: ['eval-pass'],
+          requestedEvidence: 'Add or cite failure-path test evidence.',
+          status: 'open',
         },
       ],
     });
     const blockingOutput = await server.inject({
       method: 'POST',
-      url: '/api/v1/multi-agent/workflows/wf-complete-v1/questioner-outputs',
-      payload: {
-        id: 'q-blocking',
-        subtaskId: 'st-api',
-        intent: 'question_evaluation',
-        actor: { kind: 'claude-code-questioner', invocationId: 'claude-q-1' },
-        source: 'claude-plugin',
-        headSha: 'head-1',
-        evaluationRunId: 'eval-pass',
-        contractId: 'contract-st-api-v1',
-        artifactRef: 'questioner://claude-q-1',
-        verdict: 'need_clarification',
-        questions: [
-          {
-            id: 'q1',
-            priority: 'blocking',
-            question: 'Was the failure path evaluated?',
-            whyItMatters: 'The contract includes an error path.',
-            expectedAnswerType: 'test_case',
-          },
-        ],
-        risks: [],
-        missingTests: [],
-        suggestedContractChanges: [],
+      url: '/api/v1/multi-agent/workflows/wf-complete-v1/questioner-runs/qr-blocking/output',
+      headers: {
+        authorization: `Bearer ${blockingRun.json().token}`,
       },
+      payload: { output: blockingV2 },
     });
     expect(blockingOutput.statusCode).toBe(200);
 
@@ -403,6 +411,258 @@ describe('codex evaluator and Claude questioner workflow', () => {
       accepted: true,
       code: 'ok',
     });
+  });
+
+  it('creates a token-scoped QuestionerRun context and accepts a matching QuestionerOutputV2', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-questioner-run-v2', root);
+    await putSingleSubtaskGraph(server, 'wf-questioner-run-v2');
+    await createAcceptedContract(server, 'wf-questioner-run-v2');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-v2/evidence',
+      payload: {
+        id: 'ev-impl',
+        kind: 'implementation',
+        title: 'Codex Builder implementation',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/workflow-store.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    await moveSubtaskToQuestioningEvidence(server, 'wf-questioner-run-v2', 'st-api');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-v2/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-pass',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-questioner-run-v2', 'eval-pass');
+    await createCompletedInvocation(server, 'wf-questioner-run-v2', {
+      id: 'inv-builder-v2',
+      subtaskId: 'st-api',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+      threadId: 'builder-thread-v2',
+      headSha: 'head-1',
+      evidenceRefs: ['ev-impl'],
+    });
+    await createCompletedInvocation(server, 'wf-questioner-run-v2', {
+      id: 'inv-evaluator-v2',
+      subtaskId: 'st-api',
+      role: 'evaluator',
+      runner: 'codex-evaluator',
+      promptContract: 'codex-evaluator.v1',
+      threadId: 'evaluator-thread-v2',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-pass',
+      readonlyPolicy: { enforced: true, violations: [] },
+    });
+
+    const run = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-v2/questioner-runs',
+      payload: {
+        id: 'qr-v2',
+        invocationId: 'inv-questioner-v2',
+        subtaskId: 'st-api',
+        intent: 'question_evaluation',
+        contractId: 'contract-st-api-v1',
+        evaluationRunId: 'eval-pass',
+        headSha: 'head-1',
+        start: true,
+      },
+    });
+    expect(run.statusCode).toBe(200);
+    expect(run.json()).toMatchObject({
+      questionerRunId: 'qr-v2',
+      invocationId: 'inv-questioner-v2',
+      contextHash: expect.stringMatching(/^sha256:/),
+      token: expect.any(String),
+    });
+
+    const context = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-v2/questioner-runs/qr-v2/context',
+      headers: {
+        authorization: `Bearer ${run.json().token}`,
+      },
+    });
+    expect(context.statusCode).toBe(200);
+    expect(context.json()).toMatchObject({
+      context: {
+        schemaVersion: 'questioner-context.v1',
+        run: {
+          questionerRunId: 'qr-v2',
+          invocationId: 'inv-questioner-v2',
+          contextHash: run.json().contextHash,
+        },
+        contract: {
+          id: 'contract-st-api-v1',
+        },
+        evaluation: {
+          id: 'eval-pass',
+          readonly: true,
+        },
+      },
+    });
+
+    const output = buildQuestionerOutputV2({
+      id: 'q-v2-clear',
+      runResponse: run.json(),
+      workflowId: 'wf-questioner-run-v2',
+      subtaskId: 'st-api',
+      intent: 'question_evaluation',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-pass',
+      contractId: 'contract-st-api-v1',
+      verdict: 'evidence_sufficient',
+      coverageMatrix: [
+        {
+          criterionId: 'ac-1',
+          criterionText: 'API responds with expected payload.',
+          required: true,
+          status: 'covered',
+          evidenceRefs: ['eval-pass:criteria:ac-1', 'cmd-test'],
+          comment: 'Evaluator criterion and command evidence cover the contract must criterion.',
+        },
+      ],
+    });
+    const submitted = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-v2/questioner-runs/qr-v2/output',
+      headers: {
+        authorization: `Bearer ${run.json().token}`,
+      },
+      payload: { output },
+    });
+    expect(submitted.statusCode).toBe(200);
+    expect(submitted.json()).toMatchObject({
+      questionerRun: {
+        id: 'qr-v2',
+        status: 'validated',
+        outputHash: output.attestation.outputHash,
+      },
+      questionerOutput: {
+        id: 'q-v2-clear',
+        schemaVersion: 'questioner-output.v2',
+        questionerRunId: 'qr-v2',
+      },
+      invocation: {
+        id: 'inv-questioner-v2',
+        status: 'completed',
+      },
+    });
+
+    const complete = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-v2/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-questioner-run-v2', {
+          id: 'dec-complete-v2',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Strict QuestionerOutputV2 covers the current evaluation evidence.',
+          evidenceRefs: ['ev-impl'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(complete.statusCode).toBe(200);
+    expect(complete.json().guard).toMatchObject({ accepted: true, code: 'ok' });
+  });
+
+  it('rejects QuestionerOutputV2 with missing required coverage before it can satisfy the gate', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-questioner-run-coverage', root);
+    await putSingleSubtaskGraph(server, 'wf-questioner-run-coverage');
+    await createAcceptedContract(server, 'wf-questioner-run-coverage');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-coverage/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-pass',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-questioner-run-coverage', 'eval-pass');
+
+    const run = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-coverage/questioner-runs',
+      payload: {
+        id: 'qr-missing-coverage',
+        invocationId: 'inv-questioner-missing-coverage',
+        subtaskId: 'st-api',
+        intent: 'question_evaluation',
+        contractId: 'contract-st-api-v1',
+        evaluationRunId: 'eval-pass',
+        headSha: 'head-1',
+        start: true,
+      },
+    });
+    expect(run.statusCode).toBe(200);
+
+    const output = buildQuestionerOutputV2({
+      id: 'q-missing-coverage',
+      runResponse: run.json(),
+      workflowId: 'wf-questioner-run-coverage',
+      subtaskId: 'st-api',
+      intent: 'question_evaluation',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-pass',
+      contractId: 'contract-st-api-v1',
+      verdict: 'evidence_sufficient',
+      coverageMatrix: [
+        {
+          criterionId: 'ac-1',
+          criterionText: 'API responds with expected payload.',
+          required: true,
+          status: 'missing',
+          evidenceRefs: [],
+          comment: 'No evidence cited.',
+        },
+      ],
+    });
+    const rejected = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-coverage/questioner-runs/qr-missing-coverage/output',
+      headers: {
+        authorization: `Bearer ${run.json().token}`,
+      },
+      payload: { output },
+    });
+    expect(rejected.statusCode).toBe(409);
+    expect(rejected.json().error).toMatchObject({
+      code: 'evaluation_evidence_insufficient',
+    });
+
+    const workflow = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-coverage',
+    });
+    expect(workflow.statusCode).toBe(200);
+    expect(workflow.json().questionerRuns).toEqual([
+      expect.objectContaining({
+        id: 'qr-missing-coverage',
+        status: 'rejected',
+      }),
+    ]);
   });
 
   it('accepts implementation evidence inside contract glob allowed paths', async () => {
@@ -1470,7 +1730,36 @@ describe('codex evaluator and Claude questioner workflow', () => {
     await createV1Workflow(server, 'wf-questioner-artifact-noise', root);
     await putSingleSubtaskGraph(server, 'wf-questioner-artifact-noise');
     await createAcceptedContract(server, 'wf-questioner-artifact-noise');
-    await recordClearQuestioner(server, 'wf-questioner-artifact-noise', 'q-artifact-noise');
+    await createCompletedQuestionerInvocation(server, 'wf-questioner-artifact-noise', {
+      id: 'claude-q-artifact-noise',
+      subtaskId: 'st-api',
+      intent: 'question_contract',
+      headSha: 'head-1',
+      contractId: 'contract-st-api-v1',
+      artifactRef: 'questioner://artifact-noise',
+      outputId: 'q-artifact-noise',
+      verdict: 'evidence_sufficient',
+    });
+    const recorded = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-artifact-noise/questioner-outputs',
+      payload: {
+        id: 'q-artifact-noise',
+        subtaskId: 'st-api',
+        intent: 'question_contract',
+        actor: { kind: 'claude-code-questioner', invocationId: 'claude-q-artifact-noise' },
+        source: 'claude-plugin',
+        headSha: 'head-1',
+        contractId: 'contract-st-api-v1',
+        artifactRef: 'questioner://artifact-noise',
+        verdict: 'evidence_sufficient',
+        questions: [],
+        risks: [],
+        missingTests: [],
+        suggestedContractChanges: [],
+      },
+    });
+    expect(recorded.statusCode).toBe(200);
 
     const noisyDir = path.join(root, '.tik', 'multi-agent', 'workflows', 'wf-questioner-artifact-noise', 'questioner');
     await fs.writeFile(
@@ -2411,42 +2700,73 @@ async function recordClearQuestioner(
     ? undefined
     : 'st-api';
   const invocationId = options.invocationId || `inv-${questionerId}`;
-  const finalEvaluationRunId = options.finalEvaluationRunId;
-  const evaluationRunId = options.evaluationRunId
-    || (finalEvaluationRunId ? undefined : intent === 'question_final_evidence' ? 'eval-final-pass' : 'eval-pass');
-  const contractId = options.contractId || (intent === 'question_final_evidence' ? undefined : 'contract-st-api-v1');
-  await createCompletedQuestionerInvocation(server, workflowId, {
-    id: invocationId,
+  const finalEvaluationRunId = intent === 'question_final_evidence'
+    ? options.finalEvaluationRunId || options.evaluationRunId || 'eval-final-pass'
+    : undefined;
+  const evaluationRunId = Object.hasOwn(options, 'evaluationRunId')
+    ? (intent === 'question_final_evidence' ? undefined : options.evaluationRunId)
+    : finalEvaluationRunId
+      ? undefined
+      : 'eval-pass';
+  const contractId = Object.hasOwn(options, 'contractId')
+    ? options.contractId
+    : intent === 'question_final_evidence' ? undefined : 'contract-st-api-v1';
+  const createdRun = await server.inject({
+    method: 'POST',
+    url: `/api/v1/multi-agent/workflows/${workflowId}/questioner-runs`,
+    payload: {
+      id: `qr-${questionerId}`,
+      invocationId,
+      subtaskId,
+      intent,
+      contractId,
+      evaluationRunId,
+      finalEvaluationRunId,
+      headSha: options.headSha || 'head-1',
+      start: true,
+    },
+  });
+  expect(createdRun.statusCode).toBe(200);
+  const output = buildQuestionerOutputV2({
+    id: questionerId,
+    runResponse: createdRun.json(),
+    workflowId,
     subtaskId,
     intent,
     headSha: options.headSha || 'head-1',
     evaluationRunId,
     finalEvaluationRunId,
     contractId,
-    artifactRef: `questioner://${questionerId}`,
-    outputId: questionerId,
     verdict: 'evidence_sufficient',
+    coverageMatrix: intent === 'question_final_evidence'
+      ? [
+        {
+          criterionId: 'global-ac-1',
+          criterionText: 'Workflow global acceptance criterion is covered.',
+          required: true,
+          status: 'covered',
+          evidenceRefs: [finalEvaluationRunId || evaluationRunId || 'eval-final-pass'],
+          comment: 'Final evaluation evidence covers the global criterion.',
+        },
+      ]
+      : [
+        {
+          criterionId: 'ac-1',
+          criterionText: 'API responds with expected payload.',
+          required: true,
+          status: 'covered',
+          evidenceRefs: [evaluationRunId || 'eval-pass', 'ac-1'],
+          comment: 'Evaluator criteria result and command evidence cover the must criterion.',
+        },
+      ],
   });
   const response = await server.inject({
     method: 'POST',
-    url: `/api/v1/multi-agent/workflows/${workflowId}/questioner-outputs`,
-    payload: {
-      id: questionerId,
-      subtaskId,
-      intent,
-      actor: { kind: 'claude-code-questioner', invocationId },
-      source: 'claude-plugin',
-      headSha: options.headSha || 'head-1',
-      evaluationRunId,
-      finalEvaluationRunId,
-      contractId,
-      artifactRef: `questioner://${questionerId}`,
-      verdict: 'evidence_sufficient',
-      questions: [],
-      risks: [],
-      missingTests: [],
-      suggestedContractChanges: [],
+    url: `/api/v1/multi-agent/workflows/${workflowId}/questioner-runs/${createdRun.json().questionerRunId}/output`,
+    headers: {
+      authorization: `Bearer ${createdRun.json().token}`,
     },
+    payload: { output },
   });
   expect(response.statusCode).toBe(200);
 }
@@ -2523,6 +2843,103 @@ async function createCompletedQuestionerInvocation(
     },
   });
   expect(completed.statusCode).toBe(200);
+}
+
+function buildQuestionerOutputV2(input: {
+  id: string;
+  runResponse: any;
+  workflowId: string;
+  subtaskId?: string;
+  intent: 'question_contract' | 'question_evaluation' | 'question_final_evidence';
+  headSha: string;
+  evaluationRunId?: string;
+  finalEvaluationRunId?: string;
+  contractId?: string;
+  verdict: 'questions_blocking' | 'evidence_needed' | 'risk_found' | 'no_blocking_questions' | 'evidence_sufficient';
+  coverageMatrix: Array<{
+    criterionId: string;
+    criterionText: string;
+    required: boolean;
+    status: 'covered' | 'partially_covered' | 'missing' | 'not_applicable';
+    evidenceRefs: string[];
+    comment: string;
+  }>;
+  questions?: Array<{
+    id: string;
+    priority: 'blocking' | 'evidence_needed' | 'advisory';
+    category: 'coverage_gap' | 'missing_test' | 'weak_evidence' | 'head_mismatch' | 'artifact_gap';
+    claim: string;
+    evidenceRefs: string[];
+    requestedEvidence?: string;
+    status: 'open';
+  }>;
+}) {
+  const output = {
+    schemaVersion: 'questioner-output.v2',
+    id: input.id,
+    questionerRunId: input.runResponse.questionerRunId,
+    workflowId: input.workflowId,
+    subtaskId: input.subtaskId,
+    intent: input.intent,
+    source: 'claude-plugin',
+    actor: {
+      kind: 'claude-code-questioner',
+      invocationId: input.runResponse.invocationId,
+      pluginName: 'agent-loop-claude-review',
+      skillName: 'question-tik-agent-loop',
+    },
+    attestation: {
+      headSha: input.headSha,
+      contextArtifactRef: input.runResponse.contextArtifactRef,
+      contextHash: input.runResponse.contextHash,
+      outputArtifactRef: input.runResponse.expectedOutputArtifactRef,
+      outputHash: '',
+      generatedAt: '2026-07-01T00:02:00.000Z',
+    },
+    references: {
+      contractId: input.contractId,
+      evaluationRunId: input.evaluationRunId,
+      finalEvaluationRunId: input.finalEvaluationRunId,
+    },
+    verdict: input.verdict,
+    coverageMatrix: input.coverageMatrix,
+    questions: input.questions || [],
+    risks: [],
+    missingTests: [],
+    advisoryNotes: [],
+  };
+  output.attestation.outputHash = canonicalQuestionerOutputHash(output);
+  return output;
+}
+
+function canonicalQuestionerOutputHash(output: any): string {
+  return `sha256:${createHash('sha256').update(stableStringify({
+    ...output,
+    attestation: {
+      ...output.attestation,
+      outputHash: '',
+    },
+    createdAt: undefined,
+  })).digest('hex')}`;
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(sortJson(value));
+}
+
+function sortJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortJson);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, sortJson(entry)]),
+  );
 }
 
 async function createCompletedInvocation(

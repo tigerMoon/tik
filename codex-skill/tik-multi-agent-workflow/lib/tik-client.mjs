@@ -143,6 +143,13 @@ export async function recordQuestionerOutput(options, workflowId, output) {
   });
 }
 
+export async function createQuestionerRun(options, workflowId, input) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/questioner-runs`, {
+    method: 'POST',
+    body: input,
+  });
+}
+
 export async function saveContextSnapshot(options, workflowId, snapshot, input = {}) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/context-snapshots`, {
     method: 'POST',

@@ -165,6 +165,7 @@ describe('workbench view models', () => {
           completedAt: '2026-07-03T00:03:00.000Z',
         },
       ],
+      questionerRuns: [],
       questionerOutputs: [
         {
           id: 'q-final',
@@ -283,6 +284,53 @@ describe('workbench view models', () => {
       'Questioner Question final evidence',
       'Evaluator invocation',
     ]);
+  });
+
+  it('keeps task detail workflow evidence renderable for legacy bundles missing optional collections', () => {
+    const model = buildTaskWorkflowPanelModel({
+      workflow: {
+        id: 'wf-legacy',
+        driver: 'codex-workflow',
+        status: 'completed',
+        goal: 'Legacy workflow response',
+        rootTaskId: 'TIK-135',
+        currentHeadSha: 'abcdef1234567890',
+        maxRounds: 3,
+        createdAt: '2026-07-03T00:00:00.000Z',
+        updatedAt: '2026-07-03T00:05:00.000Z',
+      },
+      taskGraph: null,
+      subtasks: {},
+      contracts: [],
+      evaluationRuns: [],
+      questionerOutputs: [],
+      decisions: [],
+      evidence: [
+        {
+          id: 'ev-final',
+          workflowId: 'wf-legacy',
+          kind: 'validation',
+          title: 'Final validation',
+          passed: true,
+          headSha: 'abcdef1234567890',
+          createdAt: '2026-07-03T00:04:00.000Z',
+        },
+      ],
+      invocations: [],
+      events: [],
+    });
+
+    expect(model).toMatchObject({
+      workflowId: 'wf-legacy',
+      metrics: [
+        { label: 'Subtasks', value: '0' },
+        { label: 'Evidence', value: '1' },
+        { label: 'Decisions', value: '0' },
+        { label: 'Contracts', value: '0' },
+        { label: 'Runtime', value: '0' },
+      ],
+    });
+    expect(model?.evidence[0]).toMatchObject({ title: 'Final validation', tone: 'green' });
   });
 
   it('sorts tasks by last progress time before created time', () => {

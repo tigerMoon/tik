@@ -15,6 +15,7 @@ import {
   acceptContract,
   createContract,
   createInvocation,
+  createQuestionerRun,
   createTask,
   createEvaluationRun,
   commentTask,
@@ -549,37 +550,39 @@ async function startQuestioner(options) {
       ? undefined
       : subtaskId ? latestContractId(state, subtaskId) : undefined
   );
-  const invocation = await createInvocation(options, workflowId, {
-    id: stringOption(options.invocation),
+  const run = await createQuestionerRun(options, workflowId, {
+    id: stringOption(options.run),
+    invocationId: stringOption(options.invocationId) || stringOption(options.invocation),
     subtaskId,
-    role: 'questioner',
-    runner: 'claude-code',
-    promptContract: stringOption(options.promptContract) || 'claude-questioner.v1',
-    input: omitUndefined({
-      goal: state.workflow.goal,
-      intent,
-      subtaskId,
-      contractId,
-      evaluationRunId: finalEvaluationRunId ? undefined : evaluationRunId,
-      finalEvaluationRunId,
-      headSha,
-      artifactRef: stringOption(options.artifactRef),
-    }),
-    threadId: stringOption(options.thread),
+    intent,
+    contractId,
+    evaluationRunId: finalEvaluationRunId ? undefined : evaluationRunId,
+    finalEvaluationRunId,
     headSha,
-    evaluationRunId,
+    start: options.start === false || options.start === 'false' ? false : true,
   });
-  const started = options.start === false || options.start === 'false'
-    ? invocation
-    : await tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(invocation.invocation.id)}/start`, {
-      method: 'POST',
-      body: {},
-    });
   printJson({
-    action: started.invocation.status === 'started' ? 'questioner-started' : 'questioner-pending',
+    action: run.invocation.status === 'started' ? 'questioner-run-started' : 'questioner-run-created',
     workflowId,
-    invocation: started.invocation,
-    instruction: 'Run the Claude Questioner plugin/runtime for this invocation, then call complete-questioner with the plugin output artifact.',
+    questionerRunId: run.questionerRunId,
+    invocationId: run.invocationId,
+    contextArtifactRef: run.contextArtifactRef,
+    contextHash: run.contextHash,
+    expectedOutputArtifactRef: run.expectedOutputArtifactRef,
+    submitUrl: run.submitUrl,
+    contextUrl: run.contextUrl,
+    tokenExpiresAt: run.tokenExpiresAt,
+    token: run.token,
+    invocation: run.invocation,
+    instruction: 'Run the Claude Questioner plugin/runtime with the printed TIK_QUESTIONER_* values; the plugin should POST QuestionerOutputV2 to submitUrl.',
+    env: {
+      TIK_QUESTIONER_RUN_ID: run.questionerRunId,
+      TIK_QUESTIONER_CONTEXT_URL: absoluteApiUrl(options, run.contextUrl),
+      TIK_QUESTIONER_SUBMIT_URL: absoluteApiUrl(options, run.submitUrl),
+      TIK_QUESTIONER_TOKEN: run.token,
+      TIK_EXPECTED_HEAD_SHA: headSha,
+      TIK_QUESTIONER_OUTPUT_PATH: run.expectedOutputArtifactRef,
+    },
   });
 }
 
@@ -2615,6 +2618,13 @@ function splitList(value) {
   if (!value || value === true) return undefined;
   const values = Array.isArray(value) ? value : [value];
   return values.flatMap((entry) => String(entry).split(',')).map((item) => item.trim()).filter(Boolean);
+}
+
+function absoluteApiUrl(options, route) {
+  if (!route) return undefined;
+  if (/^https?:\/\//.test(route)) return route;
+  const baseUrl = String(options.apiBaseUrl || process.env.TIK_API_BASE_URL || 'http://127.0.0.1:3300/api').replace(/\/$/, '');
+  return `${baseUrl}${route.startsWith('/v1/') ? route : route.replace(/^\/api/, '')}`;
 }
 
 function appendOptionValue(current, value) {

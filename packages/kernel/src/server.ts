@@ -27,7 +27,9 @@ import type {
   HumanOverrideRecord,
   MultiAgentWorkflowBundle,
   MultiAgentWorkflowRecord,
+  QuestionerIntent,
   QuestionerOutput,
+  QuestionerOutputV2,
   SprintContract,
   SubtaskRunState,
   TaskGraph,
@@ -230,6 +232,23 @@ interface RecordQuestionerOutputBody {
   risks?: QuestionerOutput['risks'];
   missingTests?: QuestionerOutput['missingTests'];
   suggestedContractChanges?: QuestionerOutput['suggestedContractChanges'];
+}
+
+interface CreateQuestionerRunBody {
+  id?: string;
+  invocationId?: string;
+  intent: QuestionerIntent;
+  subtaskId?: string;
+  contractId?: string;
+  evaluationRunId?: string;
+  finalEvaluationRunId?: string;
+  headSha: string;
+  start?: boolean;
+  tokenTtlMs?: number;
+}
+
+interface SubmitQuestionerRunOutputBody {
+  output: QuestionerOutputV2;
 }
 
 interface RecordWorkflowDecisionBody {
@@ -1759,6 +1778,66 @@ export async function createServer(
           reply.code(409);
         }
         return result;
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: CreateQuestionerRunBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/questioner-runs',
+    async (req, reply) => {
+      try {
+        const result = await multiAgentStore.createQuestionerRun(req.params.workflowId, req.body);
+        return {
+          questionerRunId: result.run.id,
+          invocationId: result.invocation.id,
+          contextArtifactRef: result.run.contextArtifactRef,
+          contextHash: result.run.contextHash,
+          expectedOutputArtifactRef: result.run.expectedOutputArtifactRef,
+          submitUrl: `/v1/multi-agent/workflows/${encodeURIComponent(result.run.workflowId)}/questioner-runs/${encodeURIComponent(result.run.id)}/output`,
+          contextUrl: `/v1/multi-agent/workflows/${encodeURIComponent(result.run.workflowId)}/questioner-runs/${encodeURIComponent(result.run.id)}/context`,
+          token: result.token,
+          tokenExpiresAt: result.run.tokenExpiresAt,
+          questionerRun: redactSensitiveObject(result.run),
+          invocation: sanitizeAgentInvocation(result.invocation),
+        };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.get<{ Params: { workflowId: string; runId: string } }>(
+    '/api/v1/multi-agent/workflows/:workflowId/questioner-runs/:runId/context',
+    async (req, reply) => {
+      try {
+        const token = bearerToken(req.headers.authorization);
+        const result = await multiAgentStore.readQuestionerRunContext(req.params.workflowId, req.params.runId, token);
+        return {
+          questionerRun: redactSensitiveObject(result.run),
+          context: result.context,
+        };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string; runId: string }; Body: SubmitQuestionerRunOutputBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/questioner-runs/:runId/output',
+    async (req, reply) => {
+      try {
+        const token = bearerToken(req.headers.authorization);
+        const result = await multiAgentStore.submitQuestionerRunOutput(req.params.workflowId, req.params.runId, {
+          token,
+          output: req.body.output,
+        });
+        return {
+          questionerRun: redactSensitiveObject(result.run),
+          questionerOutput: result.questionerOutput,
+          invocation: sanitizeAgentInvocation(result.invocation),
+        };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -3774,7 +3853,21 @@ function isRemoteBindHost(host: string | undefined): boolean {
 function isPublicApiRoute(method: string, url: string): boolean {
   if (method === 'OPTIONS') return true;
   const pathname = url.split('?')[0] || '/';
+  if (
+    /^\/api\/v1\/multi-agent\/workflows\/[^/]+\/questioner-runs\/[^/]+\/(?:context|output)$/.test(pathname)
+    && (method === 'GET' || method === 'POST')
+  ) {
+    return true;
+  }
   return method === 'GET' && (pathname === '/api/health' || pathname === '/health');
+}
+
+function bearerToken(authorization: string | undefined): string | undefined {
+  if (!authorization) {
+    return undefined;
+  }
+  const match = /^Bearer\s+(.+)$/i.exec(authorization.trim());
+  return match?.[1];
 }
 
 function workflowV2SelectorSkipReason(
@@ -3851,16 +3944,27 @@ async function resolveTaskMultiAgentWorkflowBundle(
 }
 
 function sanitizeMultiAgentWorkflowBundle(bundle: MultiAgentWorkflowBundle): MultiAgentWorkflowBundle {
+  const contracts = Array.isArray(bundle.contracts) ? bundle.contracts : [];
+  const decisions = Array.isArray(bundle.decisions) ? bundle.decisions : [];
+  const evidence = Array.isArray(bundle.evidence) ? bundle.evidence : [];
+  const evaluationRuns = Array.isArray(bundle.evaluationRuns) ? bundle.evaluationRuns : [];
+  const invocations = Array.isArray(bundle.invocations) ? bundle.invocations : [];
+  const questionerOutputs = Array.isArray(bundle.questionerOutputs) ? bundle.questionerOutputs : [];
+  const questionerRuns = Array.isArray(bundle.questionerRuns) ? bundle.questionerRuns : [];
+  const events = Array.isArray(bundle.events) ? bundle.events : [];
+
   return {
     ...bundle,
     workflow: redactSensitiveObject(bundle.workflow) as MultiAgentWorkflowBundle['workflow'],
     taskGraph: redactSensitiveObject(bundle.taskGraph) as MultiAgentWorkflowBundle['taskGraph'],
-    contracts: redactSensitiveObject(bundle.contracts) as MultiAgentWorkflowBundle['contracts'],
-    decisions: redactSensitiveObject(bundle.decisions) as MultiAgentWorkflowBundle['decisions'],
-    evidence: redactSensitiveObject(bundle.evidence) as MultiAgentWorkflowBundle['evidence'],
-    questionerOutputs: redactSensitiveObject(bundle.questionerOutputs) as MultiAgentWorkflowBundle['questionerOutputs'],
-    invocations: bundle.invocations.map(sanitizeAgentInvocation),
-    events: redactSensitiveObject(bundle.events) as MultiAgentWorkflowBundle['events'],
+    contracts: redactSensitiveObject(contracts) as MultiAgentWorkflowBundle['contracts'],
+    decisions: redactSensitiveObject(decisions) as MultiAgentWorkflowBundle['decisions'],
+    evidence: redactSensitiveObject(evidence) as MultiAgentWorkflowBundle['evidence'],
+    evaluationRuns: redactSensitiveObject(evaluationRuns) as MultiAgentWorkflowBundle['evaluationRuns'],
+    questionerRuns: redactSensitiveObject(questionerRuns) as MultiAgentWorkflowBundle['questionerRuns'],
+    questionerOutputs: redactSensitiveObject(questionerOutputs) as MultiAgentWorkflowBundle['questionerOutputs'],
+    invocations: invocations.map(sanitizeAgentInvocation),
+    events: redactSensitiveObject(events) as MultiAgentWorkflowBundle['events'],
   };
 }
 

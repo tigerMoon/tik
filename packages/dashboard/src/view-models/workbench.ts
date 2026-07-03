@@ -4,8 +4,10 @@ import type {
   MultiAgentWorkflowBundle,
   MultiAgentWorkflowEvidence,
   QuestionerOutput,
+  QuestionerRun,
   SprintContract,
   SubtaskRunState,
+  TaskGraph,
   WorkflowDecision,
   WorkbenchArtifactRecord as SharedWorkbenchArtifactRecord,
   TaskWorkspaceBinding,
@@ -164,6 +166,20 @@ export interface TaskWorkflowPanelModel {
   runtime: TaskWorkflowRow[];
   hasDetails: boolean;
 }
+
+type TaskWorkflowPanelBundle = Omit<
+  MultiAgentWorkflowBundle,
+  'contracts' | 'decisions' | 'evidence' | 'evaluationRuns' | 'invocations' | 'questionerOutputs' | 'questionerRuns' | 'subtasks'
+> & {
+  contracts?: MultiAgentWorkflowBundle['contracts'];
+  decisions?: MultiAgentWorkflowBundle['decisions'];
+  evidence?: MultiAgentWorkflowBundle['evidence'];
+  evaluationRuns?: MultiAgentWorkflowBundle['evaluationRuns'];
+  invocations?: MultiAgentWorkflowBundle['invocations'];
+  questionerOutputs?: MultiAgentWorkflowBundle['questionerOutputs'];
+  questionerRuns?: MultiAgentWorkflowBundle['questionerRuns'];
+  subtasks?: MultiAgentWorkflowBundle['subtasks'];
+};
 
 export interface WorkbenchQueueSignal {
   tone: 'green' | 'blue' | 'yellow' | 'red' | 'neutral';
@@ -1118,14 +1134,14 @@ function formatArtifactStatusLabel(status: SharedWorkbenchArtifactRecord['status
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
-function compareByTaskGraphOrder(bundle: MultiAgentWorkflowBundle, leftId: string, rightId: string): number {
-  const order = new Map((bundle.taskGraph?.subtasks || []).map((subtask, index) => [subtask.id, index]));
+function compareByTaskGraphOrder(taskGraph: TaskGraph | null | undefined, leftId: string, rightId: string): number {
+  const order = new Map((taskGraph?.subtasks || []).map((subtask, index) => [subtask.id, index]));
   return (order.get(leftId) ?? Number.MAX_SAFE_INTEGER) - (order.get(rightId) ?? Number.MAX_SAFE_INTEGER)
     || leftId.localeCompare(rightId);
 }
 
-function buildPlanWorkflowRows(bundle: MultiAgentWorkflowBundle): TaskWorkflowRow[] {
-  const graph = bundle.taskGraph;
+function buildPlanWorkflowRows(taskGraph: TaskGraph | null | undefined): TaskWorkflowRow[] {
+  const graph = taskGraph;
   if (!graph) {
     return [];
   }
@@ -1178,8 +1194,8 @@ function buildPlanWorkflowRows(bundle: MultiAgentWorkflowBundle): TaskWorkflowRo
   return rows;
 }
 
-function buildSubtaskWorkflowRow(bundle: MultiAgentWorkflowBundle, subtask: SubtaskRunState): TaskWorkflowRow {
-  const spec = bundle.taskGraph?.subtasks.find((item) => item.id === subtask.subtaskId);
+function buildSubtaskWorkflowRow(taskGraph: TaskGraph | null | undefined, subtask: SubtaskRunState): TaskWorkflowRow {
+  const spec = taskGraph?.subtasks.find((item) => item.id === subtask.subtaskId);
   const evidenceCount = subtask.evidenceRefs.length;
   const validationCount = subtask.validationRunIds.length;
   const reviewCount = subtask.reviewRoundIds.length;
@@ -1281,6 +1297,26 @@ function buildQuestionerWorkflowRow(output: QuestionerOutput): TaskWorkflowRow {
   };
 }
 
+function buildQuestionerRunWorkflowRow(run: QuestionerRun): TaskWorkflowRow {
+  return {
+    id: `questioner-run:${run.id}`,
+    title: `Questioner run ${humanizeWorkflowStatus(run.intent)}`,
+    detail: [
+      humanizeWorkflowStatus(run.status),
+      run.contextHash,
+      run.outputHash ? `output ${run.outputHash}` : undefined,
+      run.rejectionReason,
+    ].filter(Boolean).join(' · '),
+    meta: [
+      run.subtaskId || 'workflow',
+      run.invocationId,
+      compactSha(run.headSha),
+      run.contextArtifactRef,
+    ].filter(Boolean).join(' · '),
+    tone: run.status === 'rejected' || run.status === 'expired' ? 'red' : toneForRuntimeStatus(run.status),
+  };
+}
+
 function summarizeReviewEvidence(evidence: MultiAgentWorkflowEvidence): string | undefined {
   const result = evidence.payload?.result;
   if (!result || typeof result !== 'object') {
@@ -1347,33 +1383,41 @@ function humanizeWorkflowStatus(value: string): string {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
-export function buildTaskWorkflowPanelModel(bundle: MultiAgentWorkflowBundle | null): TaskWorkflowPanelModel | null {
+export function buildTaskWorkflowPanelModel(bundle: TaskWorkflowPanelBundle | null): TaskWorkflowPanelModel | null {
   if (!bundle) {
     return null;
   }
 
   const workflow = bundle.workflow;
-  const planRows = buildPlanWorkflowRows(bundle);
-  const contractRows = bundle.contracts
+  const contracts = Array.isArray(bundle.contracts) ? bundle.contracts : [];
+  const decisions = Array.isArray(bundle.decisions) ? bundle.decisions : [];
+  const evidence = Array.isArray(bundle.evidence) ? bundle.evidence : [];
+  const evaluationRuns = Array.isArray(bundle.evaluationRuns) ? bundle.evaluationRuns : [];
+  const invocations = Array.isArray(bundle.invocations) ? bundle.invocations : [];
+  const questionerOutputs = Array.isArray(bundle.questionerOutputs) ? bundle.questionerOutputs : [];
+  const questionerRuns = Array.isArray(bundle.questionerRuns) ? bundle.questionerRuns : [];
+  const subtasks = bundle.subtasks && typeof bundle.subtasks === 'object' ? bundle.subtasks : {};
+  const planRows = buildPlanWorkflowRows(bundle.taskGraph);
+  const contractRows = contracts
     .slice()
     .sort((left, right) => right.version - left.version || left.subtaskId.localeCompare(right.subtaskId))
     .slice(0, 6)
     .map(buildContractWorkflowRow);
-  const subtaskRows = Object.values(bundle.subtasks)
-    .sort((left, right) => compareByTaskGraphOrder(bundle, left.subtaskId, right.subtaskId))
-    .map((subtask) => buildSubtaskWorkflowRow(bundle, subtask));
-  const evidenceRows = bundle.evidence
+  const subtaskRows = Object.values(subtasks)
+    .sort((left, right) => compareByTaskGraphOrder(bundle.taskGraph, left.subtaskId, right.subtaskId))
+    .map((subtask) => buildSubtaskWorkflowRow(bundle.taskGraph, subtask));
+  const evidenceRows = evidence
     .slice()
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
     .slice(0, 6)
     .map(buildEvidenceWorkflowRow);
-  const decisionRows = bundle.decisions
+  const decisionRows = decisions
     .slice()
     .sort((left, right) => right.decidedAt.localeCompare(left.decidedAt))
     .slice(0, 6)
     .map(buildDecisionWorkflowRow);
   const runtimeRows = [
-    ...bundle.evaluationRuns
+    ...evaluationRuns
       .slice()
       .sort((left, right) => (right.completedAt || right.startedAt).localeCompare(left.completedAt || left.startedAt))
       .slice(0, 3)
@@ -1384,12 +1428,17 @@ export function buildTaskWorkflowPanelModel(bundle: MultiAgentWorkflowBundle | n
         meta: [run.subtaskId, compactSha(run.headSha), run.completedAt || run.startedAt].filter(Boolean).join(' · '),
         tone: toneForPassed(run.status === 'passed'),
       }) satisfies TaskWorkflowRow),
-    ...bundle.questionerOutputs
+    ...questionerOutputs
       .slice()
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .slice(0, 3)
       .map(buildQuestionerWorkflowRow),
-    ...bundle.invocations
+    ...questionerRuns
+      .slice()
+      .sort((left, right) => String(right.completedAt || right.startedAt || right.createdAt).localeCompare(String(left.completedAt || left.startedAt || left.createdAt)))
+      .slice(0, 3)
+      .map(buildQuestionerRunWorkflowRow),
+    ...invocations
       .slice()
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
       .slice(0, 3)
@@ -1417,11 +1466,11 @@ export function buildTaskWorkflowPanelModel(bundle: MultiAgentWorkflowBundle | n
     headLabel: compactSha(workflow.currentHeadSha),
     lastDecisionLabel: workflow.lastDecisionId || 'No decision yet',
     metrics: [
-      { label: 'Subtasks', value: String(Object.keys(bundle.subtasks).length) },
-      { label: 'Evidence', value: String(bundle.evidence.length) },
-      { label: 'Decisions', value: String(bundle.decisions.length) },
-      { label: 'Contracts', value: String(bundle.contracts.length) },
-      { label: 'Runtime', value: String(bundle.evaluationRuns.length + bundle.questionerOutputs.length + bundle.invocations.length) },
+      { label: 'Subtasks', value: String(Object.keys(subtasks).length) },
+      { label: 'Evidence', value: String(evidence.length) },
+      { label: 'Decisions', value: String(decisions.length) },
+      { label: 'Contracts', value: String(contracts.length) },
+      { label: 'Runtime', value: String(evaluationRuns.length + questionerRuns.length + questionerOutputs.length + invocations.length) },
     ],
     plan: planRows,
     contracts: contractRows,

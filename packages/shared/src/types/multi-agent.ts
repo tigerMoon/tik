@@ -293,6 +293,13 @@ export interface AgentInvocationRecord {
   completedAt?: string;
 }
 
+export interface AgentRuntimePolicy {
+  filesystem: 'read-only' | 'workspace-write' | 'unrestricted';
+  network: 'tik-api-only' | 'disabled' | 'unrestricted';
+  shell: 'disabled' | 'read-only' | 'unrestricted';
+  permissionMode: 'dontAsk' | 'bypassPermissions';
+}
+
 export interface SubagentRuntimeAttestation {
   source: 'codex-subagent-runtime' | 'codex-plugin-hook';
   parentThreadId: string;
@@ -359,6 +366,11 @@ export type MultiAgentWorkflowEventType =
   | 'evaluation.updated'
   | 'evaluation.result.recorded'
   | 'evaluation.readonly_validated'
+  | 'questioner.run.created'
+  | 'questioner.run.started'
+  | 'questioner.run.output_received'
+  | 'questioner.run.validated'
+  | 'questioner.run.rejected'
   | 'questioner.output.recorded'
   | 'agent_invocation.created'
   | 'agent_invocation.started'
@@ -393,6 +405,7 @@ export interface MultiAgentWorkflowBundle {
   subtasks: Record<string, SubtaskRunState>;
   contracts: SprintContract[];
   evaluationRuns: EvaluationRun[];
+  questionerRuns: QuestionerRun[];
   questionerOutputs: QuestionerOutput[];
   decisions: WorkflowDecision[];
   evidence: MultiAgentWorkflowEvidence[];
@@ -413,6 +426,48 @@ export interface WorkflowPolicy {
   loopContract?: LoopContract;
   stalledInvocationTimeoutMs?: number;
   snapshotMaxChars?: Partial<Record<WorkflowContextSnapshotTarget, number>>;
+}
+
+export type QuestionerIntent =
+  | 'question_requirement'
+  | 'question_task_graph'
+  | 'question_contract'
+  | 'question_evaluation'
+  | 'question_fix'
+  | 'question_final_evidence';
+
+export interface QuestionerRun {
+  id: string;
+  workflowId: string;
+  subtaskId?: string;
+  intent: QuestionerIntent;
+  status:
+    | 'created'
+    | 'started'
+    | 'output_received'
+    | 'validated'
+    | 'rejected'
+    | 'expired';
+  invocationId: string;
+  runner: 'claude-code';
+  pluginSkill: 'question-tik-agent-loop';
+  contractId?: string;
+  evaluationRunId?: string;
+  finalEvaluationRunId?: string;
+  headSha: string;
+  contextArtifactRef: string;
+  contextHash: string;
+  expectedOutputArtifactRef?: string;
+  outputHash?: string;
+  outputArtifactRef?: string;
+  rejectionReason?: string;
+  tokenId: string;
+  tokenHash: string;
+  tokenExpiresAt: string;
+  runtimePolicy: AgentRuntimePolicy;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
 }
 
 export type LoopStopCondition =
@@ -596,6 +651,132 @@ export interface EvaluationRun {
   completedAt?: string;
 }
 
+export interface QuestionerContextV1 {
+  schemaVersion: 'questioner-context.v1';
+  run: {
+    questionerRunId: string;
+    invocationId: string;
+    workflowId: string;
+    intent: QuestionerIntent;
+    headSha: string;
+    contextHash: string;
+    submitUrl: string;
+  };
+  workflow: {
+    goal: string;
+    policy: Record<string, unknown>;
+    globalAcceptanceCriteria: string[];
+  };
+  subtask?: {
+    id: string;
+    title: string;
+    description?: string;
+    status: string;
+    dependencies: string[];
+  };
+  contract?: {
+    id: string;
+    status: SprintContract['status'];
+    mustCriteria: Array<{
+      id: string;
+      statement: string;
+      verificationMethod?: string;
+    }>;
+    shouldCriteria: Array<{
+      id: string;
+      statement: string;
+      verificationMethod?: string;
+    }>;
+    outOfScope: string[];
+    requiredEvidence: string[];
+  };
+  implementationEvidence?: {
+    id: string;
+    builderInvocationId?: string;
+    headSha?: string;
+    summary: string;
+    changedFiles: Array<{
+      path: string;
+      changeType?: string;
+    }>;
+    commands: Array<{
+      id?: string;
+      command: string;
+      status?: string;
+      summary?: string;
+    }>;
+    artifacts: Array<{
+      ref: string;
+      kind?: string;
+      summary?: string;
+    }>;
+  };
+  evaluation?: {
+    id: string;
+    evaluatorInvocationId?: string;
+    readonly: boolean;
+    headSha: string;
+    verdict?: string;
+    commands: CodexEvaluationResult['commandResults'];
+    artifacts: Array<{
+      ref: string;
+      kind?: string;
+      summary?: string;
+    }>;
+    coverage: CodexEvaluationResult['criteriaResults'];
+    coverageGaps: CodexEvaluationResult['coverageGaps'];
+    logs: Array<{
+      artifactRef?: string;
+      excerpt: string;
+    }>;
+  };
+  finalEvaluation?: {
+    id: string;
+    headSha: string;
+    verdict?: string;
+    globalCriteriaCoverage: CodexEvaluationResult['criteriaResults'];
+    requiredEvidence: Array<{
+      ref: string;
+      kind?: string;
+      summary?: string;
+    }>;
+    coverageGaps: CodexEvaluationResult['coverageGaps'];
+  };
+  diff?: {
+    baseSha?: string;
+    headSha: string;
+    files: Array<{
+      path: string;
+      changeType?: string;
+    }>;
+    excerpts: Array<{
+      path: string;
+      excerpt: string;
+    }>;
+  };
+  relevantFiles: Array<{
+    path: string;
+    sha256: string;
+    excerpt: string;
+    reason: string;
+  }>;
+  previousQuestionerOutputs: Array<{
+    id: string;
+    intent: QuestionerIntent;
+    verdict: string;
+    unresolvedQuestions: Array<{
+      id: string;
+      priority: string;
+      claim: string;
+    }>;
+  }>;
+  outputContract: {
+    schemaVersion: 'questioner-output.v2';
+    requiredFields: string[];
+    allowedVerdicts: string[];
+  };
+}
+
 export interface CodexEvaluationResult {
   workflowId: string;
   subtaskId: string;
@@ -641,7 +822,9 @@ export interface CodexEvaluationResult {
 }
 
 export interface QuestionerOutput {
+  schemaVersion?: 'questioner-output.v1' | 'questioner-output.v2';
   id: string;
+  questionerRunId?: string;
   workflowId: string;
   subtaskId?: string;
   source: 'claude-plugin' | 'manual' | 'codex-workflow';
@@ -650,17 +833,17 @@ export interface QuestionerOutput {
   evaluationRunId?: string;
   finalEvaluationRunId?: string;
   artifactRef?: string;
-  intent:
-    | 'question_requirement'
-    | 'question_task_graph'
-    | 'question_contract'
-    | 'question_evaluation'
-    | 'question_fix'
-    | 'question_final_evidence';
+  attestation?: QuestionerOutputV2['attestation'];
+  references?: QuestionerOutputV2['references'];
+  coverageMatrix?: QuestionerOutputV2['coverageMatrix'];
+  advisoryNotes?: string[];
+  intent: QuestionerIntent;
   actor: {
     kind: 'claude-code-questioner';
     invocationId?: string;
     model?: string;
+    pluginName?: 'agent-loop-claude-review';
+    skillName?: 'question-tik-agent-loop';
   };
   verdict:
     | 'need_clarification'
@@ -670,33 +853,11 @@ export interface QuestionerOutput {
     | 'no_blocking_questions'
     | 'questions_blocking'
     | 'questions_non_blocking'
+    | 'evidence_needed'
     | 'human_review_required';
-  questions: Array<{
-    id: string;
-    priority: 'blocking' | 'important' | 'optional';
-    question: string;
-    whyItMatters: string;
-    expectedAnswerType:
-      | 'requirement'
-      | 'constraint'
-      | 'acceptance_criterion'
-      | 'test_case'
-      | 'edge_case'
-      | 'architecture_decision'
-      | 'evidence'
-      | 'human_decision';
-  }>;
-  risks: Array<{
-    id: string;
-    severity: 'high' | 'medium' | 'low';
-    description: string;
-    suggestedMitigation: string;
-  }>;
-  missingTests: Array<{
-    id: string;
-    scenario: string;
-    reason: string;
-  }>;
+  questions: QuestionerQuestion[];
+  risks: QuestionerRisk[];
+  missingTests: QuestionerMissingTest[];
   suggestedContractChanges: Array<{
     target:
       | 'acceptanceCriteria'
@@ -708,5 +869,150 @@ export interface QuestionerOutput {
     change: string;
     reason: string;
   }>;
+  createdAt: string;
+}
+
+export interface QuestionerQuestion {
+  id: string;
+  priority: 'blocking' | 'important' | 'optional' | 'evidence_needed' | 'advisory';
+  question?: string;
+  whyItMatters?: string;
+  expectedAnswerType?:
+    | 'requirement'
+    | 'constraint'
+    | 'acceptance_criterion'
+    | 'test_case'
+    | 'edge_case'
+    | 'architecture_decision'
+    | 'evidence'
+    | 'human_decision';
+  category?:
+    | 'ambiguous_requirement'
+    | 'contract_gap'
+    | 'coverage_gap'
+    | 'missing_test'
+    | 'weak_evidence'
+    | 'stale_evidence'
+    | 'head_mismatch'
+    | 'artifact_gap'
+    | 'safety_risk'
+    | 'regression_risk';
+  claim?: string;
+  evidenceRefs?: string[];
+  requestedFix?: string;
+  requestedEvidence?: string;
+  reproductionCommand?: string;
+  status?: 'open' | 'resolved' | 'accepted_risk' | 'wont_fix';
+}
+
+export interface QuestionerRisk {
+  id: string;
+  severity: 'high' | 'medium' | 'low';
+  description: string;
+  suggestedMitigation?: string;
+  evidenceRefs?: string[];
+  mitigation?: string;
+}
+
+export interface QuestionerMissingTest {
+  id: string;
+  scenario?: string;
+  testScenario?: string;
+  reason: string;
+  relatedCriteria?: string[];
+  suggestedCommand?: string;
+}
+
+export interface QuestionerOutputV2 {
+  schemaVersion: 'questioner-output.v2';
+  id: string;
+  questionerRunId: string;
+  workflowId: string;
+  subtaskId?: string;
+  intent: QuestionerIntent;
+  source: 'claude-plugin';
+  actor: {
+    kind: 'claude-code-questioner';
+    invocationId: string;
+    pluginName: 'agent-loop-claude-review';
+    skillName: 'question-tik-agent-loop';
+    model?: string;
+  };
+  attestation: {
+    headSha: string;
+    contextArtifactRef: string;
+    contextHash: string;
+    outputArtifactRef: string;
+    outputHash: string;
+    generatedAt: string;
+  };
+  references: {
+    contractId?: string;
+    evaluationRunId?: string;
+    finalEvaluationRunId?: string;
+  };
+  verdict:
+    | 'questions_blocking'
+    | 'evidence_needed'
+    | 'risk_found'
+    | 'no_blocking_questions'
+    | 'evidence_sufficient';
+  coverageMatrix: Array<{
+    criterionId: string;
+    criterionText: string;
+    required: boolean;
+    status:
+      | 'covered'
+      | 'partially_covered'
+      | 'missing'
+      | 'not_applicable';
+    evidenceRefs: string[];
+    comment: string;
+  }>;
+  questions: Array<{
+    id: string;
+    priority: 'blocking' | 'evidence_needed' | 'advisory';
+    category:
+      | 'ambiguous_requirement'
+      | 'contract_gap'
+      | 'coverage_gap'
+      | 'missing_test'
+      | 'weak_evidence'
+      | 'stale_evidence'
+      | 'head_mismatch'
+      | 'artifact_gap'
+      | 'safety_risk'
+      | 'regression_risk';
+    claim: string;
+    evidenceRefs: string[];
+    requestedFix?: string;
+    requestedEvidence?: string;
+    reproductionCommand?: string;
+    status: 'open';
+  }>;
+  risks: Array<{
+    id: string;
+    severity: 'low' | 'medium' | 'high';
+    description: string;
+    evidenceRefs: string[];
+    mitigation?: string;
+  }>;
+  missingTests: Array<{
+    id: string;
+    testScenario: string;
+    reason: string;
+    relatedCriteria: string[];
+    suggestedCommand?: string;
+  }>;
+  advisoryNotes: string[];
+  createdAt?: string;
+}
+
+export interface QuestionResolution {
+  questionId: string;
+  status: 'resolved' | 'accepted_risk' | 'wont_fix';
+  resolvedByInvocationId: string;
+  evidenceRefs: string[];
+  explanation: string;
   createdAt: string;
 }

@@ -20,6 +20,7 @@ let decisions = [];
 let evidence = [];
 let contracts = [];
 let evaluationRuns = [];
+let questionerRuns = [];
 let questionerOutputs = [];
 let invocations = [];
 let reviewTask = null;
@@ -116,6 +117,7 @@ try {
           evidence,
           contracts,
           evaluationRuns,
+          questionerRuns,
           questionerOutputs,
           invocations,
           events,
@@ -329,6 +331,78 @@ try {
           }
           : run);
         sendJson(res, { evaluationRun: evaluationRuns.find((run) => run.id === 'eval-final-v1') });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/questioner-runs') {
+        const body = await readRequestJson(req);
+        const runId = body.id || `qr-${questionerRuns.length + 1}`;
+        const invocationId = body.invocationId || body.invocation || `inv-questioner-${questionerRuns.length + 1}`;
+        const contextArtifactRef = `.tik/multi-agent/workflows/wf-cli/questioner-runs/${runId}/context.json`;
+        const expectedOutputArtifactRef = `.tik/multi-agent/workflows/wf-cli/questioner-runs/${runId}/output.json`;
+        const contextHash = `sha256:${runId}`;
+        const invocation = {
+          id: invocationId,
+          workflowId: 'wf-cli',
+          subtaskId: body.subtaskId,
+          role: 'questioner',
+          runner: 'claude-code',
+          promptContract: 'claude-questioner.v2',
+          input: {
+            intent: body.intent,
+            subtaskId: body.subtaskId,
+            contractId: body.contractId,
+            evaluationRunId: body.finalEvaluationRunId ? undefined : body.evaluationRunId,
+            finalEvaluationRunId: body.finalEvaluationRunId,
+            headSha: body.headSha,
+            questionerRunId: runId,
+            contextArtifactRef,
+            expectedOutputArtifactRef,
+          },
+          headSha: body.headSha,
+          evaluationRunId: body.evaluationRunId || body.finalEvaluationRunId,
+          status: body.start === false ? 'created' : 'started',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          startedAt: body.start === false ? undefined : new Date().toISOString(),
+        };
+        invocations.push(invocation);
+        const run = {
+          id: runId,
+          workflowId: 'wf-cli',
+          subtaskId: body.subtaskId,
+          intent: body.intent,
+          status: body.start === false ? 'created' : 'started',
+          invocationId,
+          runner: 'claude-code',
+          pluginSkill: 'question-tik-agent-loop',
+          contractId: body.contractId,
+          evaluationRunId: body.evaluationRunId,
+          finalEvaluationRunId: body.finalEvaluationRunId,
+          headSha: body.headSha,
+          contextArtifactRef,
+          contextHash,
+          expectedOutputArtifactRef,
+          tokenId: `tok-${runId}`,
+          tokenHash: `sha256:${runId}-token`,
+          tokenExpiresAt: new Date(Date.now() + 3600000).toISOString(),
+          runtimePolicy: { filesystem: 'read-only', network: 'tik-api-only', shell: 'read-only', permissionMode: 'dontAsk' },
+          createdAt: new Date().toISOString(),
+          startedAt: body.start === false ? undefined : new Date().toISOString(),
+        };
+        questionerRuns.push(run);
+        sendJson(res, {
+          questionerRunId: run.id,
+          invocationId,
+          contextArtifactRef,
+          contextHash,
+          expectedOutputArtifactRef,
+          submitUrl: `/v1/multi-agent/workflows/wf-cli/questioner-runs/${run.id}/output`,
+          contextUrl: `/v1/multi-agent/workflows/wf-cli/questioner-runs/${run.id}/context`,
+          token: `token-${run.id}`,
+          tokenExpiresAt: run.tokenExpiresAt,
+          questionerRun: run,
+          invocation,
+        });
         return;
       }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/questioner-outputs') {
@@ -898,10 +972,39 @@ try {
       result: { verdict: 'pass', headSha: workflow.currentHeadSha },
       startedAt: new Date().toISOString(),
     }],
+    questionerRuns: [{
+      id: 'qr-clear',
+      status: 'validated',
+      invocationId: 'inv-q-clear',
+      contextHash: 'sha256:ctx-clear',
+      contextArtifactRef: 'context://qr-clear',
+      outputHash: 'sha256:out-clear',
+    }],
+    invocations: [{
+      id: 'inv-q-clear',
+      status: 'completed',
+    }],
     questionerOutputs: [{
+      schemaVersion: 'questioner-output.v2',
       id: 'q-clear',
+      questionerRunId: 'qr-clear',
       subtaskId: 'st-api',
       intent: 'question_evaluation',
+      actor: { invocationId: 'inv-q-clear' },
+      references: { contractId: 'contract-st-api-v1', evaluationRunId: 'eval-pass' },
+      attestation: {
+        headSha: workflow.currentHeadSha,
+        contextHash: 'sha256:ctx-clear',
+        contextArtifactRef: 'context://qr-clear',
+        outputHash: 'sha256:out-clear',
+      },
+      coverageMatrix: [{
+        criterionId: 'ac-1',
+        required: true,
+        status: 'covered',
+        evidenceRefs: ['eval-pass'],
+        comment: 'covered',
+      }],
       verdict: 'evidence_sufficient',
       questions: [],
       createdAt: new Date().toISOString(),
@@ -968,9 +1071,38 @@ try {
       result: { verdict: 'pass', headSha: workflow.currentHeadSha },
       startedAt: new Date().toISOString(),
     }],
+    questionerRuns: [{
+      id: 'qr-final-clear',
+      status: 'validated',
+      invocationId: 'inv-q-final-clear',
+      contextHash: 'sha256:ctx-final-clear',
+      contextArtifactRef: 'context://qr-final-clear',
+      outputHash: 'sha256:out-final-clear',
+    }],
+    invocations: [{
+      id: 'inv-q-final-clear',
+      status: 'completed',
+    }],
     questionerOutputs: [{
+      schemaVersion: 'questioner-output.v2',
       id: 'q-final-clear',
+      questionerRunId: 'qr-final-clear',
       intent: 'question_final_evidence',
+      actor: { invocationId: 'inv-q-final-clear' },
+      references: { finalEvaluationRunId: 'eval-final-pass' },
+      attestation: {
+        headSha: workflow.currentHeadSha,
+        contextHash: 'sha256:ctx-final-clear',
+        contextArtifactRef: 'context://qr-final-clear',
+        outputHash: 'sha256:out-final-clear',
+      },
+      coverageMatrix: [{
+        criterionId: 'global-ac-1',
+        required: true,
+        status: 'covered',
+        evidenceRefs: ['eval-final-pass'],
+        comment: 'covered',
+      }],
       verdict: 'evidence_sufficient',
       questions: [],
       createdAt: new Date().toISOString(),
@@ -1114,7 +1246,7 @@ try {
     '--evaluation', 'eval-st-api-v1',
     '--artifact-ref', '.tik/multi-agent/workflows/wf-cli/questioner/q-cli.json',
   ]);
-  assert.equal(questionerStarted.action, 'questioner-started');
+  assert.equal(questionerStarted.action, 'questioner-run-started');
   assert.equal(questionerStarted.invocation.status, 'started');
 
   const questioned = await run([
@@ -1188,7 +1320,7 @@ try {
     '--evaluation', 'eval-final-v1',
     '--artifact-ref', '.tik/multi-agent/workflows/wf-cli/questioner/q-final-cli.json',
   ]);
-  assert.equal(finalQuestionerStarted.action, 'questioner-started');
+  assert.equal(finalQuestionerStarted.action, 'questioner-run-started');
   assert.equal(finalQuestionerStarted.invocation.input.finalEvaluationRunId, 'eval-final-v1');
   assert.equal(finalQuestionerStarted.invocation.input.evaluationRunId, undefined);
 
