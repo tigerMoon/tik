@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
 import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -807,21 +807,52 @@ async function evaluate(options) {
     : options.result
       ? await readJsonFile(options.result)
       : null;
-  const command = options.command || (options.inferCommand === 'false' ? null : inferEvaluationCommand(state, subtaskId));
+  const commands = evaluationCommandsFromOptions(options, state, subtaskId);
+  const setupCommands = splitList(options.evaluatorSetupCommand) || splitList(options.setupCommand) || [];
+  const commandResults = [];
   let commandResult = null;
+  let setupFailure = null;
   try {
-    if (command) {
-      commandResult = await runCommandWithArtifacts({
-        command,
+    for (const [index, setupCommand] of setupCommands.entries()) {
+      const setupResult = await runCommandWithArtifacts({
+        command: setupCommand,
         cwd: evaluationCwd,
         artifactBasePath: projectPath,
-        hardTimeoutMs: numberOption(options.timeoutMs, 120000),
+        hardTimeoutMs: numberOption(options.setupTimeoutMs, numberOption(options.timeoutMs, 120000)),
         idleTimeoutMs: numberOption(options.idleTimeoutMs, 0),
         maxOutputBytes: numberOption(options.maxOutputBytes, 20000),
-        stdoutArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'evaluations', evaluationRun.evaluationRun.id, 'stdout.log'),
-        stderrArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'evaluations', evaluationRun.evaluationRun.id, 'stderr.log'),
+        stdoutArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'evaluations', evaluationRun.evaluationRun.id, `setup-${index + 1}.stdout.log`),
+        stderrArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'evaluations', evaluationRun.evaluationRun.id, `setup-${index + 1}.stderr.log`),
       });
-      commandResult.commandId = stringOption(options.commandId) || 'cmd-evaluate';
+      setupResult.commandId = `cmd-evaluate-setup-${index + 1}`;
+      commandResults.push(setupResult);
+      if (setupResult.status !== 'passed') {
+        setupFailure = setupResult;
+        break;
+      }
+    }
+    if (commands.length > 0 && !setupFailure) {
+      const commandIds = splitList(options.commandId) || [];
+      for (const [index, command] of commands.entries()) {
+        const artifactSuffix = commands.length === 1 ? '' : `-${index + 1}`;
+        const currentResult = await runCommandWithArtifacts({
+          command,
+          cwd: evaluationCwd,
+          artifactBasePath: projectPath,
+          hardTimeoutMs: numberOption(options.timeoutMs, 120000),
+          idleTimeoutMs: numberOption(options.idleTimeoutMs, 0),
+          maxOutputBytes: numberOption(options.maxOutputBytes, 20000),
+          stdoutArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'evaluations', evaluationRun.evaluationRun.id, `stdout${artifactSuffix}.log`),
+          stderrArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'evaluations', evaluationRun.evaluationRun.id, `stderr${artifactSuffix}.log`),
+        });
+        currentResult.commandId = commandIds[index]
+          || (commands.length === 1 ? 'cmd-evaluate' : `cmd-evaluate-${index + 1}`);
+        commandResults.push(currentResult);
+        commandResult = currentResult;
+        if (currentResult.status !== 'passed') {
+          break;
+        }
+      }
     }
   } finally {
     await cleanupEvaluatorSandbox(sandbox);
@@ -835,23 +866,25 @@ async function evaluate(options) {
     ? 'fail'
     : structuredResult?.verdict
       ? structuredResult.verdict
-      : commandResult && commandResult.status !== 'passed'
+      : setupFailure || evaluationCommandResults(commandResults).some((result) => result.status !== 'passed')
       ? 'fail'
-      : !commandResult
+      : !hasEvaluationCommandResult(commandResults)
         ? 'inconclusive'
       : 'pass';
   const coverageGaps = Array.isArray(structuredResult?.coverageGaps)
     ? structuredResult.coverageGaps
-    : !commandResult
+    : !hasEvaluationCommandResult(commandResults)
       ? [{
         criterionId: 'all',
         description: 'Evaluator did not provide command, criteria, artifact, or reproduction evidence.',
         reason: 'No evaluator command, criteria result, or artifact evidence was provided.',
       }]
       : [];
+  const failedCommandResult = evaluationCommandResults(commandResults).find((result) => result.status !== 'passed');
+  const decisiveCommandResult = setupFailure || failedCommandResult || commandResult;
   const criteriaResults = Array.isArray(structuredResult?.criteriaResults)
     ? structuredResult.criteriaResults
-    : buildCriteriaResultsFromCommand(state, subtaskId, commandResult, coverageGaps);
+    : buildCriteriaResultsFromCommands(state, subtaskId, evaluationCommandResults(commandResults), decisiveCommandResult, coverageGaps);
   const runtimeFindings = Array.isArray(structuredResult?.runtimeFindings)
     ? structuredResult.runtimeFindings
     : verdict === 'pass'
@@ -860,11 +893,15 @@ async function evaluate(options) {
       id: 'evaluation_failed',
       severity: 'blocker',
       title: 'Evaluation failed',
-      observed: commandResult?.summary || readonly.guard?.message || 'Evaluation did not pass.',
+      observed: decisiveCommandResult?.summary || readonly.guard?.message || 'Evaluation did not pass.',
       expected: 'Evaluation passes without readonly violations.',
-      reproductionSteps: command ? [command] : ['Inspect evaluator artifacts and readonly guard output.'],
+      reproductionSteps: decisiveCommandResult?.command
+        ? [decisiveCommandResult.command]
+        : commands.length > 0
+          ? commands
+          : ['Inspect evaluator artifacts and readonly guard output.'],
     }];
-  const hasCommandEvidence = Boolean(commandResult);
+  const hasCommandEvidence = hasEvaluationCommandResult(commandResults);
   const hasStructuredCriteriaEvidence = Array.isArray(structuredResult?.criteriaResults)
     && structuredResult.criteriaResults.length > 0;
   const hasArtifactEvidence = Array.isArray(structuredResult?.artifacts) && structuredResult.artifacts.length > 0;
@@ -892,16 +929,16 @@ async function evaluate(options) {
     headSha,
     verdict,
     criteriaResults,
-    commandResults: commandResult
-      ? [{
-        commandId: commandResult.commandId,
-        command: commandResult.command,
-        status: commandResult.status,
-        exitCode: commandResult.exitCode,
-        stdoutArtifactId: commandResult.stdoutArtifactId,
-        stderrArtifactId: commandResult.stderrArtifactId,
-        summary: commandResult.summary,
-      }]
+    commandResults: hasEvaluationCommandResult(commandResults) || setupFailure
+      ? commandResults.map((result) => ({
+        commandId: result.commandId,
+        command: result.command,
+        status: result.status,
+        exitCode: result.exitCode,
+        stdoutArtifactId: result.stdoutArtifactId,
+        stderrArtifactId: result.stderrArtifactId,
+        summary: result.summary,
+      }))
       : [],
     runtimeFindings,
     coverageGaps,
@@ -949,10 +986,15 @@ async function evaluate(options) {
       command: commandResult.command,
       status: commandResult.status,
       exitCode: commandResult.exitCode,
+      commands: evaluationCommandResults(commandResults)
+        .map((result) => ({ command: result.command, status: result.status, exitCode: result.exitCode })),
+      setupCommands: commandResults
+        .filter((result) => result.commandId?.startsWith('cmd-evaluate-setup-'))
+        .map((result) => ({ command: result.command, status: result.status, exitCode: result.exitCode })),
     } : undefined,
   });
   if (verdict !== 'pass' && options.failOnValidationError) {
-    process.exitCode = commandResult?.exitCode || 1;
+    process.exitCode = (setupFailure || failedCommandResult || commandResult)?.exitCode || 1;
   }
 }
 
@@ -1783,6 +1825,29 @@ function inferEvaluationCommand(state, subtaskId) {
     || inferValidationCommand(state, subtaskId);
 }
 
+function evaluationCommandsFromOptions(options, state, subtaskId) {
+  if (options.command) {
+    return Array.isArray(options.command) ? options.command.map(String) : [String(options.command)];
+  }
+  if (options.inferCommand === 'false') {
+    return [];
+  }
+  const command = inferEvaluationCommand(state, subtaskId);
+  return command ? [command] : [];
+}
+
+function evaluationCommandResults(commandResults) {
+  return (commandResults || []).filter((result) => !isSetupCommandResult(result));
+}
+
+function isSetupCommandResult(result) {
+  return result.commandId?.startsWith('cmd-evaluate-setup-');
+}
+
+function hasEvaluationCommandResult(commandResults) {
+  return evaluationCommandResults(commandResults).length > 0;
+}
+
 function latestContractId(state, subtaskId) {
   return latestAcceptedContract(state, subtaskId)?.id || latestContract(state, subtaskId)?.id;
 }
@@ -2201,7 +2266,16 @@ function escapeRegExp(value) {
   return String(value).replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
 }
 
-function buildCriteriaResultsFromCommand(state, subtaskId, commandResult, coverageGaps) {
+function buildCriteriaResultsFromCommands(state, subtaskId, commandResults, decisiveCommandResult, coverageGaps) {
+  const allCommandsPassed = commandResults.length > 0 && commandResults.every((result) => result.status === 'passed');
+  const reproductionSteps = commandResults.length > 0
+    ? commandResults.map((result) => result.command)
+    : decisiveCommandResult
+      ? [decisiveCommandResult.command]
+      : undefined;
+  const evidenceSummary = decisiveCommandResult?.summary || (
+    allCommandsPassed ? 'All evaluator commands passed.' : 'No evaluator command or structured criterion result was provided.'
+  );
   if (subtaskId === '__final__') {
     const finalCriteria = (state.taskGraph?.globalAcceptanceCriteria || []).map((statement, index) => ({
       id: `global-ac-${index + 1}`,
@@ -2210,14 +2284,14 @@ function buildCriteriaResultsFromCommand(state, subtaskId, commandResult, covera
     }));
     return finalCriteria.map((criterion) => ({
       criterionId: criterion.id,
-      status: !commandResult || coverageGaps.length > 0 ? 'not_tested' : commandResult.status === 'passed' ? 'pass' : 'fail',
-      evidence: commandResult?.summary || 'No final evaluator command or structured criterion result was provided.',
-      reproductionSteps: commandResult ? [commandResult.command] : undefined,
+      status: commandResults.length === 0 || coverageGaps.length > 0 ? 'not_tested' : allCommandsPassed ? 'pass' : 'fail',
+      evidence: evidenceSummary,
+      reproductionSteps,
     }));
   }
   const contract = latestAcceptedContract(state, subtaskId);
   const mustCriteria = contract?.acceptanceCriteria?.filter((criterion) => criterion.priority === 'must') || [];
-  if (!commandResult || coverageGaps.length > 0) {
+  if (commandResults.length === 0 || coverageGaps.length > 0) {
     return mustCriteria.map((criterion) => ({
       criterionId: criterion.id,
       status: 'not_tested',
@@ -2226,9 +2300,9 @@ function buildCriteriaResultsFromCommand(state, subtaskId, commandResult, covera
   }
   return mustCriteria.map((criterion) => ({
     criterionId: criterion.id,
-    status: commandResult.status === 'passed' ? 'pass' : 'fail',
-    evidence: commandResult.summary,
-    reproductionSteps: [commandResult.command],
+    status: allCommandsPassed ? 'pass' : 'fail',
+    evidence: evidenceSummary,
+    reproductionSteps,
   }));
 }
 
@@ -2411,6 +2485,7 @@ async function prepareEvaluatorSandbox(projectPath, headSha, options) {
   const tempPath = await mkdtemp(path.join(os.tmpdir(), 'tik-evaluator-worktree-'));
   try {
     git(projectPath, ['worktree', 'add', '--detach', tempPath, headSha || 'HEAD']);
+    await overlayCurrentGitChanges(projectPath, tempPath);
   } catch (error) {
     await rm(tempPath, { recursive: true, force: true });
     throw error;
@@ -2427,6 +2502,28 @@ async function prepareEvaluatorSandbox(projectPath, headSha, options) {
       headSha,
     },
   };
+}
+
+async function overlayCurrentGitChanges(projectPath, sandboxPath) {
+  const diff = git(projectPath, ['diff', '--binary', '--no-ext-diff', 'HEAD'], { optional: true });
+  if (diff) {
+    const applied = spawnSync('git', ['apply', '--whitespace=nowarn', '-'], {
+      cwd: sandboxPath,
+      input: `${diff}\n`,
+      encoding: 'utf-8',
+    });
+    if (applied.status !== 0) {
+      throw new Error(`git apply current diff failed in evaluator sandbox: ${applied.stderr || applied.stdout}`);
+    }
+  }
+
+  const untracked = git(projectPath, ['ls-files', '--others', '--exclude-standard'], { optional: true });
+  for (const relativePath of splitLines(untracked)) {
+    const source = path.join(projectPath, relativePath);
+    const target = path.join(sandboxPath, relativePath);
+    await mkdir(path.dirname(target), { recursive: true });
+    await cp(source, target, { recursive: true });
+  }
 }
 
 async function cleanupEvaluatorSandbox(sandbox) {

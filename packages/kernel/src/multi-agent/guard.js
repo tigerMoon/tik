@@ -663,6 +663,7 @@ function guardCanRunCodexEvaluator(bundle, decision) {
     }
     const statusGuard = requireSubtaskStatus(bundle, decision, [
         'implemented',
+        'validated',
         'evaluation_failed',
         'needs_fix',
         'fixing',
@@ -691,11 +692,10 @@ function guardCanFixEvaluationFindings(bundle, decision) {
     const statusGuard = requireSubtaskStatus(bundle, decision, ['evaluation_failed', 'needs_fix', 'questioning_evidence']);
     if (!statusGuard.accepted)
         return statusGuard;
-    const evaluation = latestEvaluationRun(bundle, decision.subtaskId || '');
+    const evaluation = failedEvaluationRunForDecision(bundle, decision);
     const questioner = latestQuestionerOutput(bundle, decision.subtaskId, 'question_evaluation');
-    const hasFailedEvaluation = evaluation?.result?.verdict === 'fail' || evaluation?.status === 'failed';
     const hasBlockingQuestion = questioner ? hasBlockingQuestions(questioner) : false;
-    if (!hasFailedEvaluation && !hasBlockingQuestion) {
+    if (!evaluation && !hasBlockingQuestion) {
         return reject('invalid_transition', 'Fixing evaluation findings requires failed evaluation evidence or blocking Questioner output.');
     }
     return accept();
@@ -721,6 +721,22 @@ function latestEvaluationRun(bundle, subtaskId) {
     return bundle.evaluationRuns
         .filter((run) => run.subtaskId === subtaskId)
         .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
+}
+function failedEvaluationRunForDecision(bundle, decision) {
+    const subtaskId = decision.subtaskId || '';
+    const requestedEvaluationRunId = readStringInput(decision.inputs, 'evaluationRunId');
+    if (requestedEvaluationRunId) {
+        const requested = bundle.evaluationRuns.find((run) => run.subtaskId === subtaskId && run.id === requestedEvaluationRunId);
+        if (isFailedEvaluationRun(requested)) {
+            return requested;
+        }
+    }
+    return bundle.evaluationRuns
+        .filter((run) => run.subtaskId === subtaskId && isFailedEvaluationRun(run))
+        .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
+}
+function isFailedEvaluationRun(run) {
+    return run?.result?.verdict === 'fail' || run?.status === 'failed';
 }
 function latestQuestionerOutput(bundle, subtaskId, intent) {
     return bundle.questionerOutputs
@@ -973,11 +989,11 @@ function isRuntimeAttestedInvocation(invocation) {
     return Boolean(invocation.hookAttested === true
         && attestation
         && attestation.source === 'codex-plugin-hook'
-            && attestation.role === invocation.role
-            && attestation.parentThreadId
-            && attestation.nonce
-            && actualThreadId
-            && actualThreadId === attestation.actualSubagentThreadId);
+        && attestation.role === invocation.role
+        && attestation.nonce
+        && attestation.parentThreadId
+        && actualThreadId
+        && actualThreadId === attestation.actualSubagentThreadId);
 }
 function readWorkflowParentCodexThreadId(workflow) {
     const value = workflow.metadata?.parentCodexThreadId;

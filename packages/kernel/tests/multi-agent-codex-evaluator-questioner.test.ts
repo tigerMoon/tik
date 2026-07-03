@@ -1766,6 +1766,87 @@ describe('codex evaluator and Claude questioner workflow', () => {
       code: 'missing_implementation_evidence',
     });
 
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-action-guards/evidence',
+      payload: {
+        id: 'ev-action-guard-impl',
+        kind: 'implementation',
+        title: 'Implementation evidence',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    const executing = await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guards/subtasks/st-api',
+      payload: { status: 'executing' },
+    });
+    expect(executing.statusCode).toBe(200);
+    const implemented = await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guards/subtasks/st-api',
+      payload: {
+        status: 'implemented',
+        implementationHeadSha: 'head-1',
+        evidenceRefs: ['ev-action-guard-impl'],
+      },
+    });
+    expect(implemented.statusCode).toBe(200);
+    const validated = await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guards/subtasks/st-api',
+      payload: {
+        status: 'validated',
+        implementationHeadSha: 'head-1',
+        lastValidatedHeadSha: 'head-1',
+        evidenceRefs: ['ev-action-guard-impl'],
+      },
+    });
+    expect(validated.statusCode).toBe(200);
+    const evaluatorAfterValidation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-action-guards/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-action-guards', {
+          id: 'dec-run-evaluator-after-validation',
+          action: 'run_codex_evaluator',
+          subtaskId: 'st-api',
+          reason: 'The documented validate -> evaluator path should remain legal in v1 mode.',
+          evidenceRefs: ['ev-action-guard-impl'],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(evaluatorAfterValidation.statusCode).toBe(200);
+    expect(evaluatorAfterValidation.json().guard).toMatchObject({
+      accepted: true,
+      code: 'ok',
+    });
+    const evaluating = await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guards/subtasks/st-api',
+      payload: { status: 'evaluating' },
+    });
+    expect(evaluating.statusCode).toBe(200);
+    const evaluationFailed = await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guards/subtasks/st-api',
+      payload: { status: 'evaluation_failed' },
+    });
+    expect(evaluationFailed.statusCode).toBe(200);
+    const reEvaluating = await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-action-guards/subtasks/st-api',
+      payload: { status: 'evaluating' },
+    });
+    expect(reEvaluating.statusCode).toBe(200);
+
     const finalEvaluationBeforeDone = await server.inject({
       method: 'POST',
       url: '/api/v1/multi-agent/workflows/wf-action-guards/decisions/preflight',

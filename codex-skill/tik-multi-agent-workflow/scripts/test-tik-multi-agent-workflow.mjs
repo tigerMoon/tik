@@ -629,7 +629,10 @@ try {
       }],
       risks: [],
       globalAcceptanceCriteria: ['Workflow finishes with guarded evidence.'],
-      finalValidationCommands: [`${process.execPath} -e "process.exit(0)"`],
+      finalValidationCommands: [
+        `${process.execPath} -e "console.log('final command one')"`,
+        `${process.execPath} -e "console.log('final command two')"`,
+      ],
     }),
   ]);
   assert.equal(putGraph.action, 'accepted-plan');
@@ -1036,13 +1039,15 @@ try {
   assert.equal(evaluatorHookStarted.invocation.status, 'started');
   assert.equal(hookStarts.at(-1).body.nonce, 'nonce-evaluator-cli');
 
+  await writeFile(path.join(repo, 'builder-output.txt'), 'visible to evaluator sandbox\n', 'utf-8');
   const evaluated = await run([
     'evaluate',
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
     '--evaluation', 'eval-st-api-v1',
-    '--command', `${process.execPath} -e "console.log('evaluation ok')"`,
+    '--evaluator-setup-command', `${process.execPath} -e "console.log('setup ok')"`,
+    '--command', `${process.execPath} -e "const fs=require('fs'); if(!fs.existsSync('builder-output.txt')) process.exit(2); console.log(fs.readFileSync('builder-output.txt','utf8').trim()); console.log('evaluation ok')"`,
     '--invocation', 'inv-evaluator-cli',
     '--attestation-token', 'att-inv-evaluator-cli',
   ]);
@@ -1053,11 +1058,21 @@ try {
   assert.equal(evaluated.invocation.threadId, 'evaluator-thread-cli');
   assert.equal(evaluationRuns[0].status, 'passed');
   assert.equal(
-    evaluated.evaluationRun.result.commandResults[0].stdoutArtifactId,
+    evaluated.evaluationRun.result.commandResults[1].stdoutArtifactId,
     '.tik/multi-agent/workflows/wf-cli/evaluations/eval-st-api-v1/stdout.log',
   );
+  assert.equal(evaluated.evaluationRun.result.commandResults[0].commandId, 'cmd-evaluate-setup-1');
+  assert.equal(evaluated.evaluationRun.result.commandResults[0].status, 'passed');
   assert.match(
     await readFile(path.join(repo, evaluated.evaluationRun.result.commandResults[0].stdoutArtifactId), 'utf-8'),
+    /setup ok/,
+  );
+  assert.match(
+    await readFile(path.join(repo, evaluated.evaluationRun.result.commandResults[1].stdoutArtifactId), 'utf-8'),
+    /visible to evaluator sandbox/,
+  );
+  assert.match(
+    await readFile(path.join(repo, evaluated.evaluationRun.result.commandResults[1].stdoutArtifactId), 'utf-8'),
     /evaluation ok/,
   );
   assert.equal(subtasks['st-api'].status, 'evaluation_passed');
@@ -1129,16 +1144,39 @@ try {
   assert.equal(v1CompletedSubtask.decision.action, 'complete_subtask');
   assert.equal(subtasks['st-api'].status, 'done');
 
-  const finalEvaluated = await run([
-    'evaluate',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', '__final__',
-    '--evaluation', 'eval-final-v1',
-    '--command', `${process.execPath} -e "process.exit(0)"`,
-  ]);
-  assert.equal(finalEvaluated.action, 'evaluation-recorded');
-  assert.equal(finalEvaluated.passed, true);
+	  const finalEvaluated = await run([
+	    'evaluate',
+	    '--api-base-url', apiBaseUrl,
+	    '--workflow', 'wf-cli',
+	    '--subtask', '__final__',
+	    '--evaluation', 'eval-final-v1',
+	    '--command', `${process.execPath} -e "console.log('final command one')"`,
+	    '--command', `${process.execPath} -e "console.log('final command two')"`,
+	  ]);
+	  assert.equal(finalEvaluated.action, 'evaluation-recorded');
+	  assert.equal(finalEvaluated.passed, true);
+	  assert.deepEqual(
+	    finalEvaluated.evaluationRun.result.commandResults
+	      .filter((result) => result.commandId.startsWith('cmd-evaluate'))
+	      .map((result) => result.command),
+	    graph.finalValidationCommands,
+	  );
+	  assert.equal(
+	    finalEvaluated.evaluationRun.result.commandResults.find((result) => result.commandId === 'cmd-evaluate-1')?.stdoutArtifactId,
+	    '.tik/multi-agent/workflows/wf-cli/evaluations/eval-final-v1/stdout-1.log',
+	  );
+	  assert.equal(
+	    finalEvaluated.evaluationRun.result.commandResults.find((result) => result.commandId === 'cmd-evaluate-2')?.stdoutArtifactId,
+	    '.tik/multi-agent/workflows/wf-cli/evaluations/eval-final-v1/stdout-2.log',
+	  );
+	  assert.match(
+	    await readFile(path.join(repo, '.tik/multi-agent/workflows/wf-cli/evaluations/eval-final-v1/stdout-1.log'), 'utf-8'),
+	    /final command one/,
+	  );
+	  assert.match(
+	    await readFile(path.join(repo, '.tik/multi-agent/workflows/wf-cli/evaluations/eval-final-v1/stdout-2.log'), 'utf-8'),
+	    /final command two/,
+	  );
 
   const finalQuestionerStarted = await run([
     'start-questioner',
@@ -2166,6 +2204,12 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           headSha,
           result: { verdict: 'fail', headSha },
           startedAt: new Date().toISOString(),
+        }, {
+          id: 'eval-created-after-fail',
+          subtaskId: 'st-api',
+          status: 'created',
+          headSha,
+          startedAt: new Date(Date.now() + 1000).toISOString(),
         }],
       }),
     },
@@ -2316,6 +2360,9 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
     assert.equal(continued.decision.action, testCase.expectedAction, testCase.suffix);
     assert.match(continued.instruction, testCase.expectedInstruction, testCase.suffix);
     assert.equal(continued.guard.accepted, true, testCase.suffix);
+    if (testCase.suffix === 'fix-evaluation-findings') {
+      assert.equal(continued.decision.inputs.evaluationRunId, 'eval-fail');
+    }
     assert.equal(decisionsPosted, 0, testCase.suffix);
     await new Promise((resolve) => server.close(resolve));
   }

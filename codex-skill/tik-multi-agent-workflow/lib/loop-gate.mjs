@@ -167,7 +167,7 @@ function decideNextV1Action(state, graph, subtasks) {
 
   const needsFix = Object.values(subtasks).find((subtask) => subtask.status === 'needs_fix' || subtask.status === 'evaluation_failed');
   if (needsFix) {
-    const invalidatedEvaluation = latestEvaluation(state.evaluationRuns, needsFix.subtaskId);
+    const invalidatedEvaluation = latestEvaluationWithStatus(state.evaluationRuns, needsFix.subtaskId, ['invalidated']);
     if (invalidatedEvaluation?.status === 'invalidated') {
       return {
         action: 'request_human_review',
@@ -182,7 +182,10 @@ function decideNextV1Action(state, graph, subtasks) {
       subtaskId: needsFix.subtaskId,
       reason: 'Subtask needs Codex Builder to fix evaluator or questioner findings.',
       evidenceRefs: needsFix.evidenceRefs || [],
-      inputs: { fixRound: needsFix.fixRound || 0 },
+      inputs: {
+        fixRound: needsFix.fixRound || 0,
+        evaluationRunId: latestFailedEvaluation(state.evaluationRuns, needsFix.subtaskId)?.id,
+      },
     };
   }
 
@@ -330,6 +333,19 @@ function latestContract(contracts = [], subtaskId) {
 function latestEvaluation(evaluationRuns = [], subtaskId) {
   return evaluationRuns
     .filter((run) => run.subtaskId === subtaskId)
+    .sort((left, right) => String(right.startedAt || '').localeCompare(String(left.startedAt || '')))[0];
+}
+
+function latestEvaluationWithStatus(evaluationRuns = [], subtaskId, statuses = []) {
+  const allowed = new Set(statuses);
+  return evaluationRuns
+    .filter((run) => run.subtaskId === subtaskId && allowed.has(run.status))
+    .sort((left, right) => String(right.startedAt || '').localeCompare(String(left.startedAt || '')))[0];
+}
+
+function latestFailedEvaluation(evaluationRuns = [], subtaskId) {
+  return evaluationRuns
+    .filter((run) => run.subtaskId === subtaskId && (run.status === 'failed' || run.result?.verdict === 'fail'))
     .sort((left, right) => String(right.startedAt || '').localeCompare(String(left.startedAt || '')))[0];
 }
 
