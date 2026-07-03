@@ -284,7 +284,7 @@ function validateActionTransition(
       if (usesCodexEvaluatorQuestionerGate(bundle)) {
         return guardCompleteWorkflowV1(bundle, decision);
       }
-      if (!hasApprovedFinalReview(bundle) && !plannedFinalReviewApproved(decision)) {
+      if (!hasApprovedFinalReview(bundle) && !allDoneSubtasksHaveApprovedReview(bundle) && !plannedFinalReviewApproved(decision)) {
         return reject('invalid_transition', 'Completing a workflow requires approved final review evidence.');
       }
       return accept();
@@ -1343,6 +1343,14 @@ function hasApprovedFinalReview(bundle: MultiAgentWorkflowBundle): boolean {
     const result = reviewResultPayload(item);
     return result?.verdict === 'approve' && reviewBlockingIssueCount(item) === 0;
   });
+}
+
+function allDoneSubtasksHaveApprovedReview(bundle: MultiAgentWorkflowBundle): boolean {
+  const subtasks = bundle.taskGraph?.subtasks || [];
+  return subtasks.length > 0 && subtasks.every((subtask) =>
+    bundle.subtasks[subtask.id]?.status === 'done'
+    && latestApprovedReviewForSubtask(bundle, subtask.id) !== undefined
+  );
 }
 
 function plannedFinalReviewApproved(decision: WorkflowDecision): boolean {

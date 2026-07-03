@@ -1468,7 +1468,20 @@ async function processFinalReview(options) {
     },
     risks: (result.blockingIssues || []).map((issue) => issue.title || issue.reason).filter(Boolean),
   });
-  const preflight = await safePreflightDecision(options, workflowId, plannedDecision, state);
+  const evidence = await recordEvidence(options, workflowId, {
+    id: finalReviewEvidenceId,
+    kind: 'review',
+    title: `Final Claude review ${task.shortIdentifier || task.id}`,
+    summary: `${result.verdict} with ${(result.blockingIssues || []).length} blocking issue(s).`,
+    headSha: result.headShaReviewed || result.currentHeadSha || state.workflow.currentHeadSha,
+    payload: {
+      taskId: task.id,
+      final: true,
+      result,
+    },
+  });
+  const stateWithEvidence = await readWorkflow(options, workflowId);
+  const preflight = await safePreflightDecision(options, workflowId, plannedDecision, stateWithEvidence);
   if (!preflight.guard?.accepted) {
     printJson({
       action: 'final-review-process-rejected',
@@ -1488,7 +1501,7 @@ async function processFinalReview(options) {
       plannedFinalReviewResult: undefined,
     }),
   };
-  const recorded = await safeRecordDecision(options, workflowId, decision, state);
+  const recorded = await safeRecordDecision(options, workflowId, decision, stateWithEvidence);
   if (recorded.guard?.accepted === false) {
     printJson({
       action: 'final-review-process-rejected',
@@ -1501,18 +1514,6 @@ async function processFinalReview(options) {
     });
     return;
   }
-  const evidence = await recordEvidence(options, workflowId, {
-    id: finalReviewEvidenceId,
-    kind: 'review',
-    title: `Final Claude review ${task.shortIdentifier || task.id}`,
-    summary: `${result.verdict} with ${(result.blockingIssues || []).length} blocking issue(s).`,
-    headSha: result.headShaReviewed || result.currentHeadSha || state.workflow.currentHeadSha,
-    payload: {
-      taskId: task.id,
-      final: true,
-      result,
-    },
-  });
   printJson({
     action: approved ? 'workflow-completed' : 'final-review-needs-human',
     workflowId,

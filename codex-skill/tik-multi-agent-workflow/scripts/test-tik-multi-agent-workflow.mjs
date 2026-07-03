@@ -1428,22 +1428,29 @@ try {
   assert.equal(subtasks['st-api'].status, 'done');
   assert.deepEqual(subtaskStatusHistory.slice(-2), ['review_approved', 'done']);
 
-  const continueToFinalReview = await run([
+  const continueToCompleteWorkflow = await run([
     'continue',
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
     '--path', repo,
   ]);
-  assert.equal(continueToFinalReview.action, 'final-review-requested');
-  assert.equal(continueToFinalReview.decision.action, 'request_final_review');
-  assert.equal(continueToFinalReview.taskId, 'task-final-review');
+  assert.equal(continueToCompleteWorkflow.action, 'continue');
+  assert.equal(continueToCompleteWorkflow.status, 'completed');
+  assert.equal(workflow.status, 'completed');
+
+  workflow = {
+    ...workflow,
+    status: 'active',
+    completedAt: undefined,
+  };
 
   finalReviewTask = {
-    ...finalReviewTask,
+    id: 'task-final-review',
+    shortIdentifier: 'TIK-FINAL',
     status: 'blocked',
     labels: ['agent-loop', 'external-claude-review', 'final-claude-review', 'stale-head'],
     agentLoop: {
-      ...finalReviewTask.agentLoop,
+      headSha: workflow.currentHeadSha,
       phase: 'stale',
       stale: {
         expectedHeadSha: workflow.currentHeadSha,
@@ -1509,8 +1516,8 @@ try {
   await assertProcessReviewCommitPrecedesEvidenceAndStateMutation(repo);
   await assertContinueStopsForCurrentSessionActions(repo);
   await assertRejectedFinalReviewDoesNotCreateOrStartReview(repo);
-  await assertRejectedProcessFinalReviewDoesNotMutate(repo);
-  await assertProcessFinalReviewCommitPrecedesEvidence(repo);
+  await assertRejectedProcessFinalReviewDoesNotCompleteWorkflow(repo);
+  await assertProcessFinalReviewRecordsEvidenceBeforeCommit(repo);
   console.log('tik-multi-agent-workflow helper smoke test passed');
 } finally {
   await rm(tempRoot, { recursive: true, force: true });
@@ -2390,7 +2397,7 @@ function buildContinueWorkflow(workflowId, headSha, policy) {
   };
 }
 
-async function assertRejectedProcessFinalReviewDoesNotMutate(repoPath) {
+async function assertRejectedProcessFinalReviewDoesNotCompleteWorkflow(repoPath) {
   const headSha = gitHead(repoPath);
   let localWorkflow = {
     id: 'wf-reject-process-final-review',
@@ -2467,6 +2474,7 @@ async function assertRejectedProcessFinalReviewDoesNotMutate(repoPath) {
   await listen(server);
   const address = server.address();
   const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
+  const decisionCountBefore = decisions.length;
   const rejected = await run([
     'process-final-review',
     '--api-base-url', apiBaseUrl,
@@ -2474,7 +2482,8 @@ async function assertRejectedProcessFinalReviewDoesNotMutate(repoPath) {
     '--task', 'task-final-review',
   ]);
   assert.equal(rejected.guard.accepted, false);
-  assert.equal(localEvidence.length, 0);
+  assert.equal(localEvidence.length, 1);
+  assert.equal(decisions.length, decisionCountBefore);
   assert.equal(localWorkflow.status, 'active');
   await new Promise((resolve) => server.close(resolve));
 }
@@ -2584,14 +2593,14 @@ async function assertRejectedFinalReviewDoesNotCreateOrStartReview(repoPath) {
   await new Promise((resolve) => server.close(resolve));
 }
 
-async function assertProcessFinalReviewCommitPrecedesEvidence(repoPath) {
+async function assertProcessFinalReviewRecordsEvidenceBeforeCommit(repoPath) {
   const headSha = gitHead(repoPath);
   const operations = [];
   let localWorkflow = {
     id: 'wf-process-final-review-order',
     driver: 'codex-workflow',
     status: 'active',
-    goal: 'Commit process-final-review decision before evidence',
+    goal: 'Record process-final-review evidence before decision',
     rootTaskId: 'wf-process-final-review-order',
     repo: 'repo',
     baseRef: 'main',
@@ -2674,7 +2683,8 @@ async function assertProcessFinalReviewCommitPrecedesEvidence(repoPath) {
   assert.equal(processed.guard.accepted, true);
   assert.equal(processed.action, 'workflow-completed');
   assert.equal(decisions.length, 1);
-  assert.ok(operations.indexOf('decision_commit') < operations.indexOf('evidence_recorded'));
+  assert.ok(operations.indexOf('evidence_recorded') < operations.indexOf('decision_preflight'));
+  assert.ok(operations.indexOf('evidence_recorded') < operations.indexOf('decision_commit'));
   assert.equal(localEvidence.length, 1);
   assert.ok(processed.decision.evidenceRefs.includes(localEvidence[0].id));
   await new Promise((resolve) => server.close(resolve));

@@ -19,6 +19,14 @@ export function decideNextAction(state) {
   }
 
   if (allSubtasksDone(graph, subtasks)) {
+    if (allDoneSubtasksHaveApprovedReview(state, graph)) {
+      return {
+        action: 'complete_workflow',
+        reason: 'All subtasks are done and have approved Claude review evidence.',
+        evidenceRefs: collectEvidenceRefs(subtasks),
+        inputs: { taskGraphVersion: graph.version },
+      };
+    }
     return {
       action: 'request_final_review',
       reason: 'All subtasks are done; request final review before completing workflow.',
@@ -103,6 +111,19 @@ export function decideNextAction(state) {
 
 function collectEvidenceRefs(subtasks) {
   return Array.from(new Set(Object.values(subtasks).flatMap((subtask) => subtask.evidenceRefs || [])));
+}
+
+function allDoneSubtasksHaveApprovedReview(state, graph) {
+  const evidence = state.evidence || [];
+  return graph.subtasks.every((subtask) =>
+    evidence.some((item) => {
+      const result = item.payload?.result;
+      return item.kind === 'review'
+        && item.subtaskId === subtask.id
+        && result?.verdict === 'approve'
+        && (!Array.isArray(result.blockingIssues) || result.blockingIssues.length === 0);
+    })
+  );
 }
 
 function decideNextV1Action(state, graph, subtasks) {

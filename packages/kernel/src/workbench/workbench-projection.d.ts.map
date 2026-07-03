@@ -1,1 +1,0 @@
-{"version":3,"file":"workbench-projection.d.ts","sourceRoot":"","sources":["workbench-projection.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,mBAAmB,EAAE,qBAAqB,EAAE,MAAM,aAAa,CAAC;AAE9E,MAAM,WAAW,qBAAsB,SAAQ,mBAAmB;IAChE,aAAa,EAAE,MAAM,CAAC;CACvB;AAED,wBAAgB,sBAAsB,CACpC,KAAK,EAAE,mBAAmB,EAAE,EAC5B,gBAAgB,EAAE,GAAG,CAAC,MAAM,EAAE,qBAAqB,EAAE,CAAC,GACrD,qBAAqB,EAAE,CAOzB"}
