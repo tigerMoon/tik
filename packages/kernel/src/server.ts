@@ -25,6 +25,7 @@ import type {
   CreateMultiAgentWorkflowInput,
   EvaluationRun,
   HumanOverrideRecord,
+  MultiAgentEvidenceKind,
   MultiAgentWorkflowBundle,
   MultiAgentWorkflowRecord,
   QuestionerIntent,
@@ -332,8 +333,6 @@ interface UpdateSubtaskBody {
   status?: SubtaskRunState['status'];
   implementationHeadSha?: string;
   lastValidatedHeadSha?: string;
-  lastReviewedHeadSha?: string;
-  reviewRoundIds?: string[];
   validationRunIds?: string[];
   evidenceRefs?: string[];
   blockerFindingIds?: string[];
@@ -343,7 +342,7 @@ interface UpdateSubtaskBody {
 interface RecordEvidenceBody {
   id?: string;
   subtaskId?: string;
-  kind: 'implementation' | 'validation' | 'review' | 'fix' | 'plan' | 'decision' | 'note';
+  kind: MultiAgentEvidenceKind;
   title: string;
   summary?: string;
   command?: string;
@@ -4250,8 +4249,6 @@ const ALLOWED_SUBTASK_PATCH_KEYS = new Set([
   'status',
   'implementationHeadSha',
   'lastValidatedHeadSha',
-  'lastReviewedHeadSha',
-  'reviewRoundIds',
   'validationRunIds',
   'evidenceRefs',
   'blockerFindingIds',

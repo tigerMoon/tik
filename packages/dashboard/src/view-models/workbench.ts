@@ -1198,7 +1198,6 @@ function buildSubtaskWorkflowRow(taskGraph: TaskGraph | null | undefined, subtas
   const spec = taskGraph?.subtasks.find((item) => item.id === subtask.subtaskId);
   const evidenceCount = subtask.evidenceRefs.length;
   const validationCount = subtask.validationRunIds.length;
-  const reviewCount = subtask.reviewRoundIds.length;
   return {
     id: subtask.subtaskId,
     title: spec?.title || subtask.subtaskId,
@@ -1206,11 +1205,10 @@ function buildSubtaskWorkflowRow(taskGraph: TaskGraph | null | undefined, subtas
       humanizeWorkflowStatus(subtask.status),
       evidenceCount ? `${evidenceCount} evidence` : 'no evidence',
       validationCount ? `${validationCount} validation` : undefined,
-      reviewCount ? `${reviewCount} review` : undefined,
     ].filter(Boolean).join(' · '),
     meta: [
       spec?.allowedPaths.slice(0, 2).join(', '),
-      compactSha(subtask.implementationHeadSha || subtask.lastValidatedHeadSha || subtask.lastReviewedHeadSha),
+      compactSha(subtask.implementationHeadSha || subtask.lastValidatedHeadSha),
     ].filter(Boolean).join(' · '),
     tone: toneForSubtaskStatus(subtask.status),
   };
@@ -1332,7 +1330,7 @@ function summarizeReviewEvidence(evidence: MultiAgentWorkflowEvidence): string |
 }
 
 function toneForSubtaskStatus(status: SubtaskRunState['status']): TaskWorkflowRow['tone'] {
-  if (status === 'done' || status === 'approved' || status === 'review_approved' || status === 'validated' || status === 'evaluation_passed') {
+  if (status === 'done' || status === 'validated' || status === 'evaluation_passed') {
     return 'green';
   }
   if (status === 'blocked' || status === 'needs_fix' || status === 'validation_failed' || status === 'evaluation_failed' || status === 'human_review_required') {

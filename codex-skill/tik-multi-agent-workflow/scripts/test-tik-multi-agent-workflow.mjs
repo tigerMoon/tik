@@ -23,9 +23,6 @@ let evaluationRuns = [];
 let questionerRuns = [];
 let questionerOutputs = [];
 let invocations = [];
-let reviewTask = null;
-let finalReviewTask = null;
-let reviewTasks = {};
 let rootTask = null;
 let subtaskStatusHistory = [];
 let hookStarts = [];
@@ -186,7 +183,6 @@ try {
           'st-api': {
             subtaskId: 'st-api',
             status: 'ready',
-            reviewRoundIds: [],
             validationRunIds: [],
             evidenceRefs: [],
             blockerFindingIds: [],
@@ -744,35 +740,8 @@ try {
         });
         return;
       }
-      if (req.method === 'POST' && route === '/api/v1/agent-loop/worktree-review-rounds') {
-        const body = await readRequestJson(req);
-        assert.equal(body.labels.includes('external-claude-review'), true);
-        assert.equal(body.rootTaskId, 'task-root');
-        assert.equal(body.reviewInputSource, 'local_diff');
-        const isFinalReview = body.title?.includes('Final');
-        const task = {
-          id: isFinalReview ? 'task-final-review' : `task-review-${body.round || 1}`,
-          shortIdentifier: isFinalReview ? 'TIK-FINAL' : `TIK-REVIEW-${body.round || 1}`,
-          status: 'todo',
-          labels: ['agent-loop', 'claude-review', 'external-claude-review', 'needs-claude-review'],
-          agentLoop: {
-            kind: 'claude_review',
-            phase: 'needs_claude_review',
-            headSha: body.headSha,
-            round: body.round,
-            maxRounds: body.maxRounds,
-          },
-        };
-        if (isFinalReview) {
-          finalReviewTask = task;
-        } else {
-          setReviewTask(task);
-        }
-        sendJson(res, { task });
-        return;
-      }
       if (req.method === 'GET' && route === '/api/v1/tasks') {
-        sendJson(res, { tasks: [rootTask, ...Object.values(reviewTasks), finalReviewTask].filter(Boolean) });
+        sendJson(res, { tasks: [rootTask].filter(Boolean) });
         return;
       }
       sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
@@ -831,8 +800,8 @@ try {
   assert.equal(init.workflowId, 'wf-cli');
   assert.equal(init.rootTaskId, 'task-root');
   assert.equal(workflow.metadata.parentCodexThreadId, 'workflow-thread-cli');
-  assert.equal(init.mode, 'legacy');
-  assert.match(init.deprecation, /Legacy compatibility mode is deprecated/);
+  assert.equal(init.mode, 'v1');
+  assert.match(init.breakingChange, /v1\.1 removed legacy multi-agent Claude review commands/);
 
   const putGraph = await run([
     'accept-plan',
@@ -865,9 +834,9 @@ try {
   assert.equal(putGraph.action, 'accepted-plan');
 
   const next = await run(['next', '--api-base-url', apiBaseUrl, '--workflow', 'wf-cli']);
-  assert.equal(next.decision.action, 'execute_subtask');
+  assert.equal(next.decision.action, 'draft_contract');
   assert.equal(next.decision.subtaskId, 'st-api');
-  assert.match(next.instruction, /Implement subtask st-api/);
+  assert.match(next.instruction, /Draft a SprintContract/);
   assert.equal(decisionIfMatchLog.at(-1).ifMatch, undefined);
 
   forceConcurrentDecisionChange = true;
@@ -875,6 +844,32 @@ try {
   assert.equal(staleNext.guard.accepted, false);
   assert.equal(staleNext.guard.code, 'invalid_transition');
   assert.equal(decisionIfMatchLog.at(-1).ifMatch, next.decision.id);
+
+  const draftedContract = await run([
+    'draft-contract',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+  ]);
+  assert.equal(draftedContract.action, 'contract-drafted');
+  assert.equal(draftedContract.contract.id, 'contract-st-api-v1');
+  assert.equal(contracts[0].status, 'draft');
+
+  const acceptedContract = await run([
+    'accept-contract',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--contract', 'contract-st-api-v1',
+  ]);
+  assert.equal(acceptedContract.action, 'contract-accepted');
+  assert.equal(acceptedContract.contract.status, 'accepted');
+  assert.equal(subtasks['st-api'].status, 'contract_accepted');
+
+  const nextAfterContract = await run(['next', '--api-base-url', apiBaseUrl, '--workflow', 'wf-cli']);
+  assert.equal(nextAfterContract.decision.action, 'execute_subtask');
+  assert.equal(nextAfterContract.decision.subtaskId, 'st-api');
+  assert.match(nextAfterContract.instruction, /Implement subtask st-api/);
 
   const builderStarted = await run([
     'start-builder',
@@ -969,20 +964,24 @@ try {
   assert.deepEqual(subtasks['st-api'].evidenceRefs, ['ev-preflight-questioner', 'ev-cli', 'ev-validation-cli']);
 
   const nextAfterValidation = await run(['next', '--api-base-url', apiBaseUrl, '--workflow', 'wf-cli']);
-  assert.equal(nextAfterValidation.decision.action, 'request_claude_review');
+  assert.equal(nextAfterValidation.decision.action, 'run_codex_evaluator');
   assert.equal(nextAfterValidation.decision.subtaskId, 'st-api');
 
-  const legacyApprovedNext = decideNextAction({
+  const approvedNext = decideNextAction({
     workflow,
     taskGraph: graph,
     subtasks: {
       'st-api': {
         ...subtasks['st-api'],
-        status: 'approved',
+        status: 'validated',
       },
     },
+    evidence,
+    contracts,
+    evaluationRuns,
+    questionerOutputs,
   });
-  assert.equal(legacyApprovedNext.action, 'request_claude_review');
+  assert.equal(approvedNext.action, 'run_codex_evaluator');
 
   const v1Policy = {
     requireAcceptedContract: true,
@@ -1302,7 +1301,7 @@ try {
     '--v1',
   ]);
   assert.equal(v1Init.mode, 'v1');
-  assert.match(v1Init.deprecation, /Legacy review\/process\/fix\/final-review commands are disabled/);
+  assert.match(v1Init.breakingChange, /v1\.1 removed legacy multi-agent Claude review commands/);
 
   await assert.rejects(
     run([
@@ -1312,29 +1311,10 @@ try {
       '--subtask', 'st-api',
       '--path', repo,
     ]),
-    /disabled for v1 workflows/,
+    /Unknown command: review/,
   );
 
-  const draftedContract = await run([
-    'draft-contract',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-  ]);
-  assert.equal(draftedContract.action, 'contract-drafted');
-  assert.equal(draftedContract.contract.id, 'contract-st-api-v1');
-  assert.equal(contracts[0].status, 'draft');
-
-  const acceptedContract = await run([
-    'accept-contract',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-    '--contract', 'contract-st-api-v1',
-  ]);
-  assert.equal(acceptedContract.action, 'contract-accepted');
-  assert.equal(acceptedContract.contract.status, 'accepted');
-  assert.equal(subtasks['st-api'].status, 'contract_accepted');
+  assert.equal(contracts.find((item) => item.id === 'contract-st-api-v1')?.status, 'accepted');
 
   const evaluatorStarted = await run([
     'start-evaluator',
@@ -1609,287 +1589,6 @@ try {
   assert.equal(v1CompletedWorkflow.decision.action, 'complete_workflow');
   assert.equal(workflow.status, 'completed');
 
-  workflow = {
-    ...workflow,
-    status: 'active',
-    completedAt: undefined,
-    policy: undefined,
-  };
-  subtasks['st-api'] = {
-    ...subtasks['st-api'],
-    status: 'validated',
-    evidenceRefs: mergeTestRefs(subtasks['st-api'].evidenceRefs, ['ev-cli']),
-    validationRunIds: mergeTestRefs(subtasks['st-api'].validationRunIds, ['ev-cli']),
-  };
-
-  const review = await run([
-    'review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-    '--review-input-source', 'local_diff',
-    '--path', repo,
-    '--round', '1',
-    '--max-rounds', '2',
-  ]);
-  assert.equal(review.action, 'review-requested');
-  assert.equal(review.taskId, 'task-review-1');
-
-  reviewTask = {
-    ...reviewTask,
-    status: 'blocked',
-    labels: ['agent-loop', 'external-claude-review', 'stale-head'],
-    agentLoop: {
-      ...reviewTask.agentLoop,
-      phase: 'stale',
-      stale: {
-        expectedHeadSha: reviewTask.agentLoop.headSha,
-        actualHeadSha: 'new-head-after-review-started',
-      },
-      reviewResult: undefined,
-    },
-  };
-  setReviewTask(reviewTask);
-
-  const staleReview = await run([
-    'process-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-    '--task', 'task-review-1',
-  ]);
-  assert.equal(staleReview.action, 'review-stale');
-  assert.equal(staleReview.stale.actualHeadSha, 'new-head-after-review-started');
-  assert.equal(subtasks['st-api'].status, 'validated');
-  assert.deepEqual(subtasks['st-api'].reviewRoundIds, []);
-
-  const freshReview = await run([
-    'review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-    '--path', repo,
-    '--round', '1',
-    '--max-rounds', '2',
-  ]);
-  assert.equal(freshReview.action, 'review-requested');
-  assert.equal(freshReview.taskId, 'task-review-1');
-  assert.equal(subtasks['st-api'].status, 'reviewing');
-  assert.deepEqual(subtasks['st-api'].reviewRoundIds, ['task-review-1']);
-
-  reviewTask = {
-    ...reviewTask,
-    status: 'in_review',
-    labels: ['agent-loop', 'external-claude-review', 'human-review', 'needs-human-review'],
-    agentLoop: {
-      ...reviewTask.agentLoop,
-      kind: 'human_review',
-      phase: 'needs_human_review',
-      reviewResult: {
-        verdict: 'approve',
-        headShaReviewed: 'different-head',
-        currentHeadSha: 'different-head',
-        blockingIssues: [],
-        nonBlockingSuggestions: [],
-        testsNeeded: [],
-        markdown: 'Approved stale or unvalidated head.',
-      },
-    },
-  };
-  setReviewTask(reviewTask);
-
-  const processUnvalidatedApprove = await run([
-    'process-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-    '--task', 'task-review-1',
-  ]);
-  assert.equal(processUnvalidatedApprove.decision.action, 'validate_subtask');
-  assert.match(processUnvalidatedApprove.instruction, /validation/i);
-  assert.equal(subtasks['st-api'].status, 'implemented');
-  assert.deepEqual(subtasks['st-api'].evidenceRefs.includes('ev_review_task-review-1'), true);
-
-  subtasks['st-api'] = {
-    ...subtasks['st-api'],
-    status: 'reviewing',
-  };
-  reviewTask = {
-    ...reviewTask,
-    status: 'todo',
-    labels: ['agent-loop', 'codex-fix', 'external-claude-review', 'needs-codex-fix'],
-    agentLoop: {
-      ...reviewTask.agentLoop,
-      kind: 'codex_fix',
-      phase: 'needs_codex_fix',
-      reviewResult: {
-        verdict: 'request_changes',
-        headShaReviewed: reviewTask.agentLoop.headSha,
-        blockingIssues: [{
-          title: 'Missing test',
-          file: 'src/index.ts',
-          reason: 'No regression test covers this workflow.',
-        }],
-        nonBlockingSuggestions: [],
-        testsNeeded: ['Add a regression test.'],
-        markdown: 'Blocking issue found.',
-      },
-    },
-  };
-  setReviewTask(reviewTask);
-
-  const processReview = await run([
-    'process-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-    '--task', 'task-review-1',
-  ]);
-  assert.equal(processReview.decision.action, 'fix_claude_blockers');
-  assert.match(processReview.instruction, /Fix Claude blocking issues/);
-  assert.equal(subtasks['st-api'].status, 'needs_fix');
-
-  const fix = await run([
-    'fix',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-    '--review-round', 'task-review-1',
-    '--summary', 'Fixed the Claude blocking issue',
-  ]);
-  assert.equal(fix.action, 'fix-recorded');
-  assert.equal(fix.decision.action, 'validate_subtask');
-  assert.equal(subtasks['st-api'].status, 'implemented');
-
-  const validateAfterFix = await run([
-    'validate',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-    '--command', `${process.execPath} -e "process.exit(0)"`,
-  ]);
-  assert.equal(validateAfterFix.action, 'validation-recorded');
-  assert.equal(validateAfterFix.decision.action, 'request_re_review');
-  assert.equal(subtasks['st-api'].status, 'validated');
-
-  const continueToReview = await run([
-    'continue',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--path', repo,
-  ]);
-  assert.equal(continueToReview.action, 'review-requested');
-  assert.equal(continueToReview.decision.action, 'request_re_review');
-  assert.equal(continueToReview.taskId, 'task-review-2');
-  assert.equal(subtasks['st-api'].status, 'reviewing');
-  assert.ok(contextSnapshots.main);
-  assert.equal(contextSnapshots.main.target, 'main');
-  assert.equal(contextSnapshots.main.objectiveSummary, workflow.goal);
-  assert.match(await readFile(path.join(repo, '.tik/multi-agent/workflows/wf-cli/context/main.snapshot.md'), 'utf-8'), /Workflow Snapshot/);
-
-  reviewTask = {
-    ...reviewTask,
-    status: 'in_review',
-    labels: ['agent-loop', 'external-claude-review', 'human-review', 'needs-human-review'],
-    agentLoop: {
-      ...reviewTask.agentLoop,
-      kind: 'human_review',
-      phase: 'needs_human_review',
-      reviewResult: {
-        verdict: 'approve',
-        headShaReviewed: reviewTask.agentLoop.headSha,
-        currentHeadSha: reviewTask.agentLoop.headSha,
-        blockingIssues: [],
-        nonBlockingSuggestions: [],
-        testsNeeded: [],
-        markdown: 'Approved after fix.',
-      },
-    },
-  };
-  setReviewTask(reviewTask);
-
-  const approveAfterFix = await run([
-    'process-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--subtask', 'st-api',
-    '--task', 'task-review-2',
-  ]);
-  assert.equal(approveAfterFix.decision.action, 'complete_subtask');
-  assert.equal(subtasks['st-api'].status, 'done');
-  assert.deepEqual(subtaskStatusHistory.slice(-2), ['review_approved', 'done']);
-
-  const continueToCompleteWorkflow = await run([
-    'continue',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--path', repo,
-  ]);
-  assert.equal(continueToCompleteWorkflow.action, 'continue');
-  assert.equal(continueToCompleteWorkflow.status, 'completed');
-  assert.equal(workflow.status, 'completed');
-
-  workflow = {
-    ...workflow,
-    status: 'active',
-    completedAt: undefined,
-  };
-
-  finalReviewTask = {
-    id: 'task-final-review',
-    shortIdentifier: 'TIK-FINAL',
-    status: 'blocked',
-    labels: ['agent-loop', 'external-claude-review', 'final-claude-review', 'stale-head'],
-    agentLoop: {
-      headSha: workflow.currentHeadSha,
-      phase: 'stale',
-      stale: {
-        expectedHeadSha: workflow.currentHeadSha,
-        actualHeadSha: 'new-final-head',
-      },
-      reviewResult: undefined,
-    },
-  };
-
-  const staleFinalReview = await run([
-    'process-final-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--task', 'task-final-review',
-  ]);
-  assert.equal(staleFinalReview.action, 'final-review-stale');
-  assert.equal(staleFinalReview.stale.actualHeadSha, 'new-final-head');
-
-  finalReviewTask = {
-    ...finalReviewTask,
-    status: 'in_review',
-    labels: ['agent-loop', 'external-claude-review', 'human-review', 'needs-human-review'],
-    agentLoop: {
-      ...finalReviewTask.agentLoop,
-      kind: 'human_review',
-      phase: 'needs_human_review',
-      reviewResult: {
-        verdict: 'approve',
-        headShaReviewed: workflow.currentHeadSha,
-        currentHeadSha: workflow.currentHeadSha,
-        blockingIssues: [],
-        nonBlockingSuggestions: [],
-        testsNeeded: [],
-        markdown: 'Final review approved.',
-      },
-    },
-  };
-
-  const finalApproval = await run([
-    'process-final-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-cli',
-    '--task', 'task-final-review',
-  ]);
-  assert.equal(finalApproval.action, 'workflow-completed');
-  assert.equal(finalApproval.decision.action, 'complete_workflow');
-  assert.equal(workflow.status, 'completed');
-
   const status = await run([
     'status',
     '--api-base-url', apiBaseUrl,
@@ -1901,14 +1600,7 @@ try {
 
   await new Promise((resolve) => server.close(resolve));
   await assertRejectedExecutionDoesNotMutate(repo);
-  await assertRejectedReviewDoesNotMutate(repo);
-  await assertReviewCommitUsesPreMutationState(repo);
-  await assertRejectedProcessReviewDoesNotMutate(repo);
-  await assertProcessReviewCommitPrecedesEvidenceAndStateMutation(repo);
   await assertContinueStopsForCurrentSessionActions(repo);
-  await assertRejectedFinalReviewDoesNotCreateOrStartReview(repo);
-  await assertRejectedProcessFinalReviewDoesNotCompleteWorkflow(repo);
-  await assertProcessFinalReviewRecordsEvidenceBeforeCommit(repo);
   console.log('tik-multi-agent-workflow helper smoke test passed');
 } finally {
   await rm(tempRoot, { recursive: true, force: true });
@@ -1931,7 +1623,6 @@ async function assertRejectedExecutionDoesNotMutate(repoPath) {
     'st-api': {
       subtaskId: 'st-api',
       status: 'ready',
-      reviewRoundIds: [],
       validationRunIds: [],
       evidenceRefs: [],
       blockerFindingIds: [],
@@ -1993,452 +1684,6 @@ async function assertRejectedExecutionDoesNotMutate(repoPath) {
   await new Promise((resolve) => server.close(resolve));
 }
 
-async function assertRejectedReviewDoesNotMutate(repoPath) {
-  const headSha = gitHead(repoPath);
-  let reviewCreated = false;
-  let localWorkflow = {
-    id: 'wf-reject-review',
-    driver: 'codex-workflow',
-    status: 'active',
-    goal: 'Reject review',
-    rootTaskId: 'wf-reject-review',
-    repo: 'repo',
-    baseRef: 'main',
-    headRef: 'main',
-    currentHeadSha: headSha,
-    maxRounds: 3,
-  };
-  let localSubtasks = {
-    'st-api': {
-      subtaskId: 'st-api',
-      status: 'validated',
-      reviewRoundIds: [],
-      validationRunIds: ['ev-validation'],
-      evidenceRefs: ['ev-validation'],
-      blockerFindingIds: [],
-      fixRound: 0,
-    },
-  };
-  const localEvidence = [{
-    id: 'ev-validation',
-    workflowId: 'wf-reject-review',
-    subtaskId: 'st-api',
-    kind: 'validation',
-    title: 'Validation',
-    passed: true,
-    headSha,
-    createdAt: new Date().toISOString(),
-  }];
-  const localGraph = buildGraph('wf-reject-review');
-  const server = http.createServer(async (req, res) => {
-    try {
-      const route = req.url || '/';
-      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-reject-review') {
-        sendJson(res, { workflow: localWorkflow, taskGraph: localGraph, subtasks: localSubtasks, decisions: [], evidence: localEvidence });
-        return;
-      }
-      if (
-        req.method === 'POST'
-        && (route === '/api/v1/multi-agent/workflows/wf-reject-review/decisions'
-          || route === '/api/v1/multi-agent/workflows/wf-reject-review/decisions/preflight')
-      ) {
-        const body = await readRequestJson(req);
-        sendJson(res, {
-          decision: body.decision,
-          guard: { accepted: false, code: 'invalid_transition', message: 'Rejected by test guard.' },
-          workflow: localWorkflow,
-        }, route.endsWith('/decisions') ? 409 : 200);
-        return;
-      }
-      if (req.method === 'POST' && route === '/api/v1/agent-loop/worktree-review-rounds') {
-        reviewCreated = true;
-        sendJson(res, { task: { id: 'task-review', shortIdentifier: 'TIK-REJECT' } });
-        return;
-      }
-      if (req.method === 'PATCH' && route === '/api/v1/multi-agent/workflows/wf-reject-review/subtasks/st-api') {
-        const body = await readRequestJson(req);
-        localSubtasks['st-api'] = { ...localSubtasks['st-api'], ...body };
-        sendJson(res, { subtask: localSubtasks['st-api'] });
-        return;
-      }
-      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
-    } catch (error) {
-      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
-    }
-  });
-  await listen(server);
-  const address = server.address();
-  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
-  const rejected = await run([
-    'review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-reject-review',
-    '--subtask', 'st-api',
-    '--path', repoPath,
-  ]);
-  assert.equal(rejected.guard.accepted, false);
-  assert.equal(reviewCreated, false);
-  assert.equal(localSubtasks['st-api'].status, 'validated');
-  assert.deepEqual(localSubtasks['st-api'].reviewRoundIds, []);
-  await new Promise((resolve) => server.close(resolve));
-}
-
-async function assertReviewCommitUsesPreMutationState(repoPath) {
-  const headSha = gitHead(repoPath);
-  let reviewCreated = false;
-  const operations = [];
-  let decisions = [];
-  let localWorkflow = {
-    id: 'wf-review-commit-order',
-    driver: 'codex-workflow',
-    status: 'active',
-    goal: 'Commit review decision before mutating subtask state',
-    rootTaskId: 'wf-review-commit-order',
-    repo: 'repo',
-    baseRef: 'main',
-    headRef: 'main',
-    currentHeadSha: headSha,
-    maxRounds: 3,
-  };
-  let localSubtasks = {
-    'st-api': {
-      subtaskId: 'st-api',
-      status: 'validated',
-      reviewRoundIds: [],
-      validationRunIds: ['ev-validation'],
-      evidenceRefs: ['ev-validation'],
-      blockerFindingIds: [],
-      fixRound: 0,
-    },
-  };
-  const localEvidence = [{
-    id: 'ev-validation',
-    workflowId: 'wf-review-commit-order',
-    subtaskId: 'st-api',
-    kind: 'validation',
-    title: 'Validation',
-    passed: true,
-    headSha,
-    createdAt: new Date().toISOString(),
-  }];
-  const localGraph = buildGraph('wf-review-commit-order');
-  const server = http.createServer(async (req, res) => {
-    try {
-      const route = req.url || '/';
-      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-review-commit-order') {
-        sendJson(res, { workflow: localWorkflow, taskGraph: localGraph, subtasks: localSubtasks, decisions, evidence: localEvidence });
-        return;
-      }
-      if (
-        req.method === 'POST'
-        && (route === '/api/v1/multi-agent/workflows/wf-review-commit-order/decisions'
-          || route === '/api/v1/multi-agent/workflows/wf-review-commit-order/decisions/preflight')
-      ) {
-        const body = await readRequestJson(req);
-        operations.push(route.endsWith('/preflight') ? 'decision_preflight' : 'decision_commit');
-        const allowed = ['validated', 'approved'].includes(localSubtasks['st-api'].status);
-        if (!allowed) {
-          sendJson(res, {
-            decision: body.decision,
-            guard: {
-              accepted: false,
-              code: 'invalid_transition',
-              message: `request_claude_review rejected from ${localSubtasks['st-api'].status}.`,
-            },
-            workflow: localWorkflow,
-          }, route.endsWith('/decisions') ? 409 : 200);
-          return;
-        }
-        if (route.endsWith('/decisions')) {
-          decisions.push(body.decision);
-          localWorkflow = { ...localWorkflow, lastDecisionId: body.decision.id };
-        }
-        sendJson(res, { decision: body.decision, guard: { accepted: true, code: 'ok' }, workflow: localWorkflow });
-        return;
-      }
-      if (req.method === 'POST' && route === '/api/v1/agent-loop/worktree-review-rounds') {
-        operations.push('review_task_created');
-        reviewCreated = true;
-        sendJson(res, { task: { id: 'task-review-order', shortIdentifier: 'TIK-ORDER' } });
-        return;
-      }
-      if (req.method === 'POST' && route === '/api/v1/agent-loop/tasks/task-review-order/claude-review-runs') {
-        operations.push('review_started');
-        sendJson(res, { run: { id: 'run-review-order' } });
-        return;
-      }
-      if (req.method === 'PATCH' && route === '/api/v1/multi-agent/workflows/wf-review-commit-order/subtasks/st-api') {
-        operations.push('subtask_patch');
-        const body = await readRequestJson(req);
-        localSubtasks['st-api'] = { ...localSubtasks['st-api'], ...body };
-        sendJson(res, { subtask: localSubtasks['st-api'] });
-        return;
-      }
-      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
-    } catch (error) {
-      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
-    }
-  });
-  await listen(server);
-  const address = server.address();
-  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
-  const reviewed = await run([
-    'review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-review-commit-order',
-    '--subtask', 'st-api',
-    '--path', repoPath,
-    '--start',
-  ]);
-  assert.equal(reviewed.guard.accepted, true);
-  assert.equal(reviewCreated, true);
-  assert.equal(decisions.length, 1);
-  assert.ok(operations.indexOf('decision_commit') < operations.indexOf('subtask_patch'));
-  assert.ok(operations.indexOf('decision_commit') < operations.indexOf('review_started'));
-  assert.equal(localSubtasks['st-api'].status, 'reviewing');
-  assert.deepEqual(localSubtasks['st-api'].reviewRoundIds, ['task-review-order']);
-  await new Promise((resolve) => server.close(resolve));
-}
-
-async function assertRejectedProcessReviewDoesNotMutate(repoPath) {
-  const headSha = gitHead(repoPath);
-  let localWorkflow = {
-    id: 'wf-reject-process-review',
-    driver: 'codex-workflow',
-    status: 'active',
-    goal: 'Reject process review',
-    rootTaskId: 'wf-reject-process-review',
-    repo: 'repo',
-    baseRef: 'main',
-    headRef: 'main',
-    currentHeadSha: headSha,
-    maxRounds: 3,
-  };
-  let localSubtasks = {
-    'st-api': {
-      subtaskId: 'st-api',
-      status: 'reviewing',
-      reviewRoundIds: ['task-review'],
-      validationRunIds: ['ev-validation'],
-      evidenceRefs: ['ev-validation'],
-      blockerFindingIds: [],
-      fixRound: 0,
-    },
-  };
-  const localEvidence = [{
-    id: 'ev-validation',
-    workflowId: 'wf-reject-process-review',
-    subtaskId: 'st-api',
-    kind: 'validation',
-    title: 'Validation',
-    passed: true,
-    headSha,
-    createdAt: new Date().toISOString(),
-  }];
-  const localGraph = buildGraph('wf-reject-process-review');
-  const reviewTask = {
-    id: 'task-review',
-    shortIdentifier: 'TIK-REJECT-PROCESS',
-    agentLoop: {
-      reviewResult: {
-        verdict: 'approve',
-        headShaReviewed: headSha,
-        currentHeadSha: headSha,
-        blockingIssues: [],
-      },
-    },
-  };
-  const server = http.createServer(async (req, res) => {
-    try {
-      const route = req.url || '/';
-      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-reject-process-review') {
-        sendJson(res, { workflow: localWorkflow, taskGraph: localGraph, subtasks: localSubtasks, decisions: [], evidence: localEvidence });
-        return;
-      }
-      if (req.method === 'GET' && route === '/api/v1/tasks') {
-        sendJson(res, { tasks: [reviewTask] });
-        return;
-      }
-      if (
-        req.method === 'POST'
-        && (route === '/api/v1/multi-agent/workflows/wf-reject-process-review/decisions'
-          || route === '/api/v1/multi-agent/workflows/wf-reject-process-review/decisions/preflight')
-      ) {
-        const body = await readRequestJson(req);
-        sendJson(res, {
-          decision: body.decision,
-          guard: { accepted: false, code: 'invalid_transition', message: 'Rejected by test guard.' },
-          workflow: localWorkflow,
-        }, route.endsWith('/decisions') ? 409 : 200);
-        return;
-      }
-      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-reject-process-review/evidence') {
-        const body = await readRequestJson(req);
-        localEvidence.push({ id: body.id || 'ev-should-not-exist', workflowId: localWorkflow.id, ...body });
-        sendJson(res, { evidence: localEvidence.at(-1) });
-        return;
-      }
-      if (req.method === 'PATCH' && route === '/api/v1/multi-agent/workflows/wf-reject-process-review/subtasks/st-api') {
-        const body = await readRequestJson(req);
-        localSubtasks['st-api'] = { ...localSubtasks['st-api'], ...body };
-        sendJson(res, { subtask: localSubtasks['st-api'] });
-        return;
-      }
-      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
-    } catch (error) {
-      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
-    }
-  });
-  await listen(server);
-  const address = server.address();
-  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
-  const rejected = await run([
-    'process-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-reject-process-review',
-    '--subtask', 'st-api',
-    '--task', 'task-review',
-  ]);
-  assert.equal(rejected.guard.accepted, false);
-  assert.equal(localEvidence.length, 1);
-  assert.equal(localSubtasks['st-api'].status, 'reviewing');
-  await new Promise((resolve) => server.close(resolve));
-}
-
-async function assertProcessReviewCommitPrecedesEvidenceAndStateMutation(repoPath) {
-  const headSha = gitHead(repoPath);
-  const operations = [];
-  let decisions = [];
-  let localWorkflow = {
-    id: 'wf-process-review-order',
-    driver: 'codex-workflow',
-    status: 'active',
-    goal: 'Commit process-review decision before evidence and subtask mutations',
-    rootTaskId: 'wf-process-review-order',
-    repo: 'repo',
-    baseRef: 'main',
-    headRef: 'main',
-    currentHeadSha: headSha,
-    maxRounds: 3,
-  };
-  let localSubtasks = {
-    'st-api': {
-      subtaskId: 'st-api',
-      status: 'reviewing',
-      reviewRoundIds: ['task-review'],
-      validationRunIds: ['ev-validation'],
-      evidenceRefs: ['ev-validation'],
-      blockerFindingIds: [],
-      fixRound: 0,
-    },
-  };
-  const localEvidence = [{
-    id: 'ev-validation',
-    workflowId: 'wf-process-review-order',
-    subtaskId: 'st-api',
-    kind: 'validation',
-    title: 'Validation',
-    passed: true,
-    headSha,
-    createdAt: new Date().toISOString(),
-  }];
-  const localGraph = buildGraph('wf-process-review-order');
-  const reviewTask = {
-    id: 'task-review',
-    shortIdentifier: 'TIK-PROCESS-ORDER',
-    agentLoop: {
-      reviewResult: {
-        verdict: 'changes_requested',
-        headShaReviewed: headSha,
-        currentHeadSha: headSha,
-        blockingIssues: [{
-          title: 'Fix API edge case',
-          severity: 'blocker',
-        }],
-      },
-    },
-  };
-  const server = http.createServer(async (req, res) => {
-    try {
-      const route = req.url || '/';
-      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-process-review-order') {
-        sendJson(res, { workflow: localWorkflow, taskGraph: localGraph, subtasks: localSubtasks, decisions, evidence: localEvidence });
-        return;
-      }
-      if (req.method === 'GET' && route === '/api/v1/tasks') {
-        sendJson(res, { tasks: [reviewTask] });
-        return;
-      }
-      if (
-        req.method === 'POST'
-        && (route === '/api/v1/multi-agent/workflows/wf-process-review-order/decisions'
-          || route === '/api/v1/multi-agent/workflows/wf-process-review-order/decisions/preflight')
-      ) {
-        const body = await readRequestJson(req);
-        operations.push(route.endsWith('/preflight') ? 'decision_preflight' : 'decision_commit');
-        const allowed = localSubtasks['st-api'].status === 'reviewing';
-        if (!allowed) {
-          sendJson(res, {
-            decision: body.decision,
-            guard: {
-              accepted: false,
-              code: 'invalid_transition',
-              message: `process-review decision rejected from ${localSubtasks['st-api'].status}.`,
-            },
-            workflow: localWorkflow,
-          }, route.endsWith('/decisions') ? 409 : 200);
-          return;
-        }
-        if (route.endsWith('/decisions')) {
-          decisions.push(body.decision);
-          localWorkflow = { ...localWorkflow, lastDecisionId: body.decision.id };
-        }
-        sendJson(res, { decision: body.decision, guard: { accepted: true, code: 'ok' }, workflow: localWorkflow });
-        return;
-      }
-      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-process-review-order/evidence') {
-        operations.push('evidence_recorded');
-        const body = await readRequestJson(req);
-        localEvidence.push({ id: body.id || 'ev-review', workflowId: localWorkflow.id, ...body });
-        sendJson(res, { evidence: localEvidence.at(-1) });
-        return;
-      }
-      if (req.method === 'PATCH' && route === '/api/v1/multi-agent/workflows/wf-process-review-order/subtasks/st-api') {
-        operations.push('subtask_patch');
-        const body = await readRequestJson(req);
-        localSubtasks['st-api'] = { ...localSubtasks['st-api'], ...body };
-        sendJson(res, { subtask: localSubtasks['st-api'] });
-        return;
-      }
-      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
-    } catch (error) {
-      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
-    }
-  });
-  await listen(server);
-  const address = server.address();
-  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
-  const processed = await run([
-    'process-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-process-review-order',
-    '--subtask', 'st-api',
-    '--task', 'task-review',
-  ]);
-  assert.equal(processed.guard.accepted, true);
-  assert.equal(processed.decision.action, 'fix_claude_blockers');
-  assert.equal(decisions.length, 1);
-  assert.ok(operations.indexOf('decision_commit') < operations.indexOf('evidence_recorded'));
-  assert.ok(operations.indexOf('decision_commit') < operations.indexOf('subtask_patch'));
-  assert.equal(localEvidence.length, 2);
-  const reviewEvidence = localEvidence.at(-1);
-  assert.ok(decisions[0].evidenceRefs.includes(reviewEvidence.id));
-  assert.ok(processed.decision.evidenceRefs.includes(reviewEvidence.id));
-  assert.equal(localSubtasks['st-api'].status, 'needs_fix');
-  assert.deepEqual(localSubtasks['st-api'].evidenceRefs, ['ev-validation', reviewEvidence.id]);
-  await new Promise((resolve) => server.close(resolve));
-}
-
 async function assertContinueStopsForCurrentSessionActions(repoPath) {
   const headSha = gitHead(repoPath);
   const manualActionPolicy = {
@@ -2489,19 +1734,19 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
       expectedPendingAction: 'builder-pending',
       expectedInstruction: /After the Builder produces code changes/,
       build: (workflowId) => ({
-        workflow: buildContinueWorkflow(workflowId, headSha, loopOnlyPolicy),
+        workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
         taskGraph: buildGraph(workflowId),
         subtasks: {
           'st-api': {
             subtaskId: 'st-api',
-            status: 'ready',
-            reviewRoundIds: [],
+            status: 'contract_accepted',
             validationRunIds: [],
             evidenceRefs: [],
             blockerFindingIds: [],
             fixRound: 0,
           },
         },
+        contracts: [acceptedContract],
       }),
     },
     {
@@ -2518,7 +1763,6 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           'st-api': {
             subtaskId: 'st-api',
             status: 'ready',
-            reviewRoundIds: [],
             validationRunIds: [],
             evidenceRefs: [],
             blockerFindingIds: [],
@@ -2542,7 +1786,6 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           'st-api': {
             subtaskId: 'st-api',
             status: 'ready',
-            reviewRoundIds: [],
             validationRunIds: [],
             evidenceRefs: [],
             blockerFindingIds: [],
@@ -2568,7 +1811,6 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           'st-api': {
             subtaskId: 'st-api',
             status: 'implemented',
-            reviewRoundIds: [],
             validationRunIds: [],
             evidenceRefs: ['ev-impl'],
             blockerFindingIds: [],
@@ -2595,7 +1837,6 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           'st-api': {
             subtaskId: 'st-api',
             status: 'evaluation_failed',
-            reviewRoundIds: [],
             validationRunIds: [],
             evidenceRefs: ['ev-impl'],
             blockerFindingIds: [],
@@ -2635,7 +1876,6 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           'st-api': {
             subtaskId: 'st-api',
             status: 'evaluation_passed',
-            reviewRoundIds: [],
             validationRunIds: [],
             evidenceRefs: ['ev-impl'],
             blockerFindingIds: [],
@@ -2664,7 +1904,6 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           'st-api': {
             subtaskId: 'st-api',
             status: 'done',
-            reviewRoundIds: [],
             validationRunIds: [],
             evidenceRefs: ['ev-impl'],
             blockerFindingIds: [],
@@ -2688,7 +1927,6 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           'st-api': {
             subtaskId: 'st-api',
             status: 'done',
-            reviewRoundIds: [],
             validationRunIds: [],
             evidenceRefs: ['ev-impl'],
             blockerFindingIds: [],
@@ -2916,299 +2154,6 @@ function buildContinueWorkflow(workflowId, headSha, policy) {
   };
 }
 
-async function assertRejectedProcessFinalReviewDoesNotCompleteWorkflow(repoPath) {
-  const headSha = gitHead(repoPath);
-  let localWorkflow = {
-    id: 'wf-reject-process-final-review',
-    driver: 'codex-workflow',
-    status: 'active',
-    goal: 'Reject process final review',
-    rootTaskId: 'wf-reject-process-final-review',
-    repo: 'repo',
-    baseRef: 'main',
-    headRef: 'main',
-    currentHeadSha: headSha,
-    maxRounds: 3,
-  };
-  const localSubtasks = {
-    'st-api': {
-      subtaskId: 'st-api',
-      status: 'done',
-      reviewRoundIds: ['task-review'],
-      validationRunIds: ['ev-validation'],
-      evidenceRefs: ['ev-validation', 'ev-review'],
-      blockerFindingIds: [],
-      fixRound: 0,
-    },
-  };
-  const localEvidence = [];
-  const localGraph = buildGraph('wf-reject-process-final-review');
-  const reviewTask = {
-    id: 'task-final-review',
-    shortIdentifier: 'TIK-REJECT-FINAL',
-    agentLoop: {
-      reviewResult: {
-        verdict: 'approve',
-        headShaReviewed: headSha,
-        currentHeadSha: headSha,
-        blockingIssues: [],
-      },
-    },
-  };
-  const server = http.createServer(async (req, res) => {
-    try {
-      const route = req.url || '/';
-      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-reject-process-final-review') {
-        sendJson(res, { workflow: localWorkflow, taskGraph: localGraph, subtasks: localSubtasks, decisions: [], evidence: localEvidence });
-        return;
-      }
-      if (req.method === 'GET' && route === '/api/v1/tasks') {
-        sendJson(res, { tasks: [reviewTask] });
-        return;
-      }
-      if (
-        req.method === 'POST'
-        && (route === '/api/v1/multi-agent/workflows/wf-reject-process-final-review/decisions'
-          || route === '/api/v1/multi-agent/workflows/wf-reject-process-final-review/decisions/preflight')
-      ) {
-        const body = await readRequestJson(req);
-        sendJson(res, {
-          decision: body.decision,
-          guard: { accepted: false, code: 'invalid_transition', message: 'Rejected by test guard.' },
-          workflow: localWorkflow,
-        }, route.endsWith('/decisions') ? 409 : 200);
-        return;
-      }
-      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-reject-process-final-review/evidence') {
-        const body = await readRequestJson(req);
-        localEvidence.push({ id: body.id || 'ev-final-should-not-exist', workflowId: localWorkflow.id, ...body });
-        sendJson(res, { evidence: localEvidence.at(-1) });
-        return;
-      }
-      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
-    } catch (error) {
-      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
-    }
-  });
-  await listen(server);
-  const address = server.address();
-  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
-  const decisionCountBefore = decisions.length;
-  const rejected = await run([
-    'process-final-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-reject-process-final-review',
-    '--task', 'task-final-review',
-  ]);
-  assert.equal(rejected.guard.accepted, false);
-  assert.equal(localEvidence.length, 1);
-  assert.equal(decisions.length, decisionCountBefore);
-  assert.equal(localWorkflow.status, 'active');
-  await new Promise((resolve) => server.close(resolve));
-}
-
-async function assertRejectedFinalReviewDoesNotCreateOrStartReview(repoPath) {
-  const headSha = gitHead(repoPath);
-  let reviewCreated = false;
-  let reviewStarted = false;
-  const localWorkflow = {
-    id: 'wf-reject-final-review',
-    driver: 'codex-workflow',
-    status: 'active',
-    goal: 'Reject final review',
-    rootTaskId: 'wf-reject-final-review',
-    repo: 'repo',
-    baseRef: 'main',
-    headRef: 'main',
-    currentHeadSha: headSha,
-    maxRounds: 3,
-  };
-  const localSubtasks = {
-    'st-api': {
-      subtaskId: 'st-api',
-      status: 'done',
-      reviewRoundIds: ['task-review'],
-      validationRunIds: ['ev-validation'],
-      evidenceRefs: ['ev-validation', 'ev-review'],
-      blockerFindingIds: [],
-      fixRound: 0,
-    },
-  };
-  const localEvidence = [
-    {
-      id: 'ev-validation',
-      workflowId: localWorkflow.id,
-      subtaskId: 'st-api',
-      kind: 'validation',
-      title: 'Validation',
-      passed: true,
-      headSha,
-      createdAt: new Date().toISOString(),
-    },
-    {
-      id: 'ev-review',
-      workflowId: localWorkflow.id,
-      subtaskId: 'st-api',
-      kind: 'review',
-      title: 'Review',
-      headSha,
-      payload: { result: { verdict: 'approve', blockingIssues: [] } },
-      createdAt: new Date().toISOString(),
-    },
-  ];
-  const localGraph = buildGraph('wf-reject-final-review');
-  const server = http.createServer(async (req, res) => {
-    try {
-      const route = req.url || '/';
-      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-reject-final-review') {
-        sendJson(res, { workflow: localWorkflow, taskGraph: localGraph, subtasks: localSubtasks, decisions: [], evidence: localEvidence });
-        return;
-      }
-      if (
-        req.method === 'POST'
-        && (route === '/api/v1/multi-agent/workflows/wf-reject-final-review/decisions'
-          || route === '/api/v1/multi-agent/workflows/wf-reject-final-review/decisions/preflight')
-      ) {
-        const body = await readRequestJson(req);
-        sendJson(res, {
-          decision: body.decision,
-          guard: {
-            accepted: !route.endsWith('/decisions'),
-            code: route.endsWith('/decisions') ? 'invalid_transition' : 'ok',
-            message: route.endsWith('/decisions') ? 'Rejected by test guard.' : undefined,
-          },
-          workflow: localWorkflow,
-        }, route.endsWith('/decisions') ? 409 : 200);
-        return;
-      }
-      if (req.method === 'POST' && route === '/api/v1/agent-loop/worktree-review-rounds') {
-        reviewCreated = true;
-        sendJson(res, { task: { id: 'task-final-review', shortIdentifier: 'TIK-FINAL-REJECT' } });
-        return;
-      }
-      if (req.method === 'POST' && route === '/api/v1/agent-loop/tasks/task-final-review/claude-review-runs') {
-        reviewStarted = true;
-        sendJson(res, { run: { id: 'run-final-review' } });
-        return;
-      }
-      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
-    } catch (error) {
-      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
-    }
-  });
-  await listen(server);
-  const address = server.address();
-  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
-  const rejected = await run([
-    'final-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-reject-final-review',
-    '--path', repoPath,
-    '--start',
-  ]);
-  assert.equal(rejected.guard.accepted, false);
-  assert.equal(reviewCreated, false);
-  assert.equal(reviewStarted, false);
-  await new Promise((resolve) => server.close(resolve));
-}
-
-async function assertProcessFinalReviewRecordsEvidenceBeforeCommit(repoPath) {
-  const headSha = gitHead(repoPath);
-  const operations = [];
-  let localWorkflow = {
-    id: 'wf-process-final-review-order',
-    driver: 'codex-workflow',
-    status: 'active',
-    goal: 'Record process-final-review evidence before decision',
-    rootTaskId: 'wf-process-final-review-order',
-    repo: 'repo',
-    baseRef: 'main',
-    headRef: 'main',
-    currentHeadSha: headSha,
-    maxRounds: 3,
-  };
-  const decisions = [];
-  const localSubtasks = {
-    'st-api': {
-      subtaskId: 'st-api',
-      status: 'done',
-      reviewRoundIds: ['task-review'],
-      validationRunIds: ['ev-validation'],
-      evidenceRefs: ['ev-validation', 'ev-review'],
-      blockerFindingIds: [],
-      fixRound: 0,
-    },
-  };
-  const localEvidence = [];
-  const localGraph = buildGraph('wf-process-final-review-order');
-  const reviewTask = {
-    id: 'task-final-review',
-    shortIdentifier: 'TIK-FINAL-ORDER',
-    agentLoop: {
-      reviewResult: {
-        verdict: 'approve',
-        headShaReviewed: headSha,
-        currentHeadSha: headSha,
-        blockingIssues: [],
-      },
-    },
-  };
-  const server = http.createServer(async (req, res) => {
-    try {
-      const route = req.url || '/';
-      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-process-final-review-order') {
-        sendJson(res, { workflow: localWorkflow, taskGraph: localGraph, subtasks: localSubtasks, decisions, evidence: localEvidence });
-        return;
-      }
-      if (req.method === 'GET' && route === '/api/v1/tasks') {
-        sendJson(res, { tasks: [reviewTask] });
-        return;
-      }
-      if (
-        req.method === 'POST'
-        && (route === '/api/v1/multi-agent/workflows/wf-process-final-review-order/decisions'
-          || route === '/api/v1/multi-agent/workflows/wf-process-final-review-order/decisions/preflight')
-      ) {
-        const body = await readRequestJson(req);
-        operations.push(route.endsWith('/preflight') ? 'decision_preflight' : 'decision_commit');
-        if (route.endsWith('/decisions')) {
-          decisions.push(body.decision);
-          localWorkflow = { ...localWorkflow, lastDecisionId: body.decision.id, status: 'completed' };
-        }
-        sendJson(res, { decision: body.decision, guard: { accepted: true, code: 'ok' }, workflow: localWorkflow });
-        return;
-      }
-      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-process-final-review-order/evidence') {
-        operations.push('evidence_recorded');
-        const body = await readRequestJson(req);
-        localEvidence.push({ id: body.id || 'ev-final-review', workflowId: localWorkflow.id, ...body });
-        sendJson(res, { evidence: localEvidence.at(-1) });
-        return;
-      }
-      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
-    } catch (error) {
-      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
-    }
-  });
-  await listen(server);
-  const address = server.address();
-  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
-  const processed = await run([
-    'process-final-review',
-    '--api-base-url', apiBaseUrl,
-    '--workflow', 'wf-process-final-review-order',
-    '--task', 'task-final-review',
-  ]);
-  assert.equal(processed.guard.accepted, true);
-  assert.equal(processed.action, 'workflow-completed');
-  assert.equal(decisions.length, 1);
-  assert.ok(operations.indexOf('evidence_recorded') < operations.indexOf('decision_preflight'));
-  assert.ok(operations.indexOf('evidence_recorded') < operations.indexOf('decision_commit'));
-  assert.equal(localEvidence.length, 1);
-  assert.ok(processed.decision.evidenceRefs.includes(localEvidence[0].id));
-  await new Promise((resolve) => server.close(resolve));
-}
-
 async function initRepo(repoPath) {
   await mkdir(repoPath, { recursive: true });
   await writeFile(path.join(repoPath, 'README.md'), '# test\n', 'utf-8');
@@ -3390,14 +2335,6 @@ function createMockQuestionerRun(body) {
 
 function mergeTestRefs(...groups) {
   return Array.from(new Set(groups.flatMap((group) => group || []).filter(Boolean)));
-}
-
-function setReviewTask(task) {
-  reviewTask = task;
-  reviewTasks = {
-    ...reviewTasks,
-    [task.id]: task,
-  };
 }
 
 function listen(server) {

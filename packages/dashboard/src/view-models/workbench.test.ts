@@ -87,7 +87,6 @@ describe('workbench view models', () => {
         'st-ui': {
           subtaskId: 'st-ui',
           status: 'done',
-          reviewRoundIds: ['rr-1'],
           validationRunIds: ['ev-validation'],
           evidenceRefs: ['ev-validation', 'ev-review'],
           blockerFindingIds: [],
@@ -192,7 +191,7 @@ describe('workbench view models', () => {
           decidedBy: 'codex-workflow',
           decidedAt: '2026-07-03T00:04:30.000Z',
           action: 'complete_subtask',
-          reason: 'Validation and review passed.',
+          reason: 'Validation and Questioner evidence passed.',
           evidenceRefs: ['ev-validation', 'ev-review'],
           confidence: 0.94,
         },
@@ -214,8 +213,8 @@ describe('workbench view models', () => {
           id: 'ev-review',
           workflowId: 'wf-task-detail',
           subtaskId: 'st-ui',
-          kind: 'review',
-          title: 'Claude approved',
+          kind: 'questioner',
+          title: 'Questioner approved',
           passed: true,
           headSha: 'abcdef1234567890',
           payload: {
@@ -271,12 +270,12 @@ describe('workbench view models', () => {
     });
     expect(model?.subtasks[0]).toMatchObject({
       title: 'Render workflow panel',
-      detail: 'Done · 2 evidence · 1 validation · 1 review',
+      detail: 'Done · 2 evidence · 1 validation',
       tone: 'green',
     });
     expect(model?.evidence[0]).toMatchObject({
-      title: 'Claude approved',
-      detail: 'review · passed · verdict approve · 0 blocking',
+      title: 'Questioner approved',
+      detail: 'questioner · passed · verdict approve · 0 blocking',
       tone: 'green',
     });
     expect(model?.decisions[0]?.detail).toContain('2 evidence refs');

@@ -11,7 +11,6 @@ export type WorkflowActionPhase =
   | 'final_evaluation'
   | 'final_questioning'
   | 'workflow_completion'
-  | 'review'
   | 'human_review'
   | 'abort';
 
@@ -27,7 +26,7 @@ export interface WorkflowActionDefinition {
   kind: WorkflowActionKind;
   title: string;
   runner?: 'codex' | 'codex-evaluator' | 'claude-code';
-  role?: 'planner' | 'executor' | 'evaluator' | 'questioner' | 'reviewer' | 'final-reviewer';
+  role?: 'planner' | 'executor' | 'evaluator' | 'questioner';
   intent?: QuestionerIntent;
   produces?: string[];
   handler: string;
@@ -35,7 +34,7 @@ export interface WorkflowActionDefinition {
   runtimePolicy?: 'readonly' | 'readonly_tik_api_only';
 }
 
-export const tikV1Actions = {
+export const tikV1Actions: Partial<Record<WorkflowDecisionAction, WorkflowActionDefinition>> = {
   request_dynamic_plan: {
     id: 'request_dynamic_plan',
     phase: 'planning',
@@ -176,49 +175,6 @@ export const tikV1Actions = {
     title: 'Complete Workflow',
     handler: 'workflow.complete',
   },
-  request_claude_review: {
-    id: 'request_claude_review',
-    phase: 'review',
-    kind: 'agent_invocation',
-    title: 'Request Claude Review',
-    runner: 'claude-code',
-    role: 'reviewer',
-    produces: ['ReviewEvidence'],
-    handler: 'review.start',
-    runtimePolicy: 'readonly_tik_api_only',
-  },
-  request_re_review: {
-    id: 'request_re_review',
-    phase: 'review',
-    kind: 'agent_invocation',
-    title: 'Request Claude Re-review',
-    runner: 'claude-code',
-    role: 'reviewer',
-    produces: ['ReviewEvidence'],
-    handler: 'review.start',
-    runtimePolicy: 'readonly_tik_api_only',
-  },
-  request_final_review: {
-    id: 'request_final_review',
-    phase: 'review',
-    kind: 'agent_invocation',
-    title: 'Request Final Review',
-    runner: 'claude-code',
-    role: 'final-reviewer',
-    produces: ['ReviewEvidence'],
-    handler: 'review.start_final',
-    runtimePolicy: 'readonly_tik_api_only',
-  },
-  fix_claude_blockers: {
-    id: 'fix_claude_blockers',
-    phase: 'building',
-    kind: 'agent_invocation',
-    title: 'Fix Claude Blockers',
-    runner: 'codex',
-    role: 'executor',
-    produces: ['ImplementationEvidence'],
-    handler: 'builder.fix_review',
-  },
   validate_subtask: {
     id: 'validate_subtask',
     phase: 'evaluation',
@@ -244,13 +200,6 @@ export const tikV1Actions = {
     produces: ['TaskGraphPatch'],
     handler: 'planner.replan',
     runtimePolicy: 'readonly_tik_api_only',
-  },
-  skip_non_blocking_suggestions: {
-    id: 'skip_non_blocking_suggestions',
-    phase: 'review',
-    kind: 'state_transition',
-    title: 'Skip Non-blocking Suggestions',
-    handler: 'review.skip_non_blocking',
   },
   ask_claude_question_requirement: {
     id: 'ask_claude_question_requirement',
@@ -285,7 +234,7 @@ export const tikV1Actions = {
     title: 'Abort Workflow',
     handler: 'workflow.abort',
   },
-} satisfies Partial<Record<WorkflowDecisionAction, WorkflowActionDefinition>>;
+};
 
 export function getWorkflowActionDefinition(action: WorkflowDecisionAction): WorkflowActionDefinition {
   const definition = tikV1Actions[action];
@@ -294,4 +243,3 @@ export function getWorkflowActionDefinition(action: WorkflowDecisionAction): Wor
   }
   return definition;
 }
-

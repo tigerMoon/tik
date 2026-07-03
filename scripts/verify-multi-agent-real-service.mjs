@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import os from 'node:os';
@@ -115,6 +116,12 @@ try {
   recordStep('task.transition.in_progress', taskInProgress);
   await captureTask(client, taskId, 'in_progress');
 
+  const contract = await createAcceptedContract(client, workflowId, {
+    subtaskId: 'st-real-service',
+    headSha: verificationHeadSha,
+  });
+  report.contract = contract.contract;
+
   const subtaskExecuting = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
     status: 'executing',
   });
@@ -130,6 +137,14 @@ try {
     payload: {
       servicePid: child.process.pid,
       apiBaseUrl: child.apiBaseUrl,
+      changedFiles: [{
+        path: 'scripts/verify-multi-agent-real-service.mjs',
+        changeType: 'modified',
+      }],
+      scopeCheck: {
+        allowed: true,
+        violations: [],
+      },
     },
   });
   recordStep('evidence.implementation', implementationEvidence);
@@ -141,13 +156,13 @@ try {
   });
   recordStep('subtask.implemented', subtaskImplemented);
 
-  const taskNeedsReview = await client.post(`/v1/tasks/${encodeURIComponent(taskId)}/transitions`, {
+  const taskNeedsV1Evidence = await client.post(`/v1/tasks/${encodeURIComponent(taskId)}/transitions`, {
     to: 'needs_review',
     actor: 'agent',
-    reason: 'Implementation evidence was recorded; review is required.',
+    reason: 'Implementation evidence was recorded; v1 evaluator and questioner gates are pending.',
   });
-  recordStep('task.transition.needs_review', taskNeedsReview);
-  await captureTask(client, taskId, 'needs_review');
+  recordStep('task.transition.needs_v1_evidence', taskNeedsV1Evidence);
+  await captureTask(client, taskId, 'needs_v1_evidence');
 
   const validationEvidence = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/evidence`, {
     id: 'ev-real-service-validation',
@@ -169,37 +184,110 @@ try {
   });
   recordStep('subtask.validated', subtaskValidated);
 
-  const workflowReviewEvidence = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/evidence`, {
-    id: 'ev-real-service-review',
-    kind: 'review',
-    title: 'Real-service review evidence',
-    summary: 'Review evidence recorded through the external Tik service.',
+  const builderInvocation = await createCompletedCodexInvocation(client, workflowId, {
+    id: 'inv-real-service-builder',
     subtaskId: 'st-real-service',
-    passed: true,
+    role: 'executor',
+    runner: 'codex',
+    promptContract: 'codex-builder.v1',
+    threadId: 'real-service-builder-thread',
     headSha: verificationHeadSha,
-    payload: {
-      result: {
-        verdict: 'approve',
-        headShaReviewed: verificationHeadSha,
-        currentHeadSha: verificationHeadSha,
-        blockingIssues: [],
-      },
+    evidenceRefs: ['ev-real-service-implementation'],
+  });
+  recordStep('invocation.builder.completed', builderInvocation);
+
+  const evaluationRun = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service/evaluations`, {
+    id: 'eval-real-service',
+    contractId: contract.contract.id,
+    headSha: verificationHeadSha,
+    evaluator: { kind: 'codex-evaluator', sessionId: 'real-service-evaluator' },
+  });
+  recordStep('evaluation.created', evaluationRun);
+
+  const subtaskEvaluating = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
+    status: 'evaluating',
+  });
+  recordStep('subtask.evaluating', subtaskEvaluating);
+
+  const evaluationResult = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service/evaluations/eval-real-service/result`, {
+    result: {
+      workflowId,
+      subtaskId: 'st-real-service',
+      contractId: contract.contract.id,
+      evaluatorRunId: 'eval-real-service',
+      headSha: verificationHeadSha,
+      verdict: 'pass',
+      criteriaResults: [
+        { criterionId: 'ac-1', status: 'pass', evidence: 'Real Tik service APIs persisted workflow state.' },
+        { criterionId: 'ac-2', status: 'pass', evidence: 'Workbench task content remained visible through HTTP.' },
+      ],
+      commandResults: [{
+        commandId: 'cmd-real-service',
+        command: 'node scripts/verify-multi-agent-real-service.mjs',
+        status: 'passed',
+        exitCode: 0,
+        summary: 'Real-service verifier exercised HTTP workflow APIs.',
+      }],
+      runtimeFindings: [],
+      coverageGaps: [],
+      confidence: 0.9,
     },
   });
-  recordStep('evidence.review', workflowReviewEvidence);
+  recordStep('evaluation.result', evaluationResult);
 
-  const subtaskReviewed = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
-    status: 'reviewing',
-    reviewRoundIds: ['rr-real-service'],
+  const evaluatorInvocation = await createCompletedCodexInvocation(client, workflowId, {
+    id: 'inv-real-service-evaluator',
+    subtaskId: 'st-real-service',
+    role: 'evaluator',
+    runner: 'codex-evaluator',
+    promptContract: 'codex-evaluator.v1',
+    threadId: 'real-service-evaluator-thread',
+    headSha: verificationHeadSha,
+    evaluationRunId: 'eval-real-service',
+    readonlyPolicy: { enforced: true, violations: [] },
   });
-  recordStep('subtask.reviewing', subtaskReviewed);
+  recordStep('invocation.evaluator.completed', evaluatorInvocation);
 
-  const subtaskReviewApproved = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
-    status: 'review_approved',
-    evidenceRefs: ['ev-real-service-review'],
-    lastReviewedHeadSha: verificationHeadSha,
+  const subtaskEvaluationPassed = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
+    status: 'evaluation_passed',
+    evidenceRefs: ['ev-real-service-implementation', 'ev-real-service-validation'],
   });
-  recordStep('subtask.review_approved', subtaskReviewApproved);
+  recordStep('subtask.evaluation_passed', subtaskEvaluationPassed);
+
+  const evaluationQuestioner = await submitQuestionerOutput(client, workflowId, {
+    runId: 'qr-real-service-evaluation',
+    invocationId: 'inv-real-service-questioner',
+    subtaskId: 'st-real-service',
+    intent: 'question_evaluation',
+    contractId: contract.contract.id,
+    evaluationRunId: 'eval-real-service',
+    headSha: verificationHeadSha,
+    outputId: 'q-real-service-evaluation',
+    coverageMatrix: [
+      {
+        criterionId: 'ac-1',
+        criterionText: 'The workflow records evidence and a guarded decision.',
+        required: true,
+        status: 'covered',
+        evidenceRefs: ['eval-real-service', 'cmd-real-service'],
+        comment: 'Evaluator result and command evidence cover workflow persistence.',
+      },
+      {
+        criterionId: 'ac-2',
+        criterionText: 'The root workbench task exposes every state and full content through HTTP.',
+        required: true,
+        status: 'covered',
+        evidenceRefs: ['eval-real-service', 'task.timeline'],
+        comment: 'HTTP task snapshots and evaluator evidence cover workbench visibility.',
+      },
+    ],
+  });
+  recordStep('questioner.evaluation.validated', evaluationQuestioner);
+
+  const subtaskQuestioned = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/st-real-service`, {
+    status: 'questioning_evidence',
+  });
+  recordStep('subtask.questioning_evidence', subtaskQuestioned);
 
   const decision = {
     id: 'dec-real-service-complete-subtask',
@@ -209,10 +297,12 @@ try {
     decidedBy: 'codex-workflow',
     decidedAt: new Date().toISOString(),
     action: 'complete_subtask',
-    reason: 'External Tik service accepted implementation and validation evidence.',
-    evidenceRefs: ['ev-real-service-implementation', 'ev-real-service-validation', 'ev-real-service-review'],
+    reason: 'External Tik service accepted v1 contract, implementation, evaluator, and Questioner evidence.',
+    evidenceRefs: ['ev-real-service-implementation', 'ev-real-service-validation'],
     inputs: {
       currentHeadSha: verificationHeadSha,
+      evaluationRunId: 'eval-real-service',
+      questionerOutputId: 'q-real-service-evaluation',
     },
     expectedTikMutation: {
       taskStatus: 'completed',
@@ -238,64 +328,75 @@ try {
   });
   recordStep('subtask.done', subtaskDone);
 
-  const requestFinalReviewDecision = {
-    id: 'dec-real-service-request-final-review',
-    workflowId,
-    rootTaskId: taskId,
-    decidedBy: 'codex-workflow',
-    decidedAt: new Date().toISOString(),
-    action: 'request_final_review',
-    reason: 'All subtasks are done; request final Claude review before completing the workflow.',
-    evidenceRefs: ['ev-real-service-implementation', 'ev-real-service-validation', 'ev-real-service-review'],
-    inputs: {
-      currentHeadSha: verificationHeadSha,
-      taskGraphVersion: graph.version,
-    },
-  };
-  const finalReviewRequested = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions`, {
-    decision: requestFinalReviewDecision,
-  });
-  recordStep('workflow.decision.request_final_review', finalReviewRequested);
-
-  const completeWithoutFinalReview = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions`, {
+  const completeWithoutFinalEvaluation = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions`, {
     decision: {
-      id: 'dec-real-service-complete-without-final-review',
+      id: 'dec-real-service-complete-without-final-evaluation',
       workflowId,
       rootTaskId: taskId,
       decidedBy: 'codex-workflow',
       decidedAt: new Date().toISOString(),
       action: 'complete_workflow',
-      reason: 'Intentional guard check: final approval is required.',
+      reason: 'Intentional guard check: final v1 evidence is required.',
       evidenceRefs: [],
       inputs: {
         currentHeadSha: verificationHeadSha,
       },
     },
   }, { okStatuses: [409] });
-  recordStep('workflow.decision.complete_without_final_review_guard', completeWithoutFinalReview);
+  recordStep('workflow.decision.complete_without_final_evaluation_guard', completeWithoutFinalEvaluation);
 
-  const finalReview = await createDashboardReviewEvidence(client, {
-    rootTaskId: taskId,
+  const finalEvaluationRun = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/__final__/evaluations`, {
+    id: 'eval-real-service-final',
+    contractId: `${workflowId}__final__`,
     headSha: verificationHeadSha,
-    title: '[REAL FINAL REVIEW RESULT] MultiAgentWorkflowService dashboard evidence',
-    idempotencyPrefix: 'real-service-final-review',
+    evaluator: { kind: 'codex-evaluator', sessionId: 'real-service-final-evaluator' },
   });
-  report.finalReview = finalReview;
+  recordStep('final_evaluation.created', finalEvaluationRun);
 
-  const finalReviewEvidence = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/evidence`, {
-    id: 'ev-real-service-final-review',
-    kind: 'review',
-    title: 'Real-service final review evidence',
-    summary: 'Final review evidence recorded through the external Tik service.',
-    passed: true,
-    headSha: verificationHeadSha,
-    payload: {
-      taskId: finalReview.taskId,
-      final: true,
-      result: finalReview.finalTask.agentLoop?.reviewResult,
+  const finalEvaluationResult = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/__final__/evaluations/eval-real-service-final/result`, {
+    result: {
+      workflowId,
+      subtaskId: '__final__',
+      contractId: `${workflowId}__final__`,
+      evaluatorRunId: 'eval-real-service-final',
+      headSha: verificationHeadSha,
+      verdict: 'pass',
+      criteriaResults: [{
+        criterionId: 'global-ac-1',
+        status: 'pass',
+        evidence: 'Task and workflow state are visible through real Tik APIs.',
+      }],
+      commandResults: [{
+        commandId: 'node scripts/verify-multi-agent-real-service.mjs',
+        command: 'node scripts/verify-multi-agent-real-service.mjs',
+        status: 'passed',
+        exitCode: 0,
+        summary: 'Final evaluator covered the configured final validation command.',
+      }],
+      runtimeFindings: [],
+      coverageGaps: [],
+      confidence: 0.9,
     },
   });
-  recordStep('evidence.final_review', finalReviewEvidence);
+  recordStep('final_evaluation.result', finalEvaluationResult);
+
+  const finalQuestioner = await submitQuestionerOutput(client, workflowId, {
+    runId: 'qr-real-service-final',
+    invocationId: 'inv-real-service-final-questioner',
+    intent: 'question_final_evidence',
+    finalEvaluationRunId: 'eval-real-service-final',
+    headSha: verificationHeadSha,
+    outputId: 'q-real-service-final',
+    coverageMatrix: [{
+      criterionId: 'global-ac-1',
+      criterionText: 'Task and workflow state are visible through real Tik APIs.',
+      required: true,
+      status: 'covered',
+      evidenceRefs: ['eval-real-service-final'],
+      comment: 'Final evaluator evidence covers the workflow-level must criterion.',
+    }],
+  });
+  recordStep('questioner.final.validated', finalQuestioner);
 
   const workflowCompletedDecision = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions`, {
     decision: {
@@ -305,12 +406,12 @@ try {
       decidedBy: 'codex-workflow',
       decidedAt: new Date().toISOString(),
       action: 'complete_workflow',
-      reason: 'Final Claude review approved the real-service workflow.',
-      evidenceRefs: ['ev-real-service-final-review'],
+      reason: 'Final Codex evaluation and Claude Questioner evidence passed the v1 workflow gate.',
+      evidenceRefs: [],
       inputs: {
         currentHeadSha: verificationHeadSha,
-        finalReviewApproved: true,
-        reviewTaskId: finalReview.taskId,
+        evaluationRunId: 'eval-real-service-final',
+        questionerOutputId: 'q-real-service-final',
       },
       confidence: 0.95,
     },
@@ -358,16 +459,7 @@ try {
       agentLoopPhase: snapshot.task?.agentLoop?.phase,
     })),
     workflowEventTypes: report.workflowTimeline.map((event) => event.type),
-    reviewTaskId: finalReview.taskId,
-    reviewTaskShortIdentifier: finalReview.shortIdentifier,
-    reviewTaskStatus: finalReview.finalTask.status,
-    reviewTaskAgentLoop: {
-      kind: finalReview.finalTask.agentLoop?.kind,
-      phase: finalReview.finalTask.agentLoop?.phase,
-      verdict: finalReview.finalTask.agentLoop?.reviewResult?.verdict,
-      blockingIssueCount: finalReview.finalTask.agentLoop?.reviewResult?.blockingIssues?.length ?? null,
-    },
-    finalReviewGuard: completeWithoutFinalReview.body.guard,
+    finalEvidenceGuard: completeWithoutFinalEvaluation.body.guard,
     workflowStatus: workflowCompletedDecision.body.workflow?.status,
     invalidTransitionStatus: illegalTaskTransition.status,
     missingEvidenceGuard: missingEvidenceDecision.body.guard,
@@ -435,129 +527,195 @@ function buildTaskGraph(workflowId) {
   };
 }
 
-async function createDashboardReviewEvidence(client, input) {
-  const reviewTask = await client.post('/v1/agent-loop/worktree-review-rounds', {
-    rootTaskId: input.rootTaskId,
-    round: 1,
-    maxRounds: 2,
-    repo: path.basename(projectPath),
-    title: input.title || '[REAL REVIEW RESULT] MultiAgentWorkflowService dashboard evidence',
-    baseRef: 'main',
-    headRef: 'codex/multi-agent-workflow-service-codex-workflow',
-    headSha: input.headSha,
-    idempotencyKey: `${input.idempotencyPrefix || 'real-service-review'}:${input.rootTaskId}:${input.headSha}:r1:${Date.now()}`,
-    labels: ['external-claude-review', 'real-service', 'multi-agent', 'dashboard-evidence'],
-    allowedScope: [
-      'packages/kernel/src/multi-agent/**',
-      'packages/kernel/src/server.ts',
-      'packages/shared/src/types/multi-agent.ts',
-      'codex-skill/tik-multi-agent-workflow/**',
-      'scripts/verify-multi-agent-real-service.mjs',
-    ],
-    acceptanceCriteria: [
-      'Dashboard task contains ReviewResult JSON.',
-      'Task timeline records review-result ingestion.',
-      'Comments show workflow state transitions and review outcome.',
-    ],
-    reviewFocus: ['workflow guardrails', 'real service API evidence', 'dashboard observability'],
-    createdBy: 'codex',
-    workspaceBinding: buildWorkspaceBinding(workspaceRoot, projectPath),
-  });
-  recordStep('review_task.created', reviewTask);
-  const reviewTaskId = reviewTask.body.task.id;
-
-  await client.post(`/v1/tasks/${encodeURIComponent(reviewTaskId)}/comments`, {
-    authorKind: 'system',
-    authorId: 'real-service-verifier',
-    body: [
-      'Workflow execution marker: created real agent-loop Claude review task through POST /api/v1/agent-loop/worktree-review-rounds.',
-      `Initial status=${reviewTask.body.task.status}, agentLoop.kind=${reviewTask.body.task.agentLoop?.kind}, phase=${reviewTask.body.task.agentLoop?.phase}.`,
-    ].join('\n'),
-  });
-
-  let runtimeLaunch = null;
-  if (options.launchClaudeRuntime) {
-    runtimeLaunch = await client.post(
-      `/v1/agent-loop/tasks/${encodeURIComponent(reviewTaskId)}/claude-review-runs`,
-      undefined,
-      { okStatuses: [200, 400, 409, 500] },
-    );
-    recordStep('review_task.runtime_launch_attempt', runtimeLaunch);
-    await client.post(`/v1/tasks/${encodeURIComponent(reviewTaskId)}/comments`, {
-      authorKind: 'system',
-      authorId: 'real-service-verifier',
-      body: [
-        `Runtime launch attempt through POST /api/v1/agent-loop/tasks/${reviewTaskId}/claude-review-runs returned HTTP ${runtimeLaunch.status}.`,
-        'Response:',
-        '```json',
-        JSON.stringify(runtimeLaunch.body, null, 2),
-        '```',
-      ].join('\n'),
-    });
-  } else {
-    await client.post(`/v1/tasks/${encodeURIComponent(reviewTaskId)}/comments`, {
-      authorKind: 'system',
-      authorId: 'real-service-verifier',
-      body: [
-        'Claude runtime launch intentionally skipped by this verifier.',
-        'This avoids leaving a long-running local Claude process in automated verification.',
-        'Pass --launch-claude-runtime to exercise the runtime dispatch endpoint explicitly.',
-      ].join('\n'),
-    });
-  }
-
-  const reviewResultBody = {
-    verdict: 'approve',
-    headShaReviewed: input.headSha,
-    currentHeadSha: input.headSha,
-    blockingIssues: [],
-    nonBlockingSuggestions: [{
-      title: 'Keep real-service dashboard verification explicit',
-      file: 'scripts/verify-multi-agent-real-service.mjs',
-      reason: 'It makes workflow execution evidence visible and reproducible from the Dashboard workspace.',
+async function createAcceptedContract(client, workflowId, input) {
+  const created = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(input.subtaskId)}/contracts`, {
+    id: `contract-${input.subtaskId}-v1`,
+    status: 'draft',
+    goal: 'Verify real Tik service contract',
+    scope: {
+      allowedPaths: ['packages/kernel/src/**', 'packages/shared/src/**', 'codex-skill/tik-multi-agent-workflow/**', 'scripts/verify-multi-agent-real-service.mjs'],
+      blockedPaths: [],
+    },
+    deliverables: [{
+      id: 'deliver-real-service',
+      description: 'Real-service verification evidence is recorded through Tik APIs.',
+      expectedFiles: ['scripts/verify-multi-agent-real-service.mjs'],
     }],
-    testsNeeded: [],
-    markdown: [
-      '## Real Review Result',
-      '',
-      'No blocking findings.',
-      '',
-      `This structured ReviewResult was submitted through the real Tik API endpoint /api/v1/agent-loop/tasks/${reviewTaskId}/review-result.`,
-    ].join('\n'),
-    reviewerWorkerId: 'real-service-verifier',
-  };
-  const reviewResult = await client.post(
-    `/v1/agent-loop/tasks/${encodeURIComponent(reviewTaskId)}/review-result`,
-    reviewResultBody,
-  );
-  recordStep('review_task.review_result_ingested', reviewResult);
-
-  await client.post(`/v1/tasks/${encodeURIComponent(reviewTaskId)}/comments`, {
-    authorKind: 'system',
-    authorId: 'real-service-verifier',
-    body: [
-      'State flow marker:',
-      '1. Review task created as claude_review / needs_claude_review.',
-      options.launchClaudeRuntime
-        ? '2. Runtime launch endpoint was called.'
-        : '2. Runtime launch was skipped by verifier configuration.',
-      `3. ReviewResult ingested with verdict=${reviewResult.body.task.agentLoop?.reviewResult?.verdict}.`,
-      `4. Tik transitioned task to status=${reviewResult.body.task.status}, agentLoop.kind=${reviewResult.body.task.agentLoop?.kind}, phase=${reviewResult.body.task.agentLoop?.phase}.`,
-    ].join('\n'),
+    acceptanceCriteria: [
+      {
+        id: 'ac-1',
+        statement: 'The workflow records evidence and a guarded decision.',
+        priority: 'must',
+        verificationMethod: 'test',
+      },
+      {
+        id: 'ac-2',
+        statement: 'The root workbench task exposes every state and full content through HTTP.',
+        priority: 'must',
+        verificationMethod: 'test',
+      },
+    ],
+    verificationPlan: {
+      commands: [{
+        id: 'cmd-real-service',
+        command: 'node scripts/verify-multi-agent-real-service.mjs',
+        required: true,
+      }],
+    },
+    headShaAtAcceptance: input.headSha,
   });
+  recordStep('contract.created', created);
+  const subtaskContractDrafting = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(input.subtaskId)}`, {
+    status: 'contract_drafting',
+  });
+  recordStep('subtask.contract_drafting', subtaskContractDrafting);
+  const accepted = await client.post(
+    `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(input.subtaskId)}/contracts/${encodeURIComponent(created.body.contract.id)}/accept`,
+    { acceptedBy: 'codex-workflow-plugin', headShaAtAcceptance: input.headSha },
+  );
+  recordStep('contract.accepted', accepted);
+  const subtaskContractAccepted = await client.patch(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(input.subtaskId)}`, {
+    status: 'contract_accepted',
+  });
+  recordStep('subtask.contract_accepted', subtaskContractAccepted);
+  return accepted.body;
+}
 
-  const finalTask = await readTaskById(client, reviewTaskId);
-  const timeline = await client.get(`/workbench/tasks/${encodeURIComponent(reviewTaskId)}/timeline`);
-  recordStep('review_task.timeline', timeline);
-  return {
-    taskId: reviewTaskId,
-    shortIdentifier: finalTask.shortIdentifier,
-    createdTask: reviewTask.body.task,
-    runtimeLaunch,
-    reviewResult: reviewResult.body,
-    finalTask,
-    timeline: timeline.body.timeline,
+async function createCompletedCodexInvocation(client, workflowId, input) {
+  const created = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations`, {
+    id: input.id,
+    subtaskId: input.subtaskId,
+    role: input.role,
+    runner: input.runner,
+    promptContract: input.promptContract,
+    threadId: input.threadId,
+    headSha: input.headSha,
+    evidenceRefs: input.evidenceRefs,
+    evaluationRunId: input.evaluationRunId,
+    readonlyPolicy: input.readonlyPolicy,
+  });
+  const token = created.body.invocation.attestationToken;
+  await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(input.id)}/hook-start`, {
+    attestationToken: token,
+    nonce: `nonce-${input.id}`,
+    parentThreadId: 'real-service-parent-thread',
+    actualSubagentThreadId: input.threadId,
+    role: input.role,
+    startedAt: '2026-07-03T00:00:00.000Z',
+  });
+  return client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(input.id)}/hook-stop`, {
+    attestationToken: token,
+    status: 'completed',
+    stoppedAt: '2026-07-03T00:01:00.000Z',
+    headSha: input.headSha,
+    evidenceRefs: input.evidenceRefs,
+    evaluationRunId: input.evaluationRunId,
+    readonlyPolicy: input.readonlyPolicy,
+    result: {
+      threadId: input.threadId,
+      headSha: input.headSha,
+      evidenceRefs: input.evidenceRefs,
+      evaluationRunId: input.evaluationRunId,
+      readonlyPolicy: input.readonlyPolicy,
+    },
+  });
+}
+
+async function submitQuestionerOutput(client, workflowId, input) {
+  const run = await client.post(`/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/questioner-runs`, {
+    id: input.runId,
+    invocationId: input.invocationId,
+    subtaskId: input.subtaskId,
+    intent: input.intent,
+    contractId: input.contractId,
+    evaluationRunId: input.evaluationRunId,
+    finalEvaluationRunId: input.finalEvaluationRunId,
+    headSha: input.headSha,
+    start: true,
+    runtimeAudit: { gitStatusBefore: '' },
+  });
+  const output = buildQuestionerOutput({
+    id: input.outputId,
+    runResponse: run.body,
+    workflowId,
+    subtaskId: input.subtaskId,
+    intent: input.intent,
+    contractId: input.contractId,
+    evaluationRunId: input.evaluationRunId,
+    finalEvaluationRunId: input.finalEvaluationRunId,
+    headSha: input.headSha,
+    coverageMatrix: input.coverageMatrix,
+  });
+  return client.post(
+    `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/questioner-runs/${encodeURIComponent(input.runId)}/output`,
+    { output, runtimeAudit: { gitStatusAfter: '' } },
+    { headers: { authorization: `Bearer ${run.body.token}` } },
+  );
+}
+
+function buildQuestionerOutput(input) {
+  const output = {
+    schemaVersion: 'questioner-output.v2',
+    id: input.id,
+    questionerRunId: input.runResponse.questionerRunId,
+    workflowId: input.workflowId,
+    subtaskId: input.subtaskId,
+    intent: input.intent,
+    source: 'claude-plugin',
+    actor: {
+      kind: 'claude-code-questioner',
+      invocationId: input.runResponse.invocationId,
+      pluginName: 'agent-loop-claude-review',
+      skillName: 'question-tik-agent-loop',
+    },
+    attestation: {
+      headSha: input.headSha,
+      contextArtifactRef: input.runResponse.contextArtifactRef,
+      contextHash: input.runResponse.contextHash,
+      outputArtifactRef: input.runResponse.expectedOutputArtifactRef,
+      outputHash: '',
+      generatedAt: '2026-07-03T00:02:00.000Z',
+    },
+    references: {
+      contractId: input.contractId,
+      evaluationRunId: input.evaluationRunId,
+      finalEvaluationRunId: input.finalEvaluationRunId,
+    },
+    verdict: 'evidence_sufficient',
+    coverageMatrix: input.coverageMatrix,
+    questions: [],
+    risks: [],
+    missingTests: [],
+    advisoryNotes: [],
   };
+  output.attestation.outputHash = canonicalQuestionerOutputHash(output);
+  return output;
+}
+
+function canonicalQuestionerOutputHash(output) {
+  return `sha256:${createHash('sha256').update(stableStringify({
+    ...output,
+    attestation: {
+      ...output.attestation,
+      outputHash: '',
+    },
+    createdAt: undefined,
+  })).digest('hex')}`;
+}
+
+function stableStringify(value) {
+  return JSON.stringify(sortJson(value));
+}
+
+function sortJson(value) {
+  if (Array.isArray(value)) return value.map(sortJson);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, sortJson(entry)]),
+  );
 }
 
 async function startTikServe(input) {
@@ -646,9 +804,11 @@ function createClient(apiBaseUrl) {
   async function request(method, route, body, input = {}) {
     const response = await fetch(`${apiBaseUrl}${route}`, {
       method,
-      headers: body === undefined
-        ? { accept: 'application/json' }
-        : { accept: 'application/json', 'content-type': 'application/json' },
+      headers: {
+        accept: 'application/json',
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        ...(input.headers || {}),
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const text = await response.text();
@@ -797,13 +957,10 @@ function printSummary(value) {
     taskId: result.taskId,
     workflowId: result.workflowId,
     taskStates: result.taskStates,
-    reviewTaskId: result.reviewTaskId,
-    reviewTaskShortIdentifier: result.reviewTaskShortIdentifier,
-    reviewTaskStatus: result.reviewTaskStatus,
-    reviewTaskAgentLoop: result.reviewTaskAgentLoop,
     workflowEventTypes: result.workflowEventTypes,
     invalidTransitionStatus: result.invalidTransitionStatus,
     missingEvidenceGuard: result.missingEvidenceGuard,
+    finalEvidenceGuard: result.finalEvidenceGuard,
     error: result.message,
   }, null, 2));
 }

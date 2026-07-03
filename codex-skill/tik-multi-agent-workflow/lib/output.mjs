@@ -27,13 +27,6 @@ export function instructionForDecision(decision, state) {
       return `Fix Codex Evaluator or Claude Questioner findings for subtask ${decision.subtaskId}, then re-evaluate.`;
     case 'validate_subtask':
       return `Run the validation commands for subtask ${decision.subtaskId}, then record validation evidence.`;
-    case 'request_claude_review':
-    case 'request_re_review':
-      return `Request a Tik-owned Claude review for subtask ${decision.subtaskId}.`;
-    case 'fix_claude_blockers':
-      return `Fix Claude blocking issues for subtask ${decision.subtaskId} in the current Codex session, then record fix evidence and request re-review.`;
-    case 'request_final_review':
-      return 'Request final Claude review for the workflow before completion.';
     case 'complete_subtask':
       return `Complete subtask ${decision.subtaskId} only after contract, implementation evidence, Codex evaluation evidence, Claude Questioner approval, same-headSha, scope, and subagent-isolation guards pass.`;
     case 'complete_workflow':

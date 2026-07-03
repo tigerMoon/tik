@@ -3,8 +3,8 @@
 Codex-side driver for Tik multi-agent workflows.
 
 This skill lets Codex drive implementation decisions while Tik stores durable
-workflow state, TaskGraph plans, subtask state, evidence, review tasks, guard
-decisions, and Dashboard-visible audit history.
+workflow state, TaskGraph plans, subtask state, evidence, evaluator/questioner
+runs, guard decisions, and Dashboard-visible audit history.
 
 ## Capability Summary
 
@@ -18,13 +18,12 @@ decisions, and Dashboard-visible audit history.
 | `execute` | Record Codex implementation evidence for a subtask. | Implementation evidence, subtask state, validation decision. |
 | Evaluation APIs | Record isolated Codex Evaluator runs, results, artifacts, and readonly validation. | `EvaluationRun`, `CodexEvaluationResult`, readonly guard result. |
 | Questioner APIs | Store Claude plugin Questioner outputs for contract, evaluation, and final evidence challenges. | `QuestionerOutput` records with source, head SHA, artifact refs, and timeline events. |
-| `validate` | Run a validation command and persist the result. | Validation evidence, pass/fail state, next review/fix decision. |
-| `review` | Create a Tik-owned external Claude review task for a subtask. | Workbench task with `agentLoop.kind=claude_review`, `external-claude-review` label, review metadata, subtask review state. |
-| `process-review` | Read a Tik ReviewResult and decide fix, validation retry, human review, or subtask completion. | Review evidence, guarded workflow decision, `review_approved -> done` state when approved. |
-| `fix` | Record Codex fix evidence after Claude blockers. | Fix evidence, `fixing -> implemented`, validation decision before re-review. |
-| `final-review` | Create a Tik-owned final Claude review task after all subtasks are done. | `request_final_review` decision and final review task. |
-| `process-final-review` | Read the final ReviewResult and complete or escalate the workflow. | Final review evidence and guarded `complete_workflow` decision. |
-| `continue` | Advance safe automated steps such as planning request, validation, review request, re-review request, and final-review request. | The corresponding guarded decision and Tik mutation for the safe step. |
+| `validate` | Run a validation command and persist the result. | Validation evidence, pass/fail state, next evaluator/build decision. |
+| `start-evaluator` / `evaluate` | Record isolated Codex Evaluator runs, results, artifacts, and readonly validation. | `EvaluationRun`, `CodexEvaluationResult`, readonly guard result. |
+| `start-questioner` / `record-questioner` | Store Claude plugin Questioner outputs for contract, evaluation, and final evidence challenges. | `QuestionerOutput` records with source, head SHA, artifact refs, and timeline events. |
+| `complete-subtask` | Complete a subtask after v1 evidence gates pass. | Guarded `complete_subtask` decision and `done` state. |
+| `complete-workflow` | Complete the workflow after final evaluator/questioner gates pass. | Guarded `complete_workflow` decision. |
+| `continue` | Advance safe automated steps such as planning request, contract draft/accept, validation, and v1 runtime launch preparation. | The corresponding guarded decision and Tik mutation for the safe step. |
 | `status` | Inspect workflow state, counts, and recent timeline for Dashboard/CLI cross-checks. | No mutation. |
 
 ## Workflow Shape
@@ -33,13 +32,13 @@ decisions, and Dashboard-visible audit history.
 Codex skill
   -> Tik multi-agent workflow APIs
   -> Tik guardrails and evidence store
-  -> Tik-owned Claude planner/reviewer task when needed
+  -> Tik-owned Claude planner/questioner task when needed
   -> Codex inspects results and records the next decision
 ```
 
 Codex owns implementation and policy decisions. Tik owns persistence,
-guardrails, review task creation, state transitions, and the Dashboard-visible
-history. Claude Code planner/reviewer output is treated as input, not as an
+guardrails, runtime launch, state transitions, and the Dashboard-visible
+history. Claude Code planner/questioner output is treated as input, not as an
 automatic authority.
 
 When a workflow policy enables the v1 Codex Evaluator / Claude Questioner gates,
@@ -75,7 +74,7 @@ other explicitly allowed artifact paths.
 Plan acceptance is explicit: a Claude planner invocation can produce a TaskGraph
 draft, but Codex must inspect/edit it and call `accept-plan` before subtasks run.
 
-### Legacy Review Loop
+### V1 Evaluator / Questioner Loop
 
 ```bash
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs init \
@@ -90,54 +89,9 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs a
   --workflow <workflow-id> \
   --task-graph /path/to/task-graph.json
 
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute \
-  --workflow <workflow-id> \
-  --subtask <subtask-id> \
-  --summary "Implemented the scoped change."
-
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs validate \
-  --workflow <workflow-id> \
-  --subtask <subtask-id> \
-  --command "pnpm test"
-
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs review \
-  --workflow <workflow-id> \
-  --subtask <subtask-id> \
-  --start
-
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs process-review \
-  --workflow <workflow-id> \
-  --subtask <subtask-id> \
-  --task <review-task-id>
-
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs final-review \
-  --workflow <workflow-id> \
-  --start
-
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs process-final-review \
-  --workflow <workflow-id> \
-  --task <final-review-task-id>
-```
-
-### V1 Evaluator / Questioner Loop
-
-Use `init --v1` for the Codex Evaluator / Claude Questioner gates. Final Codex
-evaluation uses the magic subtask id `__final__`.
-
-```bash
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs init \
-  --goal "implement multi-agent workflow service" \
-  --path /Users/huyuehui/ace/tik \
-  --base main \
-  --v1
-
-node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs accept-plan \
-  --workflow <workflow-id> \
-  --task-graph /path/to/task-graph.json
-
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs draft-contract \
   --workflow <workflow-id> \
-  --subtask <subtask-id>
+  --subtask <subtask-id> \
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs accept-contract \
   --workflow <workflow-id> \
@@ -201,7 +155,7 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs r
   --artifact-ref <final-questioner-output-artifact>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs complete-workflow \
-  --workflow <workflow-id> \
+  --workflow <workflow-id>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs status \
   --workflow <workflow-id>
@@ -214,8 +168,8 @@ Use `--api-base-url` or `TIK_API_BASE_URL` when Tik is not running at
 
 A real workflow run should leave evidence in both places:
 
-- Workbench task comments/timeline: task creation, state transitions, review
-  request, ReviewResult ingestion, and human-review state.
+- Dashboard/task comments and timeline: task creation, state transitions,
+  evaluator/questioner launch, evidence recording, and completion state.
 - Multi-agent workflow timeline: `workflow.created`, `task_graph.created`,
   `subtask.updated`, `evidence.recorded`, `decision.recorded`, and
   `workflow.completed` events.
@@ -232,7 +186,8 @@ node scripts/verify-multi-agent-real-service.mjs
 
 That script starts a real Tik API service, creates a real task, exercises the
 workflow APIs over HTTP, records implementation and validation evidence, submits
-a real ReviewResult, and writes a report under `.tik/verification/`.
+strict v1 QuestionerOutputV2 for subtask and final gates, and writes a report
+under `.tik/verification/`.
 
 Core and skill regression tests are part of the default root test command:
 
@@ -253,22 +208,18 @@ pnpm run test:multi-agent-skill
   the TaskGraph back to Tik.
 - `next`/`continue` advance the DAG; dependent pending subtasks become
   executable only after dependencies are `done`.
-- Each subtask follows `execute -> validate -> review`; validation uses
-  `validated`, while Claude approval uses `review_approved`.
-- In v1 policy mode, each subtask requires an accepted `SprintContract`, same-head
+- Each subtask follows the v1 contract -> build -> evaluate -> question -> complete loop.
+- Each subtask requires an accepted `SprintContract`, same-head
   implementation/evaluation evidence, hook-attested isolated Builder and
   Evaluator subagent invocations, readonly evaluator sandbox/audit validation,
   full must acceptance-criteria coverage, real command/artifact/reproduction
   evidence, and no blocking `question_evaluation` output from the Claude plugin.
-- Claude blocking findings route to `fix -> validate -> re-review`.
-- `complete_subtask` is guarded by same-head passing validation and Claude
-  approval evidence in legacy mode, or by Codex Evaluator plus Claude Questioner
-  evidence gates in v1 policy mode.
-- After all subtasks are `done`, the workflow must request final review.
-- `complete_workflow` is guarded by approved final review evidence in legacy
-  mode, or by final Codex evaluation that covers every global must criterion,
+- Claude Questioner blocking findings route back to `fix_evaluation_findings`.
+- `complete_subtask` is guarded by Codex Evaluator plus Claude Questioner evidence gates.
+- After all subtasks are `done`, the workflow must run final evaluation and final Questioner.
+- `complete_workflow` is guarded by final Codex evaluation that covers every global must criterion,
   passes every final validation command, has no coverage gaps, and matches
-  `question_final_evidence` output in v1 policy mode.
+  `question_final_evidence` output.
 - Tik exposes action APIs such as `record-implementation`,
   `record-evaluation-result`, `record-questioner-output`, `complete-subtask`,
   and `complete-workflow` so higher-level drivers can submit guarded mutations
@@ -285,7 +236,7 @@ in the current Dashboard workspace.
 Do:
 
 - keep all decisions recorded through Tik workflow APIs;
-- use Tik review tasks for Claude planner/reviewer work;
+- use Tik invocations/runs for Claude planner/questioner work;
 - inspect Claude output before applying fixes;
 - keep code edits in the current Codex session unless a future CodexRunner path
   is explicitly added.
@@ -293,6 +244,6 @@ Do:
 Do not:
 
 - let Tik core choose the next Codex policy action;
-- call Claude directly for canonical workflow review;
+- call Claude directly for canonical workflow questioning;
 - let Claude Code edit files, commit, push, or claim arbitrary tasks;
 - auto-merge or bypass human/project policy.

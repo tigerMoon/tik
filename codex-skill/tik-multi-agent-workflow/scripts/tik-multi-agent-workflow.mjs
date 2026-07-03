@@ -8,7 +8,6 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { decideNextAction } from '../lib/loop-gate.mjs';
-import { decideAfterReview } from '../lib/review-policy.mjs';
 import { findSubtask } from '../lib/task-graph.mjs';
 import { buildWorkspaceBinding, git, resolveProjectPath } from '../lib/git.mjs';
 import {
@@ -38,8 +37,6 @@ import {
   validateEvaluationReadonly,
 } from '../lib/tik-client.mjs';
 import { instructionForDecision, printJson } from '../lib/output.mjs';
-
-const EXTERNAL_OWNER_LABEL = 'external-claude-review';
 
 async function main() {
   const [command = 'help', ...args] = process.argv.slice(2);
@@ -116,26 +113,6 @@ async function main() {
       case 'complete-workflow':
         await completeWorkflow(options);
         break;
-      case 'review':
-        await assertLegacyReviewCommandAllowed(options, 'review');
-        await requestReview(options);
-        break;
-      case 'process-review':
-        await assertLegacyReviewCommandAllowed(options, 'process-review');
-        await processReview(options);
-        break;
-      case 'final-review':
-        await assertLegacyReviewCommandAllowed(options, 'final-review');
-        await requestFinalReview(options);
-        break;
-      case 'process-final-review':
-        await assertLegacyReviewCommandAllowed(options, 'process-final-review');
-        await processFinalReview(options);
-        break;
-      case 'fix':
-        await assertLegacyReviewCommandAllowed(options, 'fix');
-        await fix(options);
-        break;
       case 'continue':
         await continueWorkflow(options);
         break;
@@ -179,9 +156,7 @@ async function initWorkflow(options) {
     metadata: omitUndefined({
       parentCodexThreadId: stringOption(options.parentThread),
     }),
-    policy: options.v1 || options.codexEvaluatorQuestioner
-      ? codexEvaluatorQuestionerPolicy()
-      : undefined,
+    policy: codexEvaluatorQuestionerPolicy(),
   };
   const response = await tikFetch(options, '/v1/multi-agent/workflows', {
     method: 'POST',
@@ -196,10 +171,8 @@ async function initWorkflow(options) {
     driver: response.workflow?.driver,
     headSha: response.workflow?.currentHeadSha,
     policy: response.workflow?.policy,
-    mode: usesCodexEvaluatorQuestionerGate(response.workflow) ? 'v1' : 'legacy',
-    deprecation: usesCodexEvaluatorQuestionerGate(response.workflow)
-      ? 'Legacy review/process/fix/final-review commands are disabled for v1 workflows; legacy compatibility is scheduled for v1.1 removal.'
-      : 'Legacy compatibility mode is deprecated; create new workflows with --v1. Legacy review/process/fix/final-review compatibility is scheduled for v1.1 removal.',
+    mode: 'v1',
+    breakingChange: 'v1.1 removed legacy multi-agent Claude review commands; use the contract/evaluator/questioner loop.',
     nextCommand: `node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs next --workflow ${response.workflow?.id}`,
   });
 }
@@ -839,22 +812,16 @@ async function validate(options) {
     validationRunIds: [evidence.evidence.id],
     evidenceRefs,
   });
-  const reviewAction = shouldRequestReReviewAfterValidation(state, subtaskId)
-    ? 'request_re_review'
-    : 'request_claude_review';
   const decision = buildDecision(state.workflow, {
-    action: passed ? reviewAction : 'execute_subtask',
+    action: passed ? 'run_codex_evaluator' : 'execute_subtask',
     subtaskId,
     reason: passed
-      ? (reviewAction === 'request_re_review'
-        ? 'Validation passed after fixing Claude blockers; request Claude re-review through Tik.'
-        : 'Validation passed; request Claude review through Tik.')
+      ? 'Validation passed; run an isolated Codex Evaluator.'
       : 'Validation failed; current Codex session must inspect and fix.',
     evidenceRefs,
     inputs: {
       currentHeadSha: headSha,
       validationPassed: passed,
-      fixRecorded: reviewAction === 'request_re_review',
     },
   });
   const recorded = await safeRecordDecision(options, workflowId, decision, state);
@@ -1194,497 +1161,6 @@ async function completeWorkflow(options) {
   });
 }
 
-async function requestReview(options) {
-  const workflowId = requireOption(options.workflow, '--workflow is required');
-  const subtaskId = requireOption(options.subtask, '--subtask is required');
-  const state = await readWorkflow(options, workflowId);
-  const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
-  const subtask = findSubtask(state.taskGraph, subtaskId);
-  const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD']);
-  const headRef = options.headRef || git(projectPath, ['branch', '--show-current'], { optional: true }) || 'HEAD';
-  const round = numberOption(options.round, nextReviewRound(state.subtasks?.[subtaskId]));
-  const maxRounds = numberOption(options.maxRounds, state.workflow.maxRounds || 3);
-  const repo = options.repo || state.workflow.repo || path.basename(projectPath);
-  const decision = buildDecision(state.workflow, {
-    action: round > 1 ? 'request_re_review' : 'request_claude_review',
-    subtaskId,
-    reason: 'Codex workflow is about to request a Tik-owned Claude review.',
-    evidenceRefs: state.subtasks?.[subtaskId]?.evidenceRefs || [],
-    inputs: { round, maxRounds, currentHeadSha: headSha, fixRecorded: round > 1 },
-  });
-  const preflight = await safePreflightDecision(options, workflowId, decision, state);
-  if (!preflight.guard?.accepted) {
-    printJson({
-      action: 'review-rejected',
-      workflowId,
-      subtaskId,
-      round,
-      headSha,
-      decision,
-      guard: preflight.guard,
-    });
-    return;
-  }
-  const response = await tikFetch(options, '/v1/agent-loop/worktree-review-rounds', {
-    method: 'POST',
-    body: {
-      rootTaskId: state.workflow.rootTaskId,
-      round,
-      maxRounds,
-      repo,
-      title: options.title || `Claude review for ${subtaskId}: ${subtask?.title || state.workflow.goal}`,
-      baseRef: options.base || state.workflow.baseRef || 'HEAD~1',
-      headRef,
-      headSha,
-      idempotencyKey: options.idempotencyKey || [
-        'multi_agent_claude_review',
-        repo,
-        workflowId,
-        subtaskId,
-        headSha,
-        `r${round}`,
-      ].join(':'),
-      labels: mergeLabels(options.label, [EXTERNAL_OWNER_LABEL]),
-      allowedScope: splitList(options.allowedScope) || subtask?.allowedPaths,
-      acceptanceCriteria: splitList(options.acceptanceCriteria) || subtask?.acceptanceCriteria,
-      reviewFocus: splitList(options.reviewFocus) || subtask?.reviewFocus,
-      reviewInputSource: reviewInputSourceOption(options),
-      mergeRequestUrl: options.mergeRequestUrl || options.mrUrl,
-      fetchRemote: reviewFetchRemoteOption(options),
-      fetchRef: options.fetchRef,
-      createdBy: 'codex',
-      workspaceBinding: state.workflow.workspaceBinding || buildWorkspaceBinding(projectPath, options),
-    },
-  });
-  const taskId = response.task?.id;
-  const finalDecision = {
-    ...decision,
-    reviewRoundId: taskId,
-    reason: 'Codex workflow requested a Tik-owned Claude review.',
-    inputs: { ...decision.inputs, reviewTaskId: taskId },
-  };
-  const recorded = await safeRecordDecision(options, workflowId, finalDecision, state);
-  if (recorded.guard?.accepted === false) {
-    printJson({
-      action: 'review-rejected',
-      workflowId,
-      subtaskId,
-      round,
-      headSha,
-      taskId,
-      decision: finalDecision,
-      guard: recorded.guard,
-    });
-    return;
-  }
-  await updateSubtask(options, workflowId, subtaskId, {
-      status: 'reviewing',
-      lastReviewedHeadSha: headSha,
-      reviewRoundIds: taskId ? [taskId] : [],
-  });
-  let started = null;
-  if (options.start) {
-    started = await tikFetch(options, `/v1/agent-loop/tasks/${encodeURIComponent(taskId)}/claude-review-runs`, {
-      method: 'POST',
-    });
-  }
-  printJson({
-    action: 'review-requested',
-    workflowId,
-    subtaskId,
-    taskId,
-    shortIdentifier: response.task?.shortIdentifier,
-    round,
-    headSha,
-    decision: finalDecision,
-    guard: recorded.guard,
-    started,
-  });
-}
-
-async function processReview(options) {
-  const workflowId = requireOption(options.workflow, '--workflow is required');
-  const subtaskId = requireOption(options.subtask, '--subtask is required');
-  const taskId = requireOption(options.task, '--task is required');
-  const state = await readWorkflow(options, workflowId);
-  const task = await readTask(options, taskId);
-  const result = task.agentLoop?.reviewResult;
-  if (!result) {
-    if (task.agentLoop?.stale) {
-      const subtask = await updateSubtask(options, workflowId, subtaskId, {
-        status: 'validated',
-        reviewRoundIds: withoutRef(state.subtasks?.[subtaskId]?.reviewRoundIds || [], task.id),
-      });
-      printJson({
-        action: 'review-stale',
-        workflowId,
-        subtaskId,
-        reviewTaskId: task.id,
-        stale: task.agentLoop.stale,
-        subtask: subtask.subtask,
-        instruction: 'Claude marked this review stale because HEAD changed. Request a fresh Claude review for the current workflow head.',
-      });
-      return;
-    }
-    throw new Error(`Task ${taskId} does not have an agentLoop.reviewResult yet.`);
-  }
-  const validationEvidence = findPassedValidationForReviewedHead(state, subtaskId, result);
-  const validationPassed = Boolean(validationEvidence);
-  const policy = decideAfterReview({
-    workflow: state.workflow,
-    subtaskId,
-    task,
-    result,
-    validationPassed,
-    validationEvidence,
-  });
-  const reviewEvidenceId = reviewEvidenceIdForTask(task.id);
-  const plannedDecision = buildDecision(state.workflow, {
-    ...policy,
-    reviewRoundId: task.id,
-    evidenceRefs: mergeEvidenceRefs(state.subtasks?.[subtaskId]?.evidenceRefs, [reviewEvidenceId]),
-    inputs: {
-      ...(policy.inputs || {}),
-      plannedReviewEvidenceId: reviewEvidenceId,
-      plannedReviewResult: result,
-    },
-  });
-  const preflight = await safePreflightDecision(options, workflowId, plannedDecision, state);
-  if (!preflight.guard?.accepted) {
-    printJson({
-      action: 'review-process-rejected',
-      workflowId,
-      subtaskId,
-      reviewTaskId: task.id,
-      verdict: result.verdict,
-      decision: plannedDecision,
-      guard: preflight.guard,
-    });
-    return;
-  }
-  const decision = plannedDecision;
-  const recorded = await safeRecordDecision(options, workflowId, decision, state);
-  if (recorded.guard?.accepted === false) {
-    printJson({
-      action: 'review-process-rejected',
-      workflowId,
-      subtaskId,
-      reviewTaskId: task.id,
-      verdict: result.verdict,
-      decision,
-      guard: recorded.guard,
-    });
-    return;
-  }
-  const evidence = await recordEvidence(options, workflowId, {
-    id: reviewEvidenceId,
-    kind: 'review',
-    title: `Claude review ${task.shortIdentifier || task.id}`,
-    summary: `${result.verdict} with ${(result.blockingIssues || []).length} blocking issue(s).`,
-    subtaskId,
-    headSha: result.headShaReviewed,
-    payload: {
-      taskId: task.id,
-      result,
-    },
-  });
-  const evidenceRefs = mergeEvidenceRefs(state.subtasks?.[subtaskId]?.evidenceRefs, [evidence.evidence.id]);
-  const blockerFindingIds = (result.blockingIssues || []).map((issue, index) => `${task.id}:blocking:${index + 1}`);
-  const fixRound = decision.action === 'fix_claude_blockers'
-    ? (state.subtasks?.[subtaskId]?.fixRound || 0) + 1
-    : state.subtasks?.[subtaskId]?.fixRound || 0;
-  if (decision.action === 'complete_subtask') {
-    await updateSubtask(options, workflowId, subtaskId, {
-      status: 'review_approved',
-      lastReviewedHeadSha: result.headShaReviewed,
-      evidenceRefs,
-      blockerFindingIds: [],
-      fixRound,
-    });
-    await updateSubtask(options, workflowId, subtaskId, {
-      status: 'done',
-      lastReviewedHeadSha: result.headShaReviewed,
-      evidenceRefs,
-      blockerFindingIds: [],
-      fixRound,
-    });
-  } else if (decision.action === 'validate_subtask') {
-    await updateSubtask(options, workflowId, subtaskId, {
-      status: 'implemented',
-      lastReviewedHeadSha: result.headShaReviewed,
-      evidenceRefs,
-      blockerFindingIds: [],
-      fixRound,
-    });
-  } else {
-    await updateSubtask(options, workflowId, subtaskId, {
-      status: statusForReviewDecision(decision.action),
-      lastReviewedHeadSha: result.headShaReviewed,
-      evidenceRefs,
-      blockerFindingIds,
-      fixRound,
-    });
-  }
-  printJson({
-    action: 'review-processed',
-    workflowId,
-    subtaskId,
-    reviewTaskId: task.id,
-    verdict: result.verdict,
-    blockingIssueCount: (result.blockingIssues || []).length,
-    decision,
-    guard: recorded.guard,
-    instruction: instructionForDecision(decision, state),
-  });
-}
-
-async function requestFinalReview(options) {
-  const workflowId = requireOption(options.workflow, '--workflow is required');
-  const state = await readWorkflow(options, workflowId);
-  const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
-  const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
-  const headRef = options.headRef || git(projectPath, ['branch', '--show-current'], { optional: true }) || 'HEAD';
-  const repo = options.repo || state.workflow.repo || path.basename(projectPath);
-  const decision = buildDecision(state.workflow, {
-    action: 'request_final_review',
-    reason: 'All subtasks are done; Codex workflow is about to request final Claude review.',
-    evidenceRefs: collectSubtaskEvidenceRefs(state),
-    inputs: {
-      currentHeadSha: headSha,
-      taskGraphVersion: state.taskGraph?.version,
-    },
-  });
-  const preflight = await safePreflightDecision(options, workflowId, decision, state);
-  if (!preflight.guard?.accepted) {
-    printJson({
-      action: 'final-review-rejected',
-      workflowId,
-      decision,
-      guard: preflight.guard,
-    });
-    return;
-  }
-  const recorded = await safeRecordDecision(options, workflowId, decision, state);
-  if (recorded.guard?.accepted === false) {
-    printJson({
-      action: 'final-review-rejected',
-      workflowId,
-      headSha,
-      decision,
-      guard: recorded.guard,
-    });
-    return;
-  }
-  const response = await tikFetch(options, '/v1/agent-loop/worktree-review-rounds', {
-    method: 'POST',
-    body: {
-      rootTaskId: state.workflow.rootTaskId,
-      round: 1,
-      maxRounds: 1,
-      repo,
-      title: options.title || `Final Claude review for workflow ${workflowId}: ${state.workflow.goal}`,
-      baseRef: options.base || state.workflow.baseRef || 'HEAD~1',
-      headRef,
-      headSha,
-      idempotencyKey: options.idempotencyKey || [
-        'multi_agent_final_claude_review',
-        repo,
-        workflowId,
-        headSha,
-      ].join(':'),
-      labels: mergeLabels(options.label, [EXTERNAL_OWNER_LABEL, 'final-claude-review']),
-      allowedScope: collectAllowedPaths(state),
-      acceptanceCriteria: state.taskGraph?.globalAcceptanceCriteria || [],
-      reviewFocus: ['final workflow integration', 'all subtasks done', 'regression risk'],
-      reviewInputSource: reviewInputSourceOption(options),
-      mergeRequestUrl: options.mergeRequestUrl || options.mrUrl,
-      fetchRemote: reviewFetchRemoteOption(options),
-      fetchRef: options.fetchRef,
-      createdBy: 'codex',
-      workspaceBinding: state.workflow.workspaceBinding || buildWorkspaceBinding(projectPath, options),
-    },
-  });
-  const taskId = response.task?.id;
-  const outputDecision = {
-    ...decision,
-    reviewRoundId: taskId,
-    reason: 'Codex workflow requested final Tik-owned Claude review.',
-    inputs: { ...decision.inputs, reviewTaskId: taskId },
-  };
-  let started = null;
-  if (options.start) {
-    started = await tikFetch(options, `/v1/agent-loop/tasks/${encodeURIComponent(taskId)}/claude-review-runs`, {
-      method: 'POST',
-    });
-  }
-  printJson({
-    action: 'final-review-requested',
-    workflowId,
-    taskId,
-    shortIdentifier: response.task?.shortIdentifier,
-    headSha,
-    decision: outputDecision,
-    guard: recorded.guard,
-    started,
-  });
-}
-
-async function processFinalReview(options) {
-  const workflowId = requireOption(options.workflow, '--workflow is required');
-  const taskId = requireOption(options.task, '--task is required');
-  const state = await readWorkflow(options, workflowId);
-  const task = await readTask(options, taskId);
-  const result = task.agentLoop?.reviewResult;
-  if (!result) {
-    if (task.agentLoop?.stale) {
-      printJson({
-        action: 'final-review-stale',
-        workflowId,
-        reviewTaskId: task.id,
-        stale: task.agentLoop.stale,
-        instruction: 'Claude marked the final review stale because HEAD changed. Request a fresh final review for the current workflow head.',
-      });
-      return;
-    }
-    throw new Error(`Task ${taskId} does not have an agentLoop.reviewResult yet.`);
-  }
-  const approved = result.verdict === 'approve' && (result.blockingIssues || []).length === 0;
-  const finalReviewEvidenceId = reviewEvidenceIdForTask(task.id);
-  const plannedDecision = buildDecision(state.workflow, {
-    action: approved ? 'complete_workflow' : 'request_human_review',
-    reviewRoundId: task.id,
-    reason: approved
-      ? 'Final Claude review approved the workflow.'
-      : 'Final Claude review did not approve the workflow.',
-    evidenceRefs: [finalReviewEvidenceId],
-    inputs: {
-      currentHeadSha: result.headShaReviewed || result.currentHeadSha || state.workflow.currentHeadSha,
-      reviewTaskId: task.id,
-      finalReviewApproved: approved,
-      plannedReviewEvidenceId: finalReviewEvidenceId,
-      plannedFinalReviewResult: result,
-    },
-    risks: (result.blockingIssues || []).map((issue) => issue.title || issue.reason).filter(Boolean),
-  });
-  const evidence = await recordEvidence(options, workflowId, {
-    id: finalReviewEvidenceId,
-    kind: 'review',
-    title: `Final Claude review ${task.shortIdentifier || task.id}`,
-    summary: `${result.verdict} with ${(result.blockingIssues || []).length} blocking issue(s).`,
-    headSha: result.headShaReviewed || result.currentHeadSha || state.workflow.currentHeadSha,
-    payload: {
-      taskId: task.id,
-      final: true,
-      result,
-    },
-  });
-  const stateWithEvidence = await readWorkflow(options, workflowId);
-  const preflight = await safePreflightDecision(options, workflowId, plannedDecision, stateWithEvidence);
-  if (!preflight.guard?.accepted) {
-    printJson({
-      action: 'final-review-process-rejected',
-      workflowId,
-      reviewTaskId: task.id,
-      verdict: result.verdict,
-      blockingIssueCount: (result.blockingIssues || []).length,
-      decision: plannedDecision,
-      guard: preflight.guard,
-    });
-    return;
-  }
-  const decision = {
-    ...plannedDecision,
-    inputs: omitUndefined({
-      ...plannedDecision.inputs,
-      plannedFinalReviewResult: undefined,
-    }),
-  };
-  const recorded = await safeRecordDecision(options, workflowId, decision, stateWithEvidence);
-  if (recorded.guard?.accepted === false) {
-    printJson({
-      action: 'final-review-process-rejected',
-      workflowId,
-      reviewTaskId: task.id,
-      verdict: result.verdict,
-      blockingIssueCount: (result.blockingIssues || []).length,
-      decision,
-      guard: recorded.guard,
-    });
-    return;
-  }
-  printJson({
-    action: approved ? 'workflow-completed' : 'final-review-needs-human',
-    workflowId,
-    reviewTaskId: task.id,
-    verdict: result.verdict,
-    blockingIssueCount: (result.blockingIssues || []).length,
-    evidence: evidence.evidence,
-    decision,
-    guard: recorded.guard,
-  });
-}
-
-async function fix(options) {
-  const workflowId = requireOption(options.workflow, '--workflow is required');
-  const subtaskId = requireOption(options.subtask, '--subtask is required');
-  const state = await readWorkflow(options, workflowId);
-  const headSha = git(resolveProjectPath(options.path), ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
-  const preflightDecision = buildDecision(state.workflow, {
-    action: 'fix_claude_blockers',
-    subtaskId,
-    reviewRoundId: stringOption(options.reviewRound),
-    reason: 'Codex is about to record a fix for Claude blocking issues.',
-    evidenceRefs: state.subtasks?.[subtaskId]?.evidenceRefs || [],
-    inputs: { currentHeadSha: headSha },
-  });
-  const preflight = await safePreflightDecision(options, workflowId, preflightDecision, state);
-  if (!preflight.guard?.accepted) {
-    printJson({
-      action: 'fix-rejected',
-      workflowId,
-      subtaskId,
-      decision: preflightDecision,
-      guard: preflight.guard,
-    });
-    return;
-  }
-  await updateSubtask(options, workflowId, subtaskId, { status: 'fixing' });
-  const evidence = await recordEvidence(options, workflowId, {
-    kind: 'fix',
-    title: options.title || `Codex fix for ${subtaskId}`,
-    summary: options.summary || 'Codex recorded fix evidence for Claude blockers.',
-    subtaskId,
-    headSha,
-    payload: {
-      reviewRoundId: stringOption(options.reviewRound),
-    },
-  });
-  const evidenceRefs = mergeEvidenceRefs(state.subtasks?.[subtaskId]?.evidenceRefs, [evidence.evidence.id]);
-  const subtask = await updateSubtask(options, workflowId, subtaskId, {
-    status: 'implemented',
-    implementationHeadSha: headSha,
-    evidenceRefs,
-  });
-  const decision = buildDecision(state.workflow, {
-    action: 'validate_subtask',
-    subtaskId,
-    reviewRoundId: stringOption(options.reviewRound),
-    reason: 'Codex recorded a fix for Claude blockers; validation is required before re-review.',
-    evidenceRefs,
-    inputs: { currentHeadSha: headSha, fixRecorded: true },
-  });
-  const recorded = await safeRecordDecision(options, workflowId, decision, state);
-  printJson({
-    action: 'fix-recorded',
-    workflowId,
-    subtaskId,
-    evidence: evidence.evidence,
-    subtask: subtask.subtask,
-    decision,
-    guard: recorded.guard,
-  });
-}
-
 async function continueWorkflow(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
   const initialState = await readWorkflow(options, workflowId);
@@ -1827,14 +1303,6 @@ async function executeContinueDecision(options, state, decision) {
   }
   if (decision.action === 'validate_subtask') {
     const output = await capturePrintedJson(() => validate({ ...options, subtask: decision.subtaskId }));
-    return { directOutput: output, action: output.action, guard: output.guard };
-  }
-  if (decision.action === 'request_claude_review' || decision.action === 'request_re_review') {
-    const output = await capturePrintedJson(() => requestReview({ ...options, subtask: decision.subtaskId }));
-    return { directOutput: output, action: output.action, guard: output.guard };
-  }
-  if (decision.action === 'request_final_review') {
-    const output = await capturePrintedJson(() => requestFinalReview(options));
     return { directOutput: output, action: output.action, guard: output.guard };
   }
   if (decision.action === 'execute_subtask') {
@@ -2137,13 +1605,8 @@ function loopMaxRounds(workflow, options) {
   return numberOption(options.maxRounds, workflow?.policy?.loopContract?.budget?.maxRounds || workflow?.maxRounds || 3);
 }
 
-function reviewEvidenceIdForTask(taskId) {
-  return `ev_review_${String(taskId).replace(/[^A-Za-z0-9._:-]/g, '_')}`;
-}
-
 function requiresCurrentCodexSession(action) {
   return [
-    'fix_claude_blockers',
     'fix_evaluation_findings',
     'request_human_review',
   ].includes(action);
@@ -2168,31 +1631,6 @@ function intentForQuestionerDecision(action) {
     default:
       throw new Error(`Unsupported Questioner decision: ${action}`);
   }
-}
-
-function usesCodexEvaluatorQuestionerGate(workflow) {
-  const policy = workflow?.policy;
-  return Boolean(
-    policy?.requireAcceptedContract
-      || policy?.requireEvaluationPassForComplete
-      || policy?.requireQuestionerAfterEvaluation,
-  );
-}
-
-async function assertLegacyReviewCommandAllowed(options, command) {
-  const workflowId = stringOption(options.workflow);
-  if (!workflowId) {
-    return;
-  }
-  const state = await readWorkflow(options, workflowId);
-  if (!usesCodexEvaluatorQuestionerGate(state.workflow)) {
-    return;
-  }
-  throw new Error(
-    `${command} is a legacy Claude-review command and is disabled for v1 workflows. `
-      + 'Use the v1 Codex Evaluator / Claude Questioner loop: start-evaluator/evaluate, start-questioner, complete-subtask, and complete-workflow. '
-      + 'Legacy compatibility is scheduled for v1.1 removal.',
-  );
 }
 
 async function refreshMainSnapshot(options, state, input = {}) {
@@ -2439,27 +1877,6 @@ function blockingQuestionerQuestions(output) {
   return (output.questions || []).filter((question) =>
     question.priority === 'blocking' || question.priority === 'evidence_needed'
   );
-}
-
-function nextReviewRound(subtask) {
-  return (subtask?.reviewRoundIds?.length || 0) + 1;
-}
-
-function statusForReviewDecision(action) {
-  if (action === 'complete_subtask') return 'review_approved';
-  if (action === 'fix_claude_blockers') return 'needs_fix';
-  if (action === 'request_human_review') return 'human_review_required';
-  if (action === 'validate_subtask') return 'implemented';
-  if (action === 'request_re_review') return 'reviewing';
-  return 'reviewing';
-}
-
-function shouldRequestReReviewAfterValidation(state, subtaskId) {
-  const subtask = state.subtasks?.[subtaskId];
-  if ((subtask?.fixRound || 0) > 0 || (subtask?.reviewRoundIds || []).length > 0) {
-    return (state.evidence || []).some((item) => item.subtaskId === subtaskId && item.kind === 'fix');
-  }
-  return false;
 }
 
 function mergeEvidenceRefs(...groups) {
@@ -2868,23 +2285,6 @@ async function readWorkflowTimeline(options, workflowId) {
   }
 }
 
-function findPassedValidationForReviewedHead(state, subtaskId, result) {
-  const reviewedHeadSha = result?.headShaReviewed || result?.currentHeadSha;
-  if (!reviewedHeadSha) return null;
-  const subtask = state.subtasks?.[subtaskId];
-  const validationRunIds = new Set(subtask?.validationRunIds || []);
-  return [...(state.evidence || [])]
-    .filter((item) =>
-      item.subtaskId === subtaskId
-      && item.kind === 'validation'
-      && item.passed === true
-      && item.headSha === reviewedHeadSha
-      && (validationRunIds.size === 0 || validationRunIds.has(item.id))
-    )
-    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))
-    [0] || null;
-}
-
 function parseArgs(args) {
   const options = {};
   for (let index = 0; index < args.length; index += 1) {
@@ -2937,18 +2337,6 @@ function appendOptionValue(current, value) {
   return Array.isArray(current) ? [...current, value] : [current, value];
 }
 
-function mergeLabels(value, required) {
-  return Array.from(new Set([...(splitList(value) || []), ...required])).sort();
-}
-
-function reviewInputSourceOption(options) {
-  return options.reviewInputSource || (options.mergeRequestUrl || options.mrUrl ? 'merge_request' : 'local_diff');
-}
-
-function reviewFetchRemoteOption(options) {
-  return options.fetchRemote || (reviewInputSourceOption(options) === 'merge_request' ? 'origin' : undefined);
-}
-
 function numberOption(value, fallback) {
   if (value === undefined || value === true || value === '') return fallback;
   const parsed = Number(value);
@@ -2999,11 +2387,6 @@ Usage:
   node ${script} record-questioner --workflow <workflow-id> --intent <intent> [--subtask <id>]
   node ${script} complete-subtask --workflow <workflow-id> --subtask <id>
   node ${script} complete-workflow --workflow <workflow-id>
-  node ${script} review --workflow <workflow-id> --subtask <id> [--start]
-  node ${script} process-review --workflow <workflow-id> --subtask <id> --task <review-task-id>
-  node ${script} final-review --workflow <workflow-id> [--start]
-  node ${script} process-final-review --workflow <workflow-id> --task <review-task-id>
-  node ${script} fix --workflow <workflow-id> --subtask <id> --review-round <id>
   node ${script} continue --workflow <workflow-id>
   node ${script} status --workflow <workflow-id>
 
@@ -3022,8 +2405,7 @@ Options:
   --invocation <id>          Tik AgentInvocation id for a Codex subagent thread.
   --thread <id>              Codex subagent thread/session id.
   --v1                       Enable Codex Evaluator / Claude Questioner gates.
-  --round <n>                Review round.
-  --max-rounds <n>           Max review rounds. Defaults to 3.
+  --max-rounds <n>           Max loop rounds. Defaults to 3.
   --evaluator-artifact-path <path>  Extra evaluator artifact path allowed by readonly policy. Repeat or comma-separate.
   --output <path>            (init only) Write full JSON response to a file.
 `);

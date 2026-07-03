@@ -114,52 +114,21 @@ describe('multi-agent coordination API over real HTTP', () => {
     });
     expect(validated.status).toBe(200);
 
-    const reviewEvidence = await client.post('/api/v1/multi-agent/workflows/wf-real-http/evidence', {
-      id: 'ev-real-http-review',
-      kind: 'review',
-      title: 'Real HTTP Claude review approve',
-      subtaskId: 'st-api',
-      passed: true,
-      headSha: 'head-1',
-      payload: {
-        result: {
-          verdict: 'approve',
-          headShaReviewed: 'head-1',
-          currentHeadSha: 'head-1',
-          blockingIssues: [],
-        },
-      },
-    });
-    expect(reviewEvidence.status).toBe(200);
-
-    const reviewing = await client.patch('/api/v1/multi-agent/workflows/wf-real-http/subtasks/st-api', {
-      status: 'reviewing',
-      reviewRoundIds: ['rr-real-http'],
-    });
-    expect(reviewing.status).toBe(200);
-
-    const reviewApproved = await client.patch('/api/v1/multi-agent/workflows/wf-real-http/subtasks/st-api', {
-      status: 'review_approved',
-      evidenceRefs: ['ev-real-http-review'],
-      lastReviewedHeadSha: 'head-1',
-    });
-    expect(reviewApproved.status).toBe(200);
-
     const decision = {
-      id: 'dec-real-http-complete-api',
+      id: 'dec-real-http-human-review-api',
       workflowId: 'wf-real-http',
       rootTaskId: 'root-real-http',
       subtaskId: 'st-api',
       decidedBy: 'codex-workflow',
       decidedAt: '2026-06-30T00:00:00.000Z',
-      action: 'complete_subtask',
-      reason: 'Real HTTP validation evidence exists and the state transition is guarded by Tik.',
-      evidenceRefs: ['ev-real-http-validation', 'ev-real-http-review'],
+      action: 'request_human_review',
+      reason: 'Real HTTP validation evidence exists and can be escalated by Tik.',
+      evidenceRefs: ['ev-real-http-validation'],
       inputs: {
         currentHeadSha: 'head-1',
       },
       expectedTikMutation: {
-        taskStatus: 'done',
+        taskStatus: 'human_review_required',
       },
       confidence: 0.94,
     };
@@ -170,7 +139,7 @@ describe('multi-agent coordination API over real HTTP', () => {
       decision,
       workflow: {
         id: 'wf-real-http',
-        lastDecisionId: 'dec-real-http-complete-api',
+        lastDecisionId: 'dec-real-http-human-review-api',
       },
     });
 
@@ -188,14 +157,13 @@ describe('multi-agent coordination API over real HTTP', () => {
     });
 
     const done = await client.patch('/api/v1/multi-agent/workflows/wf-real-http/subtasks/st-api', {
-      status: 'done',
+      status: 'human_review_required',
     });
     expect(done.status).toBe(200);
     expect(done.body.subtask).toMatchObject({
-      status: 'done',
-      evidenceRefs: ['ev-real-http-validation', 'ev-real-http-review'],
+      status: 'human_review_required',
+      evidenceRefs: ['ev-real-http-validation'],
       lastValidatedHeadSha: 'head-1',
-      lastReviewedHeadSha: 'head-1',
     });
 
     const workflow = await client.get('/api/v1/multi-agent/workflows/wf-real-http');
@@ -206,15 +174,15 @@ describe('multi-agent coordination API over real HTTP', () => {
         driver: 'codex-workflow',
         status: 'active',
         taskGraphVersion: 1,
-        lastDecisionId: 'dec-real-http-complete-api',
+        lastDecisionId: 'dec-real-http-human-review-api',
       },
       taskGraph: graph,
       subtasks: {
-        'st-api': { status: 'done' },
+        'st-api': { status: 'human_review_required' },
         'st-validation': { status: 'pending' },
       },
     });
-    expect(workflow.body.evidence).toHaveLength(2);
+    expect(workflow.body.evidence).toHaveLength(1);
     expect(workflow.body.decisions).toHaveLength(1);
 
     const timeline = await client.get('/api/v1/multi-agent/workflows/wf-real-http/timeline');
@@ -222,9 +190,6 @@ describe('multi-agent coordination API over real HTTP', () => {
     expect(timeline.body.events.map((event: { type: string }) => event.type)).toEqual([
       'workflow.created',
       'task_graph.created',
-      'subtask.updated',
-      'evidence.recorded',
-      'subtask.updated',
       'subtask.updated',
       'evidence.recorded',
       'subtask.updated',
@@ -239,7 +204,7 @@ describe('multi-agent coordination API over real HTTP', () => {
     expect(storedWorkflow).toMatchObject({
       id: 'wf-real-http',
       driver: 'codex-workflow',
-      lastDecisionId: 'dec-real-http-complete-api',
+      lastDecisionId: 'dec-real-http-human-review-api',
       workspaceBinding: {
         workspaceRoot: root,
         effectiveProjectPath: repoPath,

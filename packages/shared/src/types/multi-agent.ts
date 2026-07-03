@@ -26,17 +26,12 @@ export type WorkflowDecisionAction =
   | 'validate_subtask'
   | 'ask_claude_question_evaluation'
   | 'fix_evaluation_findings'
-  | 'request_claude_review'
-  | 'fix_claude_blockers'
   | 're_evaluate'
-  | 'request_re_review'
   | 'request_replan'
-  | 'skip_non_blocking_suggestions'
   | 'request_human_review'
   | 'complete_subtask'
   | 'run_final_evaluation'
   | 'ask_claude_question_final_evidence'
-  | 'request_final_review'
   | 'complete_workflow'
   | 'abort_workflow';
 
@@ -178,11 +173,8 @@ export type SubtaskRunStatus =
   | 'validated'
   | 'validation_failed'
   | 'questioning_evidence'
-  | 'reviewing'
   | 'needs_fix'
   | 'fixing'
-  | 'review_approved'
-  | 'approved'
   | 'done'
   | 'blocked'
   | 'human_review_required';
@@ -192,8 +184,6 @@ export interface SubtaskRunState {
   status: SubtaskRunStatus;
   implementationHeadSha?: string;
   lastValidatedHeadSha?: string;
-  lastReviewedHeadSha?: string;
-  reviewRoundIds: string[];
   validationRunIds: string[];
   evidenceRefs: string[];
   blockerFindingIds: string[];
@@ -213,7 +203,6 @@ export type MultiAgentEvidenceKind =
   | 'validation'
   | 'evaluation'
   | 'questioner'
-  | 'review'
   | 'fix'
   | 'plan'
   | 'decision'
@@ -253,7 +242,7 @@ export interface ImplementationEvidencePayload extends Record<string, unknown> {
   scopeCheck?: ImplementationScopeCheck;
 }
 
-export type MultiAgentInvocationRole = 'planner' | 'reviewer' | 'final-reviewer' | 'executor' | 'questioner' | 'evaluator';
+export type MultiAgentInvocationRole = 'planner' | 'executor' | 'questioner' | 'evaluator';
 export type MultiAgentInvocationRunner = 'claude-code' | 'codex' | 'codex-evaluator';
 export type MultiAgentInvocationStatus = 'created' | 'started' | 'completed' | 'failed' | 'cancelled';
 
@@ -344,8 +333,6 @@ export interface LoopGateInput {
 export interface LoopGateDecision extends WorkflowDecision {
   action:
     | 'complete_subtask'
-    | 'fix_claude_blockers'
-    | 'request_re_review'
     | 'request_replan'
     | 'request_human_review'
     | 'complete_workflow';
@@ -383,11 +370,6 @@ export type MultiAgentWorkflowEventType =
   | 'codex.execute.completed'
   | 'validation.started'
   | 'validation.completed'
-  | 'claude.review.requested'
-  | 'claude.review.started'
-  | 'claude.review.completed'
-  | 'codex.fix.started'
-  | 'codex.fix.completed'
   | 'replan.requested'
   | 'human_review.requested'
   | 'workflow.completed'
@@ -425,7 +407,6 @@ export interface WorkflowPolicy {
   requireAcceptedContract: boolean;
   requireEvaluationPassForComplete: boolean;
   requireSameHeadShaForEvidence: boolean;
-  allowClaudeFinalReview?: boolean;
   allowHumanOverride: boolean;
   loopContract?: LoopContract;
   stalledInvocationTimeoutMs?: number;

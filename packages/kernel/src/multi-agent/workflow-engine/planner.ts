@@ -20,7 +20,6 @@ import {
   latestEvaluationRun,
   latestImplementationEvidence,
   latestMatchingQuestionerOutput,
-  usesCodexEvaluatorQuestionerGate,
   type WorkflowDecisionContext,
 } from './predicates.js';
 import type { PredicateRef } from './predicate-result.js';
@@ -55,11 +54,7 @@ export function planNextAction(input: {
     });
   }
 
-  if (usesCodexEvaluatorQuestionerGate(ctx.workflow)) {
-    return planNextV1Action(ctx);
-  }
-
-  return planLegacyAction(ctx);
+  return planNextV1Action(ctx);
 }
 
 function planNextV1Action(ctx: WorkflowDecisionContext): PlannedAction {
@@ -507,107 +502,6 @@ function actionForRejectedCompletion(code: string | undefined): WorkflowDecision
   return 'request_human_review';
 }
 
-function planLegacyAction(ctx: WorkflowDecisionContext): PlannedAction {
-  if (allSubtasksDone(ctx).ok) {
-    if (allDoneSubtasksHaveApprovedReview(ctx)) {
-      return planned('complete_workflow', {
-        reason: 'All subtasks are done and have approved Claude review evidence.',
-        reasonCode: 'legacy_workflow_gates_satisfied',
-        evidenceRefs: collectEvidenceRefs(ctx.subtasks),
-        refs: collectSubtaskRefs(ctx),
-        inputs: { taskGraphVersion: ctx.taskGraph?.version },
-      });
-    }
-    return planned('request_final_review', {
-      reason: 'All subtasks are done; request final review before completing workflow.',
-      reasonCode: 'missing_final_review',
-      evidenceRefs: collectEvidenceRefs(ctx.subtasks),
-      refs: collectSubtaskRefs(ctx),
-      inputs: { taskGraphVersion: ctx.taskGraph?.version },
-    });
-  }
-
-  const needsFix = Object.values(ctx.subtasks).find((subtask) => subtask.status === 'needs_fix');
-  if (needsFix) {
-    return planned('fix_claude_blockers', {
-      subtaskId: needsFix.subtaskId,
-      reason: 'Subtask is waiting for Codex to fix Claude blocking issues.',
-      reasonCode: 'claude_blockers',
-      evidenceRefs: needsFix.evidenceRefs || [],
-      refs: [{ kind: 'subtask', id: needsFix.subtaskId }],
-      inputs: { fixRound: needsFix.fixRound || 0 },
-    });
-  }
-
-  const implemented = Object.values(ctx.subtasks).find((subtask) => subtask.status === 'implemented');
-  if (implemented) {
-    return planned('validate_subtask', {
-      subtaskId: implemented.subtaskId,
-      reason: 'Subtask has implementation evidence and should be validated.',
-      reasonCode: 'needs_validation',
-      evidenceRefs: implemented.evidenceRefs || [],
-      refs: [{ kind: 'subtask', id: implemented.subtaskId }],
-      inputs: {},
-    });
-  }
-
-  const validated = Object.values(ctx.subtasks).find((subtask) => subtask.status === 'validated' || subtask.status === 'approved');
-  if (validated) {
-    return planned('request_claude_review', {
-      subtaskId: validated.subtaskId,
-      reason: 'Subtask has passed validation and should be reviewed by Claude through Tik.',
-      reasonCode: 'needs_claude_review',
-      evidenceRefs: validated.evidenceRefs || [],
-      refs: [{ kind: 'subtask', id: validated.subtaskId }],
-      inputs: {},
-    });
-  }
-
-  const validationFailed = Object.values(ctx.subtasks).find((subtask) => subtask.status === 'validation_failed');
-  if (validationFailed) {
-    return planned('execute_subtask', {
-      subtaskId: validationFailed.subtaskId,
-      reason: 'Validation failed; current Codex session should inspect and fix the subtask.',
-      reasonCode: 'validation_failed',
-      evidenceRefs: validationFailed.evidenceRefs || [],
-      refs: [{ kind: 'subtask', id: validationFailed.subtaskId }],
-      inputs: { retry: true },
-    });
-  }
-
-  const reviewing = Object.values(ctx.subtasks).find((subtask) => subtask.status === 'reviewing');
-  if (reviewing) {
-    return planned('request_re_review', {
-      subtaskId: reviewing.subtaskId,
-      reason: 'Subtask is in review state; process or request the next Claude review round.',
-      reasonCode: 'reviewing',
-      evidenceRefs: reviewing.evidenceRefs || [],
-      refs: [{ kind: 'subtask', id: reviewing.subtaskId }],
-      inputs: {},
-    });
-  }
-
-  const ready = chooseNextReadySubtask(ctx);
-  if (ready) {
-    return planned('execute_subtask', {
-      subtaskId: ready.id,
-      reason: `Subtask ${ready.id} is ready and dependencies are done.`,
-      reasonCode: 'ready_subtask',
-      evidenceRefs: [],
-      refs: [{ kind: 'subtask', id: ready.id }],
-      inputs: { title: ready.title },
-    });
-  }
-
-  return planned('request_human_review', {
-    reason: 'No schedulable subtask or automatic workflow action is available.',
-    reasonCode: 'no_schedulable_action',
-    evidenceRefs: collectEvidenceRefs(ctx.subtasks),
-    refs: [{ kind: 'workflow', id: ctx.workflow.id }],
-    inputs: { workflowStatus: ctx.workflow.status },
-  });
-}
-
 function planned(
   action: WorkflowDecisionAction,
   input: Omit<PlannedAction, 'action' | 'phase' | 'actionDefinition' | 'commandHint'>,
@@ -671,30 +565,6 @@ function isV1SubtaskSchedulable(ctx: WorkflowDecisionContext, subtaskId: string)
   const status = state?.status || 'pending';
   if (status === 'done' || status === 'blocked' || status === 'human_review_required') return false;
   return (spec?.dependsOn || []).every((dep) => ctx.subtasks[dep]?.status === 'done');
-}
-
-function chooseNextReadySubtask(ctx: WorkflowDecisionContext): { id: string; title: string } | null {
-  return ctx.taskGraph?.subtasks.find((subtask) => {
-    const state = ctx.subtasks[subtask.id];
-    const status = state?.status || 'pending';
-    if (status !== 'pending' && status !== 'ready') return false;
-    return (subtask.dependsOn || []).every((dep) => ctx.subtasks[dep]?.status === 'done');
-  }) || null;
-}
-
-function allDoneSubtasksHaveApprovedReview(ctx: WorkflowDecisionContext): boolean {
-  return Boolean(ctx.taskGraph?.subtasks.every((subtask) =>
-    ctx.bundle.evidence.some((item) => {
-      const result = item.payload?.result;
-      return item.kind === 'review'
-        && item.subtaskId === subtask.id
-        && typeof result === 'object'
-        && result !== null
-        && !Array.isArray(result)
-        && (result as { verdict?: string }).verdict === 'approve'
-        && (!Array.isArray((result as { blockingIssues?: unknown[] }).blockingIssues) || (result as { blockingIssues?: unknown[] }).blockingIssues?.length === 0);
-    })
-  ));
 }
 
 function latestEvaluationWithStatus(

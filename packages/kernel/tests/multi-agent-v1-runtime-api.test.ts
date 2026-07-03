@@ -67,9 +67,9 @@ describe('multi-agent v1 core runtime API', () => {
 
     const firstDecision = buildDecision('wf-if-match', {
       id: 'dec-first',
-      action: 'execute_subtask',
+      action: 'draft_contract',
       subtaskId: 'st-api',
-      reason: 'First session starts work.',
+      reason: 'First session drafts the contract.',
       inputs: { currentHeadSha: 'head-1' },
     });
     const first = await server.inject({
@@ -81,9 +81,9 @@ describe('multi-agent v1 core runtime API', () => {
 
     const staleDecision = buildDecision('wf-if-match', {
       id: 'dec-stale',
-      action: 'execute_subtask',
+      action: 'draft_contract',
       subtaskId: 'st-api',
-      reason: 'Second stale session tries to commit.',
+      reason: 'Second stale session tries to draft the contract.',
       inputs: { currentHeadSha: 'head-1' },
     });
     const stale = await server.inject({
@@ -129,7 +129,7 @@ describe('multi-agent v1 core runtime API', () => {
       payload: {
         decision: buildDecision('wf-if-match-wildcard', {
           id: 'dec-first',
-          action: 'execute_subtask',
+          action: 'draft_contract',
           subtaskId: 'st-api',
           reason: 'First commit.',
           inputs: { currentHeadSha: 'head-1' },
@@ -147,7 +147,7 @@ describe('multi-agent v1 core runtime API', () => {
       payload: {
         decision: buildDecision('wf-if-match-wildcard', {
           id: 'dec-second',
-          action: 'execute_subtask',
+          action: 'draft_contract',
           subtaskId: 'st-api',
           reason: 'Wildcard accepts any current decision state.',
           inputs: { currentHeadSha: 'head-1' },
@@ -174,7 +174,7 @@ describe('multi-agent v1 core runtime API', () => {
       payload: {
         decision: buildDecision('wf-if-match-preflight', {
           id: 'dec-first',
-          action: 'execute_subtask',
+          action: 'draft_contract',
           subtaskId: 'st-api',
           reason: 'First commit.',
           inputs: { currentHeadSha: 'head-1' },
@@ -192,7 +192,7 @@ describe('multi-agent v1 core runtime API', () => {
       payload: {
         decision: buildDecision('wf-if-match-preflight', {
           id: 'dec-stale',
-          action: 'execute_subtask',
+          action: 'draft_contract',
           subtaskId: 'st-api',
           reason: 'Probe stale commit.',
           inputs: { currentHeadSha: 'head-1' },

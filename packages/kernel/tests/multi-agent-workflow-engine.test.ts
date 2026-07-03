@@ -280,7 +280,6 @@ function buildBundle(overrides: Partial<MultiAgentWorkflowBundle> = {}): MultiAg
         requireAcceptedContract: true,
         requireEvaluationPassForComplete: true,
         requireSameHeadShaForEvidence: true,
-        allowClaudeFinalReview: true,
         allowHumanOverride: false,
       },
       createdAt: '2026-07-03T00:00:00.000Z',
@@ -310,7 +309,6 @@ function buildBundle(overrides: Partial<MultiAgentWorkflowBundle> = {}): MultiAg
       'st-api': {
         subtaskId: 'st-api',
         status: 'questioning_evidence',
-        reviewRoundIds: [],
         validationRunIds: [],
         evidenceRefs: ['ev-impl'],
         blockerFindingIds: [],
