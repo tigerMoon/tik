@@ -21,6 +21,7 @@ import {
   commentTask,
   hookStartInvocation,
   hookStopInvocation,
+  readNextAction,
   readTask,
   readWorkflow,
   recordDecision,
@@ -29,6 +30,7 @@ import {
   recordQuestionerOutput,
   readContextSnapshot,
   preflightDecision,
+  runWorkflowAction,
   saveContextSnapshot,
   tikFetch,
   transitionTask,
@@ -71,6 +73,12 @@ async function main() {
         break;
       case 'next':
         await next(options);
+        break;
+      case 'run-next':
+        await runNext(options);
+        break;
+      case 'run-action':
+        await runAction(options);
         break;
       case 'execute':
       case 'record-implementation':
@@ -302,14 +310,82 @@ async function acceptPlan(options) {
 async function next(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
   const state = await readWorkflow(options, workflowId);
-  const decision = buildDecision(state.workflow, decideNextAction(state));
+  const nextAction = await resolveNextAction(options, workflowId, state);
+  const decision = buildDecision(state.workflow, nextAction);
   const recorded = await safeRecordDecision(options, workflowId, decision, state);
   printJson({
     action: 'next',
     workflowId,
+    plannedAction: nextAction,
     decision,
     guard: recorded.guard,
+    commandHint: nextAction.commandHint,
     instruction: instructionForDecision(decision, state),
+  });
+}
+
+async function runNext(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const state = await readWorkflow(options, workflowId);
+  const nextAction = await resolveNextAction(options, workflowId, state);
+  const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
+  const headSha = stringOption(options.headSha)
+    || git(projectPath, ['rev-parse', 'HEAD'], { optional: true })
+    || state.workflow.currentHeadSha;
+  await runAction({
+    ...options,
+    action: nextAction.action,
+    subtask: options.subtask || nextAction.subtaskId,
+    headSha,
+  }, nextAction);
+}
+
+async function runAction(options, plannedAction) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const actionId = requireOption(options.action, '--action is required');
+  const response = await runWorkflowAction(options, workflowId, actionId, {
+    subtaskId: stringOption(options.subtask) || plannedAction?.subtaskId,
+    headSha: stringOption(options.headSha),
+    options: omitUndefined({
+      start: options.start === false || options.start === 'false' ? false : undefined,
+      id: stringOption(options.run),
+      invocationId: stringOption(options.invocationId) || stringOption(options.invocation),
+      tokenTtlMs: stringOption(options.tokenTtlMs) ? Number(stringOption(options.tokenTtlMs)) : undefined,
+      runtimeAudit: stringOption(options.gitStatusBefore)
+        ? { gitStatusBefore: stringOption(options.gitStatusBefore) }
+        : undefined,
+    }),
+  });
+  printJson({
+    action: 'action-run',
+    workflowId,
+    workflowAction: response.action || actionId,
+    plannedAction: response.plannedAction,
+    created: response.created,
+    questionerRunId: response.questionerRunId,
+    invocationId: response.invocationId,
+    contextArtifactRef: response.contextArtifactRef,
+    contextHash: response.contextHash,
+    expectedOutputArtifactRef: response.expectedOutputArtifactRef,
+    submitUrl: response.submitUrl,
+    contextUrl: response.contextUrl,
+    tokenExpiresAt: response.tokenExpiresAt,
+    token: response.token,
+    invocation: response.invocation,
+    guard: response.guard,
+    instruction: response.token
+      ? 'Run the Claude Questioner plugin/runtime with the printed TIK_QUESTIONER_* values; the plugin should POST QuestionerOutputV2 to submitUrl.'
+      : response.guard?.message,
+    env: response.token
+      ? {
+        TIK_QUESTIONER_RUN_ID: response.questionerRunId,
+        TIK_QUESTIONER_CONTEXT_URL: absoluteApiUrl(options, response.contextUrl),
+        TIK_QUESTIONER_SUBMIT_URL: absoluteApiUrl(options, response.submitUrl),
+        TIK_QUESTIONER_TOKEN: response.token,
+        TIK_EXPECTED_HEAD_SHA: response.questionerRun?.headSha || stringOption(options.headSha),
+        TIK_QUESTIONER_OUTPUT_PATH: response.expectedOutputArtifactRef,
+      }
+      : undefined,
   });
 }
 
@@ -1643,7 +1719,7 @@ async function continueWorkflow(options) {
       return;
     }
 
-    const nextAction = decideNextAction(state);
+    const nextAction = await resolveNextAction(options, workflowId, state);
     const decision = buildDecision(state.workflow, {
       ...nextAction,
       inputs: {
@@ -1742,6 +1818,35 @@ async function executeContinueDecision(options, state, decision) {
     action: 'continue',
     guard: recorded.guard,
   };
+}
+
+async function resolveNextAction(options, workflowId, state) {
+  if (!options.offlineNext) {
+    try {
+      const response = await readNextAction(options, workflowId, {
+        subtaskId: stringOption(options.subtask),
+        headSha: stringOption(options.headSha),
+      });
+      const plannedAction = response.plannedAction || response;
+      return {
+        action: plannedAction.action,
+        subtaskId: plannedAction.subtaskId,
+        reason: plannedAction.reason,
+        evidenceRefs: plannedAction.evidenceRefs || [],
+        inputs: plannedAction.inputs || {},
+        phase: plannedAction.phase,
+        reasonCode: plannedAction.reasonCode,
+        refs: plannedAction.refs || [],
+        commandHint: plannedAction.commandHint,
+        actionDefinition: plannedAction.actionDefinition,
+      };
+    } catch (error) {
+      if (!options.allowOfflineNextFallback) {
+        throw error;
+      }
+    }
+  }
+  return decideNextAction(state);
 }
 
 async function capturePrintedJson(fn) {

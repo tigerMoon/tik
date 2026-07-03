@@ -124,6 +124,22 @@ try {
         });
         return;
       }
+      if (req.method === 'GET' && pathname(route) === '/api/v1/multi-agent/workflows/wf-cli/next-action') {
+        sendJson(res, mockNextActionPayload({
+          workflow,
+          taskGraph: graph,
+          subtasks,
+          decisions,
+          evidence,
+          contracts,
+          evaluationRuns,
+          questionerRuns,
+          questionerOutputs,
+          invocations,
+          events,
+        }));
+        return;
+      }
       if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-cli/timeline') {
         sendJson(res, { events });
         return;
@@ -335,87 +351,67 @@ try {
       }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/questioner-runs') {
         const body = await readRequestJson(req);
-        const runId = body.id || `qr-${questionerRuns.length + 1}`;
-        const invocationId = body.invocationId || body.invocation || `inv-questioner-${questionerRuns.length + 1}`;
-        const contextArtifactRef = `.tik/multi-agent/workflows/wf-cli/questioner-runs/${runId}/context.json`;
-        const expectedOutputArtifactRef = `.tik/multi-agent/workflows/wf-cli/questioner-runs/${runId}/output.json`;
-        const contextHash = `sha256:${runId}`;
-        const invocation = {
-          id: invocationId,
-          workflowId: 'wf-cli',
-          subtaskId: body.subtaskId,
-          role: 'questioner',
-          runner: 'claude-code',
-          promptContract: 'claude-questioner.v2',
-          input: {
-            intent: body.intent,
-            subtaskId: body.subtaskId,
-            contractId: body.contractId,
-            evaluationRunId: body.finalEvaluationRunId ? undefined : body.evaluationRunId,
-            finalEvaluationRunId: body.finalEvaluationRunId,
-            headSha: body.headSha,
-            questionerRunId: runId,
-            contextArtifactRef,
-            expectedOutputArtifactRef,
-          },
-          headSha: body.headSha,
-          evaluationRunId: body.evaluationRunId || body.finalEvaluationRunId,
-          readonlyPolicy: {
-            enforced: true,
-            allowedWritePaths: ['.tik/multi-agent/'],
-            forbiddenWritePaths: ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
-            violations: [],
-            gitStatusBefore: body.runtimeAudit?.gitStatusBefore,
-          },
-          status: body.start === false ? 'created' : 'started',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          startedAt: body.start === false ? undefined : new Date().toISOString(),
-        };
-        invocations.push(invocation);
-        const run = {
-          id: runId,
-          workflowId: 'wf-cli',
-          subtaskId: body.subtaskId,
-          intent: body.intent,
-          status: body.start === false ? 'created' : 'started',
-          invocationId,
-          runner: 'claude-code',
-          pluginSkill: 'question-tik-agent-loop',
-          contractId: body.contractId,
-          evaluationRunId: body.evaluationRunId,
-          finalEvaluationRunId: body.finalEvaluationRunId,
-          headSha: body.headSha,
-          contextArtifactRef,
-          contextHash,
-          expectedOutputArtifactRef,
-          tokenId: `tok-${runId}`,
-          tokenHash: `sha256:${runId}-token`,
-          tokenExpiresAt: new Date(Date.now() + 3600000).toISOString(),
-          runtimePolicy: { filesystem: 'read-only', network: 'tik-api-only', shell: 'read-only', permissionMode: 'dontAsk' },
-          readonlyAudit: {
-            enforced: true,
-            allowedWritePaths: body.runtimeAudit?.allowedWritePaths || ['.tik/multi-agent/'],
-            forbiddenWritePaths: body.runtimeAudit?.forbiddenWritePaths || ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
-            violations: [],
-            gitStatusBefore: body.runtimeAudit?.gitStatusBefore,
-          },
-          createdAt: new Date().toISOString(),
-          startedAt: body.start === false ? undefined : new Date().toISOString(),
-        };
-        questionerRuns.push(run);
+        sendJson(res, createMockQuestionerRun(body));
+        return;
+      }
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/actions\/[^/]+\/run$/)) {
+        const actionId = route.split('/').at(-2);
+        const body = await readRequestJson(req);
+        const plannedAction = decideNextAction({
+          workflow,
+          taskGraph: graph,
+          subtasks,
+          decisions,
+          evidence,
+          contracts,
+          evaluationRuns,
+          questionerRuns,
+          questionerOutputs,
+          invocations,
+          events,
+        });
+        if (plannedAction.action !== actionId) {
+          sendJson(res, {
+            plannedAction,
+            guard: {
+              accepted: false,
+              code: 'invalid_transition',
+              message: `Requested action ${actionId} is not the planned next action ${plannedAction.action}.`,
+            },
+          }, 409);
+          return;
+        }
+        if (!String(actionId).startsWith('ask_claude_question_')) {
+          sendJson(res, {
+            plannedAction,
+            guard: {
+              accepted: false,
+              code: 'invalid_transition',
+              message: `Action ${actionId} is planned but has no generic action executor yet; use its domain command.`,
+            },
+          }, 409);
+          return;
+        }
+        const run = createMockQuestionerRun({
+          id: body.options?.id,
+          invocationId: body.options?.invocationId,
+          subtaskId: plannedAction.subtaskId,
+          intent: actionId === 'ask_claude_question_final_evidence'
+            ? 'question_final_evidence'
+            : actionId === 'ask_claude_question_contract'
+              ? 'question_contract'
+              : 'question_evaluation',
+          contractId: plannedAction.inputs?.contractId,
+          evaluationRunId: actionId === 'ask_claude_question_final_evidence' ? undefined : plannedAction.inputs?.evaluationRunId,
+          finalEvaluationRunId: actionId === 'ask_claude_question_final_evidence' ? plannedAction.inputs?.evaluationRunId : undefined,
+          headSha: body.headSha || workflow.currentHeadSha,
+          runtimeAudit: body.options?.runtimeAudit,
+        });
         sendJson(res, {
-          questionerRunId: run.id,
-          invocationId,
-          contextArtifactRef,
-          contextHash,
-          expectedOutputArtifactRef,
-          submitUrl: `/v1/multi-agent/workflows/wf-cli/questioner-runs/${run.id}/output`,
-          contextUrl: `/v1/multi-agent/workflows/wf-cli/questioner-runs/${run.id}/context`,
-          token: `token-${run.id}`,
-          tokenExpiresAt: run.tokenExpiresAt,
-          questionerRun: run,
-          invocation,
+          action: actionId,
+          plannedAction,
+          created: { kind: 'questioner_run', id: run.questionerRunId },
+          ...run,
         });
         return;
       }
@@ -1264,6 +1260,12 @@ try {
   const v1WorkflowCompleteNextOutput = { instruction: instructionForDecision(v1WorkflowCompleteNext) };
   assert.match(v1WorkflowCompleteNextOutput.instruction, /final evaluation\/questioner evidence passes Tik guards/);
 
+  workflow = {
+    ...workflow,
+    currentHeadSha: 'head-v1',
+    policy: v1Policy,
+  };
+
   const draftedContract = await run([
     'draft-contract',
     '--api-base-url', apiBaseUrl,
@@ -1400,6 +1402,22 @@ try {
   ]);
   assert.equal(questionerStarted.action, 'questioner-run-started');
   assert.equal(questionerStarted.invocation.status, 'started');
+
+  const runNextQuestioner = await run([
+    'run-next',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--head-sha', 'head-v1',
+    '--run', 'qr-run-next-cli',
+    '--invocation', 'claude-questioner-run-next-cli',
+    '--git-status-before', '',
+  ]);
+  assert.equal(runNextQuestioner.action, 'action-run');
+  assert.equal(runNextQuestioner.workflowAction, 'ask_claude_question_evaluation');
+  assert.equal(runNextQuestioner.created.kind, 'questioner_run');
+  assert.equal(runNextQuestioner.questionerRunId, 'qr-run-next-cli');
+  assert.equal(runNextQuestioner.invocationId, 'claude-questioner-run-next-cli');
 
   await assert.rejects(
     run([
@@ -1546,6 +1564,7 @@ try {
     ...workflow,
     status: 'active',
     completedAt: undefined,
+    policy: undefined,
   };
   subtasks['st-api'] = {
     ...subtasks['st-api'],
@@ -2643,6 +2662,10 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           sendJson(res, localState);
           return;
         }
+        if (req.method === 'GET' && pathname(route) === `/api/v1/multi-agent/workflows/${workflowId}/next-action`) {
+          sendJson(res, mockNextActionPayload(localState));
+          return;
+        }
         if (req.method === 'GET' && route === `/api/v1/multi-agent/workflows/${workflowId}/context-snapshots/main`) {
           sendJson(res, { error: { message: 'Context snapshot not found' } }, 404);
           return;
@@ -3094,6 +3117,104 @@ function buildGraph(workflowId) {
   };
 }
 
+function mockNextActionPayload(state) {
+  const plannedAction = decideNextAction(state);
+  return {
+    plannedAction: {
+      phase: 'test',
+      reasonCode: 'test',
+      refs: [],
+      commandHint: `tik-multi-agent-workflow ${plannedAction.action}`,
+      ...plannedAction,
+    },
+  };
+}
+
+function createMockQuestionerRun(body) {
+  const runId = body.id || `qr-${questionerRuns.length + 1}`;
+  const invocationId = body.invocationId || body.invocation || `inv-questioner-${questionerRuns.length + 1}`;
+  const contextArtifactRef = `.tik/multi-agent/workflows/wf-cli/questioner-runs/${runId}/context.json`;
+  const expectedOutputArtifactRef = `.tik/multi-agent/workflows/wf-cli/questioner-runs/${runId}/output.json`;
+  const contextHash = `sha256:${runId}`;
+  const invocation = {
+    id: invocationId,
+    workflowId: 'wf-cli',
+    subtaskId: body.subtaskId,
+    role: 'questioner',
+    runner: 'claude-code',
+    promptContract: 'claude-questioner.v2',
+    input: {
+      intent: body.intent,
+      subtaskId: body.subtaskId,
+      contractId: body.contractId,
+      evaluationRunId: body.finalEvaluationRunId ? undefined : body.evaluationRunId,
+      finalEvaluationRunId: body.finalEvaluationRunId,
+      headSha: body.headSha,
+      questionerRunId: runId,
+      contextArtifactRef,
+      expectedOutputArtifactRef,
+    },
+    headSha: body.headSha,
+    evaluationRunId: body.evaluationRunId || body.finalEvaluationRunId,
+    readonlyPolicy: {
+      enforced: true,
+      allowedWritePaths: ['.tik/multi-agent/'],
+      forbiddenWritePaths: ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
+      violations: [],
+      gitStatusBefore: body.runtimeAudit?.gitStatusBefore,
+    },
+    status: body.start === false ? 'created' : 'started',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    startedAt: body.start === false ? undefined : new Date().toISOString(),
+  };
+  invocations.push(invocation);
+  const run = {
+    id: runId,
+    workflowId: 'wf-cli',
+    subtaskId: body.subtaskId,
+    intent: body.intent,
+    status: body.start === false ? 'created' : 'started',
+    invocationId,
+    runner: 'claude-code',
+    pluginSkill: 'question-tik-agent-loop',
+    contractId: body.contractId,
+    evaluationRunId: body.evaluationRunId,
+    finalEvaluationRunId: body.finalEvaluationRunId,
+    headSha: body.headSha,
+    contextArtifactRef,
+    contextHash,
+    expectedOutputArtifactRef,
+    tokenId: `tok-${runId}`,
+    tokenHash: `sha256:${runId}-token`,
+    tokenExpiresAt: new Date(Date.now() + 3600000).toISOString(),
+    runtimePolicy: { filesystem: 'read-only', network: 'tik-api-only', shell: 'read-only', permissionMode: 'dontAsk' },
+    readonlyAudit: {
+      enforced: true,
+      allowedWritePaths: body.runtimeAudit?.allowedWritePaths || ['.tik/multi-agent/'],
+      forbiddenWritePaths: body.runtimeAudit?.forbiddenWritePaths || ['src/', 'app/', 'packages/', 'server/', 'client/', 'tests/', 'package.json', 'pnpm-lock.yaml'],
+      violations: [],
+      gitStatusBefore: body.runtimeAudit?.gitStatusBefore,
+    },
+    createdAt: new Date().toISOString(),
+    startedAt: body.start === false ? undefined : new Date().toISOString(),
+  };
+  questionerRuns.push(run);
+  return {
+    questionerRunId: run.id,
+    invocationId,
+    contextArtifactRef,
+    contextHash,
+    expectedOutputArtifactRef,
+    submitUrl: `/v1/multi-agent/workflows/wf-cli/questioner-runs/${run.id}/output`,
+    contextUrl: `/v1/multi-agent/workflows/wf-cli/questioner-runs/${run.id}/context`,
+    token: `token-${run.id}`,
+    tokenExpiresAt: run.tokenExpiresAt,
+    questionerRun: run,
+    invocation,
+  };
+}
+
 function mergeTestRefs(...groups) {
   return Array.from(new Set(groups.flatMap((group) => group || []).filter(Boolean)));
 }
@@ -3131,4 +3252,8 @@ function readRequestJson(req) {
 function sendJson(res, payload, status = 200) {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(payload));
+}
+
+function pathname(route) {
+  return String(route || '/').split('?')[0] || '/';
 }

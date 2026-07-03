@@ -36,6 +36,14 @@ export async function readWorkflow(options, workflowId) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}`);
 }
 
+export async function readNextAction(options, workflowId, input = {}) {
+  const params = new URLSearchParams();
+  if (input.subtaskId) params.set('subtaskId', input.subtaskId);
+  if (input.headSha) params.set('headSha', input.headSha);
+  const query = params.toString() ? `?${params.toString()}` : '';
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/next-action${query}`);
+}
+
 export async function recordDecision(options, workflowId, decision, input = {}) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/decisions`, {
     method: 'POST',
@@ -145,6 +153,13 @@ export async function recordQuestionerOutput(options, workflowId, output) {
 
 export async function createQuestionerRun(options, workflowId, input) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/questioner-runs`, {
+    method: 'POST',
+    body: input,
+  });
+}
+
+export async function runWorkflowAction(options, workflowId, actionId, input = {}) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/actions/${encodeURIComponent(actionId)}/run`, {
     method: 'POST',
     body: input,
   });

@@ -60,7 +60,7 @@ Do:
 Do not:
 - Skip workflow creation because the user omitted `workflowId`.
 - Treat this skill as local implementation guidance when it was invoked to execute work.
-- Let Tik core decide the next workflow action.
+- Let the Codex skill override Tik Kernel's planned next action except for explicit offline/debug fallback.
 - Call Claude directly for review outside Tik.
 - Let Claude Code edit files, commit, push, or claim work.
 - Let Codex Evaluator modify source, tests, package manifests, or lockfiles.
@@ -165,7 +165,8 @@ If you cannot create or accept a TaskGraph because Tik is unavailable, state tha
 
 ## Command Notes
 
-- `next` reads Tik state and computes the next action locally in the skill.
+- `next` asks Tik Kernel for `/next-action`; local loop-gate logic is only an offline/debug fallback.
+- `run-next` / `run-action` execute Kernel-owned workflow actions through `/actions/:actionId/run` where an executor exists. Questioner actions create token-scoped `QuestionerRun`s; builder/evaluator/state actions still use their domain commands.
 - `accept-plan` stores a TaskGraph returned by Claude planner or edited by Codex/human. Tik also auto-stores a planner invocation result when it contains `taskGraph`.
 - `draft-contract` derives a SprintContract from the subtask unless `--contract` or `--contract-json` is provided.
 - `accept-contract` marks the latest challenged contract accepted and moves the subtask to `contract_accepted`.

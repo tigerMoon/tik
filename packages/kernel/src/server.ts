@@ -74,6 +74,7 @@ import { normalizeArtifactExtension } from './artifacts/artifact-security.js';
 import { FileArtifactRegistry } from './artifacts/artifact-registry.js';
 import { FileMultiAgentWorkflowStore, MultiAgentCoordinationError } from './multi-agent/workflow-store.js';
 import { evaluateWorkflowDecisionGuard } from './multi-agent/guard.js';
+import { planNextAction } from './multi-agent/workflow-engine/planner.js';
 
 export interface ServerConfig {
   port: number;
@@ -166,6 +167,11 @@ interface MultiAgentWorkflowPatchBody {
   headSha?: string;
   metadata?: Record<string, unknown>;
   policy?: Partial<WorkflowPolicy>;
+}
+
+interface MultiAgentNextActionQuery {
+  subtaskId?: string;
+  headSha?: string;
 }
 
 interface CreateSprintContractBody {
@@ -261,6 +267,18 @@ interface CreateQuestionerRunBody {
     gitStatusBefore?: string;
     allowedWritePaths?: string[];
     forbiddenWritePaths?: string[];
+  };
+}
+
+interface RunWorkflowActionBody {
+  subtaskId?: string;
+  headSha?: string;
+  options?: {
+    start?: boolean;
+    id?: string;
+    invocationId?: string;
+    tokenTtlMs?: number;
+    runtimeAudit?: CreateQuestionerRunBody['runtimeAudit'];
   };
 }
 
@@ -1223,6 +1241,38 @@ export async function createServer(
     },
   );
 
+  fastify.get<{ Params: { workflowId: string }; Querystring: MultiAgentNextActionQuery }>(
+    '/api/v1/multi-agent/workflows/:workflowId/next-action',
+    async (req, reply) => {
+      try {
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        }
+        const plannedAction = planNextAction({
+          bundle,
+          subtaskId: req.query.subtaskId,
+          headSha: req.query.headSha,
+        });
+        return {
+          plannedAction,
+          action: plannedAction.action,
+          phase: plannedAction.phase,
+          reason: plannedAction.reason,
+          reasonCode: plannedAction.reasonCode,
+          subtaskId: plannedAction.subtaskId,
+          evidenceRefs: plannedAction.evidenceRefs,
+          refs: plannedAction.refs,
+          inputs: plannedAction.inputs,
+          commandHint: plannedAction.commandHint,
+          actionDefinition: plannedAction.actionDefinition,
+        };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
   fastify.patch<{ Params: { workflowId: string }; Body: MultiAgentWorkflowPatchBody }>(
     '/api/v1/multi-agent/workflows/:workflowId',
     async (req, reply) => {
@@ -1378,6 +1428,100 @@ export async function createServer(
     async (req, reply) => {
       try {
         return await multiAgentStore.recordHumanOverride(req.params.workflowId, req.body);
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string; actionId: string }; Body: RunWorkflowActionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/actions/:actionId/run',
+    async (req, reply) => {
+      try {
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        }
+        const plannedAction = planNextAction({
+          bundle,
+          subtaskId: req.body.subtaskId,
+          headSha: req.body.headSha,
+        });
+        if (plannedAction.action !== req.params.actionId) {
+          reply.code(409);
+          return {
+            plannedAction,
+            guard: {
+              accepted: false,
+              code: 'invalid_transition',
+              message: `Requested action ${req.params.actionId} is not the planned next action ${plannedAction.action}.`,
+              currentState: {
+                requestedAction: req.params.actionId,
+                plannedAction: plannedAction.action,
+              },
+            },
+            workflow: bundle.workflow,
+          };
+        }
+        if (
+          plannedAction.action === 'ask_claude_question_contract'
+          || plannedAction.action === 'ask_claude_question_evaluation'
+          || plannedAction.action === 'ask_claude_question_final_evidence'
+        ) {
+          const questionerHeadSha = readString(plannedAction.inputs.headSha)
+            || readString(plannedAction.inputs.evaluationHeadSha)
+            || req.body.headSha
+            || bundle.workflow.currentHeadSha;
+          if (!questionerHeadSha) {
+            return sendV1Error(reply, 409, 'head_sha_mismatch', 'Questioner action requires a concrete head sha.');
+          }
+          const result = await multiAgentStore.createQuestionerRun(req.params.workflowId, {
+            id: req.body.options?.id,
+            invocationId: req.body.options?.invocationId,
+            intent: plannedAction.actionDefinition.intent || 'question_evaluation',
+            subtaskId: plannedAction.subtaskId,
+            contractId: readString(plannedAction.inputs.contractId),
+            evaluationRunId: plannedAction.action === 'ask_claude_question_final_evidence'
+              ? undefined
+              : readString(plannedAction.inputs.evaluationRunId),
+            finalEvaluationRunId: plannedAction.action === 'ask_claude_question_final_evidence'
+              ? readString(plannedAction.inputs.evaluationRunId)
+              : undefined,
+            headSha: questionerHeadSha,
+            start: req.body.options?.start,
+            tokenTtlMs: req.body.options?.tokenTtlMs,
+            runtimeAudit: req.body.options?.runtimeAudit,
+          });
+          return {
+            action: plannedAction.action,
+            plannedAction,
+            created: {
+              kind: 'questioner_run',
+              id: result.run.id,
+            },
+            questionerRunId: result.run.id,
+            invocationId: result.invocation.id,
+            contextArtifactRef: result.run.contextArtifactRef,
+            contextHash: result.run.contextHash,
+            expectedOutputArtifactRef: result.run.expectedOutputArtifactRef,
+            submitUrl: `/v1/multi-agent/workflows/${encodeURIComponent(result.run.workflowId)}/questioner-runs/${encodeURIComponent(result.run.id)}/output`,
+            contextUrl: `/v1/multi-agent/workflows/${encodeURIComponent(result.run.workflowId)}/questioner-runs/${encodeURIComponent(result.run.id)}/context`,
+            token: result.token,
+            tokenExpiresAt: result.run.tokenExpiresAt,
+            questionerRun: redactSensitiveObject(result.run),
+            invocation: sanitizeAgentInvocation(result.invocation),
+          };
+        }
+        reply.code(409);
+        return {
+          plannedAction,
+          guard: {
+            accepted: false,
+            code: 'invalid_transition',
+            message: `Action ${plannedAction.action} is planned but has no generic action executor yet; use its domain command.`,
+          },
+          workflow: bundle.workflow,
+        };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -3906,6 +4050,10 @@ function bearerToken(authorization: string | undefined): string | undefined {
   }
   const match = /^Bearer\s+(.+)$/i.exec(authorization.trim());
   return match?.[1];
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 function workflowV2SelectorSkipReason(

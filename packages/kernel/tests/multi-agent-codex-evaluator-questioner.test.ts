@@ -2451,6 +2451,321 @@ describe('codex evaluator and Claude questioner workflow', () => {
     });
   });
 
+  it('serves v1 next-action from the kernel planner with action metadata and strict questioner gates', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-next-action-v1', root);
+    await putSingleSubtaskGraph(server, 'wf-next-action-v1');
+
+    let next = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-v1/next-action',
+    });
+    expect(next.statusCode).toBe(200);
+    expect(next.json()).toMatchObject({
+      action: 'draft_contract',
+      phase: 'contract',
+      reasonCode: 'missing_contract',
+      subtaskId: 'st-api',
+      actionDefinition: {
+        id: 'draft_contract',
+        handler: 'contract.draft',
+      },
+    });
+
+    await createAcceptedContract(server, 'wf-next-action-v1');
+    next = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-v1/next-action',
+    });
+    expect(next.statusCode).toBe(200);
+    expect(next.json()).toMatchObject({
+      action: 'execute_subtask',
+      phase: 'building',
+      reasonCode: 'missing_implementation_evidence',
+      inputs: {
+        contractId: 'contract-st-api-v1',
+      },
+      actionDefinition: {
+        runner: 'codex',
+        role: 'executor',
+      },
+    });
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-v1/evidence',
+      payload: {
+        id: 'ev-next-impl',
+        kind: 'implementation',
+        title: 'Codex Builder implementation',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/workflow-engine/planner.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    await moveSubtaskToQuestioningEvidence(server, 'wf-next-action-v1', 'st-api', 'ev-next-impl');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-v1/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-next-pass',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-next-session' },
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-next-action-v1', 'eval-next-pass');
+
+    next = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-v1/next-action',
+    });
+    expect(next.statusCode).toBe(200);
+    expect(next.json()).toMatchObject({
+      action: 'ask_claude_question_evaluation',
+      phase: 'evaluation_questioning',
+      reasonCode: 'blocking_question_unresolved',
+      inputs: {
+        contractId: 'contract-st-api-v1',
+        evaluationRunId: 'eval-next-pass',
+      },
+      actionDefinition: {
+        runner: 'claude-code',
+        intent: 'question_evaluation',
+        strictOutput: 'QuestionerOutputV2',
+      },
+    });
+
+    await recordClearQuestioner(server, 'wf-next-action-v1', 'q-next-clear', {
+      evaluationRunId: 'eval-next-pass',
+    });
+
+    next = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-v1/next-action',
+    });
+    expect(next.statusCode).toBe(200);
+    expect(next.json()).toMatchObject({
+      action: 'request_human_review',
+      phase: 'human_review',
+      reasonCode: 'missing_subagent_invocation',
+    });
+
+    await createCompletedInvocation(server, 'wf-next-action-v1', {
+      id: 'inv-next-builder',
+      subtaskId: 'st-api',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+      threadId: 'builder-thread-next',
+      headSha: 'head-1',
+      evidenceRefs: ['ev-next-impl'],
+    });
+    await createCompletedInvocation(server, 'wf-next-action-v1', {
+      id: 'inv-next-evaluator',
+      subtaskId: 'st-api',
+      role: 'evaluator',
+      runner: 'codex-evaluator',
+      promptContract: 'codex-evaluator.v1',
+      threadId: 'evaluator-thread-next',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-next-pass',
+      readonlyPolicy: { enforced: true, violations: [] },
+    });
+
+    next = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-v1/next-action',
+    });
+    expect(next.statusCode).toBe(200);
+    expect(next.json()).toMatchObject({
+      action: 'complete_subtask',
+      phase: 'completion',
+      reasonCode: 'ok',
+      inputs: {
+        contractId: 'contract-st-api-v1',
+        evaluationRunId: 'eval-next-pass',
+        questionerOutputId: 'q-next-clear',
+      },
+    });
+  });
+
+  it('routes stale v1 evaluation evidence back to evaluator before starting Questioner runs', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-next-action-stale-head', root);
+    await putSingleSubtaskGraph(server, 'wf-next-action-stale-head');
+    await createAcceptedContract(server, 'wf-next-action-stale-head');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-stale-head/evidence',
+      payload: {
+        id: 'ev-stale-head-impl',
+        kind: 'implementation',
+        title: 'Codex Builder implementation',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/workflow-engine/planner.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    await moveSubtaskToQuestioningEvidence(server, 'wf-next-action-stale-head', 'st-api', 'ev-stale-head-impl');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-stale-head/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-stale-head-pass',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-stale-head-session' },
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-next-action-stale-head', 'eval-stale-head-pass');
+
+    const patch = await server.inject({
+      method: 'PATCH',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-stale-head',
+      payload: { headSha: 'head-2' },
+    });
+    expect(patch.statusCode).toBe(200);
+
+    const next = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-stale-head/next-action',
+    });
+    expect(next.statusCode).toBe(200);
+    expect(next.json()).toMatchObject({
+      action: 're_evaluate',
+      reasonCode: 'head_sha_mismatch',
+      inputs: {
+        evaluationRunId: 'eval-stale-head-pass',
+        expectedHeadSha: 'head-2',
+        evaluationHeadSha: 'head-1',
+      },
+    });
+
+    const run = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-next-action-stale-head/actions/ask_claude_question_evaluation/run',
+      payload: {
+        subtaskId: 'st-api',
+        headSha: 'head-2',
+      },
+    });
+    expect(run.statusCode).toBe(409);
+    expect(run.json().plannedAction.action).toBe('re_evaluate');
+  });
+
+  it('runs planned questioner actions through the generic action executor', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-run-action-questioner', root);
+    await putSingleSubtaskGraph(server, 'wf-run-action-questioner');
+    await createAcceptedContract(server, 'wf-run-action-questioner');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-run-action-questioner/evidence',
+      payload: {
+        id: 'ev-run-action-impl',
+        kind: 'implementation',
+        title: 'Codex Builder implementation',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/workflow-engine/planner.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    await moveSubtaskToQuestioningEvidence(server, 'wf-run-action-questioner', 'st-api', 'ev-run-action-impl');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-run-action-questioner/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-run-action-pass',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-run-action-session' },
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-run-action-questioner', 'eval-run-action-pass');
+
+    const wrongAction = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-run-action-questioner/actions/complete_subtask/run',
+      payload: {
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+      },
+    });
+    expect(wrongAction.statusCode).toBe(409);
+    expect(wrongAction.json().guard).toMatchObject({
+      accepted: false,
+      code: 'invalid_transition',
+    });
+    expect(wrongAction.json().plannedAction.action).toBe('ask_claude_question_evaluation');
+
+    const run = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-run-action-questioner/actions/ask_claude_question_evaluation/run',
+      payload: {
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        options: {
+          id: 'qr-run-action',
+          invocationId: 'inv-run-action-questioner',
+          runtimeAudit: {
+            gitStatusBefore: '',
+          },
+        },
+      },
+    });
+    expect(run.statusCode).toBe(200);
+    expect(run.json()).toMatchObject({
+      action: 'ask_claude_question_evaluation',
+      created: {
+        kind: 'questioner_run',
+        id: 'qr-run-action',
+      },
+      invocationId: 'inv-run-action-questioner',
+      plannedAction: {
+        phase: 'evaluation_questioning',
+        inputs: {
+          contractId: 'contract-st-api-v1',
+          evaluationRunId: 'eval-run-action-pass',
+        },
+      },
+    });
+    expect(run.json().token).toMatch(/^tqr_/);
+
+    const bundle = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-run-action-questioner',
+    });
+    expect(bundle.json().questionerRuns[0]).toMatchObject({
+      id: 'qr-run-action',
+      intent: 'question_evaluation',
+      contractId: 'contract-st-api-v1',
+      evaluationRunId: 'eval-run-action-pass',
+      headSha: 'head-1',
+    });
+  });
+
   it('completes a v1 workflow only after final evaluation and final Questioner evidence pass', async () => {
     const root = await makeTempWorkspace();
     const server = await createTestServer(root);
