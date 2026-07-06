@@ -1,0 +1,609 @@
+{
+  "schemaVersion": "questioner-hash-vectors.v1",
+  "vectors": [
+    {
+      "name": "base_createdAt_stripped",
+      "expectedHash": "sha256:342b94be750f5a4aadd75fbd967d928a7cd6113a9801bbf8b7b4686ed055ebd1",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_evaluation",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1",
+          "evaluationRunId": "eval-hash-vector"
+        },
+        "verdict": "evidence_sufficient",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "covered",
+            "evidenceRefs": ["eval-hash-vector:criteria:ac-1", "cmd-test"],
+            "comment": "Evaluator covered the criterion."
+          }
+        ],
+        "questions": [],
+        "risks": [],
+        "missingTests": [],
+        "advisoryNotes": [],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    },
+    {
+      "name": "without_createdAt",
+      "expectedHash": "sha256:342b94be750f5a4aadd75fbd967d928a7cd6113a9801bbf8b7b4686ed055ebd1",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_evaluation",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1",
+          "evaluationRunId": "eval-hash-vector"
+        },
+        "verdict": "evidence_sufficient",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "covered",
+            "evidenceRefs": ["eval-hash-vector:criteria:ac-1", "cmd-test"],
+            "comment": "Evaluator covered the criterion."
+          }
+        ],
+        "questions": [],
+        "risks": [],
+        "missingTests": [],
+        "advisoryNotes": []
+      }
+    },
+    {
+      "name": "output_hash_ignored",
+      "expectedHash": "sha256:342b94be750f5a4aadd75fbd967d928a7cd6113a9801bbf8b7b4686ed055ebd1",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_evaluation",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:different-ignored",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1",
+          "evaluationRunId": "eval-hash-vector"
+        },
+        "verdict": "evidence_sufficient",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "covered",
+            "evidenceRefs": ["eval-hash-vector:criteria:ac-1", "cmd-test"],
+            "comment": "Evaluator covered the criterion."
+          }
+        ],
+        "questions": [],
+        "risks": [],
+        "missingTests": [],
+        "advisoryNotes": [],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    },
+    {
+      "name": "unordered_actor_keys",
+      "expectedHash": "sha256:342b94be750f5a4aadd75fbd967d928a7cd6113a9801bbf8b7b4686ed055ebd1",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_evaluation",
+        "source": "claude-plugin",
+        "actor": {
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test",
+          "pluginName": "agent-loop-claude-review",
+          "invocationId": "inv-hash-vector",
+          "kind": "claude-code-questioner"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1",
+          "evaluationRunId": "eval-hash-vector"
+        },
+        "verdict": "evidence_sufficient",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "covered",
+            "evidenceRefs": ["eval-hash-vector:criteria:ac-1", "cmd-test"],
+            "comment": "Evaluator covered the criterion."
+          }
+        ],
+        "questions": [],
+        "risks": [],
+        "missingTests": [],
+        "advisoryNotes": [],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    },
+    {
+      "name": "question_contract_no_evaluation",
+      "expectedHash": "sha256:f841034fec3911b73dc5676d7e05908504c2378089d3d1f68f8f847cef28c8e5",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_contract",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1"
+        },
+        "verdict": "no_blocking_questions",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "covered",
+            "evidenceRefs": ["eval-hash-vector:criteria:ac-1", "cmd-test"],
+            "comment": "Evaluator covered the criterion."
+          }
+        ],
+        "questions": [],
+        "risks": [],
+        "missingTests": [],
+        "advisoryNotes": [],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    },
+    {
+      "name": "final_evidence_no_subtask",
+      "expectedHash": "sha256:eafb1ab37853a853b6982d2b9390e167756cae4b70fa88937b4ec8ce3c6001ba",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "intent": "question_final_evidence",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "finalEvaluationRunId": "eval-final-hash-vector"
+        },
+        "verdict": "evidence_sufficient",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "covered",
+            "evidenceRefs": ["eval-hash-vector:criteria:ac-1", "cmd-test"],
+            "comment": "Evaluator covered the criterion."
+          }
+        ],
+        "questions": [],
+        "risks": [],
+        "missingTests": [],
+        "advisoryNotes": [],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    },
+    {
+      "name": "blocking_question",
+      "expectedHash": "sha256:4ee43f4e1493e3dd1c55efe1b4b554fc37d308cf7d295ff7995d910511a3b55d",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_evaluation",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1",
+          "evaluationRunId": "eval-hash-vector"
+        },
+        "verdict": "questions_blocking",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "missing",
+            "evidenceRefs": [],
+            "comment": "Missing proof."
+          }
+        ],
+        "questions": [
+          {
+            "id": "q1",
+            "priority": "blocking",
+            "category": "weak_evidence",
+            "claim": "Proof is weak.",
+            "evidenceRefs": [],
+            "requestedEvidence": "Provide command output.",
+            "status": "open"
+          }
+        ],
+        "risks": [],
+        "missingTests": [],
+        "advisoryNotes": [],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    },
+    {
+      "name": "risk_found",
+      "expectedHash": "sha256:62e7164dffdaf599719edc504df2d7d8a1deac8e08806e1ccbeccbb67807820d",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_evaluation",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1",
+          "evaluationRunId": "eval-hash-vector"
+        },
+        "verdict": "risk_found",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "covered",
+            "evidenceRefs": ["eval-hash-vector:criteria:ac-1", "cmd-test"],
+            "comment": "Evaluator covered the criterion."
+          }
+        ],
+        "questions": [],
+        "risks": [
+          {
+            "id": "risk-1",
+            "severity": "medium",
+            "claim": "Risk claim",
+            "evidenceRefs": ["eval-hash-vector"],
+            "mitigation": "Mitigate it."
+          }
+        ],
+        "missingTests": [],
+        "advisoryNotes": [],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    },
+    {
+      "name": "missing_tests",
+      "expectedHash": "sha256:f7187265f0c3efd0742931b0b5f164ba11af6beb9f95c562e0e25833834e0a7e",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_evaluation",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1",
+          "evaluationRunId": "eval-hash-vector"
+        },
+        "verdict": "evidence_needed",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "covered",
+            "evidenceRefs": ["eval-hash-vector:criteria:ac-1", "cmd-test"],
+            "comment": "Evaluator covered the criterion."
+          }
+        ],
+        "questions": [],
+        "risks": [],
+        "missingTests": [
+          {
+            "id": "mt-1",
+            "criterionId": "ac-1",
+            "testScenario": "Edge case",
+            "rationale": "Edge not covered.",
+            "priority": "should"
+          }
+        ],
+        "advisoryNotes": [],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    },
+    {
+      "name": "advisory_notes",
+      "expectedHash": "sha256:1493e8af15327ad48ad77aa9579c2366dd8d30e2485a951e02abd0c348847dd9",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_evaluation",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1",
+          "evaluationRunId": "eval-hash-vector"
+        },
+        "verdict": "evidence_sufficient",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "covered",
+            "evidenceRefs": ["eval-hash-vector:criteria:ac-1", "cmd-test"],
+            "comment": "Evaluator covered the criterion."
+          }
+        ],
+        "questions": [],
+        "risks": [],
+        "missingTests": [],
+        "advisoryNotes": ["Looks good.", "Keep an eye on coverage."],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    },
+    {
+      "name": "nested_undefined_filtered",
+      "expectedHash": "sha256:4666593e50a453d4a9d9d691b7d634946ecb6d09c68928f6bdcab7daea17eb10",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_evaluation",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1",
+          "evaluationRunId": "eval-hash-vector"
+        },
+        "verdict": "evidence_sufficient",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-1",
+            "criterionText": "Criterion text",
+            "required": true,
+            "status": "covered",
+            "evidenceRefs": ["eval-hash-vector:criteria:ac-1", "cmd-test"],
+            "comment": "Evaluator covered the criterion."
+          }
+        ],
+        "questions": [],
+        "risks": [
+          {
+            "id": "risk-undef",
+            "severity": "low",
+            "claim": "Nested undefined",
+            "evidenceRefs": ["eval-hash-vector"]
+          }
+        ],
+        "missingTests": [],
+        "advisoryNotes": [],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    },
+    {
+      "name": "not_applicable_coverage",
+      "expectedHash": "sha256:79feef92da7ddc79909be184e7b3fadfdbbfdc02b23e01f0bb7d5dbd2042a9c0",
+      "output": {
+        "schemaVersion": "questioner-output.v2",
+        "id": "q-hash-vector-base",
+        "questionerRunId": "qr-hash-vector",
+        "workflowId": "wf-hash-vector",
+        "subtaskId": "st-hash-vector",
+        "intent": "question_evaluation",
+        "source": "claude-plugin",
+        "actor": {
+          "kind": "claude-code-questioner",
+          "invocationId": "inv-hash-vector",
+          "pluginName": "agent-loop-claude-review",
+          "skillName": "question-tik-agent-loop",
+          "model": "claude-test"
+        },
+        "attestation": {
+          "headSha": "head-hash-vector",
+          "contextArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/context.json",
+          "contextHash": "sha256:context-hash-vector",
+          "outputArtifactRef": ".tik/multi-agent/workflows/wf-hash-vector/questioner-runs/qr-hash-vector/output.json",
+          "outputHash": "sha256:ignored-input-output-hash",
+          "generatedAt": "2026-07-03T00:00:00.000Z"
+        },
+        "references": {
+          "contractId": "contract-st-hash-vector-v1",
+          "evaluationRunId": "eval-hash-vector"
+        },
+        "verdict": "evidence_sufficient",
+        "coverageMatrix": [
+          {
+            "criterionId": "ac-2",
+            "criterionText": "Criterion text",
+            "required": false,
+            "status": "not_applicable",
+            "evidenceRefs": [],
+            "comment": "Not applicable."
+          }
+        ],
+        "questions": [],
+        "risks": [],
+        "missingTests": [],
+        "advisoryNotes": [],
+        "createdAt": "2026-07-03T00:01:00.000Z"
+      }
+    }
+  ]
+}

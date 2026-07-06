@@ -17,6 +17,7 @@ Do:
 - Set `source=claude-plugin`, `actor.pluginName=agent-loop-claude-review`, `actor.skillName=question-tik-agent-loop`, and include run/context/output attestation.
 - Use `node scripts/post-questioner-output.mjs ./questioner-output.json` to validate, hash, write the output artifact, and submit.
 - Treat Tik server validation as authoritative: direct POSTs are rejected unless `attestation.outputHash`, `attestation.contextHash`, head SHA, referenced contract/evaluation ids, and `coverageMatrix` match the token-scoped QuestionerRun context.
+- Do not include a top-level `createdAt` field in QuestionerOutputV2. The Tik server strips it before hashing; hand-computing `outputHash` with that field included will mismatch.
 - If HEAD does not match the head SHA provided by Tik, submit a V2 output with `verdict=questions_blocking`, a blocking `head_mismatch` question, and no `evidence_sufficient` claim.
 
 Do not:

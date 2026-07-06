@@ -1,8 +1,9 @@
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
+import { canonicalOutputHash, type QuestionerOutputV2 } from '@tik/shared';
 import { EventBus } from '../src/event-bus.js';
 import { createServer } from '../src/server.js';
 import { WorkbenchService } from '../src/workbench/workbench-service.js';
@@ -17,6 +18,23 @@ afterEach(async () => {
 });
 
 describe('codex evaluator and Claude questioner workflow', () => {
+  it('matches the shared golden QuestionerOutputV2 hash vectors', async () => {
+    const fixture = JSON.parse(
+      await fs.readFile(path.resolve(__dirname, '../../shared/test-fixtures/questioner-hash-vectors.json'), 'utf-8'),
+    ) as {
+      vectors: Array<{
+        name: string;
+        expectedHash: string;
+        output: QuestionerOutputV2;
+      }>;
+    };
+    expect(fixture.vectors.length).toBeGreaterThanOrEqual(10);
+    for (const vector of fixture.vectors) {
+      expect(canonicalQuestionerOutputHash(vector.output), vector.name).toBe(vector.expectedHash);
+      expect(canonicalOutputHash(vector.output), vector.name).toBe(vector.expectedHash);
+    }
+  });
+
   it('requires an accepted SprintContract before a v1 subtask can execute', async () => {
     const root = await makeTempWorkspace();
     const server = await createTestServer(root);
@@ -631,6 +649,97 @@ describe('codex evaluator and Claude questioner workflow', () => {
     });
     expect(complete.statusCode).toBe(200);
     expect(complete.json().guard).toMatchObject({ accepted: true, code: 'ok' });
+  });
+
+  it('accepts helper-submitted QuestionerOutputV2 with top-level createdAt stripped from the hash', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-helper-created-at', root);
+    await putSingleSubtaskGraph(server, 'wf-helper-created-at');
+    await createAcceptedContract(server, 'wf-helper-created-at');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-helper-created-at/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-pass',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+      },
+    });
+    await recordPassingEvaluation(server, 'wf-helper-created-at', 'eval-pass');
+
+    const run = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-helper-created-at/questioner-runs',
+      payload: {
+        id: 'qr-helper-created-at',
+        invocationId: 'inv-helper-created-at',
+        subtaskId: 'st-api',
+        intent: 'question_evaluation',
+        contractId: 'contract-st-api-v1',
+        evaluationRunId: 'eval-pass',
+        headSha: 'head-1',
+        start: true,
+        runtimeAudit: { gitStatusBefore: '' },
+      },
+    });
+    expect(run.statusCode).toBe(200);
+
+    const outputPath = path.join(root, 'questioner-output-with-created-at.json');
+    const output = buildQuestionerOutputV2({
+      id: 'q-helper-created-at',
+      runResponse: run.json(),
+      workflowId: 'wf-helper-created-at',
+      subtaskId: 'st-api',
+      intent: 'question_evaluation',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-pass',
+      contractId: 'contract-st-api-v1',
+      verdict: 'evidence_sufficient',
+      coverageMatrix: [
+        {
+          criterionId: 'ac-1',
+          criterionText: 'API responds with expected payload.',
+          required: true,
+          status: 'covered',
+          evidenceRefs: ['eval-pass:criteria:ac-1', 'cmd-test'],
+          comment: 'Evaluator criterion and command evidence cover the contract must criterion.',
+        },
+      ],
+    }) as any;
+    output.createdAt = '2026-07-03T00:01:00.000Z';
+    output.attestation.outputHash = '';
+    await fs.writeFile(outputPath, `${JSON.stringify(output, null, 2)}\n`, 'utf-8');
+
+    const address = server.server.address();
+    expect(address && typeof address !== 'string').toBe(true);
+    const apiBaseUrl = `http://127.0.0.1:${(address as { port: number }).port}/api`;
+    const helper = await runNodeScript([
+      path.resolve(__dirname, '../../../claude-plugin/agent-loop-claude-review/scripts/post-questioner-output.mjs'),
+      outputPath,
+    ], {
+      cwd: path.join(root, 'repo'),
+      env: {
+        ...process.env,
+        TIK_QUESTIONER_CONTEXT_URL: `${apiBaseUrl}/v1/multi-agent/workflows/wf-helper-created-at/questioner-runs/qr-helper-created-at/context`,
+        TIK_QUESTIONER_SUBMIT_URL: `${apiBaseUrl}/v1/multi-agent/workflows/wf-helper-created-at/questioner-runs/qr-helper-created-at/output`,
+        TIK_QUESTIONER_TOKEN: run.json().token,
+      },
+    });
+    expect(helper.status, helper.stderr || helper.stdout).toBe(0);
+    const helperOutput = JSON.parse(helper.stdout);
+    expect(helperOutput).toMatchObject({
+      action: 'questioner-output-submitted',
+      verdict: 'evidence_sufficient',
+      response: {
+        questionerRun: {
+          status: 'validated',
+        },
+      },
+    });
+    expect(helperOutput.outputHash).toBe(canonicalOutputHash(output));
   });
 
   it('rejects QuestionerOutputV2 with missing required coverage before it can satisfy the gate', async () => {
@@ -3174,6 +3283,40 @@ async function makeTempWorkspace() {
   return root;
 }
 
+async function runNodeScript(
+  args: string[],
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+  },
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`Node script timed out: ${args.join(' ')}`));
+    }, 10_000);
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once('exit', (status) => {
+      clearTimeout(timeout);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+
 async function createTestServer(root: string) {
   const workbench = new WorkbenchService({
     rootPath: root,
@@ -3637,33 +3780,7 @@ function buildQuestionerOutputV2(input: {
 }
 
 function canonicalQuestionerOutputHash(output: any): string {
-  return `sha256:${createHash('sha256').update(stableStringify({
-    ...output,
-    attestation: {
-      ...output.attestation,
-      outputHash: '',
-    },
-    createdAt: undefined,
-  })).digest('hex')}`;
-}
-
-function stableStringify(value: unknown): string {
-  return JSON.stringify(sortJson(value));
-}
-
-function sortJson(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sortJson);
-  }
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .filter(([, entry]) => entry !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entry]) => [key, sortJson(entry)]),
-  );
+  return canonicalOutputHash(output);
 }
 
 async function createCompletedInvocation(
