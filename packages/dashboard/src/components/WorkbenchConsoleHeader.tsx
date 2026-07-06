@@ -1,12 +1,14 @@
 import React from 'react';
 import type { EnvironmentPackManifest } from '@tik/shared';
-import type { WorkbenchTaskResponse } from '../api/client';
+import type { AvailableWorkspace, WorkbenchTaskResponse } from '../api/client';
 import type { WorkbenchLens } from '../view-models/workbench';
 
 interface WorkbenchConsoleHeaderProps {
   packs: EnvironmentPackManifest[];
   activePackId: string | null;
   activeTask: WorkbenchTaskResponse | null;
+  activeApiBaseUrl: string;
+  workspaces: AvailableWorkspace[];
   waitingCount: number;
   highRiskCount: number;
   selectedLens: WorkbenchLens;
@@ -16,6 +18,8 @@ interface WorkbenchConsoleHeaderProps {
   publishingReviewRound?: boolean;
   onToggleFilter: () => void;
   onNewTask: () => void;
+  onSelectWorkspace?: (apiBaseUrl: string) => void;
+  onOpenWorkspace?: (apiBaseUrl: string) => void;
   onPublishReviewRound?: () => Promise<void>;
   onRefresh?: () => Promise<void>;
 }
@@ -24,6 +28,8 @@ export function WorkbenchConsoleHeader({
   packs,
   activePackId,
   activeTask,
+  activeApiBaseUrl,
+  workspaces,
   waitingCount,
   highRiskCount,
   selectedLens,
@@ -33,6 +39,8 @@ export function WorkbenchConsoleHeader({
   publishingReviewRound = false,
   onToggleFilter,
   onNewTask,
+  onSelectWorkspace,
+  onOpenWorkspace,
   onPublishReviewRound,
   onRefresh,
 }: WorkbenchConsoleHeaderProps) {
@@ -61,6 +69,9 @@ export function WorkbenchConsoleHeader({
           : selectedLens === 'backlog'
             ? 'Backlog'
             : 'Tasks';
+  const activeWorkspace = workspaces.find((workspace) => workspace.apiBaseUrl === activeApiBaseUrl)
+    || workspaces[0]
+    || null;
 
   return (
     <header className="console-topbar">
@@ -104,6 +115,35 @@ export function WorkbenchConsoleHeader({
       </div>
 
       <div className="console-topbar-actions">
+        <div className="workspace-switcher">
+          <label className="workspace-switcher-label" htmlFor="workspace-switcher-select">
+            Workspace
+          </label>
+          <select
+            id="workspace-switcher-select"
+            className="workspace-switcher-select"
+            value={activeWorkspace?.apiBaseUrl || activeApiBaseUrl}
+            onChange={(event) => onSelectWorkspace?.(event.target.value)}
+          >
+            {workspaces.length === 0 ? (
+              <option value={activeApiBaseUrl}>Current workspace</option>
+            ) : workspaces.map((workspace) => (
+              <option key={workspace.id} value={workspace.apiBaseUrl}>
+                {workspace.workspaceName}
+              </option>
+            ))}
+          </select>
+          {activeWorkspace ? (
+            <span className="workspace-switcher-path">{activeWorkspace.workspaceRoot}</span>
+          ) : null}
+        </div>
+        <button
+          type="button"
+          className="console-ghost-button"
+          onClick={() => onOpenWorkspace?.(activeWorkspace?.apiBaseUrl || activeApiBaseUrl)}
+        >
+          Open
+        </button>
         <button
           type="button"
           className="console-ghost-button"

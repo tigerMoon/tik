@@ -6,6 +6,7 @@
  */
 
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import type {
@@ -84,6 +85,7 @@ export interface ServerConfig {
 
 export interface WorkspaceServerOptions {
   workspaceRoot?: string;
+  publicApiBaseUrl?: string;
   apiToken?: string;
   dashboardOrigin?: string;
   allowUnauthenticatedRemote?: boolean;
@@ -99,6 +101,18 @@ interface TrackerListenerStatus {
   pid?: number;
   port?: number;
   session?: string;
+}
+
+interface WorkspaceRegistryEntry {
+  id: string;
+  workspaceRoot: string;
+  workspaceName: string;
+  apiBaseUrl: string;
+  host: string;
+  port: number;
+  pid: number;
+  startedAt: string;
+  updatedAt: string;
 }
 
 interface ResolveWorkspaceDecisionBody {
@@ -1219,6 +1233,21 @@ export async function createServer(
           workspaceBinding: await resolveMultiAgentWorkspaceBinding(req.body.workspaceBinding),
         });
         return { workflow };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.get(
+    '/api/v1/multi-agent/workflows',
+    async (_req, reply) => {
+      try {
+        const workflows = (await multiAgentStore.listWorkflowRecords())
+          .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+        return {
+          workflows: redactSensitiveObject(workflows) as MultiAgentWorkflowRecord[],
+        };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -3250,6 +3279,22 @@ export async function createServer(
   // Health
   fastify.get('/api/health', async () => ({ status: 'ok', uptime: process.uptime() }));
 
+  fastify.get('/api/workspaces', async () => {
+    const currentWorkspace = buildWorkspaceRegistryEntry({
+      workspaceRoot: serverWorkspaceRoot,
+      host: config.host,
+      port: config.port,
+      publicApiBaseUrl: options?.publicApiBaseUrl,
+    });
+    const workspaces = await listWorkspaceRegistryEntries(currentWorkspace, Boolean(options?.publicApiBaseUrl));
+    return {
+      currentApiBaseUrl: currentWorkspace.apiBaseUrl,
+      currentWorkspaceRoot: currentWorkspace.workspaceRoot,
+      workspaces,
+      generatedAt: new Date().toISOString(),
+    };
+  });
+
   fastify.get<{ Querystring: { rootPath?: string } }>('/api/workspace/status', async (req, reply) => {
     try {
       decorateWorkspaceApiReply(reply);
@@ -3464,6 +3509,14 @@ export async function createServer(
   });
 
   await fastify.listen({ port: config.port, host: config.host });
+  if (options?.publicApiBaseUrl) {
+    await registerWorkspaceServer({
+      workspaceRoot: serverWorkspaceRoot,
+      host: config.host,
+      port: config.port,
+      publicApiBaseUrl: options.publicApiBaseUrl,
+    });
+  }
   return fastify;
 }
 
@@ -3523,6 +3576,151 @@ async function assertWorkspaceBindingInsideRoot(
       throw new WorkbenchTaskError('invalid_workspace_binding', `Workspace binding path must not escape workspace root: ${candidate}`);
     }
   }
+}
+
+function workspaceRegistryPath(): string {
+  if (process.env.TIK_WORKSPACE_SERVER_REGISTRY) {
+    return process.env.TIK_WORKSPACE_SERVER_REGISTRY;
+  }
+  return path.join(os.homedir(), '.tik', 'workspace-servers.json');
+}
+
+function normalizeServerHost(host: string): string {
+  return host === 'localhost' || host === '::1' ? '127.0.0.1' : host;
+}
+
+function buildApiBaseUrl(input: {
+  host: string;
+  port: number;
+  publicApiBaseUrl?: string;
+}): string {
+  const explicit = input.publicApiBaseUrl?.trim();
+  if (explicit) {
+    return explicit.replace(/\/+$/, '');
+  }
+  return `http://${normalizeServerHost(input.host)}:${input.port}/api`;
+}
+
+function buildWorkspaceRegistryEntry(input: {
+  workspaceRoot: string;
+  host: string;
+  port: number;
+  publicApiBaseUrl?: string;
+}): WorkspaceRegistryEntry {
+  const workspaceRoot = path.resolve(input.workspaceRoot);
+  const apiBaseUrl = buildApiBaseUrl(input);
+  const now = new Date().toISOString();
+  return {
+    id: `${workspaceRoot}:${apiBaseUrl}`,
+    workspaceRoot,
+    workspaceName: path.basename(workspaceRoot),
+    apiBaseUrl,
+    host: input.host,
+    port: input.port,
+    pid: process.pid,
+    startedAt: now,
+    updatedAt: now,
+  };
+}
+
+async function readWorkspaceRegistry(): Promise<WorkspaceRegistryEntry[]> {
+  const raw = await fs.readFile(workspaceRegistryPath(), 'utf-8').catch(() => '[]');
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter(isWorkspaceRegistryEntry);
+  } catch {
+    return [];
+  }
+}
+
+async function writeWorkspaceRegistry(entries: WorkspaceRegistryEntry[]): Promise<void> {
+  const registryFile = workspaceRegistryPath();
+  await fs.mkdir(path.dirname(registryFile), { recursive: true });
+  await fs.writeFile(registryFile, `${JSON.stringify(entries, null, 2)}\n`, 'utf-8');
+}
+
+async function registerWorkspaceServer(input: {
+  workspaceRoot: string;
+  host: string;
+  port: number;
+  publicApiBaseUrl?: string;
+}): Promise<void> {
+  const entry = buildWorkspaceRegistryEntry(input);
+  const existing = await readWorkspaceRegistry();
+  const previous = existing.find((item) => item.id === entry.id);
+  await writeWorkspaceRegistry([
+    ...existing.filter((item) => item.id !== entry.id),
+    {
+      ...entry,
+      startedAt: previous?.startedAt || entry.startedAt,
+    },
+  ]);
+}
+
+async function listWorkspaceRegistryEntries(
+  currentWorkspace: WorkspaceRegistryEntry,
+  persist: boolean,
+): Promise<WorkspaceRegistryEntry[]> {
+  const entriesById = new Map<string, WorkspaceRegistryEntry>();
+  for (const entry of await readWorkspaceRegistry()) {
+    entriesById.set(entry.id, entry);
+  }
+  entriesById.set(currentWorkspace.id, currentWorkspace);
+
+  const liveEntries: WorkspaceRegistryEntry[] = [];
+  for (const entry of entriesById.values()) {
+    if (entry.id === currentWorkspace.id || await isWorkspaceServerHealthy(entry.apiBaseUrl)) {
+      liveEntries.push(entry);
+    }
+  }
+  const sorted = liveEntries.sort((left, right) => {
+    if (left.workspaceName !== right.workspaceName) {
+      return left.workspaceName.localeCompare(right.workspaceName);
+    }
+    return left.apiBaseUrl.localeCompare(right.apiBaseUrl);
+  });
+  if (persist) {
+    await writeWorkspaceRegistry(sorted);
+  }
+  return sorted;
+}
+
+async function isWorkspaceServerHealthy(apiBaseUrl: string): Promise<boolean> {
+  if (typeof fetch !== 'function') {
+    return true;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 750);
+  try {
+    const response = await fetch(`${apiBaseUrl.replace(/\/+$/, '')}/health`, {
+      signal: controller.signal,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isWorkspaceRegistryEntry(value: unknown): value is WorkspaceRegistryEntry {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Partial<WorkspaceRegistryEntry>;
+  return typeof candidate.id === 'string'
+    && typeof candidate.workspaceRoot === 'string'
+    && typeof candidate.workspaceName === 'string'
+    && typeof candidate.apiBaseUrl === 'string'
+    && typeof candidate.host === 'string'
+    && typeof candidate.port === 'number'
+    && typeof candidate.pid === 'number'
+    && typeof candidate.startedAt === 'string'
+    && typeof candidate.updatedAt === 'string';
 }
 
 function buildTrackerStateSummary(tasks: WorkbenchTaskRecord[]) {
@@ -4040,7 +4238,11 @@ function isPublicApiRoute(method: string, url: string): boolean {
   ) {
     return true;
   }
-  return method === 'GET' && (pathname === '/api/health' || pathname === '/health');
+  return method === 'GET' && (
+    pathname === '/api/health'
+    || pathname === '/api/workspaces'
+    || pathname === '/health'
+  );
 }
 
 function bearerToken(authorization: string | undefined): string | undefined {

@@ -1082,6 +1082,10 @@ try {
   });
   assert.equal(v1QuestionEvaluationNext.action, 'ask_claude_question_evaluation');
   assert.equal(v1QuestionEvaluationNext.subtaskId, 'st-api');
+  assert.match(
+    instructionForDecision(v1QuestionEvaluationNext),
+    /async Claude Questioner subagent/,
+  );
 
   const v1ReadonlyViolationNext = decideNextAction({
     workflow: { ...workflow, policy: v1Policy },
@@ -1226,6 +1230,10 @@ try {
     questionerOutputs: [],
   });
   assert.equal(v1FinalQuestionerNext.action, 'ask_claude_question_final_evidence');
+  assert.match(
+    instructionForDecision(v1FinalQuestionerNext),
+    /async Claude Questioner subagent/,
+  );
 
   const v1WorkflowCompleteNext = decideNextAction({
     workflow: { ...workflow, policy: v1Policy },
@@ -1868,7 +1876,7 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
       expectedAction: 'ask_claude_question_evaluation',
       expectedOutputAction: 'continue-instruction',
       expectedPendingAction: 'questioner-run-started',
-      expectedInstruction: /After Claude submits QuestionerOutputV2/,
+      expectedInstruction: /Do not wait synchronously for Claude/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
         taskGraph: buildGraph(workflowId),
@@ -1919,7 +1927,7 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
       expectedAction: 'ask_claude_question_final_evidence',
       expectedOutputAction: 'continue-instruction',
       expectedPendingAction: 'questioner-run-started',
-      expectedInstruction: /After Claude submits QuestionerOutputV2/,
+      expectedInstruction: /Do not wait synchronously for Claude/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
         taskGraph: buildGraph(workflowId),

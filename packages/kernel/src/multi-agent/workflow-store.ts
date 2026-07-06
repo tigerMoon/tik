@@ -213,6 +213,10 @@ export class FileMultiAgentWorkflowStore {
     return this.readJsonFile<MultiAgentWorkflowRecord>(this.workflowFile(this.normalizeId(workflowId)));
   }
 
+  async listWorkflowRecords(): Promise<MultiAgentWorkflowRecord[]> {
+    return this.listWorkflows();
+  }
+
   async findBundleByRootTaskId(rootTaskId: string): Promise<MultiAgentWorkflowBundle | null> {
     const workflows = await this.listWorkflows();
     const candidates = workflows

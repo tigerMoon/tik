@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildDashboardUrlForApiBase,
   buildWorkbenchArtifactLinkPreviewUrl,
   buildWorkbenchArtifactVersionPreviewUrl,
   resolveApiBaseUrlForLocation,
@@ -44,6 +45,14 @@ describe('resolveApiBaseUrlForLocation', () => {
       port: '3300',
       origin: 'http://127.0.0.1:3300',
     })).toBe('/api');
+  });
+});
+
+describe('buildDashboardUrlForApiBase', () => {
+  it('creates a shareable dashboard url for an api base without a browser window', () => {
+    expect(buildDashboardUrlForApiBase('http://127.0.0.1:64777/api/')).toBe(
+      '?apiBaseUrl=http%3A%2F%2F127.0.0.1%3A64777%2Fapi',
+    );
   });
 });
 

@@ -162,6 +162,22 @@ describe('multi-agent coordination API', () => {
       safeNote: 'visible evidence detail',
     });
 
+    const workflowList = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows',
+    });
+    expect(workflowList.statusCode).toBe(200);
+    expect(workflowList.json().workflows).toEqual([
+      expect.objectContaining({
+        id: 'wf-task-detail',
+        rootTaskId: rootTask.id,
+      }),
+    ]);
+    expect(workflowList.json().workflows[0].metadata).toEqual({
+      deployToken: '[redacted]',
+      safeLabel: 'workflow-visible',
+    });
+
     const fromRootIdentifier = await server.inject({
       method: 'GET',
       url: '/api/v1/tasks/TIK-ROOT/multi-agent-workflow',

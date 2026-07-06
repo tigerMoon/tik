@@ -244,6 +244,40 @@ body {
   align-items: center;
 }
 
+.workspace-switcher {
+  display: grid;
+  grid-template-columns: minmax(160px, 220px);
+  gap: 3px;
+  min-width: 180px;
+}
+
+.workspace-switcher-label {
+  color: var(--wb-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.workspace-switcher-select {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--wb-line);
+  border-radius: 12px;
+  padding: 0 34px 0 10px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--wb-text);
+}
+
+.workspace-switcher-path {
+  max-width: 220px;
+  overflow: hidden;
+  color: #9fb0cf;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .console-ghost-button,
 .console-primary-button,
 .console-secondary-button,
@@ -2239,6 +2273,10 @@ body {
   .console-topbar-actions {
     flex-wrap: wrap;
   }
+
+  .workspace-switcher {
+    min-width: min(100%, 260px);
+  }
 }
 
 @media (max-width: 768px) {
@@ -2608,6 +2646,30 @@ body {
   height: 6px;
 }
 
+.workspace-switcher {
+  min-width: 210px;
+}
+
+.workspace-switcher-label {
+  color: #6b7280;
+  font-size: 9px;
+}
+
+.workspace-switcher-select {
+  min-height: 30px;
+  border-color: #d8d8d2;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #24292f;
+  font-size: 12px;
+}
+
+.workspace-switcher-path {
+  max-width: 210px;
+  color: #6b7280;
+  font-size: 10px;
+}
+
 .console-primary-button,
 .console-ghost-button,
 .queue-inline-button,
@@ -2699,6 +2761,35 @@ body {
 
 .queue-task-list {
   gap: 0;
+}
+
+.workflow-overview {
+  border-bottom: 1px solid var(--wb-line);
+  padding-bottom: 10px;
+}
+
+.workflow-overview-header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  padding: 12px 16px 8px;
+}
+
+.workflow-overview-list {
+  display: grid;
+}
+
+.workflow-row {
+  align-items: start;
+  border-top: 1px solid var(--wb-line);
+  display: grid;
+  gap: 9px;
+  grid-template-columns: 10px minmax(0, 1fr);
+  padding: 11px 12px 12px 14px;
+}
+
+.workflow-row-main {
+  min-width: 0;
 }
 
 .queue-task-card {
@@ -4258,6 +4349,16 @@ body {
   .console-topbar-actions {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .workspace-switcher {
+    grid-template-columns: 1fr;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .workspace-switcher-path {
+    max-width: 100%;
   }
 
   .queue-task-card {

@@ -20,9 +20,9 @@ export function instructionForDecision(decision, state) {
     case 'run_final_evaluation':
       return 'Start an isolated read-only Codex Evaluator session for final workflow evidence, then record its EvaluationResult.';
     case 'ask_claude_question_evaluation':
-      return `Ask Claude Questioner to challenge the evaluation evidence for subtask ${decision.subtaskId}.`;
+      return `Start an async Claude Questioner subagent to challenge the evaluation evidence for subtask ${decision.subtaskId}; the hook/callback records QuestionerOutputV2.`;
     case 'ask_claude_question_final_evidence':
-      return 'Ask Claude Questioner to challenge final evidence before completing the workflow.';
+      return 'Start an async Claude Questioner subagent to challenge final evidence; the hook/callback records QuestionerOutputV2 before workflow completion.';
     case 'fix_evaluation_findings':
       return `Fix Codex Evaluator or Claude Questioner findings for subtask ${decision.subtaskId}, then re-evaluate.`;
     case 'validate_subtask':

@@ -13,14 +13,17 @@ import {
   acceptWorkbenchArtifact,
   archiveWorkbenchArtifact,
   archiveWorkbenchTask,
+  buildDashboardUrlForApiBase,
   controlWorkbenchTask,
   createWorkbenchTask,
   createWorktreeReviewRound,
+  fetchAvailableWorkspaces,
   fetchWorkbenchArtifact,
   fetchWorkbenchArtifacts,
   fetchWorkbenchArtifactVersions,
   fetchEnvironmentPackDashboard,
   fetchEnvironmentPacks,
+  fetchMultiAgentWorkflows,
   fetchSkillManifestRegistry,
   fetchTrackerState,
   fetchWorkbenchTaskArtifacts,
@@ -40,6 +43,8 @@ import {
   saveSkillManifestDraft,
   saveWorkflowFile,
   subscribeToWorkbenchEvents,
+  getApiBaseUrl,
+  switchDashboardApiBaseUrl,
   switchEnvironmentPack,
   transitionTrackerTask,
   updateTrackerTask,
@@ -49,12 +54,14 @@ import {
   type TrackerStateResponse,
   type UpdateWorkbenchTaskBriefResult,
   type WorkflowFileResponse,
+  type AvailableWorkspace,
   type WorkbenchTaskAttemptRecord,
   type WorkbenchArtifactRecord,
   type WorkbenchArtifactVersion,
   type WorkbenchTaskResponse,
   type WorkbenchTaskRunRecord,
   type MultiAgentWorkflowBundle,
+  type MultiAgentWorkflowRecord,
 } from './api/client';
 import { ArtifactDetail } from './components/ArtifactDetail';
 import { ArtifactGallery } from './components/ArtifactGallery';
@@ -166,11 +173,14 @@ export function App() {
   const [environmentDashboard, setEnvironmentDashboard] = useState<Awaited<ReturnType<typeof fetchEnvironmentPackDashboard>> | null>(null);
   const [skillRegistry, setSkillRegistry] = useState<Awaited<ReturnType<typeof fetchSkillManifestRegistry>>['skills']>([]);
   const [workspaceStatus, setWorkspaceStatus] = useState<Awaited<ReturnType<typeof fetchWorkspaceStatus>> | null>(null);
+  const [availableWorkspaces, setAvailableWorkspaces] = useState<AvailableWorkspace[]>([]);
+  const [activeApiBaseUrl, setActiveApiBaseUrl] = useState(() => getApiBaseUrl());
   const [trackerState, setTrackerState] = useState<TrackerStateResponse | null>(null);
   const [workflowFile, setWorkflowFile] = useState<WorkflowFileResponse | null>(null);
   const [artifacts, setArtifacts] = useState<WorkbenchArtifactRecord[]>([]);
   const [taskArtifacts, setTaskArtifacts] = useState<WorkbenchArtifactRecord[]>([]);
   const [taskWorkflowBundle, setTaskWorkflowBundle] = useState<MultiAgentWorkflowBundle | null>(null);
+  const [multiAgentWorkflows, setMultiAgentWorkflows] = useState<MultiAgentWorkflowRecord[]>([]);
   const [activeArtifactId, setActiveArtifactId] = useState<string | null>(null);
   const [activeArtifact, setActiveArtifact] = useState<WorkbenchArtifactRecord | null>(null);
   const [artifactVersions, setArtifactVersions] = useState<WorkbenchArtifactVersion[]>([]);
@@ -244,20 +254,52 @@ export function App() {
     source: 'active-pack',
   });
 
+  const handleSelectWorkspace = (apiBaseUrl: string) => {
+    if (!apiBaseUrl || apiBaseUrl === activeApiBaseUrl) {
+      return;
+    }
+    setTasks([]);
+    setMultiAgentWorkflows([]);
+    setActiveTask(null);
+    setTimeline([]);
+    setDecisions([]);
+    setWorkspaceStatus(null);
+    setTaskArtifacts([]);
+    setTaskWorkflowBundle(null);
+    setActiveArtifactId(null);
+    setActiveArtifact(null);
+    setArtifactVersions([]);
+    switchDashboardApiBaseUrl(apiBaseUrl);
+  };
+
+  const handleOpenWorkspace = (apiBaseUrl: string) => {
+    if (typeof window === 'undefined' || !apiBaseUrl) {
+      return;
+    }
+    window.open(buildDashboardUrlForApiBase(apiBaseUrl), '_blank', 'noopener,noreferrer');
+  };
+
   const refreshWorkbench = async (options?: { silent?: boolean }) => {
     if (!options?.silent) {
       setRefreshingWorkbench(true);
     }
     try {
-      const [nextTasks, packState, nextWorkspaceStatus] = await Promise.all([
+      const [nextTasks, nextMultiAgentWorkflows, packState, nextWorkspaceStatus, workspaceDirectory] = await Promise.all([
         fetchWorkbenchTasks(),
+        fetchMultiAgentWorkflows().catch(() => []),
         fetchEnvironmentPacks(),
         fetchWorkspaceStatus().catch(() => null),
+        fetchAvailableWorkspaces().catch(() => null),
       ]);
       setTasks(nextTasks);
+      setMultiAgentWorkflows(nextMultiAgentWorkflows);
       setPacks(packState.packs, packState.activePackId);
       if (nextWorkspaceStatus) {
         setWorkspaceStatus(nextWorkspaceStatus);
+      }
+      if (workspaceDirectory) {
+        setAvailableWorkspaces(workspaceDirectory.workspaces);
+        setActiveApiBaseUrl(workspaceDirectory.currentApiBaseUrl || getApiBaseUrl());
       }
       setPacksSyncedAt(new Date().toISOString());
 
@@ -605,19 +647,31 @@ export function App() {
 
     const loadTasks = async () => {
       try {
-        const [nextTasks, packState, dashboard, registryResponse, workspaceStatusResponse, artifactsResponse] = await Promise.all([
+        const [
+          nextTasks,
+          nextMultiAgentWorkflows,
+          packState,
+          dashboard,
+          registryResponse,
+          workspaceStatusResponse,
+          artifactsResponse,
+          workspaceDirectory,
+        ] = await Promise.all([
           fetchWorkbenchTasks(),
+          fetchMultiAgentWorkflows().catch(() => []),
           fetchEnvironmentPacks(),
           fetchEnvironmentPackDashboard().catch(() => null),
           fetchSkillManifestRegistry().catch(() => null),
           fetchWorkspaceStatus().catch(() => null),
           fetchWorkbenchArtifacts().catch(() => []),
+          fetchAvailableWorkspaces().catch(() => null),
         ]);
         if (cancelled) {
           return;
         }
 
         setTasks(nextTasks);
+        setMultiAgentWorkflows(nextMultiAgentWorkflows);
         setPacks(packState.packs, packState.activePackId);
         setPacksSyncedAt(new Date().toISOString());
         if (dashboard) {
@@ -629,6 +683,10 @@ export function App() {
         }
         if (workspaceStatusResponse) {
           setWorkspaceStatus(workspaceStatusResponse);
+        }
+        if (workspaceDirectory) {
+          setAvailableWorkspaces(workspaceDirectory.workspaces);
+          setActiveApiBaseUrl(workspaceDirectory.currentApiBaseUrl || getApiBaseUrl());
         }
         setArtifacts(artifactsResponse);
         setActiveArtifactId((current) => current || artifactsResponse[0]?.id || null);
@@ -647,7 +705,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [setPacks, setTasks]);
+  }, [activeApiBaseUrl, setPacks, setTasks]);
 
   useEffect(() => {
     const laneResolution = autoFocusLane
@@ -1157,6 +1215,8 @@ export function App() {
               packs={packs}
               activePackId={activePackId}
               activeTask={activeTask}
+              activeApiBaseUrl={activeApiBaseUrl}
+              workspaces={availableWorkspaces}
               waitingCount={waitingCount}
               highRiskCount={highRiskCount}
               selectedLens={selectedLens}
@@ -1174,6 +1234,8 @@ export function App() {
                 }
                 setLauncherOpen(nextOpen);
               }}
+              onSelectWorkspace={handleSelectWorkspace}
+              onOpenWorkspace={handleOpenWorkspace}
               onPublishReviewRound={handlePublishReviewRound}
               publishingReviewRound={publishingReviewRound}
               onRefresh={() => refreshWorkbench()}
@@ -1185,6 +1247,7 @@ export function App() {
                   packs={packs}
                   activePackId={activePackId}
                   tasks={filteredTasks}
+                  multiAgentWorkflows={multiAgentWorkflows}
                   activeTask={activeTask}
                   activeTaskId={activeTaskId}
                   selectedLens={selectedLens}

@@ -1,5 +1,6 @@
 import type { Command } from 'commander';
 import chalk from 'chalk';
+import path from 'node:path';
 import type { ProviderOption } from '../types.js';
 import { createKernel } from './kernel-factory.js';
 import { serverProviderHelp } from './provider-resolution.js';
@@ -22,16 +23,20 @@ Examples:
 `)
     .action(async (opts: { port: string; host: string; project: string; provider: ProviderOption; model?: string; mock?: boolean }) => {
       const provider = opts.mock ? 'mock' : opts.provider;
-      const { kernel, llmName } = createKernel(opts.project, { provider, model: opts.model });
+      const workspaceRoot = path.resolve(opts.project);
+      const port = parseInt(opts.port);
+      const publicHost = opts.host === 'localhost' || opts.host === '::1' ? '127.0.0.1' : opts.host;
+      const publicApiBaseUrl = `http://${publicHost}:${port}/api`;
+      const { kernel, llmName } = createKernel(workspaceRoot, { provider, model: opts.model });
       const { createServer } = await import('@tik/kernel');
 
       console.log(chalk.bold('\n🌐 Tik Workbench Server\n'));
       console.log(chalk.dim(`  LLM: ${llmName}`));
-      console.log(chalk.dim(`  Workspace root: ${opts.project}`));
+      console.log(chalk.dim(`  Workspace root: ${workspaceRoot}`));
 
-      await createServer(kernel, { port: parseInt(opts.port), host: opts.host }, { workspaceRoot: opts.project });
+      await createServer(kernel, { port, host: opts.host }, { workspaceRoot, publicApiBaseUrl });
 
-      console.log(chalk.green(`  API: http://${opts.host}:${opts.port}`));
+      console.log(chalk.green(`  API: ${publicApiBaseUrl}`));
       console.log(chalk.dim('  Workbench UI expects the dashboard dev server on http://localhost:5173'));
       console.log(chalk.dim('  Press Ctrl+C to stop\n'));
     });

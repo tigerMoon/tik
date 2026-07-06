@@ -11,6 +11,7 @@ import type {
   EnvironmentPackSelection,
   EnvironmentPackSnapshot,
   MultiAgentWorkflowBundle,
+  MultiAgentWorkflowRecord,
   SkillManifestMutationInput,
   SkillManifestRegistryEntry,
   TaskWorkspaceBinding,
@@ -30,6 +31,7 @@ export type {
   WorkbenchArtifactVersion,
   WorkbenchTaskAttemptRecord,
   MultiAgentWorkflowBundle,
+  MultiAgentWorkflowRecord,
   WorkbenchTaskRunRecord,
 } from '@tik/shared';
 
@@ -113,6 +115,25 @@ export interface WorkspaceStatusResponse {
   };
   memory: WorkspaceMemorySnapshot;
   worktrees: WorkspaceWorktreesResponse['worktrees'];
+}
+
+export interface AvailableWorkspace {
+  id: string;
+  workspaceRoot: string;
+  workspaceName: string;
+  apiBaseUrl: string;
+  host: string;
+  port: number;
+  pid: number;
+  startedAt: string;
+  updatedAt: string;
+}
+
+export interface AvailableWorkspacesResponse {
+  currentApiBaseUrl: string;
+  currentWorkspaceRoot: string;
+  workspaces: AvailableWorkspace[];
+  generatedAt: string;
 }
 
 export interface WorkspaceManagedWorktree {
@@ -434,7 +455,45 @@ function resolveApiBaseUrl(): string {
     : resolveApiBaseUrlForLocation(window.location, explicitBaseUrl);
 }
 
-const BASE_URL = resolveApiBaseUrl();
+export const TIK_API_BASE_URL_STORAGE_KEY = 'tik.dashboard.apiBaseUrl';
+
+export function getApiBaseUrl(): string {
+  if (typeof window !== 'undefined') {
+    const queryApiBaseUrl = new URLSearchParams(window.location.search).get('apiBaseUrl')?.trim();
+    if (queryApiBaseUrl) {
+      const normalized = normalizeApiBaseUrl(queryApiBaseUrl);
+      window.localStorage.setItem(TIK_API_BASE_URL_STORAGE_KEY, normalized);
+      return normalized;
+    }
+    const storedApiBaseUrl = window.localStorage.getItem(TIK_API_BASE_URL_STORAGE_KEY)?.trim();
+    if (storedApiBaseUrl) {
+      return normalizeApiBaseUrl(storedApiBaseUrl);
+    }
+  }
+  return resolveApiBaseUrl();
+}
+
+export function buildDashboardUrlForApiBase(apiBaseUrl: string): string {
+  if (typeof window === 'undefined') {
+    return `?apiBaseUrl=${encodeURIComponent(normalizeApiBaseUrl(apiBaseUrl))}`;
+  }
+  const url = new URL(window.location.href);
+  url.searchParams.set('apiBaseUrl', normalizeApiBaseUrl(apiBaseUrl));
+  return url.toString();
+}
+
+export function switchDashboardApiBaseUrl(apiBaseUrl: string): void {
+  const normalized = normalizeApiBaseUrl(apiBaseUrl);
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.setItem(TIK_API_BASE_URL_STORAGE_KEY, normalized);
+  window.location.assign(buildDashboardUrlForApiBase(normalized));
+}
+
+function apiBaseUrl(): string {
+  return getApiBaseUrl();
+}
 
 async function readJsonOrThrow<T>(res: Response): Promise<T> {
   const payload = await res.json().catch(() => null);
@@ -468,12 +527,12 @@ export function resolveApiErrorMessage(payload: unknown, statusText: string, sta
 }
 
 export async function fetchTasks(): Promise<Task[]> {
-  const res = await fetch(`${BASE_URL}/tasks`);
+  const res = await fetch(`${apiBaseUrl()}/tasks`);
   return readJsonOrThrow<Task[]>(res);
 }
 
 export async function fetchTask(id: string): Promise<Task> {
-  const res = await fetch(`${BASE_URL}/tasks/${id}`);
+  const res = await fetch(`${apiBaseUrl()}/tasks/${id}`);
   return readJsonOrThrow<Task>(res);
 }
 
@@ -482,7 +541,7 @@ export async function submitTask(
   strategy = 'incremental',
   mode: 'single' | 'multi' = 'single',
 ): Promise<unknown> {
-  const res = await fetch(`${BASE_URL}/tasks`, {
+  const res = await fetch(`${apiBaseUrl()}/tasks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ description, strategy, mode }),
@@ -491,7 +550,7 @@ export async function submitTask(
 }
 
 export async function controlTask(id: string, command: unknown): Promise<void> {
-  const res = await fetch(`${BASE_URL}/tasks/${id}/control`, {
+  const res = await fetch(`${apiBaseUrl()}/tasks/${id}/control`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(command),
@@ -503,7 +562,7 @@ export async function controlWorkbenchTask(
   taskId: string,
   command: { type: 'pause' | 'resume' | 'stop'; reason?: string },
 ): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/control`, {
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/control`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(command),
@@ -512,7 +571,7 @@ export async function controlWorkbenchTask(
 }
 
 export async function fetchWorkbenchTasks(): Promise<WorkbenchTaskResponse[]> {
-  const res = await fetch(`${BASE_URL}/v1/tasks`);
+  const res = await fetch(`${apiBaseUrl()}/v1/tasks`);
   return (await readJsonOrThrow<{ tasks: WorkbenchTaskResponse[] }>(res)).tasks;
 }
 
@@ -521,7 +580,7 @@ export async function createWorkbenchTask(
   goal: string,
   input?: CreateWorkbenchTaskInput,
 ): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/v1/tasks`, {
+  const res = await fetch(`${apiBaseUrl()}/v1/tasks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ title, goal, ...input }),
@@ -532,7 +591,7 @@ export async function createWorkbenchTask(
 export async function createWorktreeReviewRound(
   input: CreateWorktreeReviewRoundInput,
 ): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/v1/agent-loop/worktree-review-rounds`, {
+  const res = await fetch(`${apiBaseUrl()}/v1/agent-loop/worktree-review-rounds`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
@@ -544,7 +603,7 @@ export async function updateTrackerTask(
   taskId: string,
   input: Partial<Pick<WorkbenchTaskResponse, 'title' | 'description' | 'goal' | 'status' | 'priority' | 'labels' | 'parentTaskId' | 'humanAssignee'>>,
 ): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/v1/tasks/${encodeURIComponent(taskId)}`, {
+  const res = await fetch(`${apiBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
@@ -557,7 +616,7 @@ export async function transitionTrackerTask(
   to: WorkbenchTaskStatus,
   reason?: string,
 ): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/v1/tasks/${encodeURIComponent(taskId)}/transitions`, {
+  const res = await fetch(`${apiBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}/transitions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ to, reason }),
@@ -569,7 +628,7 @@ export async function addTrackerTaskComment(
   taskId: string,
   body: string,
 ): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/v1/tasks/${encodeURIComponent(taskId)}/comments`, {
+  const res = await fetch(`${apiBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}/comments`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ body }),
@@ -581,7 +640,7 @@ export async function setTrackerTaskLabels(
   taskId: string,
   input: { add?: string[]; remove?: string[] },
 ): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/v1/tasks/${encodeURIComponent(taskId)}/labels`, {
+  const res = await fetch(`${apiBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}/labels`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
@@ -593,7 +652,7 @@ export async function setTrackerTaskDependencies(
   taskId: string,
   input: { add?: string[]; remove?: string[] },
 ): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/v1/tasks/${encodeURIComponent(taskId)}/dependencies`, {
+  const res = await fetch(`${apiBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}/dependencies`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
@@ -602,22 +661,22 @@ export async function setTrackerTaskDependencies(
 }
 
 export async function fetchTrackerState(): Promise<TrackerStateResponse> {
-  const res = await fetch(`${BASE_URL}/v1/tracker/state`);
+  const res = await fetch(`${apiBaseUrl()}/v1/tracker/state`);
   return readJsonOrThrow<TrackerStateResponse>(res);
 }
 
 export async function refreshTracker(): Promise<{ queued: boolean; refreshedAt: string }> {
-  const res = await fetch(`${BASE_URL}/v1/tracker/refresh`, { method: 'POST' });
+  const res = await fetch(`${apiBaseUrl()}/v1/tracker/refresh`, { method: 'POST' });
   return readJsonOrThrow(res);
 }
 
 export async function fetchWorkflowFile(): Promise<WorkflowFileResponse> {
-  const res = await fetch(`${BASE_URL}/v1/workflow`);
+  const res = await fetch(`${apiBaseUrl()}/v1/workflow`);
   return readJsonOrThrow<WorkflowFileResponse>(res);
 }
 
 export async function saveWorkflowFile(content: string): Promise<WorkflowFileResponse & { saved: boolean }> {
-  const res = await fetch(`${BASE_URL}/v1/workflow`, {
+  const res = await fetch(`${apiBaseUrl()}/v1/workflow`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content }),
@@ -629,7 +688,7 @@ export async function updateWorkbenchTaskConfiguration(
   taskId: string,
   selection: UpdateWorkbenchTaskConfigurationInput,
 ): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/configuration`, {
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/configuration`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(selection),
@@ -641,7 +700,7 @@ export async function updateWorkbenchTaskBrief(
   taskId: string,
   input: UpdateWorkbenchTaskBriefInput,
 ): Promise<UpdateWorkbenchTaskBriefResult> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/brief`, {
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/brief`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
@@ -650,33 +709,33 @@ export async function updateWorkbenchTaskBrief(
 }
 
 export async function revertWorkbenchTaskBrief(taskId: string): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/brief/revert`, {
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/brief/revert`, {
     method: 'POST',
   });
   return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
 }
 
 export async function retryWorkbenchTask(taskId: string): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/retry`, {
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/retry`, {
     method: 'POST',
   });
   return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
 }
 
 export async function archiveWorkbenchTask(taskId: string): Promise<WorkbenchTaskResponse> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/archive`, {
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/archive`, {
     method: 'POST',
   });
   return (await readJsonOrThrow<{ task: WorkbenchTaskResponse }>(res)).task;
 }
 
 export async function fetchWorkbenchTimeline(taskId: string): Promise<WorkbenchTimelineResponseItem[]> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/timeline`);
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/timeline`);
   return (await readJsonOrThrow<{ timeline: WorkbenchTimelineResponseItem[] }>(res)).timeline;
 }
 
 export async function fetchWorkbenchDecisions(taskId: string): Promise<WorkbenchDecisionResponse[]> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/decisions`);
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/decisions`);
   return (await readJsonOrThrow<{ decisions: WorkbenchDecisionResponse[] }>(res)).decisions;
 }
 
@@ -696,35 +755,40 @@ export async function fetchWorkbenchArtifacts(input: FetchWorkbenchArtifactsInpu
       query.set(key, value);
     }
   });
-  const res = await fetch(`${BASE_URL}/workbench/artifacts${query.size ? `?${query}` : ''}`);
+  const res = await fetch(`${apiBaseUrl()}/workbench/artifacts${query.size ? `?${query}` : ''}`);
   return (await readJsonOrThrow<{ artifacts: WorkbenchArtifactRecord[] }>(res)).artifacts;
 }
 
 export async function fetchWorkbenchTaskArtifacts(taskId: string): Promise<WorkbenchArtifactRecord[]> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/artifacts`);
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/artifacts`);
   return (await readJsonOrThrow<{ artifacts: WorkbenchArtifactRecord[] }>(res)).artifacts;
 }
 
 export async function fetchWorkbenchTaskMultiAgentWorkflow(taskId: string): Promise<MultiAgentWorkflowBundle | null> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/multi-agent-workflow`);
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/multi-agent-workflow`);
   if (res.status === 404) {
     return null;
   }
   return readJsonOrThrow<MultiAgentWorkflowBundle>(res);
 }
 
+export async function fetchMultiAgentWorkflows(): Promise<MultiAgentWorkflowRecord[]> {
+  const res = await fetch(`${apiBaseUrl()}/v1/multi-agent/workflows`);
+  return (await readJsonOrThrow<{ workflows: MultiAgentWorkflowRecord[] }>(res)).workflows;
+}
+
 export async function fetchWorkbenchArtifact(artifactId: string): Promise<WorkbenchArtifactRecord> {
-  const res = await fetch(`${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}`);
+  const res = await fetch(`${apiBaseUrl()}/workbench/artifacts/${encodeURIComponent(artifactId)}`);
   return (await readJsonOrThrow<{ artifact: WorkbenchArtifactRecord }>(res)).artifact;
 }
 
 export async function fetchWorkbenchArtifactVersions(artifactId: string): Promise<WorkbenchArtifactVersion[]> {
-  const res = await fetch(`${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}/versions`);
+  const res = await fetch(`${apiBaseUrl()}/workbench/artifacts/${encodeURIComponent(artifactId)}/versions`);
   return (await readJsonOrThrow<{ versions: WorkbenchArtifactVersion[] }>(res)).versions;
 }
 
 export async function generateWorkbenchTaskArtifact(taskId: string, template = 'task-review'): Promise<WorkbenchArtifactRecord> {
-  const res = await fetch(`${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/artifacts/generate`, {
+  const res = await fetch(`${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/artifacts/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ template }),
@@ -733,7 +797,7 @@ export async function generateWorkbenchTaskArtifact(taskId: string, template = '
 }
 
 export async function acceptWorkbenchArtifact(artifactId: string): Promise<WorkbenchArtifactRecord> {
-  const res = await fetch(`${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}/accept`, {
+  const res = await fetch(`${apiBaseUrl()}/workbench/artifacts/${encodeURIComponent(artifactId)}/accept`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ actor: 'dashboard' }),
@@ -742,7 +806,7 @@ export async function acceptWorkbenchArtifact(artifactId: string): Promise<Workb
 }
 
 export async function rejectWorkbenchArtifact(artifactId: string, reason: string): Promise<WorkbenchArtifactRecord> {
-  const res = await fetch(`${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}/reject`, {
+  const res = await fetch(`${apiBaseUrl()}/workbench/artifacts/${encodeURIComponent(artifactId)}/reject`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ actor: 'dashboard', reason }),
@@ -751,7 +815,7 @@ export async function rejectWorkbenchArtifact(artifactId: string, reason: string
 }
 
 export async function archiveWorkbenchArtifact(artifactId: string): Promise<WorkbenchArtifactRecord> {
-  const res = await fetch(`${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}/archive`, {
+  const res = await fetch(`${apiBaseUrl()}/workbench/artifacts/${encodeURIComponent(artifactId)}/archive`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ actor: 'dashboard' }),
@@ -765,7 +829,7 @@ export async function resolveWorkbenchDecision(
   body: ResolveWorkbenchDecisionInput,
 ): Promise<{ task: WorkbenchTaskResponse; decision: WorkbenchDecisionResponse }> {
   const res = await fetch(
-    `${BASE_URL}/workbench/tasks/${encodeURIComponent(taskId)}/decisions/${encodeURIComponent(decisionId)}/resolve`,
+    `${apiBaseUrl()}/workbench/tasks/${encodeURIComponent(taskId)}/decisions/${encodeURIComponent(decisionId)}/resolve`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -776,11 +840,11 @@ export async function resolveWorkbenchDecision(
 }
 
 export function buildWorkbenchArtifactPreviewUrl(filePath: string): string {
-  return `${BASE_URL}/workbench/artifacts/preview?path=${encodeURIComponent(filePath)}`;
+  return `${apiBaseUrl()}/workbench/artifacts/preview?path=${encodeURIComponent(filePath)}`;
 }
 
 export function buildWorkbenchArtifactVersionPreviewUrl(artifactId: string, versionId: string): string {
-  return `${BASE_URL}/workbench/artifacts/${encodeURIComponent(artifactId)}/versions/${encodeURIComponent(versionId)}/preview`;
+  return `${apiBaseUrl()}/workbench/artifacts/${encodeURIComponent(artifactId)}/versions/${encodeURIComponent(versionId)}/preview`;
 }
 
 export function buildWorkbenchArtifactLinkPreviewUrl(input: {
@@ -795,17 +859,17 @@ export function buildWorkbenchArtifactLinkPreviewUrl(input: {
 }
 
 export async function fetchEnvironmentPacks(): Promise<EnvironmentPacksResponse> {
-  const res = await fetch(`${BASE_URL}/environment-packs`);
+  const res = await fetch(`${apiBaseUrl()}/environment-packs`);
   return readJsonOrThrow<EnvironmentPacksResponse>(res);
 }
 
 export async function fetchEnvironmentPackDashboard(): Promise<EnvironmentPackDashboardResponse> {
-  const res = await fetch(`${BASE_URL}/environment-packs/dashboard`);
+  const res = await fetch(`${apiBaseUrl()}/environment-packs/dashboard`);
   return readJsonOrThrow<EnvironmentPackDashboardResponse>(res);
 }
 
 export async function switchEnvironmentPack(packId: string): Promise<EnvironmentPackManifest> {
-  const res = await fetch(`${BASE_URL}/environment-packs/active`, {
+  const res = await fetch(`${apiBaseUrl()}/environment-packs/active`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ packId }),
@@ -814,7 +878,7 @@ export async function switchEnvironmentPack(packId: string): Promise<Environment
 }
 
 export async function fetchSkillManifestRegistry(): Promise<SkillManifestRegistryResponse> {
-  const res = await fetch(`${BASE_URL}/skills/registry`);
+  const res = await fetch(`${apiBaseUrl()}/skills/registry`);
   return readJsonOrThrow<SkillManifestRegistryResponse>(res);
 }
 
@@ -822,7 +886,7 @@ export async function saveSkillManifestDraft(
   skillId: string,
   input: SkillManifestMutationInput,
 ): Promise<SkillManifestRegistryEntry> {
-  const res = await fetch(`${BASE_URL}/skills/${encodeURIComponent(skillId)}/draft`, {
+  const res = await fetch(`${apiBaseUrl()}/skills/${encodeURIComponent(skillId)}/draft`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
@@ -834,7 +898,7 @@ export async function publishSkillManifest(
   skillId: string,
   input: SkillManifestMutationInput,
 ): Promise<SkillManifestRegistryEntry> {
-  const res = await fetch(`${BASE_URL}/skills/${encodeURIComponent(skillId)}/publish`, {
+  const res = await fetch(`${apiBaseUrl()}/skills/${encodeURIComponent(skillId)}/publish`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
@@ -843,7 +907,7 @@ export async function publishSkillManifest(
 }
 
 export function subscribeToEvents(taskId: string, handlers: EventSubscriptionHandlers): () => void {
-  const es = new EventSource(`${BASE_URL}/tasks/${taskId}/events`);
+  const es = new EventSource(`${apiBaseUrl()}/tasks/${taskId}/events`);
 
   es.onopen = () => {
     handlers.onOpen?.();
@@ -864,7 +928,7 @@ export function subscribeToEvents(taskId: string, handlers: EventSubscriptionHan
 }
 
 export function subscribeToWorkbenchEvents(handlers: EventSubscriptionHandlers): () => void {
-  const es = new EventSource(`${BASE_URL}/workbench/events`);
+  const es = new EventSource(`${apiBaseUrl()}/workbench/events`);
 
   es.onopen = () => {
     handlers.onOpen?.();
@@ -886,31 +950,36 @@ export function subscribeToWorkbenchEvents(handlers: EventSubscriptionHandlers):
 
 export async function fetchWorkspaceStatus(rootPath?: string): Promise<WorkspaceStatusResponse> {
   const search = rootPath ? `?rootPath=${encodeURIComponent(rootPath)}` : '';
-  const res = await fetch(`${BASE_URL}/workspace/status${search}`);
+  const res = await fetch(`${apiBaseUrl()}/workspace/status${search}`);
   return readJsonOrThrow<WorkspaceStatusResponse>(res);
+}
+
+export async function fetchAvailableWorkspaces(): Promise<AvailableWorkspacesResponse> {
+  const res = await fetch(`${apiBaseUrl()}/workspaces`);
+  return readJsonOrThrow<AvailableWorkspacesResponse>(res);
 }
 
 export async function fetchWorkspaceReport(rootPath?: string): Promise<unknown> {
   const search = rootPath ? `?rootPath=${encodeURIComponent(rootPath)}` : '';
-  const res = await fetch(`${BASE_URL}/workspace/report${search}`);
+  const res = await fetch(`${apiBaseUrl()}/workspace/report${search}`);
   return readJsonOrThrow(res);
 }
 
 export async function fetchWorkspaceBoard(rootPath?: string): Promise<unknown> {
   const search = rootPath ? `?rootPath=${encodeURIComponent(rootPath)}` : '';
-  const res = await fetch(`${BASE_URL}/workspace/board${search}`);
+  const res = await fetch(`${apiBaseUrl()}/workspace/board${search}`);
   return readJsonOrThrow(res);
 }
 
 export async function fetchWorkspaceDecisions(rootPath?: string): Promise<WorkspaceDecisionsResponse> {
   const search = rootPath ? `?rootPath=${encodeURIComponent(rootPath)}` : '';
-  const res = await fetch(`${BASE_URL}/workspace/decisions${search}`);
+  const res = await fetch(`${apiBaseUrl()}/workspace/decisions${search}`);
   return readJsonOrThrow<WorkspaceDecisionsResponse>(res);
 }
 
 export async function fetchWorkspaceWorktrees(rootPath?: string): Promise<WorkspaceWorktreesResponse> {
   const search = rootPath ? `?rootPath=${encodeURIComponent(rootPath)}` : '';
-  const res = await fetch(`${BASE_URL}/workspace/worktrees${search}`);
+  const res = await fetch(`${apiBaseUrl()}/workspace/worktrees${search}`);
   return readJsonOrThrow<WorkspaceWorktreesResponse>(res);
 }
 
@@ -919,7 +988,7 @@ export async function createWorkspaceWorktree(
   rootPath?: string,
 ): Promise<WorkspaceStatusResponse> {
   const search = rootPath ? `?rootPath=${encodeURIComponent(rootPath)}` : '';
-  const res = await fetch(`${BASE_URL}/workspace/worktrees/create${search}`, {
+  const res = await fetch(`${apiBaseUrl()}/workspace/worktrees/create${search}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -932,7 +1001,7 @@ export async function useWorkspaceWorktree(
   rootPath?: string,
 ): Promise<WorkspaceStatusResponse> {
   const search = rootPath ? `?rootPath=${encodeURIComponent(rootPath)}` : '';
-  const res = await fetch(`${BASE_URL}/workspace/worktrees/use${search}`, {
+  const res = await fetch(`${apiBaseUrl()}/workspace/worktrees/use${search}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -945,7 +1014,7 @@ export async function removeWorkspaceWorktree(
   rootPath?: string,
 ): Promise<WorkspaceStatusResponse> {
   const search = rootPath ? `?rootPath=${encodeURIComponent(rootPath)}` : '';
-  const res = await fetch(`${BASE_URL}/workspace/worktrees/remove${search}`, {
+  const res = await fetch(`${apiBaseUrl()}/workspace/worktrees/remove${search}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -959,7 +1028,7 @@ export async function resolveWorkspaceDecision(
   rootPath?: string,
 ): Promise<{ apiVersion: string; schemaVersion: number; decision: WorkspaceDecision | null; state: WorkspaceStatusResponse['state'] }> {
   const search = rootPath ? `?rootPath=${encodeURIComponent(rootPath)}` : '';
-  const res = await fetch(`${BASE_URL}/workspace/decisions/${encodeURIComponent(decisionId)}/resolve${search}`, {
+  const res = await fetch(`${apiBaseUrl()}/workspace/decisions/${encodeURIComponent(decisionId)}/resolve${search}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

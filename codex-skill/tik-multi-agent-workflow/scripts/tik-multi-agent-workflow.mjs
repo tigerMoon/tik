@@ -356,7 +356,7 @@ async function runAction(options, plannedAction) {
     invocation: response.invocation,
     guard: response.guard,
     instruction: response.token
-      ? 'Run the Claude Questioner plugin/runtime with the printed TIK_QUESTIONER_* values; the plugin should POST QuestionerOutputV2 to submitUrl.'
+      ? 'Spawn a Codex native subagent to run the Claude Questioner plugin/runtime with the printed TIK_QUESTIONER_* values, then return; the plugin hook/callback should POST QuestionerOutputV2 to submitUrl.'
       : response.guard?.message,
     env: response.token
       ? {
@@ -637,7 +637,7 @@ async function startQuestioner(options) {
     tokenExpiresAt: run.tokenExpiresAt,
     token: run.token,
     invocation: run.invocation,
-    instruction: 'Run the Claude Questioner plugin/runtime with the printed TIK_QUESTIONER_* values; the plugin should POST QuestionerOutputV2 to submitUrl.',
+    instruction: 'Spawn a Codex native subagent to run the Claude Questioner plugin/runtime with the printed TIK_QUESTIONER_* values, then return; the plugin hook/callback should POST QuestionerOutputV2 to submitUrl.',
     env: {
       TIK_QUESTIONER_RUN_ID: run.questionerRunId,
       TIK_QUESTIONER_CONTEXT_URL: absoluteApiUrl(options, run.contextUrl),
@@ -1392,7 +1392,7 @@ async function executeContinueDecision(options, state, decision) {
         pendingAction: output.action,
         instruction: [
           output.instruction,
-          'After Claude submits QuestionerOutputV2, continue the workflow.',
+          'Do not wait synchronously for Claude; after Tik records the QuestionerOutputV2 callback, continue the workflow.',
         ].filter(Boolean).join(' '),
       },
       action: output.action,

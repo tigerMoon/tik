@@ -53,6 +53,54 @@ afterEach(async () => {
 });
 
 describe('workspace API server routes', () => {
+  it('lists available workspace-backed API servers for dashboard switching', async () => {
+    const resolution = await createWorkspaceResolution();
+    const previousRegistryPath = process.env.TIK_WORKSPACE_SERVER_REGISTRY;
+    process.env.TIK_WORKSPACE_SERVER_REGISTRY = path.join(resolution.workspace!.rootPath, '.tik-workspace-servers.json');
+    const mockKernel = {
+      taskManager: { create: () => ({ id: 'task-1' }) },
+      runTask: async () => ({ status: 'pending' }),
+      listTasks: () => [],
+      getTask: () => null,
+      control: () => undefined,
+      getEvents: () => [],
+      streamEvents: async function* streamEvents() {},
+    };
+
+    try {
+      const server = await createServer(
+        mockKernel as any,
+        { port: 0, host: '127.0.0.1' },
+        {
+          workspaceRoot: resolution.workspace!.rootPath,
+          publicApiBaseUrl: 'http://127.0.0.1:43210/api',
+        },
+      );
+      servers.push(server);
+
+      const response = await server.inject({ method: 'GET', url: '/api/workspaces' });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        currentApiBaseUrl: 'http://127.0.0.1:43210/api',
+        currentWorkspaceRoot: resolution.workspace!.rootPath,
+        workspaces: [
+          expect.objectContaining({
+            workspaceRoot: resolution.workspace!.rootPath,
+            workspaceName: path.basename(resolution.workspace!.rootPath),
+            apiBaseUrl: 'http://127.0.0.1:43210/api',
+          }),
+        ],
+      });
+    } finally {
+      if (previousRegistryPath === undefined) {
+        delete process.env.TIK_WORKSPACE_SERVER_REGISTRY;
+      } else {
+        process.env.TIK_WORKSPACE_SERVER_REGISTRY = previousRegistryPath;
+      }
+    }
+  });
+
   it('serves workspace status, memory, and decisions endpoints for non-CLI consumers', async () => {
     const resolution = await createWorkspaceResolution();
     const orchestrator = new WorkspaceOrchestrator();

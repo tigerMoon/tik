@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
-import type { EnvironmentPackManifest, EnvironmentPackSelection } from '@tik/shared';
+import type { EnvironmentPackManifest, EnvironmentPackSelection, MultiAgentWorkflowRecord } from '@tik/shared';
 import {
   buildWorkbenchArtifactLinkPreviewUrl,
   type CreateWorkbenchTaskInput,
@@ -45,6 +45,7 @@ interface WorkbenchTaskListProps {
   packs: EnvironmentPackManifest[];
   activePackId: string | null;
   tasks: WorkbenchTaskResponse[];
+  multiAgentWorkflows: MultiAgentWorkflowRecord[];
   activeTask: WorkbenchTaskResponse | null;
   activeTaskId: string | null;
   selectedLens: WorkbenchLens;
@@ -68,6 +69,7 @@ export function WorkbenchTaskList({
   packs,
   activePackId,
   tasks,
+  multiAgentWorkflows,
   activeTask,
   activeTaskId,
   selectedLens,
@@ -125,6 +127,9 @@ export function WorkbenchTaskList({
   const inheritsFocusedSetup = !!activeTask
     && !!selectedPackId
     && selectedPackId === activeTask.environmentPackSnapshot?.id;
+  const emptyTaskCopy = multiAgentWorkflows.length > 0
+    ? 'Multi-agent workflows are listed above; no workbench tasks exist in this lane yet.'
+    : 'Switch lanes or launch a new task to wake the inbox.';
 
   useEffect(() => {
     const shouldInitialize = shouldInitializeWorkbenchTaskLaunchDraft({
@@ -169,6 +174,21 @@ export function WorkbenchTaskList({
   return (
     <>
       <section className="queue-card">
+      {multiAgentWorkflows.length > 0 ? (
+        <div className="workflow-overview" aria-label="Multi-agent workflows">
+          <div className="workflow-overview-header">
+            <div>
+              <div className="queue-card-kicker">Multi-agent workflows</div>
+              <div className="queue-card-title">{multiAgentWorkflows.length} workflow{multiAgentWorkflows.length === 1 ? '' : 's'}</div>
+            </div>
+          </div>
+          <div className="workflow-overview-list">
+            {multiAgentWorkflows.map((workflow) => (
+              <WorkflowOverviewRow key={workflow.id} workflow={workflow} />
+            ))}
+          </div>
+        </div>
+      ) : null}
       <div className="queue-card-header">
         <div>
           <div className="queue-card-kicker">Tasks by progress</div>
@@ -183,7 +203,7 @@ export function WorkbenchTaskList({
             <div className="queue-empty-copy">
               {loading
                 ? 'Restoring tasks, decisions, and artifact signals from the workbench.'
-                : 'Switch lanes or launch a new task to wake the inbox.'}
+                : emptyTaskCopy}
             </div>
             {loading ? (
               <div className="queue-loading-pill">Restoring operator console…</div>
@@ -680,6 +700,70 @@ function TaskRailRow({
       </div>
     </article>
   );
+}
+
+function WorkflowOverviewRow({ workflow }: { workflow: MultiAgentWorkflowRecord }) {
+  const updatedAt = formatRelativeDate(workflow.updatedAt || workflow.createdAt);
+  const subtaskCount = workflow.taskGraphVersion ? `TaskGraph v${workflow.taskGraphVersion}` : 'No TaskGraph yet';
+  const refLabel = [workflow.baseRef, workflow.headRef].filter(Boolean).join(' -> ') || workflow.repo || 'No refs';
+  const bindingLabel = buildTaskBindingLabel(workflow.workspaceBinding);
+
+  return (
+    <article className="workflow-row">
+      <div className={`queue-status-dot status-${workflowStatusTone(workflow.status)}`} />
+      <div className="workflow-row-main">
+        <div className="queue-task-top">
+          <div className="queue-task-title-line">
+            <span className="queue-task-id">{workflow.id}</span>
+            <span className="queue-task-title">{workflow.goal}</span>
+          </div>
+          <span className="queue-task-updated">{updatedAt}</span>
+        </div>
+        <div className="queue-task-meta">
+          <span className={`queue-status-badge status-${workflowStatusTone(workflow.status)}`}>
+            {humanizeWorkflowStatus(workflow.status)}
+          </span>
+          <span className="queue-binding-chip">{bindingLabel}</span>
+          <span className="queue-pack-chip">{subtaskCount}</span>
+          <span className="queue-pack-chip">{refLabel}</span>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function humanizeWorkflowStatus(status: MultiAgentWorkflowRecord['status']): string {
+  switch (status) {
+    case 'questioning_requirements':
+      return 'Questioning';
+    case 'task_graph_questioning':
+      return 'Plan review';
+    case 'human_review_required':
+      return 'Review';
+    case 'completed':
+      return 'Done';
+    case 'aborted':
+      return 'Aborted';
+    default:
+      return status.replace(/_/g, ' ');
+  }
+}
+
+function workflowStatusTone(status: MultiAgentWorkflowRecord['status']): 'green' | 'blue' | 'yellow' | 'neutral' {
+  switch (status) {
+    case 'completed':
+      return 'green';
+    case 'active':
+    case 'planning':
+      return 'blue';
+    case 'blocked':
+    case 'failed':
+    case 'human_review_required':
+    case 'aborted':
+      return 'yellow';
+    default:
+      return 'neutral';
+  }
 }
 
 function humanizeStatus(status: WorkbenchTaskResponse['status']): string {
