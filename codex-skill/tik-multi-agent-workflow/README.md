@@ -6,6 +6,22 @@ This skill lets Codex drive implementation decisions while Tik stores durable
 workflow state, TaskGraph plans, subtask state, evidence, evaluator/questioner
 runs, guard decisions, and Dashboard-visible audit history.
 
+## Migration From v1.0
+
+v1.1 removed the legacy multi-agent Claude review command path. Existing
+multi-agent workflows should use the contract/evaluator/questioner loop instead:
+
+| Removed command | v1.1 replacement |
+| --- | --- |
+| `review` | `start-questioner --intent question_evaluation`, then `record-questioner` after Claude submits `QuestionerOutputV2`. |
+| `process-review` | `record-questioner --intent question_evaluation`, followed by `complete-subtask` when Tik guards pass. |
+| `fix` | Fix in the current Codex session, then `execute`, `validate`, `evaluate`, and `record-questioner`. |
+| `final-review` | `evaluate --subtask __final__`, then `start-questioner --intent question_final_evidence`. |
+| `process-final-review` | `record-questioner --intent question_final_evidence`, then `complete-workflow`. |
+
+The separate Workbench/agent-loop Claude review product remains available; this
+removal only applies to Tik multi-agent workflow commands.
+
 ## Capability Summary
 
 | Command | Capability | Tik records |
