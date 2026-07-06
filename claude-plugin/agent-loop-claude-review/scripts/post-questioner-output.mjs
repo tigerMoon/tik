@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
-import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { canonicalOutputHash } from './_generated/questioner-hash.mjs';
 
 async function main() {
   const [outputPath] = process.argv.slice(2);
@@ -224,31 +224,6 @@ function requiredCoverageEntries(context) {
     id: `global-ac-${index + 1}`,
     text: criterion,
   }));
-}
-
-function canonicalOutputHash(output) {
-  return `sha256:${createHash('sha256').update(stableStringify({
-    ...output,
-    attestation: {
-      ...output.attestation,
-      outputHash: '',
-    },
-  })).digest('hex')}`;
-}
-
-function stableStringify(value) {
-  return JSON.stringify(sortJson(value));
-}
-
-function sortJson(value) {
-  if (Array.isArray(value)) return value.map(sortJson);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([, entry]) => entry !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entry]) => [key, sortJson(entry)]),
-  );
 }
 
 function contextResponseRef(context) {

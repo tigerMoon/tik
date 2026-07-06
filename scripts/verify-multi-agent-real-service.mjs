@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { canonicalOutputHash } from '../claude-plugin/agent-loop-claude-review/scripts/_generated/questioner-hash.mjs';
 
 const repoRoot = path.resolve(new URL('..', import.meta.url).pathname);
 const nodePath = process.execPath;
@@ -688,34 +688,8 @@ function buildQuestionerOutput(input) {
     missingTests: [],
     advisoryNotes: [],
   };
-  output.attestation.outputHash = canonicalQuestionerOutputHash(output);
+  output.attestation.outputHash = canonicalOutputHash(output);
   return output;
-}
-
-function canonicalQuestionerOutputHash(output) {
-  return `sha256:${createHash('sha256').update(stableStringify({
-    ...output,
-    attestation: {
-      ...output.attestation,
-      outputHash: '',
-    },
-    createdAt: undefined,
-  })).digest('hex')}`;
-}
-
-function stableStringify(value) {
-  return JSON.stringify(sortJson(value));
-}
-
-function sortJson(value) {
-  if (Array.isArray(value)) return value.map(sortJson);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([, entry]) => entry !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entry]) => [key, sortJson(entry)]),
-  );
 }
 
 async function startTikServe(input) {

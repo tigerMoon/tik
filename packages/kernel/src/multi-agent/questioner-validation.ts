@@ -7,7 +7,11 @@ import type {
   QuestionerRun,
   SprintContract,
 } from '@tik/shared';
-import { stableHash, stableStringify } from './questioner-context.js';
+import {
+  canonicalOutputHash,
+  canonicalOutputJson as stableCanonicalOutputJson,
+  stableHash,
+} from '@tik/shared';
 
 export interface QuestionerValidationResult {
   accepted: boolean;
@@ -38,14 +42,7 @@ export function computeQuestionerOutputHash(
     attestation: Omit<QuestionerOutputV2['attestation'], 'outputHash'> & { outputHash?: string };
   },
 ): string {
-  return stableHash({
-    ...output,
-    attestation: {
-      ...output.attestation,
-      outputHash: '',
-    },
-    createdAt: undefined,
-  });
+  return canonicalOutputHash(output as QuestionerOutputV2);
 }
 
 export function validateQuestionerOutputV2(args: {
@@ -212,14 +209,7 @@ export function assertCanonicalContextHash(context: QuestionerContextV1): boolea
 }
 
 export function canonicalOutputJson(output: QuestionerOutputV2): string {
-  return stableStringify({
-    ...output,
-    attestation: {
-      ...output.attestation,
-      outputHash: '',
-    },
-    createdAt: undefined,
-  });
+  return stableCanonicalOutputJson(output);
 }
 
 function requiredCriterionIds(context: QuestionerContextV1, contract?: SprintContract): Array<{ id: string; text: string }> {

@@ -93,3 +93,10 @@ export {
   isWorkbenchTaskWorkflowDispatchable,
   isWorkbenchTaskMaintenance,
 } from './workbench-dispatch.js';
+export {
+  canonicalOutputHash,
+  canonicalOutputJson,
+  canonicalOutputPayload,
+  stableHash,
+  stableStringify,
+} from './questioner-hash.js';

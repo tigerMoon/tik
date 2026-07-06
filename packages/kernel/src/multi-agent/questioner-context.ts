@@ -12,6 +12,7 @@ import type {
   SprintContract,
   SubtaskSpec,
 } from '@tik/shared';
+import { stableHash } from '@tik/shared';
 
 const MAX_DIFF_FILES = 8;
 const MAX_RELEVANT_FILES = 8;
@@ -141,14 +142,6 @@ export async function buildQuestionerContext(
       contextHash,
     },
   });
-}
-
-export function stableHash(value: unknown): string {
-  return `sha256:${createHash('sha256').update(stableStringify(value)).digest('hex')}`;
-}
-
-export function stableStringify(value: unknown): string {
-  return JSON.stringify(sortJson(value));
 }
 
 export function redactSensitiveContext<T>(value: T): T {
@@ -684,24 +677,6 @@ function changedFilesFromEvidence(evidence: MultiAgentWorkflowEvidence): Array<{
       return undefined;
     })
     .filter((entry): entry is { path: string; changeType?: string } => Boolean(entry));
-}
-
-function stableStringKeyOrder(entries: [string, unknown][]): [string, unknown][] {
-  return entries.sort(([left], [right]) => left.localeCompare(right));
-}
-
-function sortJson(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sortJson);
-  }
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-  return Object.fromEntries(
-    stableStringKeyOrder(Object.entries(value as Record<string, unknown>))
-      .filter(([, entry]) => entry !== undefined)
-      .map(([key, entry]) => [key, sortJson(entry)]),
-  );
 }
 
 function redactSensitiveObject(value: unknown): unknown {
