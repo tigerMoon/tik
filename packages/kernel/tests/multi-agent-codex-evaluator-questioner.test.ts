@@ -8,6 +8,7 @@ import { EventBus } from '../src/event-bus.js';
 import { createServer } from '../src/server.js';
 import { WorkbenchService } from '../src/workbench/workbench-service.js';
 import { WorkbenchStore } from '../src/workbench/workbench-store.js';
+import { createWorkflowDecisionContext, hasSufficientEvaluationQuestionerOutput } from '../src/multi-agent/workflow-engine/predicates.js';
 
 const tempDirs: string[] = [];
 const servers: Array<{ close: () => Promise<unknown> }> = [];
@@ -631,6 +632,38 @@ describe('codex evaluator and Claude questioner workflow', () => {
         id: 'inv-questioner-v2',
         status: 'completed',
       },
+    });
+    const bundleResponse = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-questioner-run-v2',
+    });
+    expect(bundleResponse.statusCode).toBe(200);
+    expect(bundleResponse.json()).toMatchObject({
+      questionerRuns: [
+        expect.objectContaining({
+          id: 'qr-v2',
+          status: 'validated',
+          outputHash: output.attestation.outputHash,
+        }),
+      ],
+      questionerOutputs: [
+        expect.objectContaining({
+          id: 'q-v2-clear',
+          questionerRunId: 'qr-v2',
+          references: expect.objectContaining({
+            contractId: 'contract-st-api-v1',
+            evaluationRunId: 'eval-pass',
+          }),
+        }),
+      ],
+    });
+    expect(
+      hasSufficientEvaluationQuestionerOutput(
+        createWorkflowDecisionContext({ bundle: bundleResponse.json() }),
+        'st-api',
+      ),
+    ).toMatchObject({
+      ok: true,
     });
 
     const complete = await server.inject({

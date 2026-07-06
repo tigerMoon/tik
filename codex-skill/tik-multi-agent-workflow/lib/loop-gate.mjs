@@ -1,5 +1,7 @@
 import { allSubtasksDone } from './task-graph.mjs';
 
+// Offline/debug fallback for CLI use when Kernel /next-action is unavailable.
+// Kernel workflow-engine/planner.ts is canonical; keep mirror fixtures aligned.
 export function decideNextAction(state) {
   const workflow = state.workflow;
   const graph = state.taskGraph;

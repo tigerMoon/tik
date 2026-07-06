@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { MultiAgentWorkflowBundle, WorkflowDecisionAction } from '@tik/shared';
 import { tikV1Actions } from '../src/multi-agent/workflow-engine/action-registry.js';
 import { planNextAction } from '../src/multi-agent/workflow-engine/planner.js';
+import { decideNextAction } from '../../../codex-skill/tik-multi-agent-workflow/lib/loop-gate.mjs';
 
 describe('multi-agent workflow engine', () => {
   it('keeps v1 action registry metadata complete for runnable actions', () => {
@@ -260,7 +261,209 @@ describe('multi-agent workflow engine', () => {
       },
     });
   });
+
+  it('keeps the Codex skill offline fallback aligned with canonical Kernel planning fixtures', () => {
+    const draftContract = buildBundle({
+      contracts: [],
+      evaluationRuns: [],
+      evidence: [],
+      questionerOutputs: [],
+      subtasks: {
+        'st-api': {
+          subtaskId: 'st-api',
+          status: 'ready',
+          validationRunIds: [],
+          evidenceRefs: [],
+          blockerFindingIds: [],
+          fixRound: 0,
+        },
+      },
+    });
+    const acceptContract = buildBundle({
+      contracts: [{
+        id: 'contract-st-api-v1',
+        workflowId: 'wf-engine',
+        subtaskId: 'st-api',
+        version: 1,
+        status: 'draft',
+        goal: 'Implement API',
+        scope: { allowedPaths: ['packages/kernel/src'], blockedPaths: [] },
+        deliverables: [],
+        acceptanceCriteria: [],
+        verificationPlan: { commands: [] },
+        questionerOutputRefs: [],
+        createdAt: '2026-07-03T00:00:00.000Z',
+        updatedAt: '2026-07-03T00:00:00.000Z',
+      }],
+      evaluationRuns: [],
+      evidence: [],
+      questionerOutputs: [],
+      subtasks: {
+        'st-api': {
+          subtaskId: 'st-api',
+          status: 'contract_drafting',
+          validationRunIds: [],
+          evidenceRefs: [],
+          blockerFindingIds: [],
+          fixRound: 0,
+        },
+      },
+    });
+    const runEvaluator = buildBundle({
+      contracts: [acceptedContractFixture()],
+      evaluationRuns: [],
+      evidence: [implementationEvidenceFixture()],
+      questionerOutputs: [],
+      subtasks: {
+        'st-api': {
+          subtaskId: 'st-api',
+          status: 'implemented',
+          validationRunIds: [],
+          evidenceRefs: ['ev-impl'],
+          blockerFindingIds: [],
+          fixRound: 0,
+        },
+      },
+    });
+    const askQuestioner = buildBundle({
+      contracts: [acceptedContractFixture()],
+      evaluationRuns: [passingEvaluationFixture()],
+      evidence: [implementationEvidenceFixture()],
+      questionerOutputs: [],
+      subtasks: {
+        'st-api': {
+          subtaskId: 'st-api',
+          status: 'evaluation_passed',
+          validationRunIds: [],
+          evidenceRefs: ['ev-impl'],
+          blockerFindingIds: [],
+          fixRound: 0,
+        },
+      },
+    });
+    const finalEvaluation = buildBundle({
+      contracts: [acceptedContractFixture()],
+      evaluationRuns: [],
+      evidence: [implementationEvidenceFixture()],
+      questionerOutputs: [],
+      subtasks: {
+        'st-api': {
+          subtaskId: 'st-api',
+          status: 'done',
+          validationRunIds: [],
+          evidenceRefs: ['ev-impl'],
+          blockerFindingIds: [],
+          fixRound: 0,
+        },
+      },
+    });
+
+    for (const [name, bundle] of [
+      ['draft contract', draftContract],
+      ['accept contract', acceptContract],
+      ['run evaluator', runEvaluator],
+      ['ask questioner', askQuestioner],
+      ['final evaluation', finalEvaluation],
+    ] satisfies Array<[string, MultiAgentWorkflowBundle]>) {
+      const planned = planNextAction({ bundle });
+      const fallback = decideNextAction(bundle);
+      expect(projectNextAction(fallback), name).toEqual(projectNextAction(planned));
+    }
+  });
 });
+
+function projectNextAction(action: {
+  action: string;
+  subtaskId?: string;
+  evidenceRefs?: string[];
+  inputs?: Record<string, unknown>;
+}) {
+  return {
+    action: action.action,
+    subtaskId: action.subtaskId,
+    evidenceRefs: action.evidenceRefs || [],
+    inputs: Object.fromEntries(
+      Object.entries(action.inputs || {})
+        .filter(([key]) => [
+          'contractId',
+          'evaluationRunId',
+          'implementationEvidenceId',
+          'taskGraphVersion',
+          'title',
+        ].includes(key))
+        .sort(([left], [right]) => left.localeCompare(right)),
+    ),
+  };
+}
+
+function acceptedContractFixture() {
+  return {
+    id: 'contract-st-api-v1',
+    workflowId: 'wf-engine',
+    subtaskId: 'st-api',
+    version: 1,
+    status: 'accepted' as const,
+    goal: 'Implement API',
+    scope: { allowedPaths: ['packages/kernel/src'], blockedPaths: [] },
+    deliverables: [],
+    acceptanceCriteria: [],
+    verificationPlan: { commands: [] },
+    questionerOutputRefs: [],
+    acceptedBy: 'codex-workflow-plugin',
+    acceptedAt: '2026-07-03T00:00:00.000Z',
+    headShaAtAcceptance: 'head-1',
+  };
+}
+
+function implementationEvidenceFixture() {
+  return {
+    id: 'ev-impl',
+    workflowId: 'wf-engine',
+    subtaskId: 'st-api',
+    kind: 'implementation' as const,
+    title: 'Implementation',
+    headSha: 'head-1',
+    payload: {
+      changedFiles: [
+        { path: 'packages/kernel/src/multi-agent/workflow-engine/planner.ts', changeType: 'modified' },
+      ],
+    },
+    createdAt: '2026-07-03T00:01:00.000Z',
+  };
+}
+
+function passingEvaluationFixture() {
+  return {
+    id: 'eval-pass',
+    workflowId: 'wf-engine',
+    subtaskId: 'st-api',
+    contractId: 'contract-st-api-v1',
+    evaluator: { kind: 'codex-evaluator' as const },
+    status: 'passed' as const,
+    headSha: 'head-1',
+    readonlyPolicy: { enforced: true, allowedWritePaths: [], forbiddenWritePaths: [], violations: [] },
+    artifactRefs: [],
+    startedAt: '2026-07-03T00:02:00.000Z',
+    result: {
+      workflowId: 'wf-engine',
+      subtaskId: 'st-api',
+      contractId: 'contract-st-api-v1',
+      evaluatorRunId: 'eval-pass',
+      headSha: 'head-1',
+      verdict: 'pass' as const,
+      criteriaResults: [],
+      commandResults: [{
+        command: 'pnpm --filter @tik/kernel test',
+        status: 'passed' as const,
+        exitCode: 0,
+        summary: 'Kernel tests passed.',
+      }],
+      runtimeFindings: [],
+      coverageGaps: [],
+      confidence: 0.9,
+    },
+  };
+}
 
 function buildBundle(overrides: Partial<MultiAgentWorkflowBundle> = {}): MultiAgentWorkflowBundle {
   const base: MultiAgentWorkflowBundle = {
