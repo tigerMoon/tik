@@ -646,6 +646,101 @@ export async function createServer(
     return binding;
   }
 
+  async function ensureMultiAgentWorkflowRootTask(
+    input: CreateMultiAgentWorkflowInput,
+    workspaceBinding: TaskWorkspaceBinding | undefined,
+  ): Promise<WorkbenchTaskRecord | null> {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      return null;
+    }
+
+    const rootTaskId = input.rootTaskId?.trim();
+    if (rootTaskId) {
+      const existing = await findWorkbenchTaskByIdOrIdentifier(workbench, rootTaskId);
+      if (existing) {
+        const labels = mergeLabels(existing.labels, ['multi-agent', 'workflow-root']);
+        if (
+          labels.length !== (existing.labels || []).length
+          || (workspaceBinding && !existing.workspaceBinding)
+        ) {
+          return await workbench.updateTaskTrackerMetadata(existing.id, {
+            labels,
+            workspaceBinding: existing.workspaceBinding || workspaceBinding,
+          }) || existing;
+        }
+        return existing;
+      }
+    }
+
+    const workflowId = input.id?.trim() || rootTaskId || undefined;
+    const taskId = rootTaskId || workflowId;
+    const title = buildMultiAgentRootTaskTitle(input);
+    const goal = input.goal;
+    const task = await workbench.createTask({
+      id: taskId,
+      title,
+      description: buildMultiAgentRootTaskDescription(input),
+      goal,
+      status: 'todo',
+      labels: ['multi-agent', 'workflow-root'],
+      createdBy: 'codex',
+      sourceUrl: workflowId ? `tik://multi-agent/workflows/${workflowId}` : undefined,
+      workspaceBinding,
+    }, taskId);
+    return task;
+  }
+
+  async function syncMultiAgentRootTaskFromWorkflow(
+    workflow: MultiAgentWorkflowRecord,
+    input: {
+      status?: WorkbenchTaskStatus;
+      reason: string;
+      labels?: string[];
+    },
+  ): Promise<WorkbenchTaskRecord | null> {
+    const workbench = (kernel as Partial<ExecutionKernel>).workbench;
+    if (!workbench) {
+      return null;
+    }
+
+    const existing = await findWorkbenchTaskByIdOrIdentifier(workbench, workflow.rootTaskId);
+    if (!existing) {
+      return null;
+    }
+
+    const labels = mergeLabels(existing.labels, ['multi-agent', 'workflow-root', ...(input.labels || [])]);
+    let task = existing;
+    if (
+      labels.length !== (existing.labels || []).length
+      || (workflow.workspaceBinding && !existing.workspaceBinding)
+    ) {
+      task = await workbench.updateTaskTrackerMetadata(existing.id, {
+        labels,
+        workspaceBinding: existing.workspaceBinding || workflow.workspaceBinding,
+      }) || existing;
+    }
+
+    if (!input.status || task.status === input.status) {
+      return task;
+    }
+    if (isWorkbenchTerminalStatus(task.status)) {
+      return task;
+    }
+
+    return await transitionMultiAgentRootTask(workbench, task, input.status, input.reason);
+  }
+
+  async function syncMultiAgentRootTaskForDecision(
+    workflow: MultiAgentWorkflowRecord,
+    decision: WorkflowDecision,
+  ): Promise<WorkbenchTaskRecord | null> {
+    return await syncMultiAgentRootTaskFromWorkflow(workflow, {
+      status: workbenchStatusForWorkflowDecision(workflow, decision),
+      reason: `Multi-agent workflow ${workflow.id} recorded decision ${decision.action}: ${decision.reason}`,
+    });
+  }
+
   function buildWorkbenchTaskDescription(
     title: string,
     goal: string,
@@ -1228,11 +1323,18 @@ export async function createServer(
     '/api/v1/multi-agent/workflows',
     async (req, reply) => {
       try {
+        const workspaceBinding = await resolveMultiAgentWorkspaceBinding(req.body.workspaceBinding);
+        const rootTask = await ensureMultiAgentWorkflowRootTask(req.body, workspaceBinding);
         const workflow = await multiAgentStore.createWorkflow({
           ...req.body,
-          workspaceBinding: await resolveMultiAgentWorkspaceBinding(req.body.workspaceBinding),
+          rootTaskId: rootTask?.id || req.body.rootTaskId,
+          workspaceBinding,
         });
-        return { workflow };
+        const syncedRootTask = await syncMultiAgentRootTaskFromWorkflow(workflow, {
+          status: 'in_progress',
+          reason: `Multi-agent workflow ${workflow.id} started.`,
+        });
+        return { workflow, rootTask: syncedRootTask || rootTask };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1263,6 +1365,51 @@ export async function createServer(
           return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
         }
         return sanitizeMultiAgentWorkflowBundle(bundle);
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string } }>(
+    '/api/v1/multi-agent/workflows/:workflowId/root-task/repair',
+    async (req, reply) => {
+      try {
+        const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        if (!workflow) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        }
+        const rootTask = await ensureMultiAgentWorkflowRootTask({
+          id: workflow.id,
+          goal: workflow.goal,
+          rootTaskId: workflow.rootTaskId,
+          repo: workflow.repo,
+          baseRef: workflow.baseRef,
+          headRef: workflow.headRef,
+          headSha: workflow.currentHeadSha,
+          maxRounds: workflow.maxRounds,
+          policy: workflow.policy,
+          workspaceBinding: workflow.workspaceBinding,
+          metadata: workflow.metadata,
+        }, workflow.workspaceBinding);
+        if (!rootTask) {
+          return sendV1Error(reply, 500, 'workbench_unavailable', 'Workbench service is unavailable');
+        }
+        const updatedWorkflow = rootTask.id === workflow.rootTaskId
+          ? workflow
+          : await multiAgentStore.updateWorkflow(workflow.id, {
+              rootTaskId: rootTask.id,
+              metadata: {
+                ...(workflow.metadata || {}),
+                previousRootTaskId: workflow.rootTaskId,
+                rootTaskRepairedAt: new Date().toISOString(),
+              },
+            });
+        const syncedRootTask = await syncMultiAgentRootTaskFromWorkflow(updatedWorkflow, {
+          status: workbenchStatusForMultiAgentWorkflow(updatedWorkflow),
+          reason: `Multi-agent workflow ${updatedWorkflow.id} root task repaired.`,
+        });
+        return { workflow: updatedWorkflow, rootTask: syncedRootTask || rootTask };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1357,10 +1504,14 @@ export async function createServer(
             workflow: recorded.workflow,
           };
         }
+        const rootTask = recorded.decision
+          ? await syncMultiAgentRootTaskForDecision(recorded.workflow, recorded.decision)
+          : null;
         return {
           decision: recorded.decision,
           guard,
           workflow: recorded.workflow,
+          rootTask,
         };
       } catch (error) {
         return sendV1CaughtError(reply, error);
@@ -1455,7 +1606,12 @@ export async function createServer(
     '/api/v1/multi-agent/workflows/:workflowId/human-overrides',
     async (req, reply) => {
       try {
-        return await multiAgentStore.recordHumanOverride(req.params.workflowId, req.body);
+        const result = await multiAgentStore.recordHumanOverride(req.params.workflowId, req.body);
+        const rootTask = await syncMultiAgentRootTaskFromWorkflow(result.workflow, {
+          status: workbenchStatusForMultiAgentWorkflow(result.workflow),
+          reason: `Multi-agent workflow ${result.workflow.id} recorded human override.`,
+        });
+        return { ...result, rootTask };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1520,6 +1676,10 @@ export async function createServer(
             tokenTtlMs: req.body.options?.tokenTtlMs,
             runtimeAudit: req.body.options?.runtimeAudit,
           });
+          const rootTask = await syncMultiAgentRootTaskFromWorkflow(bundle.workflow, {
+            status: 'in_review',
+            reason: `Multi-agent workflow ${bundle.workflow.id} started questioner run ${result.run.id}.`,
+          });
           return {
             action: plannedAction.action,
             plannedAction,
@@ -1538,6 +1698,7 @@ export async function createServer(
             tokenExpiresAt: result.run.tokenExpiresAt,
             questionerRun: redactSensitiveObject(result.run),
             invocation: sanitizeAgentInvocation(result.invocation),
+            rootTask,
           };
         }
         reply.code(409);
@@ -1591,11 +1752,17 @@ export async function createServer(
           }),
         );
         const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        const syncedWorkflow = workflow || bundle.workflow;
+        const rootTask = await syncMultiAgentRootTaskFromWorkflow(syncedWorkflow, {
+          status: workbenchStatusForSubtaskStatus(subtask.status),
+          reason: `Multi-agent workflow ${syncedWorkflow.id} completed subtask ${subtask.subtaskId}.`,
+        });
         return {
           decision,
           guard,
-          workflow: workflow || bundle.workflow,
+          workflow: syncedWorkflow,
           subtask,
+          rootTask,
         };
       } catch (error) {
         return sendV1CaughtError(reply, error);
@@ -1669,7 +1836,9 @@ export async function createServer(
           )
           : undefined;
         const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
-        return { decision, evidence, guard, workflow: workflow || bundle.workflow, subtask };
+        const syncedWorkflow = workflow || bundle.workflow;
+        const rootTask = await syncMultiAgentRootTaskForDecision(syncedWorkflow, decision);
+        return { decision, evidence, guard, workflow: syncedWorkflow, subtask, rootTask };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1712,7 +1881,12 @@ export async function createServer(
             sanitizeSubtaskPatch(req.body.subtaskPatch),
           )
           : undefined;
-        return { decision, guard, evaluationRun, subtask };
+        const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        const rootTask = await syncMultiAgentRootTaskFromWorkflow(workflow || bundle.workflow, {
+          status: workbenchStatusForEvaluationRunStatus(evaluationRun.status, evaluationRun.result?.verdict),
+          reason: `Multi-agent workflow ${req.params.workflowId} recorded evaluation result ${evaluationRun.id}.`,
+        });
+        return { decision, guard, evaluationRun, subtask, rootTask };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1750,7 +1924,16 @@ export async function createServer(
             sanitizeSubtaskPatch(req.body.subtaskPatch),
           )
           : undefined;
-        return { decision, guard, questionerOutput, subtask };
+        const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        const rootTask = await syncMultiAgentRootTaskFromWorkflow(workflow || bundle.workflow, {
+          status: ['questions_blocking', 'risk_found', 'evidence_needed'].includes(questionerOutput.verdict)
+            ? 'blocked'
+            : questionerOutput.verdict === 'human_review_required'
+              ? 'in_review'
+              : 'in_progress',
+          reason: `Multi-agent workflow ${req.params.workflowId} recorded questioner output ${questionerOutput.id}.`,
+        });
+        return { decision, guard, questionerOutput, subtask, rootTask };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1782,10 +1965,13 @@ export async function createServer(
         }
         const decision = await multiAgentStore.recordDecision(req.params.workflowId, req.body.decision);
         const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        const syncedWorkflow = workflow || bundle.workflow;
+        const rootTask = await syncMultiAgentRootTaskForDecision(syncedWorkflow, decision);
         return {
           decision,
           guard,
-          workflow: workflow || bundle.workflow,
+          workflow: syncedWorkflow,
+          rootTask,
         };
       } catch (error) {
         return sendV1CaughtError(reply, error);
@@ -1839,7 +2025,14 @@ export async function createServer(
       try {
         const patch = sanitizeSubtaskPatch(req.body);
         const subtask = await multiAgentStore.updateSubtask(req.params.workflowId, req.params.subtaskId, patch);
-        return { subtask };
+        const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        const rootTask = workflow
+          ? await syncMultiAgentRootTaskFromWorkflow(workflow, {
+              status: workbenchStatusForSubtaskStatus(subtask.status),
+              reason: `Multi-agent workflow ${workflow.id} updated subtask ${subtask.subtaskId} to ${subtask.status}.`,
+            })
+          : null;
+        return { subtask, rootTask };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -4328,6 +4521,202 @@ async function resolveTaskMultiAgentWorkflowBundle(
   }
 
   return null;
+}
+
+async function findWorkbenchTaskByIdOrIdentifier(
+  workbench: { listTasks(): Promise<WorkbenchTaskRecord[]>; readTask(taskId: string): Promise<WorkbenchTaskRecord | null> },
+  taskRef: string,
+): Promise<WorkbenchTaskRecord | null> {
+  const direct = await workbench.readTask(taskRef).catch(() => null);
+  if (direct) {
+    return direct;
+  }
+
+  const tasks = await workbench.listTasks();
+  return tasks.find((item) =>
+    item.id === taskRef
+    || item.identifier === taskRef
+    || item.shortIdentifier === taskRef
+  ) || null;
+}
+
+function buildMultiAgentRootTaskTitle(input: CreateMultiAgentWorkflowInput): string {
+  const goal = input.goal.trim();
+  return goal.length > 96 ? `${goal.slice(0, 93)}...` : goal;
+}
+
+function buildMultiAgentRootTaskDescription(input: CreateMultiAgentWorkflowInput): string {
+  return [
+    'Multi-agent workflow root task.',
+    `Workflow: ${input.id || input.rootTaskId || '(assigned by Tik)'}`,
+    input.repo ? `Repo: ${input.repo}` : null,
+    input.baseRef || input.headRef ? `Refs: ${input.baseRef || 'unknown'} -> ${input.headRef || 'unknown'}` : null,
+    input.headSha ? `Head: ${input.headSha}` : null,
+  ].filter((line): line is string => Boolean(line)).join('\n');
+}
+
+function mergeLabels(existing: string[] | undefined, additions: string[]): string[] {
+  return Array.from(new Set([...(existing || []), ...additions].filter(Boolean))).sort();
+}
+
+function workbenchStatusForMultiAgentWorkflow(workflow: MultiAgentWorkflowRecord): WorkbenchTaskStatus {
+  switch (workflow.status) {
+    case 'completed':
+      return 'completed';
+    case 'aborted':
+      return 'cancelled';
+    case 'failed':
+      return 'failed';
+    case 'blocked':
+      return 'blocked';
+    case 'human_review_required':
+      return 'in_review';
+    case 'questioning_requirements':
+    case 'task_graph_questioning':
+      return 'in_review';
+    case 'created':
+    case 'planning':
+    case 'active':
+    default:
+      return 'in_progress';
+  }
+}
+
+function workbenchStatusForWorkflowDecision(
+  workflow: MultiAgentWorkflowRecord,
+  decision: WorkflowDecision,
+): WorkbenchTaskStatus {
+  switch (decision.action) {
+    case 'complete_workflow':
+      return 'completed';
+    case 'abort_workflow':
+      return 'cancelled';
+    case 'request_human_review':
+    case 'ask_claude_question_requirement':
+    case 'ask_claude_question_task_graph':
+    case 'ask_claude_question_contract':
+    case 'ask_claude_question_evaluation':
+    case 'ask_claude_question_final_evidence':
+      return 'in_review';
+    case 'request_replan':
+      return 'todo';
+    case 'fix_evaluation_findings':
+      return 'todo';
+    case 'run_codex_evaluator':
+    case 'run_final_evaluation':
+    case 'validate_subtask':
+      return 'in_review';
+    case 'complete_subtask':
+      return workbenchStatusForMultiAgentWorkflow(workflow);
+    case 'request_dynamic_plan':
+    case 'draft_contract':
+    case 'accept_contract':
+    case 'execute_subtask':
+    case 'record_implementation':
+    case 're_evaluate':
+    default:
+      return 'in_progress';
+  }
+}
+
+function workbenchStatusForSubtaskStatus(status: SubtaskRunState['status']): WorkbenchTaskStatus {
+  switch (status) {
+    case 'blocked':
+      return 'blocked';
+    case 'human_review_required':
+      return 'in_review';
+    case 'contract_questioning':
+    case 'evaluating':
+    case 'validating':
+    case 'questioning_evidence':
+      return 'in_review';
+    case 'evaluation_failed':
+    case 'validation_failed':
+    case 'needs_fix':
+      return 'todo';
+    case 'pending':
+    case 'ready':
+    case 'contract_drafting':
+    case 'contract_accepted':
+    case 'building':
+    case 'executing':
+    case 'implemented':
+    case 'evaluation_passed':
+    case 'validated':
+    case 'fixing':
+    case 'done':
+    default:
+      return 'in_progress';
+  }
+}
+
+function workbenchStatusForEvaluationRunStatus(
+  status: 'created' | 'running' | 'passed' | 'failed' | 'inconclusive' | 'invalidated',
+  verdict?: 'pass' | 'fail' | 'inconclusive' | 'human_review_required',
+): WorkbenchTaskStatus {
+  if (verdict === 'human_review_required') {
+    return 'in_review';
+  }
+  if (status === 'failed' || status === 'inconclusive' || status === 'invalidated' || verdict === 'fail' || verdict === 'inconclusive') {
+    return 'todo';
+  }
+  return 'in_review';
+}
+
+async function transitionMultiAgentRootTask(
+  workbench: NonNullable<Partial<ExecutionKernel>['workbench']>,
+  task: WorkbenchTaskRecord,
+  status: WorkbenchTaskStatus,
+  reason: string,
+): Promise<WorkbenchTaskRecord | null> {
+  if (task.status === status) {
+    return task;
+  }
+
+  let current = task;
+  const intermediate = intermediateRootTaskStatus(current.status, status);
+  if (intermediate && intermediate !== current.status) {
+    const transitioned = await workbench.transitionTask(current.id, intermediate, {
+      actor: 'system',
+      reason,
+    });
+    current = transitioned || current;
+  }
+
+  if (current.status === status) {
+    return current;
+  }
+
+  try {
+    return await workbench.transitionTask(current.id, status, {
+      actor: 'system',
+      reason,
+    });
+  } catch (error) {
+    if (error instanceof WorkbenchTaskError && error.code === 'transition_not_allowed') {
+      return current;
+    }
+    throw error;
+  }
+}
+
+function intermediateRootTaskStatus(
+  current: WorkbenchTaskStatus,
+  target: WorkbenchTaskStatus,
+): WorkbenchTaskStatus | undefined {
+  if ((current === 'new' || current === 'todo') && ['completed', 'failed', 'in_review'].includes(target)) {
+    return 'in_progress';
+  }
+  if (current === 'in_progress' && target === 'todo') {
+    return 'in_review';
+  }
+  if (current === 'blocked' && target !== 'cancelled' && target !== 'archived') {
+    return 'todo';
+  }
+  if (current === 'paused' && target !== 'cancelled' && target !== 'archived') {
+    return 'in_progress';
+  }
+  return undefined;
 }
 
 function sanitizeMultiAgentWorkflowBundle(bundle: MultiAgentWorkflowBundle): MultiAgentWorkflowBundle {

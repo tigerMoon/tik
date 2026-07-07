@@ -238,7 +238,7 @@ export class FileMultiAgentWorkflowStore {
 
   async updateWorkflow(
     workflowId: string,
-    patch: Partial<Pick<MultiAgentWorkflowRecord, 'status' | 'currentHeadSha' | 'metadata' | 'pauseReason'>> & {
+    patch: Partial<Pick<MultiAgentWorkflowRecord, 'status' | 'currentHeadSha' | 'metadata' | 'pauseReason' | 'rootTaskId'>> & {
       policy?: Partial<WorkflowPolicy>;
     },
   ): Promise<MultiAgentWorkflowRecord> {
@@ -258,6 +258,7 @@ export class FileMultiAgentWorkflowStore {
     const workflow: MultiAgentWorkflowRecord = {
       ...existing,
       status: patch.status ?? existing.status,
+      rootTaskId: patch.rootTaskId ?? existing.rootTaskId,
       currentHeadSha: patch.currentHeadSha ?? existing.currentHeadSha,
       pauseReason: patch.pauseReason ?? existing.pauseReason,
       metadata: patch.metadata ?? existing.metadata,

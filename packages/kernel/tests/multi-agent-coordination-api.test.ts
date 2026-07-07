@@ -82,6 +82,10 @@ describe('multi-agent coordination API', () => {
       },
     });
     expect(created.statusCode).toBe(200);
+    expect(created.json().rootTask).toMatchObject({
+      id: rootTask.id,
+      labels: expect.arrayContaining(['multi-agent', 'workflow-root']),
+    });
 
     const taskGraph = buildTaskGraph('wf-task-detail', 1, [{ id: 'st-api', dependsOn: [] }]);
     taskGraph.risks = ['credential should-not-leak in task graph risk'];
@@ -200,11 +204,122 @@ describe('multi-agent coordination API', () => {
     expect(missing.json().error.code).toBe('workflow_not_found');
   });
 
+  it('creates and repairs workbench root tasks for standalone workflows', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    const repoPath = path.join(root, 'repo');
+    await fs.mkdir(repoPath, { recursive: true });
+    tempDirs.push(root);
+    const { server, workbench } = await createTestServerWithWorkbench(root);
+    servers.push(server);
+
+    const created = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-standalone-root-task',
+        goal: 'Review standalone workflow root task creation',
+        repo: 'repo',
+        baseRef: 'main',
+        headRef: 'feature/workflow-root-task',
+        headSha: 'abc123',
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: 'tik',
+          projectName: 'repo',
+          effectiveProjectPath: repoPath,
+          sourceProjectPath: repoPath,
+          worktreeKind: 'root',
+        },
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    expect(created.json()).toMatchObject({
+      workflow: {
+        id: 'wf-standalone-root-task',
+        rootTaskId: 'wf-standalone-root-task',
+      },
+      rootTask: {
+        id: 'wf-standalone-root-task',
+        status: 'in_progress',
+        labels: expect.arrayContaining(['multi-agent', 'workflow-root']),
+        sourceUrl: 'tik://multi-agent/workflows/wf-standalone-root-task',
+      },
+    });
+
+    const tasks = await workbench.listTasks();
+    expect(tasks.find((task) => task.id === 'wf-standalone-root-task')).toMatchObject({
+      title: 'Review standalone workflow root task creation',
+      workspaceBinding: {
+        effectiveProjectPath: repoPath,
+      },
+    });
+
+    const bundleFromRootTask = await server.inject({
+      method: 'GET',
+      url: '/api/v1/tasks/wf-standalone-root-task/multi-agent-workflow',
+    });
+    expect(bundleFromRootTask.statusCode).toBe(200);
+    expect(bundleFromRootTask.json().workflow.id).toBe('wf-standalone-root-task');
+
+    const repaired = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-standalone-root-task/root-task/repair',
+    });
+    expect(repaired.statusCode).toBe(200);
+    expect(repaired.json().rootTask.id).toBe('wf-standalone-root-task');
+    expect(repaired.json().rootTask.status).toBe('in_progress');
+    expect(await workbench.listTasks()).toHaveLength(1);
+  });
+
+  it('syncs terminal workflow decisions onto the workbench root task', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const { server, workbench } = await createTestServerWithWorkbench(root);
+    servers.push(server);
+
+    const created = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-root-task-terminal-sync',
+        goal: 'Sync terminal workflow status',
+        rootTaskId: 'root-terminal-sync',
+        headSha: 'head-1',
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    expect((await workbench.readTask('root-terminal-sync'))?.status).toBe('in_progress');
+
+    const abort = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-root-task-terminal-sync/decisions',
+      payload: {
+        decision: buildDecision('wf-root-task-terminal-sync', {
+          id: 'dec-abort-terminal-sync',
+          action: 'abort_workflow',
+          reason: 'Stop the workflow.',
+        }),
+      },
+    });
+    expect(abort.statusCode).toBe(200);
+    expect(abort.json()).toMatchObject({
+      workflow: {
+        id: 'wf-root-task-terminal-sync',
+        status: 'aborted',
+      },
+      rootTask: {
+        id: 'root-terminal-sync',
+        status: 'cancelled',
+      },
+    });
+    expect((await workbench.readTask('root-terminal-sync'))?.status).toBe('cancelled');
+  });
+
   it('persists workflow state, task graph, decisions, evidence, and timeline without choosing policy actions', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
     await fs.mkdir(path.join(root, 'repo'), { recursive: true });
     tempDirs.push(root);
-    const server = await createTestServer(root);
+    const { server, workbench } = await createTestServerWithWorkbench(root);
     servers.push(server);
 
     const created = await server.inject({
@@ -239,6 +354,10 @@ describe('multi-agent coordination API', () => {
       rootTaskId: 'root-auth',
       currentHeadSha: 'abc123',
       maxRounds: 2,
+    });
+    expect(created.json().rootTask).toMatchObject({
+      id: 'root-auth',
+      status: 'in_progress',
     });
 
     const taskGraph = {
@@ -302,6 +421,7 @@ describe('multi-agent coordination API', () => {
       },
     });
     expect(validationEvidence.statusCode).toBe(200);
+    expect((await workbench.readTask('root-auth'))?.status).toBe('in_progress');
 
     await server.inject({
       method: 'PATCH',
@@ -361,6 +481,10 @@ describe('multi-agent coordination API', () => {
         id: 'wf-auth',
         lastDecisionId: 'dec-human-review-api',
       },
+      rootTask: {
+        id: 'root-auth',
+        status: 'in_review',
+      },
     });
 
     const updateSubtask = await server.inject({
@@ -378,6 +502,10 @@ describe('multi-agent coordination API', () => {
       status: 'human_review_required',
       evidenceRefs: ['ev-validation'],
       lastValidatedHeadSha: 'abc123',
+    });
+    expect(updateSubtask.json().rootTask).toMatchObject({
+      id: 'root-auth',
+      status: 'in_review',
     });
 
     const readWorkflow = await server.inject({
