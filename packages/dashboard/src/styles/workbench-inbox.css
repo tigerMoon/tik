@@ -2786,10 +2786,37 @@ body {
   gap: 9px;
   grid-template-columns: 10px minmax(0, 1fr);
   padding: 11px 12px 12px 14px;
+  transition: background 120ms ease, box-shadow 120ms ease;
+}
+
+.workflow-row.is-clickable {
+  cursor: pointer;
+}
+
+.workflow-row.is-clickable:hover {
+  background: #fafafa;
+  box-shadow: inset 3px 0 0 #6b72e8;
+}
+
+.workflow-row.is-clickable:focus-visible {
+  outline: 2px solid #6b72e8;
+  outline-offset: -2px;
+}
+
+.workflow-row.is-disabled {
+  cursor: default;
 }
 
 .workflow-row-main {
   min-width: 0;
+}
+
+.workflow-linked-task-chip.is-linked {
+  color: #256f3c;
+}
+
+.workflow-linked-task-chip.is-unlinked {
+  color: #8a8f98;
 }
 
 .queue-task-card {

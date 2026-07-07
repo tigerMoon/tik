@@ -29,6 +29,7 @@ let hookStarts = [];
 let events = [];
 let contextSnapshots = {};
 let decisionIfMatchLog = [];
+let workflowInitBodies = [];
 let forceConcurrentDecisionChange = false;
 
 try {
@@ -38,6 +39,7 @@ try {
       const route = req.url || '/';
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows') {
         const body = await readRequestJson(req);
+        workflowInitBodies.push(body);
         const createdWorkflow = {
           id: body.id || 'wf-cli',
           driver: 'codex-workflow',
@@ -802,6 +804,35 @@ try {
   assert.equal(workflow.metadata.parentCodexThreadId, 'workflow-thread-cli');
   assert.equal(init.mode, 'v1');
   assert.match(init.breakingChange, /v1\.1 removed legacy multi-agent Claude review commands/);
+
+  const workspaceRoot = path.join(tempRoot, 'workspace-root');
+  const sourceProjectPath = path.join(workspaceRoot, 'projects', 'repo');
+  const worktreePath = path.join(workspaceRoot, 'worktrees', 'repo-feature');
+  await initRepo(sourceProjectPath);
+  await initRepo(worktreePath);
+  const workspaceBoundInit = await run([
+    'init',
+    '--api-base-url', apiBaseUrl,
+    '--path', worktreePath,
+    '--workspace-root', workspaceRoot,
+    '--workspace-name', 'test-workspace',
+    '--repo', 'repo',
+    '--source-path', sourceProjectPath,
+    '--lane', 'feature-lane',
+    '--worktree-kind', 'git-worktree',
+    '--goal', 'Bind workflow to workspace root and worktree',
+    '--workflow', 'wf-cli-workspace-binding',
+    '--base', 'main',
+  ]);
+  assert.equal(workspaceBoundInit.action, 'initialized');
+  const workspaceBoundBody = workflowInitBodies.find((body) => body.id === 'wf-cli-workspace-binding');
+  assert.equal(workspaceBoundBody.workspaceBinding.workspaceRoot, workspaceRoot);
+  assert.equal(workspaceBoundBody.workspaceBinding.workspaceName, 'test-workspace');
+  assert.equal(workspaceBoundBody.workspaceBinding.projectName, 'repo');
+  assert.equal(workspaceBoundBody.workspaceBinding.sourceProjectPath, sourceProjectPath);
+  assert.equal(workspaceBoundBody.workspaceBinding.effectiveProjectPath, worktreePath);
+  assert.equal(workspaceBoundBody.workspaceBinding.laneId, 'feature-lane');
+  assert.equal(workspaceBoundBody.workspaceBinding.worktreeKind, 'git-worktree');
 
   const putGraph = await run([
     'accept-plan',

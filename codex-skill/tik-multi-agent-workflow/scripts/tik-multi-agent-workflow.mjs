@@ -2394,7 +2394,11 @@ Options:
   --api-base-url <url>       Tik API base URL. Defaults to TIK_API_BASE_URL or http://127.0.0.1:3300/api
   --api-token <token>        Tik API bearer token. Defaults to TIK_API_TOKEN.
   --path <repo>              Repository/worktree path. Defaults to cwd.
-  --workspace-root <path>    Tik workspace root.
+  --workspace-root <path>    Tik workspace root; must match the API server's tik serve --project root.
+  --workspace-name <name>    Dashboard/workbench workspace name. Defaults to basename of workspace root.
+  --source-path <path>       Source project path for a managed worktree binding.
+  --lane <id>                Workspace/worktree lane id. Defaults to codex-multi-agent-workflow.
+  --worktree-kind <kind>     Binding kind such as root or git-worktree. Defaults to root.
   --workflow <id>            Workflow id.
   --root-task <id>           Root task id.
   --repo <name>              Repository name.

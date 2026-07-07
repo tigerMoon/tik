@@ -118,6 +118,7 @@ export function WorkbenchTaskList({
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const lensTasks = useMemo(() => filterWorkbenchTasksByLens(tasks, selectedLens), [tasks, selectedLens]);
   const taskColumns = useMemo(() => buildWorkbenchTaskProgressColumns(lensTasks), [lensTasks]);
+  const taskByWorkflowId = useMemo(() => buildTaskByWorkflowId(tasks), [tasks]);
   const selectedPack = packs.find((pack) => pack.id === selectedPackId) || null;
   const selectedPackLabelOptions = useMemo(
     () => buildWorkbenchLabelSelectOptions(selectedPack),
@@ -183,9 +184,17 @@ export function WorkbenchTaskList({
             </div>
           </div>
           <div className="workflow-overview-list">
-            {multiAgentWorkflows.map((workflow) => (
-              <WorkflowOverviewRow key={workflow.id} workflow={workflow} />
-            ))}
+            {multiAgentWorkflows.map((workflow) => {
+              const linkedTask = taskByWorkflowId.get(workflow.id) || taskByWorkflowId.get(workflow.rootTaskId) || null;
+              return (
+                <WorkflowOverviewRow
+                  key={workflow.id}
+                  workflow={workflow}
+                  linkedTask={linkedTask}
+                  onSelectTask={linkedTask ? () => onSelectTask(linkedTask.id) : undefined}
+                />
+              );
+            })}
           </div>
         </div>
       ) : null}
@@ -606,6 +615,25 @@ function buildGoalAttachmentId(file: File): string {
   return `${file.name || 'clipboard'}-${file.size}-${file.lastModified}-${Math.random().toString(36).slice(2)}`;
 }
 
+function buildTaskByWorkflowId(tasks: WorkbenchTaskResponse[]): Map<string, WorkbenchTaskResponse> {
+  const result = new Map<string, WorkbenchTaskResponse>();
+  for (const task of tasks) {
+    const keys = [
+      task.id,
+      task.identifier,
+      task.shortIdentifier,
+      task.agentLoop?.rootTaskId,
+      task.agentLoop?.reviewResult?.workflowId,
+    ].filter((key): key is string => Boolean(key));
+    for (const key of keys) {
+      if (!result.has(key)) {
+        result.set(key, task);
+      }
+    }
+  }
+  return result;
+}
+
 function TaskRailRow({
   task,
   active,
@@ -702,14 +730,39 @@ function TaskRailRow({
   );
 }
 
-function WorkflowOverviewRow({ workflow }: { workflow: MultiAgentWorkflowRecord }) {
+function WorkflowOverviewRow({
+  workflow,
+  linkedTask,
+  onSelectTask,
+}: {
+  workflow: MultiAgentWorkflowRecord;
+  linkedTask: WorkbenchTaskResponse | null;
+  onSelectTask?: () => void;
+}) {
   const updatedAt = formatRelativeDate(workflow.updatedAt || workflow.createdAt);
   const subtaskCount = workflow.taskGraphVersion ? `TaskGraph v${workflow.taskGraphVersion}` : 'No TaskGraph yet';
   const refLabel = [workflow.baseRef, workflow.headRef].filter(Boolean).join(' -> ') || workflow.repo || 'No refs';
   const bindingLabel = buildTaskBindingLabel(workflow.workspaceBinding);
+  const openLabel = linkedTask
+    ? `Open ${linkedTask.identifier || linkedTask.shortIdentifier || linkedTask.title}`
+    : 'No linked task';
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (!onSelectTask || (event.key !== 'Enter' && event.key !== ' ')) {
+      return;
+    }
+    event.preventDefault();
+    onSelectTask();
+  };
 
   return (
-    <article className="workflow-row">
+    <article
+      className={`workflow-row ${onSelectTask ? 'is-clickable' : 'is-disabled'}`}
+      role={onSelectTask ? 'link' : undefined}
+      tabIndex={onSelectTask ? 0 : undefined}
+      aria-label={onSelectTask ? `${openLabel} from workflow ${workflow.goal}` : `Workflow ${workflow.goal} has no linked task`}
+      onClick={onSelectTask}
+      onKeyDown={handleKeyDown}
+    >
       <div className={`queue-status-dot status-${workflowStatusTone(workflow.status)}`} />
       <div className="workflow-row-main">
         <div className="queue-task-top">
@@ -726,6 +779,9 @@ function WorkflowOverviewRow({ workflow }: { workflow: MultiAgentWorkflowRecord 
           <span className="queue-binding-chip">{bindingLabel}</span>
           <span className="queue-pack-chip">{subtaskCount}</span>
           <span className="queue-pack-chip">{refLabel}</span>
+          <span className={`queue-pack-chip workflow-linked-task-chip ${linkedTask ? 'is-linked' : 'is-unlinked'}`}>
+            {openLabel}
+          </span>
         </div>
       </div>
     </article>

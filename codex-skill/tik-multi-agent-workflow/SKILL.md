@@ -17,6 +17,13 @@ Startup rules:
 - Do not treat "no workflowId was provided" as permission to skip Tik state. Missing workflow id means "start a new workflow" by default.
 - If Tik API is unavailable, do not silently fall back to local-only work. Try the obvious recovery for this repo; if still blocked, say the workflow could not be created and clearly label any further work as local-only.
 
+Workspace binding rules:
+- Bind the Tik API server to the workspace root before creating the workflow. `tik serve --project <workspace-root>` defines the only workspace root that `/api/v1/multi-agent/workflows` will accept.
+- Treat `--workspace-root` as the Dashboard/workbench root and `--path` as the execution repo or worktree inside that root. Do not use a sibling or parent API server for a repo outside its workspace root.
+- In a multi-project workspace, run `init` against the workspace-root API and pass `--workspace-root <workspace-root> --path <workspace-root-relative-or-absolute-worktree> --repo <project-name> --source-path <source-project-path> --worktree-kind git-worktree --lane <lane-id>`.
+- If the first `init` fails with `invalid_workspace_binding`, do not retry by dropping binding fields. Start or choose the Tik API whose `--project` equals the intended workspace root, set `--api-base-url` to that server, and retry with the same `--workspace-root` and `--path`.
+- `init` creates or repairs the workflow root workbench task. Use `--root-task <id>` only to bind an existing task; otherwise let Tik use the workflow id as the root task id and expose it in Dashboard.
+
 TaskGraph rules:
 - Do not edit source before the workflow has an accepted TaskGraph, unless the user is only asking for read-only review or diagnosis.
 - For broad work, use `plan`, inspect the planner output, then `accept-plan`.
@@ -162,11 +169,55 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs c
   --workflow wf_123
 ```
 
+## Workspace Binding Examples
+
+Single-repo workspace:
+
+```bash
+tik serve --host 127.0.0.1 --port 3300 --project /Users/me/repo
+
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs init \
+  --api-base-url http://127.0.0.1:3300/api \
+  --goal "review and fix current branch" \
+  --workspace-root /Users/me/repo \
+  --path /Users/me/repo \
+  --repo repo \
+  --base main
+```
+
+Workspace root with managed worktree:
+
+```bash
+tik serve --host 127.0.0.1 --port 64777 --project /Users/me/merchant-workspace
+
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs init \
+  --api-base-url http://127.0.0.1:64777/api \
+  --goal "review C2C RESELL shop-id changes" \
+  --workspace-root /Users/me/merchant-workspace \
+  --path /Users/me/merchant-workspace/worktrees/mall-merchant-c2c-shop-id \
+  --repo mall-merchant \
+  --source-path /Users/me/merchant-workspace/projects/mall-merchant \
+  --worktree-kind git-worktree \
+  --lane c2c-shop-id \
+  --base origin/feature/funding-web-controller-switch \
+  --head-ref feature/c2c-shop-id
+```
+
+Dashboard will show the root task in the workspace served by `--api-base-url`.
+If a workflow appears in the "Multi-agent workflows" list but not in "Tasks by
+progress", run the root-task repair endpoint through that same API before
+continuing:
+
+```bash
+curl -X POST \
+  http://127.0.0.1:64777/api/v1/multi-agent/workflows/<workflow-id>/root-task/repair
+```
+
 ## Code Review Fix Flow
 
 When the user invokes this skill to fix review findings and provides no workflow id:
 
-1. Run `init --goal "<fix the listed review findings>" --path .` and capture the `workflowId`.
+1. Select the Tik API bound to the correct workspace root, then run `init --goal "<fix the listed review findings>" --workspace-root <workspace-root> --path <repo-or-worktree> --repo <project>` and capture the `workflowId`.
 2. Create or obtain a TaskGraph that maps the findings to subtasks, then run `accept-plan`.
 3. Implement the fix in the current Codex session.
 4. Run `execute --workflow <workflowId> --subtask <id> --summary "<what changed>"`.
