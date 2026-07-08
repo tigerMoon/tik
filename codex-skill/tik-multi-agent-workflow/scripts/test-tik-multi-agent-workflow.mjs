@@ -1640,6 +1640,7 @@ try {
   await new Promise((resolve) => server.close(resolve));
   await assertRejectedExecutionDoesNotMutate(repo);
   await assertContinueStopsForCurrentSessionActions(repo);
+  await assertPreexistingChangedFilesSubtracted(tempRoot);
   console.log('tik-multi-agent-workflow helper smoke test passed');
 } finally {
   await rm(tempRoot, { recursive: true, force: true });
@@ -2169,6 +2170,208 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
     assert.equal(decisionsPosted, testCase.expectedDecisionsPosted || 0, testCase.suffix);
     await new Promise((resolve) => server.close(resolve));
   }
+}
+
+/**
+ * Regression for the "worktree already dirty when workflow was initialised"
+ * failure mode. Before the fix, `execute` fell back to a raw `git diff
+ * --name-only`, so any pre-existing edits were attributed to the first
+ * subtask and rejected as `worktree_out_of_scope`.
+ *
+ * Now `init` snapshots those files into `metadata.preexistingChangedFiles`
+ * and `execute` subtracts them from the observed diff (unless the current
+ * subtask's `allowedPaths` claims them explicitly).
+ */
+async function assertPreexistingChangedFilesSubtracted(tempRoot) {
+  const localRepo = path.join(tempRoot, 'preexisting-repo');
+  await initRepo(localRepo);
+  // Two committed files so we can dirty each independently.
+  await writeFile(path.join(localRepo, 'unrelated.txt'), 'baseline unrelated\n', 'utf-8');
+  await writeFile(path.join(localRepo, 'target.txt'), 'baseline target\n', 'utf-8');
+  await runCommand('git', ['add', 'unrelated.txt', 'target.txt'], localRepo);
+  await runCommand('git', ['commit', '-m', 'seed'], localRepo);
+  // `unrelated.txt` is already dirty when the workflow is created — this
+  // is the scenario the fix addresses.
+  await writeFile(path.join(localRepo, 'unrelated.txt'), 'preexisting edit\n', 'utf-8');
+
+  let capturedInitBody = null;
+  let capturedEvidenceBodies = [];
+  const workflowRecord = {
+    id: 'wf-preexisting',
+    driver: 'codex-workflow',
+    status: 'active',
+    goal: 'Preexisting fix',
+    rootTaskId: 'wf-preexisting',
+    repo: 'preexisting-repo',
+    baseRef: 'main',
+    headRef: 'main',
+    currentHeadSha: gitHead(localRepo),
+    maxRounds: 3,
+    metadata: {},
+  };
+  const graph = {
+    workflowId: 'wf-preexisting',
+    version: 1,
+    createdBy: 'claude-code',
+    subtasks: [{
+      id: 'st-only',
+      title: 'target',
+      goal: 'Edit target.txt',
+      dependsOn: [],
+      // `unrelated.txt` is intentionally NOT in allowedPaths — that is
+      // the whole point of subtracting pre-existing dirty files.
+      allowedPaths: ['target.txt'],
+      acceptanceCriteria: ['target updated'],
+      validationCommands: [],
+      reviewFocus: [],
+      assignedExecutor: 'codex',
+      assignedReviewer: 'claude-code',
+    }],
+  };
+  const subtasksState = {
+    'st-only': { subtaskId: 'st-only', status: 'ready', evidenceRefs: [], blockerFindingIds: [], fixRound: 0 },
+  };
+  const contract = {
+    id: 'contract-st-only-v1',
+    subtaskId: 'st-only',
+    status: 'accepted',
+    version: 1,
+    headShaAtAcceptance: workflowRecord.currentHeadSha,
+    scope: { allowedPaths: ['target.txt'], blockedPaths: [] },
+    acceptedAt: new Date().toISOString(),
+  };
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const route = req.url || '/';
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows') {
+        capturedInitBody = await readRequestJson(req);
+        workflowRecord.metadata = capturedInitBody.metadata || {};
+        sendJson(res, { workflow: workflowRecord });
+        return;
+      }
+      if (req.method === 'GET' && route === '/api/v1/multi-agent/workflows/wf-preexisting') {
+        sendJson(res, {
+          workflow: workflowRecord,
+          taskGraph: graph,
+          subtasks: subtasksState,
+          contracts: [contract],
+          decisions: [],
+          evidence: [],
+        });
+        return;
+      }
+      if (
+        req.method === 'POST'
+        && route === '/api/v1/multi-agent/workflows/wf-preexisting/decisions/preflight'
+      ) {
+        const body = await readRequestJson(req);
+        sendJson(res, {
+          decision: body.decision,
+          guard: { accepted: true, code: 'ok' },
+          workflow: workflowRecord,
+        });
+        return;
+      }
+      if (req.method === 'PATCH' && route === '/api/v1/multi-agent/workflows/wf-preexisting/subtasks/st-only') {
+        const body = await readRequestJson(req);
+        subtasksState['st-only'] = { ...subtasksState['st-only'], ...body };
+        sendJson(res, { subtask: subtasksState['st-only'] });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-preexisting/evidence') {
+        const body = await readRequestJson(req);
+        capturedEvidenceBodies.push(body);
+        sendJson(res, { evidence: { id: body.id || `ev-${capturedEvidenceBodies.length}`, ...body } });
+        return;
+      }
+      if (
+        req.method === 'POST'
+        && (
+          route.startsWith('/api/v1/multi-agent/workflows/wf-preexisting/invocations')
+          || route.startsWith('/api/v1/multi-agent/workflows/wf-preexisting/decisions')
+        )
+      ) {
+        const body = await readRequestJson(req).catch(() => ({}));
+        sendJson(res, { decision: body?.decision, workflow: workflowRecord, invocation: { id: 'inv-x', status: 'completed' } });
+        return;
+      }
+      sendJson(res, { error: { message: `Unexpected route ${req.method} ${route}` } }, 404);
+    } catch (error) {
+      sendJson(res, { error: { message: error instanceof Error ? error.message : String(error) } }, 500);
+    }
+  });
+  await listen(server);
+  const address = server.address();
+  const apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
+
+  const init = await runIn(localRepo, [
+    'init',
+    '--api-base-url', apiBaseUrl,
+    '--path', localRepo,
+    '--goal', 'preexisting fix regression',
+    '--workflow', 'wf-preexisting',
+    '--base', 'main',
+  ]);
+  assert.equal(init.action, 'initialized');
+  assert.deepEqual(init.preexistingChangedFiles, ['unrelated.txt']);
+  assert.deepEqual(capturedInitBody.metadata.preexistingChangedFiles, ['unrelated.txt']);
+
+  // Now dirty `target.txt` too. `git diff --name-only` reports BOTH files,
+  // but only `target.txt` is in scope; the CLI must subtract `unrelated.txt`.
+  await writeFile(path.join(localRepo, 'target.txt'), 'edit under contract\n', 'utf-8');
+
+  // deriveObservedChangedFiles's fallback prefers the no-explicit path, so
+  // omit --observed-changed-files. buildImplementationScopeCheck uses the
+  // stored contract; the server mock returns it in the workflow bundle.
+  await runIn(localRepo, [
+    'execute',
+    '--api-base-url', apiBaseUrl,
+    '--path', localRepo,
+    '--workflow', 'wf-preexisting',
+    '--subtask', 'st-only',
+    '--summary', 'Applied scoped edit',
+    // No --changed-files, no --observed-changed-files: exercise the fallback.
+  ]);
+
+  const implEvidence = capturedEvidenceBodies.find((body) => body.kind === 'implementation');
+  assert.ok(implEvidence, 'implementation evidence recorded');
+  const observed = (implEvidence.payload?.observedChangedFiles || []).map((entry) =>
+    typeof entry === 'string' ? entry : entry?.path,
+  );
+  assert.deepEqual(observed, ['target.txt'], 'pre-existing file must be subtracted from observed diff');
+  const scope = implEvidence.payload?.scopeCheck;
+  assert.equal(scope?.allowed, true, `scopeCheck must accept, got: ${JSON.stringify(scope)}`);
+
+  await new Promise((resolve) => server.close(resolve));
+}
+
+/** Variant of `run()` that lets a test target a repo other than the shared one. */
+function runIn(cwd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [scriptPath, ...args], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr || stdout));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (error) {
+        reject(new Error(`JSON parse failed. stdout=${stdout} stderr=${stderr}`));
+      }
+    });
+  });
 }
 
 function buildContinueWorkflow(workflowId, headSha, policy) {

@@ -86,6 +86,26 @@ export interface GuardResult {
   currentState?: unknown;
 }
 
+/**
+ * Well-known keys stored in workflow.metadata.
+ * The server treats metadata as Record<string, unknown>; this interface
+ * documents the keys the CLI writes so consumers can type-narrow safely.
+ */
+export interface WorkflowMetadata {
+  /** Codex thread id that created this workflow, if any. */
+  parentCodexThreadId?: string;
+  /**
+   * Files that were already dirty in the worktree *before* this workflow was
+   * initialised (i.e. captured by `git diff --name-only` at init time).
+   *
+   * Used by the CLI's `deriveObservedChangedFiles` to subtract pre-existing
+   * changes from the observed diff when there is no headShaAtAcceptance-based
+   * baseline available, preventing `worktree_out_of_scope` rejections caused by
+   * changes that belong to earlier work rather than to the current subtask.
+   */
+  preexistingChangedFiles?: string[];
+}
+
 export interface CreateMultiAgentWorkflowInput {
   id?: string;
   goal: string;

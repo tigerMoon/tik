@@ -143,6 +143,11 @@ async function initWorkflow(options) {
   const repo = options.repo || path.basename(projectPath);
   const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD']);
   const headRef = options.headRef || git(projectPath, ['branch', '--show-current'], { optional: true }) || 'HEAD';
+  // Snapshot files that were already dirty in the worktree before this
+  // workflow was created (both unstaged and staged). Contract scope checks
+  // later subtract this set so pre-existing edits don't get attributed to
+  // the first subtask and trigger worktree_out_of_scope.
+  const preexistingChangedFiles = detectPreexistingChangedFiles(projectPath);
   const body = {
     id: stringOption(options.workflow),
     goal: requireOption(options.goal, '--goal is required'),
@@ -155,6 +160,7 @@ async function initWorkflow(options) {
     workspaceBinding: buildWorkspaceBinding(projectPath, options),
     metadata: omitUndefined({
       parentCodexThreadId: stringOption(options.parentThread),
+      preexistingChangedFiles: preexistingChangedFiles.length > 0 ? preexistingChangedFiles : undefined,
     }),
     policy: codexEvaluatorQuestionerPolicy(),
   };
@@ -171,10 +177,17 @@ async function initWorkflow(options) {
     driver: response.workflow?.driver,
     headSha: response.workflow?.currentHeadSha,
     policy: response.workflow?.policy,
+    preexistingChangedFiles,
     mode: 'v1',
     breakingChange: 'v1.1 removed legacy multi-agent Claude review commands; use the contract/evaluator/questioner loop.',
     nextCommand: `node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs next --workflow ${response.workflow?.id}`,
   });
+}
+
+function detectPreexistingChangedFiles(projectPath) {
+  const unstaged = splitLines(git(projectPath, ['diff', '--name-only'], { optional: true }));
+  const staged = splitLines(git(projectPath, ['diff', '--name-only', '--cached'], { optional: true }));
+  return Array.from(new Set([...unstaged, ...staged].map(normalizeEvidencePath).filter(Boolean)));
 }
 
 async function createWorkflowTask(options) {
@@ -1933,7 +1946,34 @@ function deriveObservedChangedFiles(projectPath, state, subtaskId, options) {
   if (fromGit.length > 0) {
     return fromGit;
   }
-  return splitLines(git(projectPath, ['diff', '--name-only'], { optional: true }));
+  const workingTreeDiff = splitLines(git(projectPath, ['diff', '--name-only'], { optional: true }));
+  return subtractPreexistingChangedFiles(workingTreeDiff, state, subtaskId);
+}
+
+/**
+ * Remove files that were already dirty when the workflow was initialised —
+ * unless the current subtask explicitly claims them in its allowedPaths (an
+ * intentional overlap, e.g. a subtask that is continuing prior work).
+ *
+ * Without this, a workflow created against a worktree that already contained
+ * unrelated edits would attribute every one of them to the first subtask and
+ * get rejected with `worktree_out_of_scope`.
+ */
+function subtractPreexistingChangedFiles(observedFiles, state, subtaskId) {
+  const preexisting = Array.isArray(state.workflow?.metadata?.preexistingChangedFiles)
+    ? state.workflow.metadata.preexistingChangedFiles.filter((entry) => typeof entry === 'string')
+    : [];
+  if (preexisting.length === 0) {
+    return observedFiles;
+  }
+  const allowedPaths = collectSubtaskAllowedPaths(state, subtaskId);
+  const preexistingSet = new Set(preexisting.map(normalizeEvidencePath));
+  return observedFiles.filter((file) => {
+    const normalized = normalizeEvidencePath(file);
+    if (!preexistingSet.has(normalized)) return true;
+    // Preserve the file if the contract claims it — the overlap is intentional.
+    return matchesAnyPath(normalized, allowedPaths);
+  });
 }
 
 function buildImplementationScopeCheck(state, subtaskId, observedChangedFiles) {
