@@ -2773,9 +2773,9 @@ function deriveObservedChangedFiles(projectPath, state, subtaskId, options) {
     return explicitObserved;
   }
   const contract = latestAcceptedContract(state, subtaskId);
-  const base = contract?.headShaAtAcceptance || state.workflow.currentHeadSha || state.workflow.baseRef;
+  const base = state.workflow.baseRef || contract?.headShaAtAcceptance || state.workflow.currentHeadSha;
   const fromGit = base
-    ? splitLines(git(projectPath, ['diff', '--name-only', `${base}..HEAD`], { optional: true }))
+    ? splitLines(git(projectPath, ['diff', '--name-only', `${base}...HEAD`], { optional: true }))
     : [];
   if (fromGit.length > 0) {
     return fromGit;
