@@ -48,7 +48,7 @@ export async function buildQuestionerContext(
       ? latestAcceptedContract(bundle.contracts, input.subtaskId)
       : undefined;
   const implementation = input.subtaskId
-    ? latestImplementationEvidence(bundle.evidence, input.subtaskId, input.headSha)
+    ? latestCommittedEvidence(bundle.evidence, input.subtaskId, input.headSha, bundle.workflow.mode === 'review')
     : undefined;
   const evaluation = input.evaluationRunId
     ? bundle.evaluationRuns.find((candidate) => candidate.id === input.evaluationRunId)
@@ -65,7 +65,7 @@ export async function buildQuestionerContext(
     evaluation,
     finalEvaluation,
   });
-  const diffExcerpts = await buildDiffExcerpts(projectPath, input.headSha, changedFiles);
+  const diffExcerpts = await buildDiffExcerpts(projectPath, bundle.workflow.baseRef, input.headSha, changedFiles);
   const relevantFiles = await buildRelevantFiles(projectPath, {
     changedFiles,
     contract,
@@ -105,6 +105,7 @@ export async function buildQuestionerContext(
     evaluation: evaluation ? buildEvaluationBlock(bundle, evaluation, [...evaluationArtifacts, ...contextArtifacts.evaluation], evaluationLogs) : undefined,
     finalEvaluation: finalEvaluation ? buildFinalEvaluationBlock(finalEvaluation, [...finalEvaluationArtifacts, ...contextArtifacts.finalEvaluation]) : undefined,
     diff: {
+      baseSha: bundle.workflow.baseRef,
       headSha: input.headSha,
       files: changedFiles,
       excerpts: [
@@ -113,7 +114,7 @@ export async function buildQuestionerContext(
       ],
     },
     relevantFiles,
-    previousQuestionerOutputs: collectPreviousOpenQuestions(bundle.questionerOutputs, input),
+    previousQuestionerOutputs: [],
     outputContract: {
       schemaVersion: 'questioner-output.v2',
       requiredFields: [
@@ -332,6 +333,7 @@ async function buildEvaluationLogs(
 
 async function buildDiffExcerpts(
   projectPath: string | undefined,
+  baseRef: string | undefined,
   headSha: string,
   changedFiles: Array<{ path: string; changeType?: string }>,
 ): Promise<NonNullable<QuestionerContextV1['diff']>['excerpts']> {
@@ -339,11 +341,12 @@ async function buildDiffExcerpts(
     return buildSyntheticDiffExcerpts(changedFiles, 'workspace path unavailable');
   }
   const excerpts: NonNullable<QuestionerContextV1['diff']>['excerpts'] = [];
-  const stat = git(projectPath, ['diff', '--stat', `${headSha}^`, headSha]);
+  const diffSpec = baseRef ? `${baseRef}...${headSha}` : `${headSha}^`;
+  const stat = git(projectPath, ['diff', '--stat', diffSpec]);
   if (stat) {
     excerpts.push({ path: '__git_diff_stat__', excerpt: truncateText(stat, MAX_DIFF_EXCERPT_CHARS) });
   }
-  const nameStatus = git(projectPath, ['diff', '--name-status', `${headSha}^`, headSha]);
+  const nameStatus = git(projectPath, ['diff', '--name-status', diffSpec]);
   if (nameStatus) {
     excerpts.push({ path: '__git_diff_name_status__', excerpt: truncateText(nameStatus, MAX_DIFF_EXCERPT_CHARS) });
   } else if (changedFiles.length > 0) {
@@ -351,7 +354,7 @@ async function buildDiffExcerpts(
   }
   for (const file of changedFiles.slice(0, MAX_DIFF_FILES)) {
     const normalized = normalizeRelativePath(file.path);
-    const diff = git(projectPath, ['diff', '--no-ext-diff', '--unified=40', `${headSha}^`, headSha, '--', normalized]);
+    const diff = git(projectPath, ['diff', '--no-ext-diff', '--unified=40', diffSpec, '--', normalized]);
     if (diff) {
       excerpts.push({ path: normalized, excerpt: truncateText(diff, MAX_DIFF_EXCERPT_CHARS) });
     } else if (file.changeType === 'deleted') {
@@ -638,13 +641,16 @@ function latestAcceptedContract(contracts: SprintContract[], subtaskId: string):
     .sort((left, right) => right.version - left.version || String(right.acceptedAt || '').localeCompare(String(left.acceptedAt || '')))[0];
 }
 
-function latestImplementationEvidence(
+function latestCommittedEvidence(
   evidence: MultiAgentWorkflowEvidence[],
   subtaskId: string,
   headSha: string,
+  reviewMode = false,
 ): MultiAgentWorkflowEvidence | undefined {
   return evidence
-    .filter((item) => item.subtaskId === subtaskId && (item.kind === 'implementation' || item.kind === 'fix'))
+    .filter((item) => item.subtaskId === subtaskId && (reviewMode
+      ? item.kind === 'review'
+      : item.kind === 'implementation' || item.kind === 'fix'))
     .filter((item) => item.headSha === headSha)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
 }
@@ -664,7 +670,9 @@ function changedFilesFromEvidence(evidence: MultiAgentWorkflowEvidence): Array<{
     ? payload.observedChangedFiles
     : Array.isArray(payload.changedFiles)
       ? payload.changedFiles
-      : [];
+      : Array.isArray(payload.reviewScope)
+        ? payload.reviewScope
+        : [];
   return changedFiles
     .map((entry) => {
       if (typeof entry === 'string') return { path: entry };

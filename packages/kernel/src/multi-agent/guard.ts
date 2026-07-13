@@ -640,6 +640,22 @@ function guardCompleteWorkflowV1(
   bundle: MultiAgentWorkflowBundle,
   decision: WorkflowDecision,
 ): GuardResult {
+  const activeInvocations = bundle.invocations
+    .filter((invocation) => invocation.status === 'created' || invocation.status === 'started')
+    .map((invocation) => invocation.id);
+  if (activeInvocations.length > 0) {
+    return reject('invocation_still_running', 'Completing a workflow requires every agent invocation to be in a terminal state.', {
+      activeInvocationIds: activeInvocations,
+    });
+  }
+  const blockingFindingIds = Array.from(new Set(
+    Object.values(bundle.subtasks).flatMap((subtask) => subtask.blockerFindingIds || []),
+  ));
+  if (blockingFindingIds.length > 0) {
+    return reject('blocking_finding_unresolved', 'Completing a workflow requires all blocking findings to be resolved.', {
+      blockingFindingIds,
+    });
+  }
   if (bundle.workflow.mode === 'review') {
     const synthesis = bundle.evidence
       .filter((item) => item.kind === 'synthesis')

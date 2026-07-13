@@ -412,6 +412,44 @@ describe('multi-agent workflow engine', () => {
     });
   });
 
+  it('waits for an in-flight Questioner instead of planning a duplicate evaluation challenge', () => {
+    const bundle = buildBundle({
+      contracts: [acceptedContractFixture()],
+      evidence: [implementationEvidenceFixture()],
+      evaluationRuns: [passingEvaluationFixture()],
+      invocations: [{
+        id: 'inv-questioner-running',
+        workflowId: 'wf-engine',
+        subtaskId: 'st-api',
+        role: 'questioner',
+        runner: 'claude-code',
+        promptContract: 'claude-questioner.v2',
+        input: {
+          intent: 'question_evaluation',
+          evaluationRunId: 'eval-pass',
+          headSha: 'head-1',
+        },
+        status: 'started',
+        headSha: 'head-1',
+        createdAt: '2026-07-03T00:03:00.000Z',
+        updatedAt: '2026-07-03T00:03:00.000Z',
+      }],
+    });
+
+    const first = planNextAction({ bundle });
+    const second = planNextAction({ bundle });
+    expect(first).toMatchObject({
+      action: 'ask_claude_question_evaluation',
+      reasonCode: 'awaiting_native_runtime',
+      inputs: { invocationId: 'inv-questioner-running', evaluationRunId: 'eval-pass' },
+    });
+    expect(second).toMatchObject({
+      action: first.action,
+      reasonCode: first.reasonCode,
+      inputs: { invocationId: 'inv-questioner-running' },
+    });
+  });
+
   it('keeps the Codex skill offline fallback aligned with canonical Kernel planning fixtures', () => {
     const draftContract = buildBundle({
       contracts: [],

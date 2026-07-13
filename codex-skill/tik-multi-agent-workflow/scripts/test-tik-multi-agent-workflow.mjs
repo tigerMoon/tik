@@ -8,10 +8,37 @@ import os from 'node:os';
 import path from 'node:path';
 import { decideNextAction } from '../lib/loop-gate.mjs';
 import { instructionForDecision } from '../lib/output.mjs';
+import { parseLastJsonObject } from '../lib/structured-output.mjs';
+import { collectSurefireEvidence, parseSurefireReport } from '../lib/surefire-evidence.mjs';
 
 const scriptPath = new URL('./tik-multi-agent-workflow.mjs', import.meta.url).pathname;
+assert.deepEqual(
+  parseLastJsonObject('progress before result.{\n  "verdict": "pass",\n  "findings": []\n}'),
+  { verdict: 'pass', findings: [] },
+);
+assert.deepEqual(
+  parseSurefireReport('<testsuite name="example.ExampleTest" tests="2" failures="0" errors="0" skipped="1"></testsuite>'),
+  { name: 'example.ExampleTest', tests: 2, failures: 0, errors: 0, skipped: 1 },
+);
 const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-workflow-test-'));
 const repo = path.join(tempRoot, 'repo');
+const surefireFixture = path.join(tempRoot, 'surefire-fixture');
+const surefireReportDir = path.join(surefireFixture, 'module', 'target', 'surefire-reports');
+await mkdir(surefireReportDir, { recursive: true });
+await writeFile(
+  path.join(surefireReportDir, 'TEST-example.ExampleTest.xml'),
+  '<testsuite name="example.ExampleTest" tests="1" failures="0" errors="0" skipped="0"></testsuite>',
+  'utf-8',
+);
+const surefireEvidence = await collectSurefireEvidence({
+  command: 'mvn test -Dtest=ExampleTest -Dsurefire.failIfNoSpecifiedTests=true',
+  cwd: surefireFixture,
+  projectRoot: tempRoot,
+  startedAt: new Date(Date.now() - 1000).toISOString(),
+  artifactDir: path.join(tempRoot, 'evaluation-artifacts', 'surefire'),
+});
+assert.deepEqual(surefireEvidence.failureCodes, []);
+assert.equal(surefireEvidence.reports[0].tests, 1);
 
 let workflow = null;
 let graph = null;
@@ -395,11 +422,15 @@ try {
       if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/subtasks\/st-api\/evaluations\/[^/]+\/result$/)) {
         const evaluationRunId = route.split('/').at(-2);
         const body = await readRequestJson(req);
+        const storedVerdict = body.result.verdict === 'pass' && body.result.coverageGaps?.length > 0
+          ? 'inconclusive'
+          : body.result.verdict;
+        const storedResult = { ...body.result, verdict: storedVerdict };
         evaluationRuns = evaluationRuns.map((run) => run.id === evaluationRunId
           ? {
             ...run,
-            status: evaluationStatusForVerdict(body.result.verdict),
-            result: body.result,
+            status: evaluationStatusForVerdict(storedVerdict),
+            result: storedResult,
             completedAt: new Date().toISOString(),
           }
           : run);
@@ -1596,6 +1627,12 @@ try {
     '--evaluation', 'eval-st-api-v1',
     '--evaluator-setup-command', `${process.execPath} -e "console.log('setup ok')"`,
     '--command', `${process.execPath} -e "const fs=require('fs'); if(!fs.existsSync('builder-output.txt')) process.exit(2); console.log(fs.readFileSync('builder-output.txt','utf8').trim()); console.log('evaluation ok')"`,
+    '--result-json', JSON.stringify({
+      verdict: 'pass',
+      criteriaResults: [{ criterionId: 'ac-1', status: 'pass', evidence: 'Evaluator inspected the implementation.' }],
+      runtimeFindings: [],
+      coverageGaps: [],
+    }),
     '--invocation', 'inv-evaluator-cli',
     '--attestation-token', 'att-inv-evaluator-cli',
   ]);
@@ -1625,6 +1662,67 @@ try {
   );
   assert.equal(subtasks['st-api'].status, 'evaluation_passed');
 
+  const commandOnlyEvaluation = await run([
+    'evaluate',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--evaluation', 'eval-command-only-cli',
+    '--command', `${process.execPath} -e "process.exit(0)"`,
+  ]);
+  assert.equal(commandOnlyEvaluation.passed, false);
+  assert.equal(commandOnlyEvaluation.evaluationRun.status, 'inconclusive');
+  assert.equal(commandOnlyEvaluation.evaluationRun.result.verdict, 'inconclusive');
+  assert.equal(subtasks['st-api'].status, 'evaluation_failed');
+
+  const storeDemotedEvaluation = await run([
+    'evaluate',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--evaluation', 'eval-store-demoted-cli',
+    '--infer-command', 'false',
+    '--result-json', JSON.stringify({
+      verdict: 'pass',
+      criteriaResults: [{ criterionId: 'ac-1', status: 'pass', evidence: 'Static evidence.' }],
+      runtimeFindings: [],
+      coverageGaps: [{ criterionId: 'runtime', description: 'Runtime proof missing.', reason: 'Not executed.' }],
+    }),
+  ]);
+  assert.equal(storeDemotedEvaluation.passed, false);
+  assert.equal(storeDemotedEvaluation.evaluationRun.status, 'inconclusive');
+  assert.equal(storeDemotedEvaluation.evaluationRun.result.verdict, 'inconclusive');
+  assert.equal(subtasks['st-api'].status, 'evaluation_failed');
+
+  const semanticPassCommandFailure = await run([
+    'evaluate',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--evaluation', 'eval-command-failure-cli',
+    '--command', `${process.execPath} -e "process.exit(7)"`,
+    '--result-json', JSON.stringify({
+      verdict: 'pass',
+      criteriaResults: [{ criterionId: 'ac-1', status: 'pass', evidence: 'Evaluator reported a semantic pass.' }],
+      runtimeFindings: [],
+      coverageGaps: [],
+    }),
+  ]);
+  assert.equal(semanticPassCommandFailure.passed, false);
+  assert.equal(semanticPassCommandFailure.evaluationRun.status, 'failed');
+  assert.equal(semanticPassCommandFailure.evaluationRun.result.verdict, 'fail');
+
+  evaluationRuns = evaluationRuns.filter((run) => ![
+    'eval-command-only-cli',
+    'eval-store-demoted-cli',
+    'eval-command-failure-cli',
+  ].includes(run.id));
+  subtasks['st-api'] = {
+    ...subtasks['st-api'],
+    status: 'evaluation_passed',
+    validationRunIds: ['eval-st-api-v1'],
+  };
+
   const thinEvaluated = await run([
     'evaluate',
     '--api-base-url', apiBaseUrl,
@@ -1650,6 +1748,21 @@ try {
     validationRunIds: ['eval-st-api-v1'],
   };
 
+  questionerRuns.push({
+    id: 'qr-rejected-same-evidence',
+    workflowId: 'wf-cli',
+    subtaskId: 'st-api',
+    intent: 'question_evaluation',
+    status: 'rejected',
+    invocationId: 'inv-rejected-same-evidence',
+    runner: 'claude-code',
+    pluginSkill: 'question-tik-agent-loop',
+    contractId: 'contract-st-api-v1',
+    evaluationRunId: 'eval-st-api-v1',
+    headSha: 'head-v1',
+    createdAt: new Date(0).toISOString(),
+  });
+
   const questionerStarted = await run([
     'start-questioner',
     '--api-base-url', apiBaseUrl,
@@ -1664,6 +1777,8 @@ try {
   ]);
   assert.equal(questionerStarted.action, 'questioner-run-started');
   assert.equal(questionerStarted.invocation.status, 'started');
+  assert.notEqual(questionerStarted.questionerRunId, 'qr-rejected-same-evidence');
+  questionerRuns = questionerRuns.filter((run) => run.id !== 'qr-rejected-same-evidence');
 
   const runNextQuestioner = await run([
     'run-next',
@@ -1744,6 +1859,12 @@ try {
 	    '--evaluation', 'eval-final-v1',
 	    '--command', `${process.execPath} -e "console.log('final command one')"`,
 	    '--command', `${process.execPath} -e "console.log('final command two')"`,
+	    '--result-json', JSON.stringify({
+	      verdict: 'pass',
+	      criteriaResults: [{ criterionId: 'global-1', status: 'pass', evidence: 'Evaluator covered the workflow outcome.' }],
+	      runtimeFindings: [],
+	      coverageGaps: [],
+	    }),
 	  ]);
 	  assert.equal(finalEvaluated.action, 'evaluation-recorded');
 	  assert.equal(finalEvaluated.passed, true);

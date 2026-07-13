@@ -97,11 +97,18 @@ export class CodexRunner implements AgentRuntimeRunner {
     if (input.mode === 'codex_app_server') {
       const lease = this.acquireAdapter(input.cwd, input.runId);
       const adapter = lease.adapter;
+      const activity = { lastActivityAt: Date.now() };
+      const refreshActivity = () => {
+        activity.lastActivityAt = Date.now();
+      };
       const turnOptions: CodexHarnessTurnOptions = {
         prompt: input.prompt || (input.promptFile ? await fs.readFile(input.promptFile, 'utf-8') : ''),
         cwd: input.cwd,
         allowWrites: input.allowWrites !== false,
         developerInstructions: input.developerInstructions,
+        onTurnVisible: refreshActivity,
+        onTextDelta: refreshActivity,
+        onProviderEvent: refreshActivity,
       };
       let threadId: string | undefined;
       let turn: Promise<unknown>;
@@ -122,6 +129,7 @@ export class CodexRunner implements AgentRuntimeRunner {
           : { output: result },
         input.timeoutMs,
         () => this.interruptAdapterRun(input.runId),
+        activity,
       );
       void completion.finally(() => this.releaseAdapter(input.runId));
       return {
@@ -150,6 +158,7 @@ export class CodexRunner implements AgentRuntimeRunner {
           this.statuses.set(input.runId, status);
         },
         input.timeoutMs,
+        logAttachment.activity,
       );
       return {
         runId: input.runId,

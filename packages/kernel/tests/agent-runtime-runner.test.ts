@@ -215,6 +215,25 @@ describe('AgentRuntimeRunner implementations', () => {
     await expect(runner.getStatus(input.runId)).resolves.toBe('failed');
   });
 
+  it('extends the Codex App Server idle deadline when turn activity is visible', async () => {
+    const input = { ...(await makeInput()), timeoutMs: 40 };
+    const runTurn = vi.fn((options: { onTextDelta?: (text: string) => void }) => new Promise((resolve) => {
+      setTimeout(() => options.onTextDelta?.('still reviewing'), 25);
+      setTimeout(() => resolve({ content: '{"verdict":"pass"}' }), 55);
+    }));
+    const stop = vi.fn(async () => undefined);
+    const runner = new CodexRunner({
+      mode: 'codex_app_server',
+      adapterFactory: () => ({ runTurn, stop }),
+    });
+    const prepared = await runner.prepare(input);
+
+    const handle = await runner.start(prepared);
+
+    await expect(handle.completion).resolves.toMatchObject({ status: 'completed' });
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
   it('starts codex exec runs as child processes and persists stdout and stderr logs', async () => {
     const input = await makeInput();
     const child = new EventEmitter() as EventEmitter & {
@@ -408,10 +427,36 @@ describe('AgentRuntimeRunner implementations', () => {
 
     await expect(handle.completion).resolves.toMatchObject({
       status: 'failed',
-      error: 'claude-code timed out after 10ms.',
+      error: expect.stringMatching(/^claude-code (?:timed out after 10ms|reached the 20ms hard timeout cap)\.$/),
     });
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
     await expect(runner.getStatus('run-1')).resolves.toBe('failed');
+  });
+
+  it('extends the Claude idle deadline when runtime output provides a heartbeat', async () => {
+    const input = await makeInput();
+    const child = new EventEmitter() as EventEmitter & {
+      pid: number;
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      kill: ReturnType<typeof vi.fn>;
+    };
+    child.pid = 4324;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = vi.fn(() => true);
+    const runner = new ClaudeCodeRunner({ mode: 'claude_print', spawnProcess: vi.fn(() => child) });
+    const prepared = {
+      ...(await runner.prepare(input)),
+      timeoutMs: 40,
+    };
+
+    const handle = await runner.start(prepared);
+    setTimeout(() => child.stdout.emit('data', Buffer.from('still reviewing\n')), 25);
+    setTimeout(() => child.emit('exit', 0), 55);
+
+    await expect(handle.completion).resolves.toMatchObject({ status: 'completed' });
+    expect(child.kill).not.toHaveBeenCalled();
   });
 
   it('reports a missing Claude Code working directory before spawning the child process', async () => {

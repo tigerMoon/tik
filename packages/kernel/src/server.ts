@@ -84,6 +84,10 @@ import {
   type NativeInvocationCompletionInput,
 } from './multi-agent/workflow-store.js';
 import { MultiAgentNativeRuntimeLauncher } from './multi-agent/native-runtime-launcher.js';
+import {
+  committedEvidenceErrorMessage,
+  validateCommittedEvidencePreflight,
+} from './multi-agent/committed-evidence-preflight.js';
 import { evaluateWorkflowDecisionGuard } from './multi-agent/guard.js';
 import { planNextAction } from './multi-agent/workflow-engine/planner.js';
 
@@ -2605,7 +2609,10 @@ export async function createServer(
     '/api/v1/multi-agent/workflows/:workflowId/questioner-runs',
     async (req, reply) => {
       try {
-        const result = await multiAgentStore.createQuestionerRun(req.params.workflowId, req.body);
+        const result = await multiAgentStore.createQuestionerRun(req.params.workflowId, {
+          ...req.body,
+          nativeRuntimeOwned: undefined,
+        });
         return {
           questionerRunId: result.run.id,
           invocationId: result.invocation.id,
@@ -2655,7 +2662,11 @@ export async function createServer(
               runtime: {
                 runId: existingRun.id,
                 runtimeRef: existingInvocation?.actualSubagentThreadId || existingInvocation?.threadId || `run:${existingRun.id}`,
-                status: existingRun.status === 'validated' ? 'completed' : 'running',
+                status: existingRun.status === 'validated'
+                  ? 'completed'
+                  : existingRun.status === 'rejected' || existingRun.status === 'expired'
+                    ? 'failed'
+                    : 'running',
               },
               rootTask: null,
               rootTaskProjection: { status: 'synced' },
@@ -2666,10 +2677,24 @@ export async function createServer(
         const workflowBeforeLaunch = await multiAgentStore.readWorkflow(req.params.workflowId);
         if (!workflowBeforeLaunch) return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
         const projectPath = workflowBeforeLaunch.workspaceBinding?.effectiveProjectPath || serverWorkspaceRoot;
+        if (runInput.intent === 'question_evaluation' || runInput.intent === 'question_final_evidence') {
+          const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+          if (!bundle) return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+          const preflight = await validateCommittedEvidencePreflight({
+            bundle,
+            projectPath,
+            headSha: runInput.headSha,
+            subtaskId: runInput.intent === 'question_final_evidence' ? '__final__' : runInput.subtaskId,
+          });
+          if (!preflight.accepted) {
+            throw new MultiAgentCoordinationError('committed_evidence_invalid', committedEvidenceErrorMessage(preflight));
+          }
+        }
         const serverAuditBefore = captureWorkspaceReadonlyAudit(projectPath);
         const result = await multiAgentStore.createQuestionerRun(req.params.workflowId, {
           ...runInput,
           start: false,
+          nativeRuntimeOwned: true,
           runtimeAudit: serverAuditBefore,
         });
         const launched = await multiAgentNativeLauncher.launchQuestioner(req.params.workflowId, {
@@ -2832,7 +2857,10 @@ export async function createServer(
     '/api/v1/multi-agent/workflows/:workflowId/agent-invocations',
     async (req, reply) => {
       try {
-        const invocation = await multiAgentStore.createInvocation(req.params.workflowId, req.body);
+        const invocation = await multiAgentStore.createInvocation(req.params.workflowId, {
+          ...req.body,
+          nativeRuntimeOwned: undefined,
+        });
         return { invocation };
       } catch (error) {
         return sendV1CaughtError(reply, error);
@@ -5506,6 +5534,18 @@ async function reconcileOrphanedNativeRuntimeState(store: FileMultiAgentWorkflow
     const bundle = await store.readBundle(workflow.id);
     if (!bundle) continue;
     for (const invocation of bundle.invocations) {
+      if (invocation.status === 'created' && invocation.nativeRuntimeOwned) {
+        const message = 'Tik server restarted before the native runtime started.';
+        const run = invocation.role === 'questioner'
+          ? bundle.questionerRuns.find((candidate) => candidate.invocationId === invocation.id)
+          : undefined;
+        if (run && (run.status === 'created' || run.status === 'started')) {
+          await store.failQuestionerRunRuntime(workflow.id, run.id, message).catch(() => undefined);
+        } else {
+          await store.failOrphanedCreatedNativeInvocation(workflow.id, invocation.id, message).catch(() => undefined);
+        }
+        continue;
+      }
       if (invocation.status !== 'started') continue;
       if (invocation.runtimeAttestation?.source === 'codex-subagent-runtime') {
         await store.completeNativeInvocation(workflow.id, invocation.id, {

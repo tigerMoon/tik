@@ -1,9 +1,12 @@
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentRunCompletion, AgentRuntimeRunner, PreparedRun } from '../src/agent-runners/agent-runtime-runner.js';
 import { EventBus } from '../src/event-bus.js';
+import { MultiAgentNativeRuntimeLauncher } from '../src/multi-agent/native-runtime-launcher.js';
 import { FileMultiAgentWorkflowStore } from '../src/multi-agent/workflow-store.js';
 import { createServer } from '../src/server.js';
 import { WorkbenchService } from '../src/workbench/workbench-service.js';
@@ -11,6 +14,7 @@ import { WorkbenchStore } from '../src/workbench/workbench-store.js';
 
 const tempDirs: string[] = [];
 const servers: Array<{ close: () => Promise<unknown> }> = [];
+const execFileAsync = promisify(execFile);
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
@@ -123,6 +127,7 @@ describe('multi-agent coordination API', () => {
         invocation: {
           id: `inv-${role}`,
           status: 'started',
+          nativeRuntimeOwned: true,
           hookAttested: true,
           parentThreadId: 'parent-thread',
           runtimeAttestation: {
@@ -137,7 +142,187 @@ describe('multi-agent coordination API', () => {
 
     expect(started).toHaveLength(2);
     expect(started[0].allowWrites).toBe(true);
-    expect(started[1].allowWrites).toBe(false);
+    expect(started[1].allowWrites).toBe(true);
+  });
+
+  it('rejects dirty committed evidence before creating a native Evaluator invocation', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-committed-evidence-'));
+    tempDirs.push(root);
+    const { baseSha, headSha } = await createCommittedEvidenceRepo(root);
+    const codexRuns: PreparedRun[] = [];
+    const server = await createTestServer(root, {
+      runtimeRunners: {
+        codex: fakeRuntimeRunner('codex', codexRuns, {
+          threadPrefix: 'codex-thread',
+          completion: Promise.resolve({ status: 'completed', result: { content: '{"verdict":"pass"}' } }),
+          onStart: async (prepared) => {
+            if (prepared.runId === 'inv-evaluator-generated') {
+              await fs.mkdir(path.join(prepared.cwd, 'module/target'), { recursive: true });
+              await fs.writeFile(path.join(prepared.cwd, 'module/target/report.txt'), 'generated\n', 'utf-8');
+              await fs.writeFile(path.join(prepared.cwd, '.risk.env'), 'RISK=checked\n', 'utf-8');
+            }
+            if (prepared.runId === 'inv-evaluator-custom-artifact') {
+              await fs.mkdir(path.join(prepared.cwd, 'custom-artifacts'), { recursive: true });
+              await fs.writeFile(path.join(prepared.cwd, 'custom-artifacts/result.json'), '{}\n', 'utf-8');
+            }
+            if (prepared.runId === 'inv-evaluator-source-mutation') {
+              await fs.writeFile(
+                path.join(prepared.cwd, 'src/main/java/example/Example.java'),
+                'package example; class Example { int value = 99; }\n',
+                'utf-8',
+              );
+            }
+          },
+        }),
+        'claude-code': fakeRuntimeRunner('claude-code', []),
+      },
+    });
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-committed-evidence',
+        goal: 'Reject stale or uncommitted evaluator evidence',
+        baseRef: baseSha,
+        headSha,
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: 'fixture',
+          effectiveProjectPath: root,
+          sourceProjectPath: root,
+          worktreeKind: 'root',
+        },
+      },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-committed-evidence/task-graph',
+      payload: { graph: buildTaskGraph('wf-committed-evidence', 1, [{ id: 'st-api', dependsOn: [] }]) },
+    });
+    await acceptContractForSubtask(server, 'wf-committed-evidence', 'st-api', headSha, ['src/main/java/example/**']);
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-committed-evidence/evidence',
+      payload: {
+        id: 'ev-committed-implementation',
+        kind: 'implementation',
+        title: 'Committed implementation evidence',
+        subtaskId: 'st-api',
+        headSha,
+        payload: {
+          observedChangedFiles: [{ path: 'src/main/java/example/Example.java', changeType: 'modified' }],
+        },
+      },
+    });
+
+    const launchPayload = {
+      subtaskId: 'st-api',
+      role: 'evaluator',
+      runner: 'codex-evaluator',
+      promptContract: 'codex-evaluator.v1',
+      headSha,
+      validationCommands: [
+        'mvn test -Dtest=ExampleTest -Dsurefire.failIfNoSpecifiedTests=true',
+      ],
+      readonlyPolicy: { enforced: true, violations: [] },
+    };
+    const accepted = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/native-launch',
+      payload: { id: 'inv-evaluator-clean', ...launchPayload },
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(codexRuns).toHaveLength(1);
+    expect(codexRuns[0].cwd).not.toBe(root);
+    expect(codexRuns[0].allowWrites).toBe(true);
+
+    await fs.writeFile(path.join(root, 'src/main/java/example/Example.java'), 'package example; class Example { int value = 3; }\n', 'utf-8');
+    const rejected = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/native-launch',
+      payload: { id: 'inv-evaluator-dirty', ...launchPayload },
+    });
+    expect(rejected.statusCode).toBe(409);
+    expect(rejected.json().error).toMatchObject({ code: 'committed_evidence_invalid' });
+    expect(codexRuns).toHaveLength(1);
+
+    await fs.writeFile(path.join(root, 'src/main/java/example/Example.java'), 'package example; class Example { int value = 2; }\n', 'utf-8');
+    const generated = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/native-launch',
+      payload: { id: 'inv-evaluator-generated', ...launchPayload },
+    });
+    expect(generated.statusCode).toBe(200);
+    await waitForCondition(async () => {
+      const response = await server.inject({
+        method: 'GET',
+        url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/inv-evaluator-generated',
+      });
+      return response.json().invocation.status === 'completed';
+    });
+    const generatedInvocation = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/inv-evaluator-generated',
+    });
+    expect(generatedInvocation.json().invocation.readonlyPolicy).toMatchObject({
+      enforced: true,
+      violations: [],
+      workspaceFingerprintBefore: expect.stringMatching(/^sha256:/),
+      workspaceFingerprintAfter: expect.stringMatching(/^sha256:/),
+    });
+
+    const customArtifact = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/native-launch',
+      payload: {
+        id: 'inv-evaluator-custom-artifact',
+        ...launchPayload,
+        allowedPaths: ['custom-artifacts/'],
+      },
+    });
+    expect(customArtifact.statusCode).toBe(200);
+    await waitForCondition(async () => {
+      const response = await server.inject({
+        method: 'GET',
+        url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/inv-evaluator-custom-artifact',
+      });
+      return response.json().invocation.status === 'completed';
+    });
+    const customInvocation = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/inv-evaluator-custom-artifact',
+    });
+    expect(customInvocation.json().invocation.readonlyPolicy).toMatchObject({
+      enforced: true,
+      violations: [],
+    });
+
+    const sourceMutation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/native-launch',
+      payload: { id: 'inv-evaluator-source-mutation', ...launchPayload },
+    });
+    expect(sourceMutation.statusCode).toBe(200);
+    await waitForCondition(async () => {
+      const response = await server.inject({
+        method: 'GET',
+        url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/inv-evaluator-source-mutation',
+      });
+      return response.json().invocation.status === 'failed';
+    });
+    const mutatedInvocation = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-committed-evidence/agent-invocations/inv-evaluator-source-mutation',
+    });
+    expect(mutatedInvocation.json().invocation.readonlyPolicy).toMatchObject({
+      enforced: false,
+      violations: expect.arrayContaining([
+        'tracked_source_changed',
+        'forbidden_write:src/main/java/example/Example.java',
+      ]),
+    });
   });
 
   it('records implementation evidence from a completed Tik-owned invocation without exposing a token', async () => {
@@ -267,11 +452,12 @@ describe('multi-agent coordination API', () => {
     expect(launched.statusCode).toBe(200);
     expect(launched.json()).toMatchObject({
       questionerRunId: 'qr-native',
-      invocation: { id: 'inv-questioner-native', status: 'started' },
+      invocation: { id: 'inv-questioner-native', status: 'started', nativeRuntimeOwned: true },
       runtime: { status: 'running', runtimeRef: 'pid:4242' },
     });
     expect(launched.json()).not.toHaveProperty('token');
     expect(claudeRuns).toHaveLength(1);
+    expect(claudeRuns[0].timeoutMs).toBe(30 * 60 * 1000);
     expect(claudeRuns[0].cwd).not.toBe(root);
     expect(claudeRuns[0].env?.TIK_QUESTIONER_TOKEN).toMatch(/^tqr_/);
     expect(claudeRuns[0].env?.TIK_QUESTIONER_CONTEXT_URL).toContain('/api/v1/multi-agent/workflows/wf-native-questioner/questioner-runs/qr-native/context');
@@ -280,6 +466,58 @@ describe('multi-agent coordination API', () => {
       gitStatusBefore: '',
       workspaceFingerprintBefore: expect.any(String),
     });
+  });
+
+  it('does not report a rejected Questioner retry as still running', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const claudeRuns: PreparedRun[] = [];
+    const server = await createTestServer(root, {
+      runtimeRunners: {
+        codex: fakeRuntimeRunner('codex', []),
+        'claude-code': fakeRuntimeRunner('claude-code', claudeRuns, {
+          completion: Promise.resolve({ status: 'failed', error: 'runtime failed' }),
+          pid: 4243,
+        }),
+      },
+    });
+    servers.push(server);
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: { id: 'wf-rejected-questioner', goal: 'Retry Questioner', headSha: 'head-1' },
+    });
+    const payload = {
+      id: 'qr-rejected',
+      invocationId: 'inv-questioner-rejected',
+      intent: 'question_requirement',
+      headSha: 'head-1',
+    };
+    const launched = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-rejected-questioner/questioner-runs/native-launch',
+      payload,
+    });
+    expect(launched.statusCode).toBe(200);
+    await waitForCondition(async () => {
+      const bundle = await server.inject({
+        method: 'GET',
+        url: '/api/v1/multi-agent/workflows/wf-rejected-questioner',
+      });
+      return bundle.json().questionerRuns.some((run: { id: string; status: string }) => run.id === 'qr-rejected' && run.status === 'rejected');
+    });
+
+    const retry = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-rejected-questioner/questioner-runs/native-launch',
+      payload,
+    });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json()).toMatchObject({
+      questionerRun: { id: 'qr-rejected', status: 'rejected' },
+      runtime: { status: 'failed' },
+    });
+    expect(claudeRuns).toHaveLength(1);
   });
 
   it('reserves native invocation ids atomically under concurrent launch requests', async () => {
@@ -324,6 +562,111 @@ describe('multi-agent coordination API', () => {
     expect(retry.statusCode).toBe(200);
     expect(retry.json()).toMatchObject({ invocation: { id: 'inv-native-once' } });
     expect(codexRuns).toHaveLength(1);
+  });
+
+  it('does not report an orphaned Tik-owned created invocation as running', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-owned-created-'));
+    tempDirs.push(root);
+    const store = new FileMultiAgentWorkflowStore(root);
+    await store.createWorkflow({ id: 'wf-owned-created-retry', goal: 'Recover native launch', headSha: 'head-1' });
+    const request = {
+      id: 'inv-owned-created-retry',
+      role: 'executor' as const,
+      runner: 'codex' as const,
+      promptContract: 'codex-builder.v1',
+      headSha: 'head-1',
+    };
+    await store.createInvocation('wf-owned-created-retry', { ...request, nativeRuntimeOwned: true });
+    const started: PreparedRun[] = [];
+    const launcher = new MultiAgentNativeRuntimeLauncher(
+      store,
+      root,
+      'http://127.0.0.1:3300/api',
+      {
+        codex: fakeRuntimeRunner('codex', started),
+        'claude-code': fakeRuntimeRunner('claude-code', []),
+      },
+    );
+
+    await expect(launcher.launchCodexInvocation('wf-owned-created-retry', { invocation: request }))
+      .rejects.toMatchObject({ code: 'native_runtime_not_started' });
+    expect(started).toHaveLength(0);
+  });
+
+  it('times out owned created invocations while preserving hook-created compatibility records', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-created-timeout-'));
+    tempDirs.push(root);
+    const store = new FileMultiAgentWorkflowStore(root);
+    await store.createWorkflow({
+      id: 'wf-created-timeout',
+      goal: 'Recover stalled invocations',
+      headSha: 'head-1',
+      policy: { stalledInvocationTimeoutMs: 1 },
+    });
+    await store.createInvocation('wf-created-timeout', {
+      id: 'inv-owned-created',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+      nativeRuntimeOwned: true,
+    });
+    await store.createInvocation('wf-created-timeout', {
+      id: 'inv-hook-created',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+    });
+    await store.createInvocation('wf-created-timeout', {
+      id: 'inv-started',
+      role: 'questioner',
+      runner: 'claude-code',
+      promptContract: 'claude-questioner.v2',
+    });
+    await store.updateInvocation('wf-created-timeout', 'inv-started', { status: 'started' });
+
+    const reconciled = await store.reconcileStalledInvocations('wf-created-timeout', {
+      now: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    expect(reconciled.stalled.map((invocation) => invocation.id).sort()).toEqual([
+      'inv-owned-created',
+      'inv-started',
+    ]);
+    expect((await store.readInvocation('wf-created-timeout', 'inv-owned-created'))?.status).toBe('failed');
+    expect((await store.readInvocation('wf-created-timeout', 'inv-started'))?.status).toBe('failed');
+    expect((await store.readInvocation('wf-created-timeout', 'inv-hook-created'))?.status).toBe('created');
+  });
+
+  it('fails owned created invocations on restart without touching hook-created records', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-created-restart-'));
+    tempDirs.push(root);
+    const store = new FileMultiAgentWorkflowStore(root);
+    await store.createWorkflow({ id: 'wf-created-restart', goal: 'Recover after restart', headSha: 'head-1' });
+    for (const [id, nativeRuntimeOwned] of [
+      ['inv-owned-created', true],
+      ['inv-hook-created', false],
+    ] as const) {
+      await store.createInvocation('wf-created-restart', {
+        id,
+        role: 'executor',
+        runner: 'codex',
+        promptContract: 'codex-builder.v1',
+        nativeRuntimeOwned,
+      });
+    }
+
+    const server = await createTestServer(root, { runtimeRunners: {} });
+    servers.push(server);
+    const bundle = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-created-restart',
+    });
+
+    expect(bundle.statusCode).toBe(200);
+    expect(bundle.json().invocations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'inv-owned-created', status: 'failed', nativeRuntimeOwned: true }),
+      expect.objectContaining({ id: 'inv-hook-created', status: 'created', nativeRuntimeOwned: false }),
+    ]));
   });
 
   it('serves a workflow bundle from root and review workbench task references', async () => {
@@ -2358,6 +2701,7 @@ function buildSprintContractPayload(patch: {
   id?: string;
   version?: number;
   goal?: string;
+  allowedPaths?: string[];
 } = {}) {
   return {
     id: patch.id,
@@ -2365,7 +2709,7 @@ function buildSprintContractPayload(patch: {
     status: 'draft',
     goal: patch.goal || 'Implement st-api',
     scope: {
-      allowedPaths: ['packages/kernel/src'],
+      allowedPaths: patch.allowedPaths || ['packages/kernel/src'],
       blockedPaths: [],
     },
     deliverables: [{
@@ -2392,7 +2736,12 @@ function buildSprintContractPayload(patch: {
 function fakeRuntimeRunner(
   name: 'codex' | 'claude-code',
   started: PreparedRun[],
-  options: { threadPrefix?: string; pid?: number; completion?: Promise<AgentRunCompletion> } = {},
+  options: {
+    threadPrefix?: string;
+    pid?: number;
+    completion?: Promise<AgentRunCompletion>;
+    onStart?: (prepared: PreparedRun) => Promise<void>;
+  } = {},
 ): AgentRuntimeRunner {
   return {
     name,
@@ -2402,9 +2751,11 @@ function fakeRuntimeRunner(
       mode: input.runnerMode,
       cwd: input.projectPath,
       prompt: input.renderedPrompt,
+      timeoutMs: input.timeoutMs,
     })),
     start: vi.fn(async (prepared) => {
       started.push(prepared);
+      await options.onStart?.(prepared);
       return {
         runId: prepared.runId,
         threadId: options.threadPrefix ? `${options.threadPrefix}-${prepared.runId}` : undefined,
@@ -2421,6 +2772,25 @@ function fakeRuntimeRunner(
     collectArtifacts: vi.fn(async () => []),
     cleanup: vi.fn(async () => undefined),
   };
+}
+
+async function createCommittedEvidenceRepo(root: string): Promise<{ baseSha: string; headSha: string }> {
+  await fs.mkdir(path.join(root, 'src/main/java/example'), { recursive: true });
+  await fs.mkdir(path.join(root, 'src/test/java/example'), { recursive: true });
+  await fs.writeFile(path.join(root, '.gitignore'), '.tik/\n', 'utf-8');
+  await fs.writeFile(path.join(root, 'src/main/java/example/Example.java'), 'package example; class Example { int value = 1; }\n', 'utf-8');
+  await fs.writeFile(path.join(root, 'src/test/java/example/ExampleTest.java'), 'package example; class ExampleTest {}\n', 'utf-8');
+  await execFileAsync('git', ['init'], { cwd: root });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: root });
+  await execFileAsync('git', ['config', 'user.name', 'Tik Test'], { cwd: root });
+  await execFileAsync('git', ['add', '.'], { cwd: root });
+  await execFileAsync('git', ['commit', '-m', 'base'], { cwd: root });
+  const baseSha = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim();
+  await fs.writeFile(path.join(root, 'src/main/java/example/Example.java'), 'package example; class Example { int value = 2; }\n', 'utf-8');
+  await execFileAsync('git', ['add', '.'], { cwd: root });
+  await execFileAsync('git', ['commit', '-m', 'implementation'], { cwd: root });
+  const headSha = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim();
+  return { baseSha, headSha };
 }
 
 async function waitForCondition(predicate: () => Promise<boolean>, timeoutMs = 1000): Promise<void> {
@@ -2497,6 +2867,7 @@ async function acceptContractForSubtask(
   workflowId: string,
   subtaskId: string,
   headSha: string,
+  allowedPaths?: string[],
 ) {
   const created = await server.inject({
     method: 'POST',
@@ -2504,6 +2875,7 @@ async function acceptContractForSubtask(
     payload: buildSprintContractPayload({
       id: `contract-${subtaskId}-v1`,
       goal: `Implement ${subtaskId}`,
+      allowedPaths,
     }),
   });
   expect(created.statusCode).toBe(200);

@@ -17,6 +17,7 @@ export type RuntimeChildProcess = EventEmitter & {
 export interface RuntimeLogAttachment {
   writers: Promise<unknown>[];
   redactedEnv: Record<string, string>;
+  activity: { lastActivityAt: number };
 }
 
 export function buildRuntimeProcessEnv(input: PreparedRun): Record<string, string> {
@@ -41,13 +42,16 @@ export function attachProcessLogs(input: PreparedRun, child: RuntimeChildProcess
   const stderrPath = path.join(runDir, 'stderr.log');
   const redactedEnv = input.env || {};
   const writers: Promise<unknown>[] = [];
+  const activity = { lastActivityAt: Date.now() };
   child.stdout?.on('data', (chunk) => {
+    activity.lastActivityAt = Date.now();
     writers.push(appendLog(stdoutPath, redactChunk(chunk, redactedEnv)));
   });
   child.stderr?.on('data', (chunk) => {
+    activity.lastActivityAt = Date.now();
     writers.push(appendLog(stderrPath, redactChunk(chunk, redactedEnv)));
   });
-  return { writers, redactedEnv };
+  return { writers, redactedEnv, activity };
 }
 
 export function childCompletion(
@@ -56,11 +60,14 @@ export function childCompletion(
   logWriters: Promise<unknown>[],
   onSettled: (status: AgentRunCompletion['status']) => void,
   timeoutMs?: number,
+  activity?: { lastActivityAt: number },
 ): Promise<AgentRunCompletion> {
   return new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
+    let timeoutReason: 'idle' | 'hard_cap' | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    const startedAt = Date.now();
     const settle = (completion: AgentRunCompletion) => {
       if (settled) return;
       settled = true;
@@ -72,20 +79,39 @@ export function childCompletion(
     };
 
     if (timeoutMs && timeoutMs > 0) {
-      timeout = setTimeout(() => {
-        timedOut = true;
-        void terminateRuntimeChild(child).finally(() => {
-          settle({
-            status: 'failed',
-            error: `${runtimeName} timed out after ${timeoutMs}ms.`,
+      const hardCapMs = timeoutMs * 2;
+      const checkDeadline = () => {
+        const now = Date.now();
+        const idleForMs = now - (activity?.lastActivityAt || startedAt);
+        const runtimeMs = now - startedAt;
+        if (runtimeMs >= hardCapMs || idleForMs >= timeoutMs) {
+          timedOut = true;
+          timeoutReason = runtimeMs >= hardCapMs ? 'hard_cap' : 'idle';
+          void terminateRuntimeChild(child).finally(() => {
+            settle({
+              status: 'failed',
+              error: timeoutReason === 'hard_cap'
+                ? `${runtimeName} reached the ${hardCapMs}ms hard timeout cap.`
+                : `${runtimeName} timed out after ${timeoutMs}ms.`,
+            });
           });
-        });
-      }, timeoutMs);
+          return;
+        }
+        const untilIdle = timeoutMs - idleForMs;
+        const untilHardCap = hardCapMs - runtimeMs;
+        timeout = setTimeout(checkDeadline, Math.max(1, Math.min(untilIdle, untilHardCap)));
+      };
+      timeout = setTimeout(checkDeadline, timeoutMs);
     }
 
     child.on('exit', (code) => {
       if (timedOut) {
-        settle({ status: 'failed', error: `${runtimeName} timed out after ${timeoutMs}ms.` });
+        settle({
+          status: 'failed',
+          error: timeoutReason === 'hard_cap'
+            ? `${runtimeName} reached the ${(timeoutMs || 0) * 2}ms hard timeout cap.`
+            : `${runtimeName} timed out after ${timeoutMs}ms.`,
+        });
         return;
       }
       if (code === 0) {
@@ -130,10 +156,13 @@ export function promiseCompletion<T>(
   resultMapper?: (value: T) => Record<string, unknown>,
   timeoutMs?: number,
   onTimeout?: () => Promise<void> | void,
+  activity?: { lastActivityAt: number },
 ): Promise<AgentRunCompletion> {
   return new Promise((resolve) => {
     let settled = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let timeoutReason: 'idle' | 'hard_cap' | undefined;
+    const startedAt = Date.now();
     const settle = (completion: AgentRunCompletion) => {
       if (settled) return;
       settled = true;
@@ -149,11 +178,29 @@ export function promiseCompletion<T>(
       }),
     );
     if (timeoutMs && timeoutMs > 0) {
-      timeout = setTimeout(() => {
-        void Promise.resolve(onTimeout?.()).catch(() => undefined).finally(() => {
-          settle({ status: 'failed', error: `codex app-server timed out after ${timeoutMs}ms.` });
-        });
-      }, timeoutMs);
+      const hardCapMs = timeoutMs * 2;
+      const checkDeadline = () => {
+        const now = Date.now();
+        const idleForMs = now - (activity?.lastActivityAt || startedAt);
+        const runtimeMs = now - startedAt;
+        if (runtimeMs >= hardCapMs || idleForMs >= timeoutMs) {
+          timeoutReason = runtimeMs >= hardCapMs ? 'hard_cap' : 'idle';
+          void Promise.resolve(onTimeout?.()).catch(() => undefined).finally(() => {
+            settle({
+              status: 'failed',
+              error: timeoutReason === 'hard_cap'
+                ? `codex app-server reached the ${hardCapMs}ms hard timeout cap.`
+                : `codex app-server timed out after ${timeoutMs}ms.`,
+            });
+          });
+          return;
+        }
+        timeout = setTimeout(
+          checkDeadline,
+          Math.max(1, Math.min(timeoutMs - idleForMs, hardCapMs - runtimeMs)),
+        );
+      };
+      timeout = setTimeout(checkDeadline, timeoutMs);
     }
   });
 }

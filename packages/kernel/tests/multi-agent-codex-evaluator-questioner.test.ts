@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { canonicalOutputHash, type QuestionerOutputV2 } from '@tik/shared';
 import { EventBus } from '../src/event-bus.js';
@@ -342,10 +343,12 @@ describe('codex evaluator and Claude questioner workflow', () => {
         evaluationRunId: 'eval-pass',
         headSha: 'head-1',
         start: true,
+        nativeRuntimeOwned: true,
         runtimeAudit: { gitStatusBefore: '' },
       },
     });
     expect(blockingRun.statusCode).toBe(200);
+    expect(blockingRun.json().invocation).not.toHaveProperty('nativeRuntimeOwned');
     const blockingV2 = buildQuestionerOutputV2({
       id: 'q-blocking',
       runResponse: blockingRun.json(),
@@ -444,8 +447,9 @@ describe('codex evaluator and Claude questioner workflow', () => {
       'utf-8',
     );
     const stdoutArtifact = path.join(root, '.tik/multi-agent/workflows/wf-questioner-run-v2/evaluations/eval-pass/stdout.log');
+    const stdoutArtifactContent = 'PASS multi-agent evaluator\ncoverage gap: none\n';
     await fs.mkdir(path.dirname(stdoutArtifact), { recursive: true });
-    await fs.writeFile(stdoutArtifact, 'PASS multi-agent evaluator\ncoverage gap: none\n', 'utf-8');
+    await fs.writeFile(stdoutArtifact, stdoutArtifactContent, 'utf-8');
 
     await createV1Workflow(server, 'wf-questioner-run-v2', root);
     await putSingleSubtaskGraph(server, 'wf-questioner-run-v2');
@@ -484,6 +488,8 @@ describe('codex evaluator and Claude questioner workflow', () => {
           status: 'passed',
           exitCode: 0,
           stdoutArtifactId: '.tik/multi-agent/workflows/wf-questioner-run-v2/evaluations/eval-pass/stdout.log',
+          stdoutArtifactSha256: `sha256:${createHash('sha256').update(stdoutArtifactContent).digest('hex')}`,
+          stdoutArtifactBytes: Buffer.byteLength(stdoutArtifactContent),
           summary: 'Kernel tests passed.',
         },
       ],
@@ -532,6 +538,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
       contextHash: expect.stringMatching(/^sha256:/),
       token: expect.any(String),
     });
+    expect(run.json().invocation).not.toHaveProperty('nativeRuntimeOwned');
 
     const context = await server.inject({
       method: 'GET',
@@ -1868,6 +1875,208 @@ describe('codex evaluator and Claude questioner workflow', () => {
     ]));
   });
 
+  it('requires every contract command to pass before a semantic pass can become a passed run', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-command-verdict', root);
+    await putSingleSubtaskGraph(server, 'wf-command-verdict');
+    await createAcceptedContract(server, 'wf-command-verdict');
+
+    for (const evaluationId of ['eval-command-failed', 'eval-command-missing']) {
+      await server.inject({
+        method: 'POST',
+        url: '/api/v1/multi-agent/workflows/wf-command-verdict/subtasks/st-api/evaluations',
+        payload: {
+          id: evaluationId,
+          contractId: 'contract-st-api-v1',
+          headSha: 'head-1',
+          evaluator: { kind: 'codex-evaluator', sessionId: evaluationId },
+        },
+      });
+    }
+
+    const failed = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-command-verdict/subtasks/st-api/evaluations/eval-command-failed/result',
+      payload: {
+        result: {
+          workflowId: 'wf-command-verdict',
+          subtaskId: 'st-api',
+          contractId: 'contract-st-api-v1',
+          evaluatorRunId: 'eval-command-failed',
+          headSha: 'head-1',
+          verdict: 'pass',
+          criteriaResults: [{ criterionId: 'ac-1', status: 'pass', evidence: 'Semantic review passed.' }],
+          commandResults: [{
+            commandId: 'cmd-test',
+            command: 'pnpm --filter @tik/kernel test',
+            status: 'failed',
+            exitCode: 1,
+            summary: 'Required command failed.',
+          }],
+          runtimeFindings: [],
+          coverageGaps: [],
+          confidence: 0.9,
+        },
+      },
+    });
+    expect(failed.statusCode).toBe(200);
+    expect(failed.json().evaluationRun).toMatchObject({
+      status: 'failed',
+      result: { verdict: 'fail' },
+    });
+
+    const missing = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-command-verdict/subtasks/st-api/evaluations/eval-command-missing/result',
+      payload: {
+        result: {
+          workflowId: 'wf-command-verdict',
+          subtaskId: 'st-api',
+          contractId: 'contract-st-api-v1',
+          evaluatorRunId: 'eval-command-missing',
+          headSha: 'head-1',
+          verdict: 'pass',
+          criteriaResults: [{ criterionId: 'ac-1', status: 'pass', evidence: 'Semantic review passed.' }],
+          commandResults: [],
+          runtimeFindings: [],
+          coverageGaps: [],
+          confidence: 0.9,
+        },
+      },
+    });
+    expect(missing.statusCode).toBe(200);
+    expect(missing.json().evaluationRun).toMatchObject({
+      status: 'inconclusive',
+      result: { verdict: 'inconclusive' },
+    });
+    expect(missing.json().evaluationRun.result.coverageGaps).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        criterionId: 'cmd-test',
+        reason: 'Required evaluation command did not pass.',
+      }),
+    ]));
+  });
+
+  it('does not pass an EvaluationRun whose referenced command artifact is missing', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-missing-evaluation-artifact', root);
+    await putSingleSubtaskGraph(server, 'wf-missing-evaluation-artifact');
+    await createAcceptedContract(server, 'wf-missing-evaluation-artifact');
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-missing-evaluation-artifact/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-missing-artifact',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-missing-artifact' },
+      },
+    });
+
+    const recorded = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-missing-evaluation-artifact/subtasks/st-api/evaluations/eval-missing-artifact/result',
+      payload: {
+        result: {
+          workflowId: 'wf-missing-evaluation-artifact',
+          subtaskId: 'st-api',
+          contractId: 'contract-st-api-v1',
+          evaluatorRunId: 'eval-missing-artifact',
+          headSha: 'head-1',
+          verdict: 'pass',
+          criteriaResults: [{ criterionId: 'ac-1', status: 'pass', evidence: 'Semantic review passed.' }],
+          commandResults: [{
+            commandId: 'cmd-test',
+            command: 'pnpm --filter @tik/kernel test',
+            status: 'passed',
+            exitCode: 0,
+            stdoutArtifactId: '.tik/multi-agent/workflows/wf-missing-evaluation-artifact/evaluations/eval-missing-artifact/stdout.log',
+            summary: 'Command claims to have passed.',
+          }],
+          runtimeFindings: [],
+          coverageGaps: [],
+          confidence: 0.9,
+        },
+      },
+    });
+
+    expect(recorded.statusCode).toBe(200);
+    expect(recorded.json().evaluationRun).toMatchObject({
+      status: 'inconclusive',
+      result: { verdict: 'inconclusive' },
+    });
+    expect(recorded.json().evaluationRun.result.coverageGaps).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        criterionId: 'artifact_missing',
+        reason: 'Referenced evaluation artifact does not exist.',
+      }),
+    ]));
+  });
+
+  it('rejects empty or hash-mismatched command artifacts before Questioner', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+    await createV1Workflow(server, 'wf-invalid-evaluation-artifacts', root);
+    await putSingleSubtaskGraph(server, 'wf-invalid-evaluation-artifacts');
+    await createAcceptedContract(server, 'wf-invalid-evaluation-artifacts');
+
+    for (const fixture of [
+      { id: 'empty', content: '', sha256: `sha256:${createHash('sha256').update('').digest('hex')}`, issue: 'artifact_empty' },
+      { id: 'tampered', content: 'actual\n', sha256: `sha256:${createHash('sha256').update('expected\n').digest('hex')}`, issue: 'artifact_hash_mismatch' },
+    ]) {
+      const evaluationId = `eval-${fixture.id}-artifact`;
+      const artifactRef = `.tik/multi-agent/workflows/wf-invalid-evaluation-artifacts/evaluations/${evaluationId}/stdout.log`;
+      const artifactPath = path.join(root, artifactRef);
+      await fs.mkdir(path.dirname(artifactPath), { recursive: true });
+      await fs.writeFile(artifactPath, fixture.content, 'utf-8');
+      await server.inject({
+        method: 'POST',
+        url: `/api/v1/multi-agent/workflows/wf-invalid-evaluation-artifacts/subtasks/st-api/evaluations`,
+        payload: { id: evaluationId, contractId: 'contract-st-api-v1', headSha: 'head-1' },
+      });
+      const recorded = await server.inject({
+        method: 'POST',
+        url: `/api/v1/multi-agent/workflows/wf-invalid-evaluation-artifacts/subtasks/st-api/evaluations/${evaluationId}/result`,
+        payload: {
+          result: {
+            workflowId: 'wf-invalid-evaluation-artifacts',
+            subtaskId: 'st-api',
+            contractId: 'contract-st-api-v1',
+            evaluatorRunId: evaluationId,
+            headSha: 'head-1',
+            verdict: 'pass',
+            criteriaResults: [{ criterionId: 'ac-1', status: 'pass', evidence: 'Semantic review passed.' }],
+            commandResults: [{
+              commandId: 'cmd-test',
+              command: 'pnpm --filter @tik/kernel test',
+              status: 'passed',
+              exitCode: 0,
+              stdoutArtifactId: artifactRef,
+              stdoutArtifactSha256: fixture.sha256,
+              stdoutArtifactBytes: Buffer.byteLength(fixture.content),
+              summary: 'Command claims to have passed.',
+            }],
+            runtimeFindings: [],
+            coverageGaps: [],
+            confidence: 0.9,
+          },
+        },
+      });
+
+      expect(recorded.json().evaluationRun).toMatchObject({ status: 'inconclusive', result: { verdict: 'inconclusive' } });
+      expect(recorded.json().evaluationRun.result.coverageGaps).toEqual(expect.arrayContaining([
+        expect.objectContaining({ criterionId: fixture.issue }),
+      ]));
+    }
+  });
+
   it('does not treat not_tested placeholder criteria as real evaluator evidence', async () => {
     const root = await makeTempWorkspace();
     const server = await createTestServer(root);
@@ -2370,8 +2579,10 @@ describe('codex evaluator and Claude questioner workflow', () => {
       threadId: 'builder-thread-manual',
       headSha: 'head-1',
       evidenceRefs: ['ev-manual-impl'],
+      nativeRuntimeOwned: true,
     });
     expect(manualBuilder.statusCode).toBe(200);
+    expect(manualBuilder.json().invocation).not.toHaveProperty('nativeRuntimeOwned');
     const manualStart = await server.inject({
       method: 'POST',
       url: '/api/v1/multi-agent/workflows/wf-manual-thread-ids/agent-invocations/inv-builder-manual/start',
@@ -3191,8 +3402,24 @@ describe('codex evaluator and Claude questioner workflow', () => {
     expect(complete.statusCode).toBe(200);
     expect(complete.json().guard).toMatchObject({
       accepted: false,
-      code: 'evaluation_evidence_insufficient',
+      code: 'evaluation_not_passed',
     });
+    const bundle = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-final-thin-evidence',
+    });
+    expect(bundle.json().evaluationRuns).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'eval-final-thin',
+        status: 'inconclusive',
+        result: expect.objectContaining({
+          verdict: 'inconclusive',
+          coverageGaps: expect.arrayContaining([
+            expect.objectContaining({ reason: 'Required evaluation command did not pass.' }),
+          ]),
+        }),
+      }),
+    ]));
   });
 
   it('records complete-subtask through a single guarded action endpoint', async () => {
@@ -3906,6 +4133,7 @@ async function createInvocationRecord(
       violations: string[];
     };
     runtimeAttestation?: Record<string, unknown>;
+    nativeRuntimeOwned?: boolean;
   },
 ) {
   return server.inject({
@@ -3923,6 +4151,7 @@ async function createInvocationRecord(
       evaluationRunId: input.evaluationRunId,
       readonlyPolicy: input.readonlyPolicy,
       runtimeAttestation: input.runtimeAttestation,
+      nativeRuntimeOwned: input.nativeRuntimeOwned,
     },
   });
 }

@@ -96,6 +96,7 @@ export class ClaudeCodeRunner implements AgentRuntimeRunner {
         this.statuses.set(input.runId, status);
       },
       input.timeoutMs,
+      logAttachment.activity,
     );
     return {
       runId: input.runId,

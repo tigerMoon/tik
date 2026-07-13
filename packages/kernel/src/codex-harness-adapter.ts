@@ -261,7 +261,7 @@ export class CodexHarnessAdapter {
       const status = await Promise.race([
         turnCompleted,
         new Promise<'completed'>((_, reject) => {
-          turnTimeout = setTimeout(() => reject(new Error('Codex App Server turn timed out.')), 15 * 60_000);
+          turnTimeout = setTimeout(() => reject(new Error('Codex App Server turn timed out.')), 30 * 60_000);
           turnTimeout.unref?.();
         }),
       ]);

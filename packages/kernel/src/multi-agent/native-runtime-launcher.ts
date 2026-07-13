@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -19,11 +19,15 @@ import {
   type CreateAgentInvocationInput,
 } from './workflow-store.js';
 import type { AgentInvocationRecord, QuestionerRun } from '@tik/shared';
+import {
+  committedEvidenceErrorMessage,
+  validateCommittedEvidencePreflight,
+} from './committed-evidence-preflight.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_BUILDER_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_READONLY_TIMEOUT_MS = 8 * 60 * 1000;
-const DEFAULT_QUESTIONER_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_QUESTIONER_TIMEOUT_MS = 30 * 60 * 1000;
 
 export interface NativeInvocationLaunchInput {
   invocation: CreateAgentInvocationInput;
@@ -95,7 +99,13 @@ export class MultiAgentNativeRuntimeLauncher {
         if (!sameNativeInvocationRequest(existing, input.invocation)) {
           throw new MultiAgentCoordinationError('version_conflict', `Agent invocation ${input.invocation.id} already exists with different input.`);
         }
-        if (existing.status === 'created' || existing.status === 'started' || existing.status === 'completed') {
+        if (existing.status === 'created' && existing.nativeRuntimeOwned) {
+          throw new MultiAgentCoordinationError(
+            'native_runtime_not_started',
+            `Tik-owned invocation ${existing.id} was persisted but its native runtime never started.`,
+          );
+        }
+        if (existing.status === 'started' || existing.status === 'completed') {
           return {
             invocation: existing,
             runId: existing.id,
@@ -107,15 +117,38 @@ export class MultiAgentNativeRuntimeLauncher {
       }
     }
     const projectPath = bundle.workflow.workspaceBinding?.effectiveProjectPath || this.workspaceRoot;
-    const invocation = await this.store.createInvocation(workflowId, input.invocation);
+    if (role === 'evaluator' && input.invocation.subtaskId) {
+      const preflight = await validateCommittedEvidencePreflight({
+        bundle,
+        projectPath,
+        headSha: input.invocation.headSha || bundle.workflow.currentHeadSha || '',
+        subtaskId: input.invocation.subtaskId,
+        validationCommands: input.invocation.validationCommands,
+      });
+      if (!preflight.accepted) {
+        throw new MultiAgentCoordinationError('committed_evidence_invalid', committedEvidenceErrorMessage(preflight));
+      }
+    }
+    const invocation = await this.store.createInvocation(workflowId, {
+      ...input.invocation,
+      nativeRuntimeOwned: true,
+    });
     const runId = invocation.id;
     const readonly = invocation.role === 'reviewer' || invocation.role === 'evaluator';
-    const statusBefore = readonly ? await readGitStatus(projectPath) : undefined;
+    const isolatedWorkspace = invocation.role === 'evaluator' && invocation.subtaskId
+      ? await createIsolatedEvaluatorWorkspace(projectPath, this.workspaceRoot, invocation.id, invocation.headSha || 'HEAD')
+      : undefined;
+    const runtimeProjectPath = isolatedWorkspace?.path || projectPath;
+    const statusBefore = readonly ? await readGitStatus(runtimeProjectPath) : undefined;
+    const evaluatorAllowedPaths = invocation.role === 'evaluator' ? invocation.allowedPaths : undefined;
+    const workspaceFingerprintBefore = readonly
+      ? await sourceFingerprint(runtimeProjectPath, evaluatorAllowedPaths)
+      : undefined;
     try {
       const prepared = await runner.prepare(buildAgentRunInput({
         runId,
         workflowId,
-        projectPath,
+        projectPath: runtimeProjectPath,
         workspaceRoot: this.workspaceRoot,
         invocation,
         prompt: input.prompt || buildCodexPrompt(bundle.workflow.goal, invocation),
@@ -124,7 +157,7 @@ export class MultiAgentNativeRuntimeLauncher {
       }));
       const handle = await runner.start({
         ...prepared,
-        allowWrites: !readonly,
+        allowWrites: invocation.role === 'evaluator' || !readonly,
         requireThreadId: true,
         developerInstructions: buildCodexDeveloperInstructions(invocation, readonly),
       });
@@ -156,9 +189,11 @@ export class MultiAgentNativeRuntimeLauncher {
         invocation: started,
         runner,
         completion: handle.completion,
-        projectPath,
+        projectPath: runtimeProjectPath,
         statusBefore,
+        workspaceFingerprintBefore,
         readonly,
+        cleanupWorkspace: isolatedWorkspace?.cleanup,
       });
       return {
         invocation: started,
@@ -168,6 +203,7 @@ export class MultiAgentNativeRuntimeLauncher {
       };
     } catch (error) {
       this.activeHandles.delete(runId);
+      await isolatedWorkspace?.cleanup().catch(() => undefined);
       const current = await this.store.readInvocation(workflowId, invocation.id);
       if (current?.status === 'created') {
         await this.store.updateInvocation(workflowId, invocation.id, {
@@ -260,27 +296,49 @@ export class MultiAgentNativeRuntimeLauncher {
     completion: Promise<AgentRunCompletion>;
     projectPath: string;
     statusBefore?: string;
+    workspaceFingerprintBefore?: string;
     readonly: boolean;
+    cleanupWorkspace?: () => Promise<void>;
   }): Promise<void> {
     try {
       const completion = await input.completion;
-      const [headSha, statusAfter, diff, transcripts] = await Promise.all([
+      const [headSha, statusAfter, workspaceFingerprintAfter, diff, transcripts] = await Promise.all([
         readGitHead(input.projectPath),
         input.readonly ? readGitStatus(input.projectPath) : Promise.resolve(undefined),
+        input.readonly
+          ? sourceFingerprint(
+            input.projectPath,
+            input.invocation.role === 'evaluator' ? input.invocation.allowedPaths : undefined,
+          )
+          : Promise.resolve(undefined),
         input.runner.collectDiff(input.invocation.id).catch(() => ({ changedFiles: [] })),
         input.runner.collectTranscript(input.invocation.id).catch(() => []),
       ]);
-      const violations = input.readonly && input.statusBefore !== statusAfter ? ['worktree_changed'] : [];
+      const violations = input.readonly
+        ? readonlyViolations({
+          role: input.invocation.role,
+          statusBefore: input.statusBefore,
+          statusAfter,
+          fingerprintBefore: input.workspaceFingerprintBefore,
+          fingerprintAfter: workspaceFingerprintAfter,
+          allowedPaths: input.invocation.allowedPaths,
+        })
+        : [];
       const readonlyPolicy = input.readonly ? {
         ...(input.invocation.readonlyPolicy || { enforced: true }),
         enforced: violations.length === 0,
         violations,
         gitStatusBefore: input.statusBefore,
         gitStatusAfter: statusAfter,
+        workspaceFingerprintBefore: input.workspaceFingerprintBefore,
+        workspaceFingerprintAfter,
       } : input.invocation.readonlyPolicy;
+      const completionStatus = violations.length > 0 ? 'failed' : completion.status;
       await this.store.completeNativeInvocation(input.workflowId, input.invocation.id, {
-        status: completion.status,
-        error: completion.error,
+        status: completionStatus,
+        error: violations.length > 0
+          ? `Readonly policy violated: ${violations.join(', ')}`
+          : completion.error,
         headSha,
         readonlyPolicy,
         result: {
@@ -302,6 +360,7 @@ export class MultiAgentNativeRuntimeLauncher {
     } finally {
       this.activeHandles.delete(input.invocation.id);
       await input.runner.cleanup(input.invocation.id).catch(() => undefined);
+      await input.cleanupWorkspace?.().catch(() => undefined);
     }
   }
 
@@ -374,6 +433,149 @@ async function createIsolatedQuestionerWorkspace(
       await fs.rm(target, { recursive: true, force: true });
     },
   };
+}
+
+async function createIsolatedEvaluatorWorkspace(
+  projectPath: string,
+  workspaceRoot: string,
+  runId: string,
+  headSha: string,
+): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  let target = path.join(workspaceRoot, '.tik', 'runtime-worktrees', `evaluator-${runId.replace(/[^A-Za-z0-9._-]/g, '_')}`);
+  await fs.rm(target, { recursive: true, force: true });
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  let gitWorktree = false;
+  try {
+    await execFileAsync('git', ['worktree', 'add', '--detach', target, headSha], {
+      cwd: projectPath,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    gitWorktree = true;
+  } catch {
+    await fs.rm(target, { recursive: true, force: true });
+    target = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-evaluator-'));
+    await fs.cp(projectPath, target, {
+      recursive: true,
+      filter: (source) => {
+        const relative = path.relative(projectPath, source);
+        return relative !== '.git'
+          && !relative.startsWith(`.git${path.sep}`)
+          && relative !== '.tik'
+          && !relative.startsWith(`.tik${path.sep}`);
+      },
+    });
+  }
+  return {
+    path: target,
+    cleanup: async () => {
+      if (gitWorktree) {
+        await execFileAsync('git', ['worktree', 'remove', '--force', target], {
+          cwd: projectPath,
+          maxBuffer: 8 * 1024 * 1024,
+        }).catch(() => undefined);
+      }
+      await fs.rm(target, { recursive: true, force: true });
+    },
+  };
+}
+
+async function sourceFingerprint(cwd: string, allowedPaths: string[] = []): Promise<string | undefined> {
+  const trackedOutput = await runGit(cwd, ['ls-files', '-z']);
+  const files = trackedOutput !== undefined
+    ? trackedOutput.split('\0').filter(Boolean)
+    : await listFingerprintFiles(cwd, allowedPaths);
+  const hash = createHash('sha256');
+  for (const relativePath of files.sort()) {
+    if (isAllowedEvaluatorGeneratedPath(relativePath, allowedPaths)) continue;
+    const filePath = path.join(cwd, relativePath);
+    const stat = await fs.stat(filePath).catch(() => null);
+    if (!stat?.isFile()) {
+      hash.update(`${relativePath}\0missing\0`);
+      continue;
+    }
+    hash.update(`${relativePath}\0`);
+    hash.update(await fs.readFile(filePath));
+    hash.update('\0');
+  }
+  return `sha256:${hash.digest('hex')}`;
+}
+
+async function listFingerprintFiles(root: string, allowedPaths: string[] = []): Promise<string[]> {
+  const files: string[] = [];
+  const visit = async (dir: string): Promise<void> => {
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      const absolute = path.join(dir, entry.name);
+      const relative = path.relative(root, absolute).replace(/\\/g, '/');
+      if (entry.isDirectory()) {
+        if (entry.name === '.git' || entry.name === '.tik' || isAllowedEvaluatorGeneratedPath(relative, allowedPaths)) continue;
+        await visit(absolute);
+      } else if (entry.isFile() && !isAllowedEvaluatorGeneratedPath(relative, allowedPaths)) {
+        files.push(relative);
+      }
+    }
+  };
+  await visit(root);
+  return files;
+}
+
+function readonlyViolations(input: {
+  role: AgentInvocationRecord['role'];
+  statusBefore?: string;
+  statusAfter?: string;
+  fingerprintBefore?: string;
+  fingerprintAfter?: string;
+  allowedPaths?: string[];
+}): string[] {
+  if (input.role !== 'evaluator') {
+    return input.statusBefore !== input.statusAfter || input.fingerprintBefore !== input.fingerprintAfter
+      ? ['worktree_changed']
+      : [];
+  }
+  const violations: string[] = [];
+  if (input.fingerprintBefore !== input.fingerprintAfter) violations.push('tracked_source_changed');
+  for (const filePath of changedPathsFromStatus(input.statusAfter || '')) {
+    if (!isAllowedEvaluatorGeneratedPath(filePath, input.allowedPaths)) violations.push(`forbidden_write:${filePath}`);
+  }
+  return violations;
+}
+
+function changedPathsFromStatus(status: string): string[] {
+  return status.split(/\r?\n/)
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean)
+    .map((filePath) => filePath.includes(' -> ') ? filePath.split(' -> ').at(-1) || filePath : filePath)
+    .map((filePath) => filePath.replace(/^"|"$/g, '').replace(/\\/g, '/'));
+}
+
+function isAllowedEvaluatorGeneratedPath(value: string, allowedPaths: string[] = []): boolean {
+  const filePath = value.replace(/\\/g, '/').replace(/^\.\/+/, '');
+  return /(^|\/)target(?:\/|$)/.test(filePath)
+    || /(^|\/)\.risk\.env$/.test(filePath)
+    || /(^|\/)(?:test-results|playwright-report|coverage)(?:\/|$)/.test(filePath)
+    || filePath.startsWith('.tmp/evaluation/')
+    || filePath.startsWith('.tik/multi-agent/')
+    || allowedPaths.some((pattern) => matchesAllowedEvaluatorPath(filePath, pattern));
+}
+
+function matchesAllowedEvaluatorPath(filePath: string, pattern: string): boolean {
+  const normalized = pattern.replace(/\\/g, '/').replace(/^\.\/+/, '');
+  if (!normalized) return false;
+  if (!normalized.includes('*')) {
+    return filePath === normalized || filePath.startsWith(`${normalized.replace(/\/$/, '')}/`);
+  }
+  let source = '';
+  for (let index = 0; index < normalized.length; index += 1) {
+    const char = normalized[index];
+    if (char === '*' && normalized[index + 1] === '*') {
+      source += '.*';
+      index += 1;
+    } else if (char === '*') {
+      source += '[^/]*';
+    } else {
+      source += char.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return new RegExp(`^${source}$`).test(filePath);
 }
 
 function buildAgentRunInput(input: {
@@ -498,7 +700,15 @@ async function readGitHead(cwd: string): Promise<string | undefined> {
 }
 
 async function readGitStatus(cwd: string): Promise<string> {
-  return (await runGit(cwd, ['status', '--porcelain=v1'])) || '';
+  try {
+    const result = await execFileAsync('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
+      cwd,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    return result.stdout.trimEnd();
+  } catch {
+    return '';
+  }
 }
 
 async function runGit(cwd: string, args: string[]): Promise<string | undefined> {

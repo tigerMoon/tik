@@ -412,12 +412,19 @@ function planSubtaskV1Action(ctx: WorkflowDecisionContext, subtaskId: string, ti
         evaluationRunId: evaluation.id,
         headSha: evaluation.result?.headSha || evaluation.headSha,
       });
+      const activeQuestioner = existing ? undefined : findActiveQuestionerInvocation(ctx.bundle, {
+        subtaskId,
+        evaluationRunId: evaluation.id,
+        headSha: evaluationHead,
+      });
       return planned(existing ? 'fix_evaluation_findings' : 'ask_claude_question_evaluation', {
         subtaskId,
-        reason: existing
+        reason: activeQuestioner
+          ? `Claude Questioner ${activeQuestioner.id} is still running for evaluation ${evaluation.id}.`
+          : existing
           ? questioner.message || `Claude Questioner output ${existing.id} contains blocking questions.`
           : `Codex evaluation ${evaluation.id} passed; Claude Questioner should challenge the evidence.`,
-        reasonCode: questioner.code || 'missing_questioner_output',
+        reasonCode: activeQuestioner ? 'awaiting_native_runtime' : questioner.code || 'missing_questioner_output',
         evidenceRefs: mergeRefs(subtaskState.evidenceRefs, [implementation.id]),
         refs: questioner.refs || [{ kind: 'evaluation', id: evaluation.id }],
         inputs: {
@@ -425,6 +432,7 @@ function planSubtaskV1Action(ctx: WorkflowDecisionContext, subtaskId: string, ti
           evaluationRunId: evaluation.id,
           headSha: evaluationHead,
           questionerOutputId: existing?.id,
+          invocationId: activeQuestioner?.id,
         },
       });
     }
@@ -558,11 +566,17 @@ function planFinalV1Action(ctx: WorkflowDecisionContext): PlannedAction {
         finalEvaluationRunId: finalEvaluation.id,
         headSha: finalEvaluation.result?.headSha || finalEvaluation.headSha,
       });
+      const activeQuestioner = existing ? undefined : findActiveQuestionerInvocation(ctx.bundle, {
+        evaluationRunId: finalEvaluation.id,
+        headSha: finalEvaluationHead,
+      });
       return planned(existing ? 'request_human_review' : 'ask_claude_question_final_evidence', {
-        reason: existing
+        reason: activeQuestioner
+          ? `Final Claude Questioner ${activeQuestioner.id} is still running for evaluation ${finalEvaluation.id}.`
+          : existing
           ? questioner.message || `Final Claude Questioner output ${existing.id} contains blocking questions.`
           : `Final Codex evaluation ${finalEvaluation.id} passed; Claude Questioner should challenge final evidence.`,
-        reasonCode: questioner.code || 'missing_questioner_output',
+        reasonCode: activeQuestioner ? 'awaiting_native_runtime' : questioner.code || 'missing_questioner_output',
         evidenceRefs: collectEvidenceRefs(ctx.subtasks),
         refs: questioner.refs || [{ kind: 'evaluation', id: finalEvaluation.id }],
         inputs: {
@@ -570,6 +584,7 @@ function planFinalV1Action(ctx: WorkflowDecisionContext): PlannedAction {
           evaluationRunId: finalEvaluation.id,
           headSha: finalEvaluationHead,
           questionerOutputId: existing?.id,
+          invocationId: activeQuestioner?.id,
         },
       });
     }
@@ -622,6 +637,24 @@ function findActiveInvocation(
     .filter((invocation) => invocation.subtaskId === subtaskId)
     .filter((invocation) => roles.includes(invocation.role))
     .filter((invocation) => invocation.status === 'created' || invocation.status === 'started')
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+}
+
+function findActiveQuestionerInvocation(
+  bundle: MultiAgentWorkflowBundle,
+  input: { subtaskId?: string; evaluationRunId: string; headSha?: string },
+) {
+  return bundle.invocations
+    .filter((invocation) => invocation.role === 'questioner')
+    .filter((invocation) => invocation.status === 'created' || invocation.status === 'started')
+    .filter((invocation) => input.subtaskId === undefined || invocation.subtaskId === input.subtaskId)
+    .filter((invocation) => {
+      const evaluationRunId = invocation.evaluationRunId
+        || (typeof invocation.input?.evaluationRunId === 'string' ? invocation.input.evaluationRunId : undefined)
+        || (typeof invocation.input?.finalEvaluationRunId === 'string' ? invocation.input.finalEvaluationRunId : undefined);
+      return evaluationRunId === input.evaluationRunId;
+    })
+    .filter((invocation) => !input.headSha || !invocation.headSha || invocation.headSha === input.headSha)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
 }
 

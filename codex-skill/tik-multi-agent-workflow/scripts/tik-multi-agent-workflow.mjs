@@ -8,6 +8,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { decideNextAction } from '../lib/loop-gate.mjs';
+import { parseLastJsonObject } from '../lib/structured-output.mjs';
+import { collectSurefireEvidence } from '../lib/surefire-evidence.mjs';
 import { findSubtask } from '../lib/task-graph.mjs';
 import { buildWorkspaceBinding, git, resolveProjectPath } from '../lib/git.mjs';
 import {
@@ -887,7 +889,22 @@ async function startQuestioner(options) {
       ? undefined
       : subtaskId ? latestContractId(state, subtaskId) : undefined
   );
-  const stableRunId = stableNativeId('questioner-run', workflowId, subtaskId || '__final__', intent, headSha, evaluationRunId, contractId);
+  const stableRunParts = [workflowId, subtaskId || '__final__', intent, headSha, evaluationRunId, contractId];
+  const baseStableRunId = stableNativeId('questioner-run', ...stableRunParts);
+  const matchingRuns = (state.questionerRuns || [])
+    .filter((candidate) => candidate.subtaskId === subtaskId
+      && candidate.intent === intent
+      && candidate.headSha === headSha
+      && candidate.evaluationRunId === (finalEvaluationRunId ? undefined : evaluationRunId)
+      && candidate.finalEvaluationRunId === finalEvaluationRunId
+      && candidate.contractId === contractId)
+    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')));
+  const reusableRun = matchingRuns.find((candidate) => ['created', 'started', 'validated'].includes(candidate.status));
+  const terminalAttempts = matchingRuns.filter((candidate) => ['rejected', 'expired'].includes(candidate.status)).length;
+  const stableRunId = reusableRun?.id
+    || (terminalAttempts === 0
+      ? baseStableRunId
+      : stableNativeId('questioner-run', ...stableRunParts, `attempt-${terminalAttempts + 1}`));
   const run = await launchNativeQuestionerRun(options, workflowId, {
     id: stringOption(options.run) || stableRunId,
     invocationId: stringOption(options.invocationId)
@@ -1151,9 +1168,7 @@ async function evaluate(options) {
     : options.result
       ? await readJsonFile(options.result)
       : nativeStructuredResult;
-  const commands = nativeStructuredResult && !options.command
-    ? []
-    : evaluationCommandsFromOptions(options, state, subtaskId);
+  const commands = evaluationCommandsFromOptions(options, state, subtaskId);
   const setupCommands = splitList(options.evaluatorSetupCommand) || splitList(options.setupCommand) || [];
   const commandResults = [];
   let commandResult = null;
@@ -1193,6 +1208,28 @@ async function evaluate(options) {
         });
         currentResult.commandId = commandIds[index]
           || (commands.length === 1 ? 'cmd-evaluate' : `cmd-evaluate-${index + 1}`);
+        const surefire = await collectSurefireEvidence({
+          command,
+          cwd: evaluationCwd,
+          projectRoot: projectPath,
+          startedAt: evaluationRun.evaluationRun.startedAt,
+          artifactDir: path.join(
+            projectPath,
+            '.tik',
+            'multi-agent',
+            'workflows',
+            workflowId,
+            'evaluations',
+            evaluationRun.evaluationRun.id,
+            'surefire',
+          ),
+        });
+        currentResult.testReports = surefire.reports;
+        currentResult.gateFailureCodes = surefire.failureCodes;
+        if (surefire.failureCodes.length > 0) {
+          currentResult.status = 'failed';
+          currentResult.summary = `Deterministic test evidence gate failed: ${surefire.failureCodes.join(', ')}.`;
+        }
         commandResults.push(currentResult);
         commandResult = currentResult;
         if (currentResult.status !== 'passed') {
@@ -1208,24 +1245,30 @@ async function evaluate(options) {
     gitStatusBefore,
     gitStatusAfter,
   });
-  let verdict = readonly.guard?.accepted === false
-    ? 'fail'
-    : structuredResult?.verdict
-      ? structuredResult.verdict
-      : setupFailure || evaluationCommandResults(commandResults).some((result) => result.status !== 'passed')
-      ? 'fail'
-      : !hasEvaluationCommandResult(commandResults)
-        ? 'inconclusive'
-      : 'pass';
+  const semanticVerdict = normalizeEvaluationVerdict(structuredResult?.verdict);
+  let verdict = composeEvaluationVerdict({
+    semanticVerdict,
+    readonlyAccepted: readonly.guard?.accepted !== false,
+    setupFailed: Boolean(setupFailure),
+    commandResults: evaluationCommandResults(commandResults),
+  });
   const coverageGaps = Array.isArray(structuredResult?.coverageGaps)
-    ? structuredResult.coverageGaps
-    : !hasEvaluationCommandResult(commandResults)
-      ? [{
+    ? [...structuredResult.coverageGaps]
+    : [];
+  if (!semanticVerdict) {
+    coverageGaps.push({
+      criterionId: 'semantic-verdict',
+      description: 'Evaluator did not provide a semantic verdict.',
+      reason: 'Command results cannot replace a native Evaluator verdict.',
+    });
+  }
+  if (!hasEvaluationCommandResult(commandResults) && !semanticVerdict) {
+    coverageGaps.push({
         criterionId: 'all',
         description: 'Evaluator did not provide command, criteria, artifact, or reproduction evidence.',
         reason: 'No evaluator command, criteria result, or artifact evidence was provided.',
-      }]
-      : [];
+    });
+  }
   const failedCommandResult = evaluationCommandResults(commandResults).find((result) => result.status !== 'passed');
   const decisiveCommandResult = setupFailure || failedCommandResult || commandResult;
   const criteriaResults = Array.isArray(structuredResult?.criteriaResults)
@@ -1283,6 +1326,12 @@ async function evaluate(options) {
         exitCode: result.exitCode,
         stdoutArtifactId: result.stdoutArtifactId,
         stderrArtifactId: result.stderrArtifactId,
+        stdoutArtifactSha256: result.stdoutArtifactSha256,
+        stderrArtifactSha256: result.stderrArtifactSha256,
+        stdoutArtifactBytes: result.stdoutArtifactBytes,
+        stderrArtifactBytes: result.stderrArtifactBytes,
+        gateFailureCodes: result.gateFailureCodes,
+        testReports: result.testReports,
         summary: result.summary,
       }))
       : [],
@@ -1291,6 +1340,8 @@ async function evaluate(options) {
     confidence: verdict === 'pass' ? 0.85 : 0.25,
   };
   const recorded = await recordEvaluationResult(options, workflowId, subtaskId, evaluationRun.evaluationRun.id, result);
+  const recordedVerdict = normalizeEvaluationVerdict(recorded.evaluationRun?.result?.verdict) || 'inconclusive';
+  const evaluationPassed = recorded.evaluationRun?.status === 'passed' && recordedVerdict === 'pass';
   let invocation = null;
   if (options.invocation) {
     const invocationId = String(options.invocation);
@@ -1317,12 +1368,12 @@ async function evaluate(options) {
       : await hookStopInvocation(options, workflowId, invocationId, {
         ...invocationResult,
         attestationToken: requireOption(options.attestationToken, '--attestation-token is required for a hook-launched Codex Evaluator invocation'),
-        status: verdict === 'pass' ? 'completed' : 'failed',
+        status: evaluationPassed ? 'completed' : 'failed',
       });
   }
   if (subtaskId !== '__final__') {
     await updateSubtask(options, workflowId, subtaskId, {
-      status: verdict === 'pass' ? 'evaluation_passed' : 'evaluation_failed',
+      status: evaluationPassed ? 'evaluation_passed' : 'evaluation_failed',
       validationRunIds: [evaluationRun.evaluationRun.id],
     });
   }
@@ -1330,7 +1381,7 @@ async function evaluate(options) {
     action: 'evaluation-recorded',
     workflowId,
     subtaskId,
-    passed: verdict === 'pass',
+    passed: evaluationPassed,
     evaluationRun: recorded.evaluationRun,
     invocation: invocation?.invocation,
     readonly: readonly.guard,
@@ -1345,7 +1396,7 @@ async function evaluate(options) {
         .map((result) => ({ command: result.command, status: result.status, exitCode: result.exitCode })),
     } : undefined,
   });
-  if (verdict !== 'pass' && options.failOnValidationError) {
+  if (!evaluationPassed && options.failOnValidationError) {
     process.exitCode = (setupFailure || failedCommandResult || commandResult)?.exitCode || 1;
   }
 }
@@ -1932,6 +1983,19 @@ function evaluationCommandResults(commandResults) {
   return (commandResults || []).filter((result) => !isSetupCommandResult(result));
 }
 
+function normalizeEvaluationVerdict(value) {
+  return ['pass', 'fail', 'inconclusive', 'human_review_required'].includes(value) ? value : undefined;
+}
+
+function composeEvaluationVerdict(input) {
+  if (!input.readonlyAccepted || input.setupFailed) return 'fail';
+  if (input.commandResults.some((result) => result.status !== 'passed')) return 'fail';
+  if (input.semanticVerdict === 'fail') return 'fail';
+  if (input.semanticVerdict === 'inconclusive') return 'inconclusive';
+  if (input.semanticVerdict === 'human_review_required') return 'human_review_required';
+  return input.semanticVerdict === 'pass' ? 'pass' : 'inconclusive';
+}
+
 function isSetupCommandResult(result) {
   return result.commandId?.startsWith('cmd-evaluate-setup-');
 }
@@ -2214,36 +2278,6 @@ function nativeInvocationStructuredResult(state, invocationId, expectedRole) {
   return result;
 }
 
-function parseLastJsonObject(value) {
-  if (typeof value !== 'string' || value.trim().length === 0) return null;
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    // Native agents may precede their final JSON with progress text.
-  }
-  const fenced = Array.from(value.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi));
-  for (const match of fenced.reverse()) {
-    try {
-      const parsed = JSON.parse(match[1].trim());
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
-    } catch {
-      // Try the next candidate.
-    }
-  }
-  const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  for (const line of lines.reverse()) {
-    if (!line.startsWith('{')) continue;
-    try {
-      const parsed = JSON.parse(line);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
-    } catch {
-      // Continue scanning earlier lines.
-    }
-  }
-  return null;
-}
-
 async function readJsonOptional(filePath) {
   try {
     return JSON.parse(await readFile(filePath, 'utf-8'));
@@ -2469,6 +2503,8 @@ function defaultEvaluatorAllowedPaths() {
     'playwright-report/',
     'coverage/',
     '.tmp/evaluation/',
+    '**/target/**',
+    '.risk.env',
   ];
 }
 
@@ -2653,6 +2689,9 @@ async function runCommandWithArtifacts(input) {
     });
     const stdoutStream = createWriteStream(input.stdoutArtifactPath, { encoding: 'utf-8' });
     const stderrStream = createWriteStream(input.stderrArtifactPath, { encoding: 'utf-8' });
+    const logHeader = `$ ${input.command}\n`;
+    stdoutStream.write(logHeader);
+    stderrStream.write(logHeader);
     let stdout = '';
     let stderr = '';
     let settled = false;
@@ -2714,19 +2753,29 @@ async function runCommandWithArtifacts(input) {
         : code === 0
           ? 'passed'
           : 'failed';
-      finishStreams(stdoutStream, stderrStream).then(() => resolve({
-        command: input.command,
-        status,
-        exitCode: code,
-        signal,
-        stdout,
-        stderr,
-        stdoutArtifactId: toProjectRelative(input.artifactBasePath || input.cwd, input.stdoutArtifactPath),
-        stderrArtifactId: toProjectRelative(input.artifactBasePath || input.cwd, input.stderrArtifactPath),
-        summary: timeout
-          ? (idleTimedOut ? 'Command timed out after idle timeout.' : 'Command timed out.')
-          : code === 0 ? 'Command passed.' : 'Command failed.',
-      })).catch(reject);
+      finishStreams(stdoutStream, stderrStream).then(async () => {
+        const [stdoutArtifact, stderrArtifact] = await Promise.all([
+          readFile(input.stdoutArtifactPath),
+          readFile(input.stderrArtifactPath),
+        ]);
+        resolve({
+          command: input.command,
+          status,
+          exitCode: code,
+          signal,
+          stdout,
+          stderr,
+          stdoutArtifactId: toProjectRelative(input.artifactBasePath || input.cwd, input.stdoutArtifactPath),
+          stderrArtifactId: toProjectRelative(input.artifactBasePath || input.cwd, input.stderrArtifactPath),
+          stdoutArtifactSha256: `sha256:${createHash('sha256').update(stdoutArtifact).digest('hex')}`,
+          stderrArtifactSha256: `sha256:${createHash('sha256').update(stderrArtifact).digest('hex')}`,
+          stdoutArtifactBytes: stdoutArtifact.byteLength,
+          stderrArtifactBytes: stderrArtifact.byteLength,
+          summary: timeout
+            ? (idleTimedOut ? 'Command timed out after idle timeout.' : 'Command timed out.')
+            : code === 0 ? 'Command passed.' : 'Command failed.',
+        });
+      }).catch(reject);
     });
   });
 }

@@ -1,6 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   generateId,
@@ -120,6 +120,7 @@ export interface CreateAgentInvocationInput {
   evidenceRefs?: string[];
   evaluationRunId?: string;
   readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
+  nativeRuntimeOwned?: boolean;
 }
 
 interface CreateQuestionerRunInput {
@@ -133,6 +134,7 @@ interface CreateQuestionerRunInput {
   headSha: string;
   start?: boolean;
   tokenTtlMs?: number;
+  nativeRuntimeOwned?: boolean;
   runtimeAudit?: {
     gitStatusBefore?: string;
     workspaceFingerprintBefore?: string;
@@ -1121,14 +1123,25 @@ export class FileMultiAgentWorkflowStore {
     run: EvaluationRun,
     result: CodexEvaluationResult,
   ): Promise<CodexEvaluationResult> {
-    const contract = isFinalEvaluationSubtask(subtaskId)
+    const finalEvaluation = isFinalEvaluationSubtask(subtaskId);
+    const contract = finalEvaluation
       ? null
       : await this.readJsonFile<SprintContract>(this.contractFile(workflowId, subtaskId, run.contractId));
+    const taskGraph = finalEvaluation
+      ? await this.readTaskGraphForWorkflow(await this.requireWorkflow(workflowId))
+      : null;
     const mustCriteria = contract?.acceptanceCriteria.filter((criterion) => criterion.priority === 'must') || [];
     const criteriaResults = Array.isArray(result.criteriaResults) ? result.criteriaResults : [];
     const commandResults = Array.isArray(result.commandResults) ? result.commandResults : [];
     const runtimeFindings = Array.isArray(result.runtimeFindings) ? result.runtimeFindings : [];
     const coverageGaps = Array.isArray(result.coverageGaps) ? result.coverageGaps : [];
+    const artifactGaps = await validateEvaluationArtifactRefs(
+      this.rootPath,
+      workflowId,
+      run,
+      criteriaResults,
+      commandResults,
+    );
     const hasCommandEvidence = commandResults.some((command) => command.status !== 'skipped');
     const hasStructuredCriteriaEvidence = criteriaResults.some((criterion) =>
       criterion.status === 'pass'
@@ -1158,7 +1171,41 @@ export class FileMultiAgentWorkflowStore {
       description: `Must acceptance criterion ${criterionId} was not proven by the evaluator.`,
       reason: 'Missing passing criteriaResult for a must acceptance criterion.',
     }));
-    const nextCoverageGaps = mergeCoverageGaps(coverageGaps, [...missingEvidence, ...missingCriteriaGaps]);
+    const requiredCommands = contract
+      ? contract.verificationPlan.commands.filter((command) => command.required)
+      : (taskGraph?.finalValidationCommands || []).map((command) => ({ id: command, command }));
+    const requiredCommandChecks = requiredCommands.map((required) => ({
+      required,
+      result: commandResults.find((command) => command.commandId === required.id || command.command === required.command),
+    }));
+    const failedRequiredCommands = requiredCommandChecks.filter(({ result: command }) =>
+      command?.status === 'failed' || command?.status === 'timeout'
+    );
+    const missingRequiredCommands = requiredCommandChecks.filter(({ result: command }) =>
+      !command || command.status === 'skipped'
+    );
+    const commandGaps = [...failedRequiredCommands, ...missingRequiredCommands].map(({ required }) => ({
+      criterionId: required.id,
+      description: `Required evaluation command ${required.id} did not pass.`,
+      reason: 'Required evaluation command did not pass.',
+    }));
+    const nextCoverageGaps = mergeCoverageGaps(coverageGaps, [
+      ...missingEvidence,
+      ...missingCriteriaGaps,
+      ...commandGaps,
+      ...artifactGaps,
+    ]);
+    if (result.verdict === 'pass' && failedRequiredCommands.length > 0) {
+      return {
+        ...result,
+        verdict: 'fail',
+        criteriaResults,
+        commandResults,
+        runtimeFindings,
+        coverageGaps: nextCoverageGaps,
+        confidence: Math.min(result.confidence, 0.25),
+      };
+    }
     if (result.verdict === 'pass' && (nextCoverageGaps.length > 0 || missingMustCriteria.length > 0)) {
       return {
         ...result,
@@ -1289,6 +1336,7 @@ export class FileMultiAgentWorkflowStore {
       },
       headSha: input.headSha,
       evaluationRunId: input.evaluationRunId || input.finalEvaluationRunId,
+      nativeRuntimeOwned: input.nativeRuntimeOwned,
       readonlyPolicy: {
         enforced: true,
         allowedWritePaths: input.runtimeAudit?.allowedWritePaths || defaultQuestionerReadonlyPolicy().allowedWritePaths,
@@ -1788,6 +1836,7 @@ export class FileMultiAgentWorkflowStore {
       evidenceRefs: input.evidenceRefs || [],
       evaluationRunId: input.evaluationRunId,
       readonlyPolicy: input.readonlyPolicy,
+      nativeRuntimeOwned: input.nativeRuntimeOwned,
       attestationToken: requiresRuntimeAttestationInput(input) ? `att_${generateId()}` : undefined,
       hookAttested: requiresRuntimeAttestationInput(input) ? false : undefined,
       status: 'created',
@@ -2061,17 +2110,23 @@ export class FileMultiAgentWorkflowStore {
     const invocations = await this.readJsonLines<AgentInvocationRecord>(this.invocationsFile(id));
     const stalled: AgentInvocationRecord[] = [];
     for (const invocation of invocations) {
-      if (invocation.status !== 'started') continue;
+      const recoverableCreated = invocation.status === 'created' && invocation.nativeRuntimeOwned === true;
+      if (invocation.status !== 'started' && !recoverableCreated) continue;
       const startedAt = Date.parse(invocation.startedAt || invocation.updatedAt || invocation.createdAt);
       if (!Number.isFinite(startedAt) || nowMs - startedAt <= timeoutMs) continue;
-      const updated: AgentInvocationRecord = {
-        ...invocation,
-        status: 'failed',
-        error: 'stalled',
-        updatedAt: new Date(nowMs).toISOString(),
-        completedAt: new Date(nowMs).toISOString(),
-      };
-      await this.upsertInvocation(updated);
+      let updated: AgentInvocationRecord;
+      if (invocation.role === 'questioner') {
+        const runs = await this.readQuestionerRuns(id);
+        const run = runs.find((candidate) => candidate.invocationId === invocation.id);
+        if (run && (run.status === 'created' || run.status === 'started')) {
+          await this.failQuestionerRunRuntime(id, run.id, 'stalled');
+          updated = await this.readInvocation(id, invocation.id) || invocation;
+        } else {
+          updated = await this.failStalledInvocation(invocation, nowMs);
+        }
+      } else {
+        updated = await this.failStalledInvocation(invocation, nowMs);
+      }
       stalled.push(updated);
       await this.appendEvent(id, 'invocation.stalled', 'tik', {
         invocationId: updated.id,
@@ -2120,6 +2175,42 @@ export class FileMultiAgentWorkflowStore {
       subtasks: await this.readSubtasks(id),
       stalled,
     };
+  }
+
+  async failOrphanedCreatedNativeInvocation(
+    workflowId: string,
+    invocationId: string,
+    error: string,
+  ): Promise<AgentInvocationRecord> {
+    const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.failOrphanedCreatedNativeInvocation(id, invocationId, error));
+    }
+    const invocation = await this.readInvocation(id, invocationId);
+    if (!invocation) {
+      throw new MultiAgentCoordinationError('invocation_not_found', `Agent invocation not found: ${invocationId}.`);
+    }
+    if (invocation.status !== 'created' || invocation.nativeRuntimeOwned !== true) {
+      throw new MultiAgentCoordinationError(
+        'invalid_invocation_status',
+        `Invocation ${invocation.id} is not a Tik-owned created native invocation.`,
+      );
+    }
+    const now = new Date().toISOString();
+    const updated: AgentInvocationRecord = {
+      ...invocation,
+      status: 'failed',
+      error,
+      updatedAt: now,
+      completedAt: now,
+    };
+    await this.upsertInvocation(updated);
+    await this.appendEvent(id, 'agent_invocation.completed', 'tik', {
+      invocationId: updated.id,
+      status: updated.status,
+      reason: 'orphaned_native_runtime',
+    });
+    return updated;
   }
 
   async recordHumanOverride(
@@ -2731,6 +2822,21 @@ export class FileMultiAgentWorkflowStore {
     return rejected;
   }
 
+  private async failStalledInvocation(
+    invocation: AgentInvocationRecord,
+    nowMs: number,
+  ): Promise<AgentInvocationRecord> {
+    const updated: AgentInvocationRecord = {
+      ...invocation,
+      status: 'failed',
+      error: 'stalled',
+      updatedAt: new Date(nowMs).toISOString(),
+      completedAt: new Date(nowMs).toISOString(),
+    };
+    await this.upsertInvocation(updated);
+    return updated;
+  }
+
   private async upsertInvocation(invocation: AgentInvocationRecord): Promise<void> {
     const invocations = await this.readJsonLines<AgentInvocationRecord>(this.invocationsFile(invocation.workflowId));
     const next = [
@@ -3288,6 +3394,148 @@ function mergeCoverageGaps(
   return merged;
 }
 
+async function validateEvaluationArtifactRefs(
+  rootPath: string,
+  workflowId: string,
+  run: EvaluationRun,
+  criteriaResults: CodexEvaluationResult['criteriaResults'],
+  commandResults: CodexEvaluationResult['commandResults'],
+): Promise<CodexEvaluationResult['coverageGaps']> {
+  const refs: Array<{
+    ref: string;
+    commandArtifact: boolean;
+    expectedSha256?: string;
+    expectedBytes?: number;
+  }> = [];
+  for (const ref of run.artifactRefs || []) refs.push({ ref, commandArtifact: false });
+  for (const criterion of criteriaResults) {
+    for (const ref of criterion.artifactRefs || []) refs.push({ ref, commandArtifact: false });
+  }
+  for (const command of commandResults) {
+    if (command.stdoutArtifactId) refs.push({
+      ref: command.stdoutArtifactId,
+      commandArtifact: true,
+      expectedSha256: command.stdoutArtifactSha256,
+      expectedBytes: command.stdoutArtifactBytes,
+    });
+    if (command.stderrArtifactId) refs.push({
+      ref: command.stderrArtifactId,
+      commandArtifact: true,
+      expectedSha256: command.stderrArtifactSha256,
+      expectedBytes: command.stderrArtifactBytes,
+    });
+    for (const report of command.testReports || []) refs.push({
+      ref: report.artifactId,
+      commandArtifact: true,
+      expectedSha256: report.artifactSha256,
+      expectedBytes: report.artifactBytes,
+    });
+  }
+
+  const gaps: CodexEvaluationResult['coverageGaps'] = [];
+  const seen = new Set<string>();
+  const root = path.resolve(rootPath);
+  const realRoot = await fs.realpath(root).catch(() => root);
+  const commandPrefix = `.tik/multi-agent/workflows/${workflowId}/evaluations/${run.id}/`;
+  for (const item of refs) {
+    const ref = normalizeEvaluationArtifactRef(item.ref);
+    if (!ref || seen.has(ref)) continue;
+    seen.add(ref);
+    if (path.isAbsolute(item.ref) || ref.startsWith('../')) {
+      gaps.push({
+        criterionId: 'artifact_path_invalid',
+        description: `Evaluation artifact reference is outside the workspace: ${item.ref}`,
+        reason: 'Evaluation artifact reference must stay inside the workspace root.',
+      });
+      continue;
+    }
+    if (item.commandArtifact && !ref.startsWith(commandPrefix)) {
+      gaps.push({
+        criterionId: 'artifact_path_mismatch',
+        description: `Command artifact does not belong to EvaluationRun ${run.id}: ${ref}`,
+        reason: 'Command artifact reference must use the canonical EvaluationRun directory.',
+      });
+      continue;
+    }
+    const resolved = path.resolve(root, ref);
+    const relative = path.relative(root, resolved);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      gaps.push({
+        criterionId: 'artifact_path_invalid',
+        description: `Evaluation artifact reference is outside the workspace: ${item.ref}`,
+        reason: 'Evaluation artifact reference must stay inside the workspace root.',
+      });
+      continue;
+    }
+    const stat = await fs.stat(resolved).catch(() => null);
+    if (!stat?.isFile()) {
+      gaps.push({
+        criterionId: 'artifact_missing',
+        description: `Referenced evaluation artifact is missing: ${ref}`,
+        reason: 'Referenced evaluation artifact does not exist.',
+      });
+      continue;
+    }
+    if (stat.size === 0) {
+      gaps.push({
+        criterionId: 'artifact_empty',
+        description: `Referenced evaluation artifact is empty: ${ref}`,
+        reason: 'Referenced evaluation artifact must contain auditable output.',
+      });
+      continue;
+    }
+    if (item.commandArtifact && !item.expectedSha256) {
+      gaps.push({
+        criterionId: 'artifact_hash_missing',
+        description: `Command artifact is missing SHA-256 metadata: ${ref}`,
+        reason: 'Command artifact metadata must include the expected SHA-256 digest.',
+      });
+      continue;
+    }
+    if (item.expectedBytes !== undefined && item.expectedBytes !== stat.size) {
+      gaps.push({
+        criterionId: 'artifact_size_mismatch',
+        description: `Evaluation artifact size does not match metadata: ${ref}`,
+        reason: `Expected ${item.expectedBytes} bytes but found ${stat.size}.`,
+      });
+      continue;
+    }
+    if (item.expectedSha256) {
+      const actualSha256 = `sha256:${createHash('sha256').update(await fs.readFile(resolved)).digest('hex')}`;
+      if (actualSha256 !== item.expectedSha256) {
+        gaps.push({
+          criterionId: 'artifact_hash_mismatch',
+          description: `Evaluation artifact hash does not match metadata: ${ref}`,
+          reason: `Expected ${item.expectedSha256} but found ${actualSha256}.`,
+        });
+        continue;
+      }
+    }
+    const real = await fs.realpath(resolved).catch(() => undefined);
+    if (!real) {
+      gaps.push({
+        criterionId: 'artifact_missing',
+        description: `Referenced evaluation artifact is unreadable: ${ref}`,
+        reason: 'Referenced evaluation artifact does not exist.',
+      });
+      continue;
+    }
+    const realRelative = path.relative(realRoot, real);
+    if (realRelative.startsWith('..') || path.isAbsolute(realRelative)) {
+      gaps.push({
+        criterionId: 'artifact_path_invalid',
+        description: `Evaluation artifact symlink escapes the workspace: ${ref}`,
+        reason: 'Evaluation artifact reference must stay inside the workspace root.',
+      });
+    }
+  }
+  return gaps;
+}
+
+function normalizeEvaluationArtifactRef(value: string): string {
+  return value.replace(/\\/g, '/').replace(/^\.\/+/, '');
+}
+
 function isStoredQuestionerOutput(item: QuestionerOutput | null): item is QuestionerOutput {
   return Boolean(
     item
@@ -3532,6 +3780,8 @@ function defaultReadonlyPolicy(): EvaluationRun['readonlyPolicy'] {
       'playwright-report/',
       'coverage/',
       '.tmp/evaluation/',
+      '**/target/**',
+      '.risk.env',
     ],
     forbiddenWritePaths: [
       'src/',

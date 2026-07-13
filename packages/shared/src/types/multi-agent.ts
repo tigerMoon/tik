@@ -74,6 +74,8 @@ export type GuardResultCode =
   | 'evaluation_not_passed'
   | 'evaluation_evidence_insufficient'
   | 'blocking_question_unresolved'
+  | 'blocking_finding_unresolved'
+  | 'invocation_still_running'
   | 'head_sha_mismatch'
   | 'readonly_policy_violated'
   | 'max_rounds_exceeded'
@@ -309,7 +311,11 @@ export interface AgentInvocationRecord {
     violations?: string[];
     gitStatusBefore?: string;
     gitStatusAfter?: string;
+    workspaceFingerprintBefore?: string;
+    workspaceFingerprintAfter?: string;
   };
+  /** True only when Tik owns launching and recovering the native runtime process. */
+  nativeRuntimeOwned?: boolean;
   attestationToken?: string;
   hookAttested?: boolean;
   attestationStartedAt?: string;
@@ -695,6 +701,8 @@ export interface EvaluationRun {
     violations?: string[];
     gitStatusBefore?: string;
     gitStatusAfter?: string;
+    workspaceFingerprintBefore?: string;
+    workspaceFingerprintAfter?: string;
   };
   result?: CodexEvaluationResult;
   artifactRefs: string[];
@@ -849,6 +857,23 @@ export interface CodexEvaluationResult {
     exitCode?: number;
     stdoutArtifactId?: string;
     stderrArtifactId?: string;
+    stdoutArtifactSha256?: string;
+    stderrArtifactSha256?: string;
+    stdoutArtifactBytes?: number;
+    stderrArtifactBytes?: number;
+    gateFailureCodes?: string[];
+    testReports?: Array<{
+      selector: string;
+      className: string;
+      tests: number;
+      failures: number;
+      errors: number;
+      skipped: number;
+      generatedAt: string;
+      artifactId: string;
+      artifactSha256: string;
+      artifactBytes: number;
+    }>;
     summary: string;
   }>;
   runtimeFindings: Array<{
