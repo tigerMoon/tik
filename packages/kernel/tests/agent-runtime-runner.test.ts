@@ -126,13 +126,21 @@ describe('AgentRuntimeRunner implementations', () => {
         stop,
       }),
     });
-    const prepared = { ...(await runner.prepare(input)), allowWrites: false, requireThreadId: true };
+    const prepared = {
+      ...(await runner.prepare({ ...input, cleanContext: true, contextTokenBudget: 16_000 })),
+      allowWrites: false,
+      requireThreadId: true,
+    };
 
     const handle = await runner.start(prepared);
     const completion = await handle.completion;
 
     expect(handle.threadId).toBe('thread-native-1');
-    expect(startThread).toHaveBeenCalledWith(expect.objectContaining({ allowWrites: false }));
+    expect(startThread).toHaveBeenCalledWith(expect.objectContaining({
+      allowWrites: false,
+      cleanContext: true,
+      maxPromptTokens: 16_000,
+    }));
     expect(runTurnOnThread).toHaveBeenCalledWith('thread-native-1', expect.objectContaining({ allowWrites: false }));
     expect(completion).toEqual({
       status: 'completed',
@@ -143,6 +151,37 @@ describe('AgentRuntimeRunner implementations', () => {
       },
     });
     expect(stop).toHaveBeenCalled();
+  });
+
+  it('repairs malformed structured output on the same native thread', async () => {
+    const input = await makeInput();
+    const startThread = vi.fn(async () => 'thread-repair');
+    const runTurnOnThread = vi.fn()
+      .mockResolvedValueOnce({ content: 'analysis without json', turnId: 'turn-1', threadId: 'thread-repair' })
+      .mockResolvedValueOnce({ content: '{"verdict":"pass"}', turnId: 'turn-2', threadId: 'thread-repair' });
+    const stop = vi.fn(async () => undefined);
+    const runner = new CodexRunner({
+      mode: 'codex_app_server',
+      adapterFactory: () => ({ runTurn: vi.fn(), startThread, runTurnOnThread, stop }),
+    });
+    const prepared = {
+      ...(await runner.prepare(input)),
+      requireThreadId: true,
+      structuredOutputRequired: true,
+    };
+
+    const handle = await runner.start(prepared);
+    const completion = await handle.completion;
+
+    expect(handle.threadId).toBe('thread-repair');
+    expect(startThread).toHaveBeenCalledTimes(1);
+    expect(runTurnOnThread).toHaveBeenCalledTimes(2);
+    expect(runTurnOnThread.mock.calls[1][0]).toBe('thread-repair');
+    expect(runTurnOnThread.mock.calls[1][1].prompt).toMatch(/Return only the required JSON object/);
+    expect(completion).toMatchObject({
+      status: 'completed',
+      result: { content: '{"verdict":"pass"}', threadId: 'thread-repair' },
+    });
   });
 
   it('shares one Codex App Server adapter across parallel native threads', async () => {

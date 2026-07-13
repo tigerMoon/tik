@@ -8,6 +8,8 @@ import {
   type AgentRuntimePolicy,
   type CodexEvaluationResult,
   type CreateMultiAgentWorkflowInput,
+  type EvaluationCheckpoint,
+  type EvaluationFailureClass,
   type EvaluationRun,
   type GuardResult,
   type HumanOverrideRecord,
@@ -121,6 +123,10 @@ export interface CreateAgentInvocationInput {
   evaluationRunId?: string;
   readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
   nativeRuntimeOwned?: boolean;
+  contextBundleHash?: string;
+  estimatedContextTokens?: number;
+  contextTokenBudget?: number;
+  cleanContext?: boolean;
 }
 
 interface CreateQuestionerRunInput {
@@ -1032,6 +1038,12 @@ export class FileMultiAgentWorkflowStore {
       headSha: input.headSha,
       readonlyPolicy: input.readonlyPolicy || defaultReadonlyPolicy(),
       result: input.result,
+      semanticResult: input.semanticResult,
+      semanticCacheKey: input.semanticCacheKey,
+      retryOfEvaluationRunId: input.retryOfEvaluationRunId,
+      resumeFromStage: input.resumeFromStage,
+      failureClass: input.failureClass,
+      checkpoints: input.checkpoints || [],
       artifactRefs: input.artifactRefs || [],
       startedAt: new Date().toISOString(),
       completedAt: input.completedAt,
@@ -1108,6 +1120,17 @@ export class FileMultiAgentWorkflowStore {
       status,
       result: normalizedResult,
       headSha: normalizedResult.headSha,
+      failureClass: evaluationFailureClass(normalizedResult, status),
+      resumeFromStage: status === 'passed' ? undefined : evaluationResumeStage(normalizedResult, status),
+      checkpoints: upsertEvaluationCheckpoint(existing.checkpoints || [], {
+        stage: 'verdict_merge',
+        status: status === 'passed' ? 'passed' : 'failed',
+        inputHash: existing.semanticCacheKey || `head:${existing.headSha}`,
+        outputHash: `sha256:${createHash('sha256').update(JSON.stringify(normalizedResult)).digest('hex')}`,
+        failureClass: status === 'passed' ? undefined : evaluationFailureClass(normalizedResult, status),
+        startedAt: existing.startedAt,
+        completedAt: new Date().toISOString(),
+      }),
     });
     await this.appendEvent(id, 'evaluation.result.recorded', 'codex-workflow', {
       evaluationRunId,
@@ -1357,13 +1380,32 @@ export class FileMultiAgentWorkflowStore {
       headSha: input.headSha,
       submitUrl,
     });
+    const estimatedContextTokens = Math.ceil(Buffer.byteLength(JSON.stringify(context), 'utf-8') / 4);
+    const contextTokenBudget = 12_000;
+    if (estimatedContextTokens > contextTokenBudget) {
+      await this.updateInvocation(id, invocation.id, {
+        status: 'cancelled',
+        error: `context_budget_exceeded: estimated ${estimatedContextTokens} tokens, budget ${contextTokenBudget}.`,
+      });
+      throw new MultiAgentCoordinationError(
+        'context_budget_exceeded',
+        `Questioner context estimated ${estimatedContextTokens} tokens exceeds budget ${contextTokenBudget}.`,
+      );
+    }
+    const boundedInvocation = await this.updateInvocation(id, invocation.id, {
+      status: 'created',
+      contextBundleHash: context.run.contextHash,
+      estimatedContextTokens,
+      contextTokenBudget,
+      cleanContext: true,
+    });
     const run: QuestionerRun = {
       id: runId,
       workflowId: id,
       subtaskId: input.subtaskId,
       intent: input.intent,
       status: input.start === false ? 'created' : 'started',
-      invocationId: invocation.id,
+      invocationId: boundedInvocation.id,
       runner: 'claude-code',
       pluginSkill: 'question-tik-agent-loop',
       contractId: input.contractId,
@@ -1398,15 +1440,15 @@ export class FileMultiAgentWorkflowStore {
       contextHash: run.contextHash,
     });
     if (input.start !== false) {
-      await this.updateInvocation(id, invocation.id, { status: 'started' });
+      await this.updateInvocation(id, boundedInvocation.id, { status: 'started' });
       await this.appendEvent(id, 'questioner.run.started', 'tik', {
         questionerRunId: run.id,
         invocationId: invocation.id,
       });
-      const startedInvocation = await this.readInvocation(id, invocation.id);
-      return { run, invocation: startedInvocation || invocation, context, token };
+      const startedInvocation = await this.readInvocation(id, boundedInvocation.id);
+      return { run, invocation: startedInvocation || boundedInvocation, context, token };
     }
-    return { run, invocation, context, token };
+    return { run, invocation: boundedInvocation, context, token };
   }
 
   async readQuestionerRun(workflowId: string, runId: string): Promise<QuestionerRun | null> {
@@ -1504,6 +1546,7 @@ export class FileMultiAgentWorkflowStore {
     });
     if (!validation.accepted) {
       await this.rejectQuestionerRun(id, run, validation.message || 'Questioner output rejected.');
+      await this.updateQuestionerCheckpointForRun(id, run, 'failed', 'invalid_output');
       throw new MultiAgentCoordinationError(validation.code || 'missing_evidence', validation.message || 'Questioner output rejected.');
     }
 
@@ -1513,6 +1556,7 @@ export class FileMultiAgentWorkflowStore {
         ...run,
         readonlyAudit: readonlyGuard.audit,
       }, readonlyGuard.message || 'Questioner readonly audit failed.');
+      await this.updateQuestionerCheckpointForRun(id, run, 'failed', 'readonly_violation');
       throw new MultiAgentCoordinationError(
         readonlyGuard.code || 'readonly_policy_violated',
         readonlyGuard.message || 'Questioner readonly audit failed.',
@@ -1552,6 +1596,13 @@ export class FileMultiAgentWorkflowStore {
       },
     });
     const questionerOutput = await this.recordQuestionerOutput(id, normalizedOutput);
+    await this.updateQuestionerCheckpointForRun(
+      id,
+      run,
+      'passed',
+      undefined,
+      input.output.attestation.outputHash,
+    );
     await this.appendEvent(id, 'questioner.run.output_received', 'claude-code', {
       questionerRunId: run.id,
       questionerOutputId: questionerOutput.id,
@@ -1837,6 +1888,10 @@ export class FileMultiAgentWorkflowStore {
       evaluationRunId: input.evaluationRunId,
       readonlyPolicy: input.readonlyPolicy,
       nativeRuntimeOwned: input.nativeRuntimeOwned,
+      contextBundleHash: input.contextBundleHash,
+      estimatedContextTokens: input.estimatedContextTokens,
+      contextTokenBudget: input.contextTokenBudget,
+      cleanContext: input.cleanContext,
       attestationToken: requiresRuntimeAttestationInput(input) ? `att_${generateId()}` : undefined,
       hookAttested: requiresRuntimeAttestationInput(input) ? false : undefined,
       status: 'created',
@@ -2006,6 +2061,7 @@ export class FileMultiAgentWorkflowStore {
     const run = await this.requireQuestionerRun(id, runId);
     if (run.status === 'validated' || run.status === 'rejected' || run.status === 'expired') return run;
     const rejected = await this.rejectQuestionerRun(id, run, message);
+    await this.updateQuestionerCheckpointForRun(id, run, 'failed', 'infra_failure');
     const invocation = await this.readInvocation(id, run.invocationId);
     if (invocation?.status === 'created' || invocation?.status === 'started') {
       await this.updateInvocation(id, invocation.id, { status: 'failed', error: message });
@@ -2337,6 +2393,10 @@ export class FileMultiAgentWorkflowStore {
       evidenceRefs?: string[];
       evaluationRunId?: string;
       readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
+      contextBundleHash?: string;
+      estimatedContextTokens?: number;
+      contextTokenBudget?: number;
+      cleanContext?: boolean;
     },
   ): Promise<AgentInvocationRecord> {
     const id = this.normalizeId(workflowId);
@@ -2371,6 +2431,10 @@ export class FileMultiAgentWorkflowStore {
       evidenceRefs: mergeUnique(existing.evidenceRefs, patch.evidenceRefs ?? readStringArrayFromRecord(patch.result, 'evidenceRefs')),
       evaluationRunId: patch.evaluationRunId ?? readStringFromRecord(patch.result, 'evaluationRunId') ?? existing.evaluationRunId,
       readonlyPolicy: patch.readonlyPolicy ?? readReadonlyPolicyFromRecord(patch.result) ?? existing.readonlyPolicy,
+      contextBundleHash: patch.contextBundleHash ?? existing.contextBundleHash,
+      estimatedContextTokens: patch.estimatedContextTokens ?? existing.estimatedContextTokens,
+      contextTokenBudget: patch.contextTokenBudget ?? existing.contextTokenBudget,
+      cleanContext: patch.cleanContext ?? existing.cleanContext,
       updatedAt: now,
       startedAt: patch.status === 'started' ? now : existing.startedAt,
       completedAt: patch.status === 'completed' || patch.status === 'failed' || patch.status === 'cancelled'
@@ -2378,15 +2442,17 @@ export class FileMultiAgentWorkflowStore {
         : existing.completedAt,
     };
     await this.upsertInvocation(updated);
-    await this.appendEvent(
-      id,
-      patch.status === 'started' ? 'agent_invocation.started' : 'agent_invocation.completed',
-      'tik',
-      {
-        invocationId: updated.id,
-        status: updated.status,
-      },
-    );
+    if (existing.status !== patch.status) {
+      await this.appendEvent(
+        id,
+        patch.status === 'started' ? 'agent_invocation.started' : 'agent_invocation.completed',
+        'tik',
+        {
+          invocationId: updated.id,
+          status: updated.status,
+        },
+      );
+    }
     return updated;
   }
 
@@ -2835,6 +2901,35 @@ export class FileMultiAgentWorkflowStore {
     };
     await this.upsertInvocation(updated);
     return updated;
+  }
+
+  private async updateQuestionerCheckpointForRun(
+    workflowId: string,
+    run: QuestionerRun,
+    status: 'passed' | 'failed',
+    failureClass?: EvaluationFailureClass,
+    outputHash?: string,
+  ): Promise<void> {
+    const evaluationRunId = run.finalEvaluationRunId || run.evaluationRunId;
+    const subtaskId = run.finalEvaluationRunId ? '__final__' : run.subtaskId;
+    if (!evaluationRunId || !subtaskId) return;
+    const evaluation = await this.requireEvaluationRun(workflowId, subtaskId, evaluationRunId).catch(() => null);
+    if (!evaluation) return;
+    const now = new Date().toISOString();
+    await this.updateEvaluationRun(workflowId, subtaskId, evaluationRunId, {
+      failureClass,
+      resumeFromStage: status === 'failed' ? 'questioner' : undefined,
+      checkpoints: upsertEvaluationCheckpoint(evaluation.checkpoints || [], {
+        stage: 'questioner',
+        status,
+        inputHash: run.contextHash,
+        outputHash,
+        failureClass,
+        artifactRefs: [run.contextArtifactRef, run.outputArtifactRef].filter((item): item is string => Boolean(item)),
+        startedAt: run.startedAt || run.createdAt,
+        completedAt: now,
+      }),
+    });
   }
 
   private async upsertInvocation(invocation: AgentInvocationRecord): Promise<void> {
@@ -4087,4 +4182,46 @@ function assertTaskGraphAcyclic(graph: TaskGraph): void {
 
 function isFinalEvaluationSubtask(subtaskId: string): boolean {
   return subtaskId === '__final__';
+}
+
+function upsertEvaluationCheckpoint(
+  checkpoints: EvaluationCheckpoint[],
+  checkpoint: EvaluationCheckpoint,
+): EvaluationCheckpoint[] {
+  return [
+    ...checkpoints.filter((item) => item.stage !== checkpoint.stage),
+    checkpoint,
+  ];
+}
+
+function evaluationFailureClass(
+  result: CodexEvaluationResult,
+  status: EvaluationRun['status'],
+): EvaluationFailureClass | undefined {
+  if (status === 'invalidated') return 'readonly_violation';
+  if (result.commandResults.some((command) => command.status === 'failed' || command.status === 'timeout')) {
+    return 'command_failure';
+  }
+  if (result.coverageGaps.some((gap) => gap.reason === 'Required evaluation command did not pass.')) {
+    return 'command_failure';
+  }
+  if (result.coverageGaps.some((gap) => /artifact|report|hash|stale/i.test(`${gap.description} ${gap.reason}`))) {
+    return 'artifact_failure';
+  }
+  if (result.coverageGaps.some((gap) => gap.criterionId === 'semantic-verdict')) return 'invalid_output';
+  if (result.verdict === 'fail' || result.verdict === 'human_review_required') return 'semantic_failure';
+  if (result.verdict === 'inconclusive') return 'invalid_output';
+  return undefined;
+}
+
+function evaluationResumeStage(
+  result: CodexEvaluationResult,
+  status: EvaluationRun['status'],
+): EvaluationRun['resumeFromStage'] {
+  const failureClass = evaluationFailureClass(result, status);
+  if (failureClass === 'command_failure') return 'validation_commands';
+  if (failureClass === 'artifact_failure') return 'artifact_verification';
+  if (failureClass === 'readonly_violation') return 'semantic_review';
+  if (failureClass === 'invalid_output' || failureClass === 'semantic_failure') return 'semantic_review';
+  return 'verdict_merge';
 }

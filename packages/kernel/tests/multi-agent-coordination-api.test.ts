@@ -128,6 +128,9 @@ describe('multi-agent coordination API', () => {
           id: `inv-${role}`,
           status: 'started',
           nativeRuntimeOwned: true,
+          cleanContext: true,
+          contextBundleHash: expect.stringMatching(/^sha256:/),
+          estimatedContextTokens: expect.any(Number),
           hookAttested: true,
           parentThreadId: 'parent-thread',
           runtimeAttestation: {
@@ -143,6 +146,24 @@ describe('multi-agent coordination API', () => {
     expect(started).toHaveLength(2);
     expect(started[0].allowWrites).toBe(true);
     expect(started[1].allowWrites).toBe(true);
+    expect(started[0]).toMatchObject({ cleanContext: true, contextTokenBudget: 24_000 });
+    expect(started[1]).toMatchObject({ cleanContext: true, contextTokenBudget: 16_000 });
+
+    const oversized = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-native-launch/agent-invocations/native-launch',
+      payload: {
+        id: 'inv-oversized-context',
+        role: 'executor',
+        runner: 'codex',
+        promptContract: 'codex-builder.v1',
+        headSha: 'head-1',
+        prompt: 'x'.repeat(120_000),
+      },
+    });
+    expect(oversized.statusCode).toBe(409);
+    expect(oversized.json().error).toMatchObject({ code: 'context_budget_exceeded' });
+    expect(started).toHaveLength(2);
   });
 
   it('rejects dirty committed evidence before creating a native Evaluator invocation', async () => {
@@ -367,7 +388,7 @@ describe('multi-agent coordination API', () => {
         method: 'GET',
         url: '/api/v1/multi-agent/workflows/wf-native-evidence/agent-invocations/inv-native-builder',
       });
-      return response.json().invocation.status === 'completed';
+      return response.statusCode === 200 && response.json().invocation?.status === 'completed';
     });
 
     const mismatchedLink = await server.inject({
@@ -2751,6 +2772,8 @@ function fakeRuntimeRunner(
       mode: input.runnerMode,
       cwd: input.projectPath,
       prompt: input.renderedPrompt,
+      cleanContext: input.cleanContext,
+      contextTokenBudget: input.contextTokenBudget,
       timeoutMs: input.timeoutMs,
     })),
     start: vi.fn(async (prepared) => {

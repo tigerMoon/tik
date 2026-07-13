@@ -402,6 +402,21 @@ try {
         sendJson(res, { evaluationRun });
         return;
       }
+      if (req.method === 'PATCH' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/subtasks\/[^/]+\/evaluations\/[^/]+$/)) {
+        const evaluationRunId = route.split('/').at(-1);
+        const body = await readRequestJson(req);
+        evaluationRuns = evaluationRuns.map((run) => run.id === evaluationRunId
+          ? {
+            ...run,
+            ...body,
+            readonlyPolicy: body.readonlyPolicy
+              ? { ...run.readonlyPolicy, ...body.readonlyPolicy }
+              : run.readonlyPolicy,
+          }
+          : run);
+        sendJson(res, { evaluationRun: evaluationRuns.find((run) => run.id === evaluationRunId) });
+        return;
+      }
       if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/subtasks\/st-api\/evaluations\/[^/]+\/validate-readonly$/)) {
         const evaluationRunId = route.split('/').at(-2);
         const body = await readRequestJson(req);
@@ -1660,6 +1675,32 @@ try {
     await readFile(path.join(repo, evaluated.evaluationRun.result.commandResults[1].stdoutArtifactId), 'utf-8'),
     /evaluation ok/,
   );
+  await rm(path.join(repo, 'builder-output.txt'));
+  const resumedEvaluation = await run([
+    'evaluate',
+    '--api-base-url', apiBaseUrl,
+    '--workflow', 'wf-cli',
+    '--subtask', 'st-api',
+    '--evaluation', 'eval-resumed-cli',
+    '--command', `${process.execPath} -e "const fs=require('fs'); if(!fs.existsSync('builder-output.txt')) process.exit(2); console.log(fs.readFileSync('builder-output.txt','utf8').trim()); console.log('evaluation ok')"`,
+  ]);
+  assert.equal(resumedEvaluation.passed, true);
+  assert.equal(resumedEvaluation.evaluationRun.semanticResult.verdict, 'pass');
+  assert.equal(
+    resumedEvaluation.evaluationRun.result.commandResults[0].reusedFromEvaluationRunId,
+    'eval-st-api-v1',
+  );
+  assert.equal(
+    resumedEvaluation.evaluationRun.result.commandResults[0].stdoutArtifactId,
+    '.tik/multi-agent/workflows/wf-cli/evaluations/eval-resumed-cli/stdout.log',
+  );
+  assert.match(
+    await readFile(path.join(repo, resumedEvaluation.evaluationRun.result.commandResults[0].stdoutArtifactId), 'utf-8'),
+    /evaluation ok/,
+  );
+  assert.ok(resumedEvaluation.evaluationRun.checkpoints.some((checkpoint) =>
+    checkpoint.stage === 'semantic_review' && checkpoint.status === 'reused'
+  ));
   assert.equal(subtasks['st-api'].status, 'evaluation_passed');
 
   const commandOnlyEvaluation = await run([
@@ -1668,6 +1709,7 @@ try {
     '--workflow', 'wf-cli',
     '--subtask', 'st-api',
     '--evaluation', 'eval-command-only-cli',
+    '--model', 'cache-miss-command-only',
     '--command', `${process.execPath} -e "process.exit(0)"`,
   ]);
   assert.equal(commandOnlyEvaluation.passed, false);

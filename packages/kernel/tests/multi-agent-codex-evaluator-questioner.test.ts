@@ -537,6 +537,12 @@ describe('codex evaluator and Claude questioner workflow', () => {
       invocationId: 'inv-questioner-v2',
       contextHash: expect.stringMatching(/^sha256:/),
       token: expect.any(String),
+      invocation: {
+        cleanContext: true,
+        contextTokenBudget: '[redacted]',
+        estimatedContextTokens: expect.any(Number),
+        contextBundleHash: expect.stringMatching(/^sha256:/),
+      },
     });
     expect(run.json().invocation).not.toHaveProperty('nativeRuntimeOwned');
 
@@ -664,6 +670,13 @@ describe('codex evaluator and Claude questioner workflow', () => {
         }),
       ],
     });
+    expect(bundleResponse.json().evaluationRuns.find((run: any) => run.id === 'eval-pass').checkpoints).toEqual(
+      expect.arrayContaining([expect.objectContaining({
+        stage: 'questioner',
+        status: 'passed',
+        outputHash: output.attestation.outputHash,
+      })]),
+    );
     expect(
       hasSufficientEvaluationQuestionerOutput(
         createWorkflowDecisionContext({ bundle: bundleResponse.json() }),
@@ -1925,7 +1938,10 @@ describe('codex evaluator and Claude questioner workflow', () => {
     expect(failed.statusCode).toBe(200);
     expect(failed.json().evaluationRun).toMatchObject({
       status: 'failed',
+      failureClass: 'command_failure',
+      resumeFromStage: 'validation_commands',
       result: { verdict: 'fail' },
+      checkpoints: [expect.objectContaining({ stage: 'verdict_merge', status: 'failed' })],
     });
 
     const missing = await server.inject({
@@ -1950,6 +1966,8 @@ describe('codex evaluator and Claude questioner workflow', () => {
     expect(missing.statusCode).toBe(200);
     expect(missing.json().evaluationRun).toMatchObject({
       status: 'inconclusive',
+      failureClass: 'command_failure',
+      resumeFromStage: 'validation_commands',
       result: { verdict: 'inconclusive' },
     });
     expect(missing.json().evaluationRun.result.coverageGaps).toEqual(expect.arrayContaining([

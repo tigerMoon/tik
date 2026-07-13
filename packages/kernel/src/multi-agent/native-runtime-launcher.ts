@@ -23,6 +23,11 @@ import {
   committedEvidenceErrorMessage,
   validateCommittedEvidencePreflight,
 } from './committed-evidence-preflight.js';
+import {
+  assertContextBudget,
+  buildNativeAgentContextBundle,
+  renderNativeContextPrompt,
+} from './native-context-bundle.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_BUILDER_TIMEOUT_MS = 15 * 60 * 1000;
@@ -129,9 +134,30 @@ export class MultiAgentNativeRuntimeLauncher {
         throw new MultiAgentCoordinationError('committed_evidence_invalid', committedEvidenceErrorMessage(preflight));
       }
     }
+    const contextBundle = buildNativeAgentContextBundle(bundle, input.invocation);
+    const prompt = renderNativeContextPrompt(contextBundle, [
+      buildCodexOutputContract(input.invocation.role),
+      input.prompt ? `Additional scoped instruction: ${input.prompt}` : undefined,
+    ].filter(Boolean).join('\n'));
+    try {
+      assertContextBudget(contextBundle, prompt);
+    } catch (error) {
+      throw new MultiAgentCoordinationError(
+        'context_budget_exceeded',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
     const invocation = await this.store.createInvocation(workflowId, {
       ...input.invocation,
+      input: {
+        ...(input.invocation.input || {}),
+        contextBundle,
+      },
       nativeRuntimeOwned: true,
+      contextBundleHash: contextBundle.contextHash,
+      estimatedContextTokens: contextBundle.budget.estimatedTokens,
+      contextTokenBudget: contextBundle.budget.maxTokens,
+      cleanContext: true,
     });
     const runId = invocation.id;
     const readonly = invocation.role === 'reviewer' || invocation.role === 'evaluator';
@@ -151,14 +177,17 @@ export class MultiAgentNativeRuntimeLauncher {
         projectPath: runtimeProjectPath,
         workspaceRoot: this.workspaceRoot,
         invocation,
-        prompt: input.prompt || buildCodexPrompt(bundle.workflow.goal, invocation),
+        prompt,
         runnerMode: 'codex_app_server',
         timeoutMs: input.timeoutMs ?? (readonly ? DEFAULT_READONLY_TIMEOUT_MS : DEFAULT_BUILDER_TIMEOUT_MS),
+        cleanContext: true,
+        contextTokenBudget: contextBundle.budget.maxTokens,
       }));
       const handle = await runner.start({
         ...prepared,
         allowWrites: invocation.role === 'evaluator' || !readonly,
         requireThreadId: true,
+        structuredOutputRequired: invocation.role === 'reviewer' || invocation.role === 'evaluator',
         developerInstructions: buildCodexDeveloperInstructions(invocation, readonly),
       });
       this.activeHandles.set(runId, handle);
@@ -587,6 +616,8 @@ function buildAgentRunInput(input: {
   prompt: string;
   runnerMode: 'codex_app_server' | 'claude_hooked';
   timeoutMs?: number;
+  cleanContext?: boolean;
+  contextTokenBudget?: number;
 }): AgentRunInput {
   const task: TrackedTask = {
     id: input.invocation.id,
@@ -613,30 +644,25 @@ function buildAgentRunInput(input: {
     labels: task.labels,
     artifactOutputDir: path.join(input.workspaceRoot, '.tik', 'multi-agent-runtime', input.runId),
     timeoutMs: input.timeoutMs,
+    cleanContext: input.cleanContext ?? input.invocation.cleanContext,
+    contextTokenBudget: input.contextTokenBudget ?? input.invocation.contextTokenBudget,
   };
 }
 
-function buildCodexPrompt(goal: string, invocation: AgentInvocationRecord): string {
-  const outputContract = invocation.role === 'reviewer'
+function buildCodexOutputContract(role: AgentInvocationRecord['role']): string {
+  return role === 'reviewer'
     ? 'Return JSON only: {"summary":string,"findings":[{"severity":"blocker|high|medium|low","file":string,"line":number,"message":string,"evidence":string}]}.'
-    : invocation.role === 'evaluator'
+    : role === 'evaluator'
       ? 'Return JSON only: {"verdict":"pass|fail|inconclusive","criteriaResults":array,"runtimeFindings":array,"coverageGaps":array,"artifacts":array}. Include concrete artifact or reproduction evidence for every required criterion.'
       : 'Return a concise structured result. Tik owns workflow state and evidence recording.';
-  return [
-    `You are the Tik-owned ${invocation.role} native subagent for workflow ${invocation.workflowId}.`,
-    `Workflow goal: ${goal}`,
-    `Prompt contract: ${invocation.promptContract}`,
-    invocation.subtaskId ? `Subtask: ${invocation.subtaskId}` : undefined,
-    invocation.allowedPaths?.length ? `Scoped paths: ${invocation.allowedPaths.join(', ')}` : undefined,
-    invocation.validationCommands?.length ? `Validation commands: ${invocation.validationCommands.join(' | ')}` : undefined,
-    invocation.input ? `Structured input: ${JSON.stringify(invocation.input)}` : undefined,
-    outputContract,
-  ].filter(Boolean).join('\n');
 }
 
 function buildCodexDeveloperInstructions(invocation: AgentInvocationRecord, readonly: boolean): string {
   return [
-    `Act only as ${invocation.role}.`,
+    `Act only as Tik's ${invocation.role} subagent for invocation ${invocation.id}.`,
+    'This is a clean native thread. Never load or reconstruct the parent conversation.',
+    'Do not invoke Tik workflow-driving skills or read complete workflow/invocation history.',
+    'Use the supplied ContextBundle and fetch only directly relevant source files or artifacts.',
     readonly
       ? 'This is a read-only run. Do not modify source, tests, manifests, lockfiles, or git state.'
       : `Writes are limited to: ${(invocation.allowedPaths || []).join(', ') || 'the invocation scope'}.`,
@@ -646,9 +672,9 @@ function buildCodexDeveloperInstructions(invocation: AgentInvocationRecord, read
 
 function buildQuestionerPrompt(run: QuestionerRun): string {
   return [
-    'Use the question-tik-agent-loop skill.',
-    `Process Tik QuestionerRun ${run.id} with intent ${run.intent}.`,
+    `Act only as the Tik Questioner for run ${run.id} with intent ${run.intent}.`,
     'Read the token-scoped context from the provided environment, produce QuestionerOutputV2, and submit it exactly once.',
+    'Do not load workflow-driving skills, parent conversation history, or unrelated workflow records.',
     'Do not edit repository files or workflow state outside the submission endpoint.',
   ].join('\n');
 }
@@ -690,9 +716,14 @@ function sameNativeInvocationRequest(existing: AgentInvocationRecord, requested:
     && existing.promptContract === requested.promptContract
     && existing.headSha === requested.headSha
     && (!requested.parentThreadId || existing.parentThreadId === requested.parentThreadId)
-    && JSON.stringify(existing.input || {}) === JSON.stringify(requested.input || {})
+    && JSON.stringify(withoutContextBundle(existing.input)) === JSON.stringify(withoutContextBundle(requested.input))
     && JSON.stringify(existing.allowedPaths || []) === JSON.stringify(requested.allowedPaths || [])
     && JSON.stringify(existing.validationCommands || []) === JSON.stringify(requested.validationCommands || []);
+}
+
+function withoutContextBundle(input: Record<string, unknown> | undefined): Record<string, unknown> {
+  const { contextBundle: _contextBundle, ...rest } = input || {};
+  return rest;
 }
 
 async function readGitHead(cwd: string): Promise<string | undefined> {

@@ -241,6 +241,12 @@ interface CreateEvaluationRunBody {
   headSha: string;
   readonlyPolicy?: EvaluationRun['readonlyPolicy'];
   artifactRefs?: string[];
+  semanticCacheKey?: EvaluationRun['semanticCacheKey'];
+  retryOfEvaluationRunId?: EvaluationRun['retryOfEvaluationRunId'];
+  resumeFromStage?: EvaluationRun['resumeFromStage'];
+  failureClass?: EvaluationRun['failureClass'];
+  checkpoints?: EvaluationRun['checkpoints'];
+  semanticResult?: EvaluationRun['semanticResult'];
 }
 
 interface UpdateEvaluationRunBody {
@@ -248,6 +254,12 @@ interface UpdateEvaluationRunBody {
   headSha?: string;
   readonlyPolicy?: Partial<EvaluationRun['readonlyPolicy']>;
   artifactRefs?: string[];
+  semanticCacheKey?: EvaluationRun['semanticCacheKey'];
+  retryOfEvaluationRunId?: EvaluationRun['retryOfEvaluationRunId'];
+  resumeFromStage?: EvaluationRun['resumeFromStage'];
+  failureClass?: EvaluationRun['failureClass'];
+  checkpoints?: EvaluationRun['checkpoints'];
+  semanticResult?: EvaluationRun['semanticResult'];
 }
 
 interface RecordEvaluationResultBody {

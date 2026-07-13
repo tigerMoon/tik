@@ -86,6 +86,8 @@ export class CodexRunner implements AgentRuntimeRunner {
         : undefined,
       promptFile,
       prompt: input.renderedPrompt,
+      cleanContext: input.cleanContext,
+      contextTokenBudget: input.contextTokenBudget,
       timeoutMs: input.timeoutMs,
     };
   }
@@ -106,6 +108,8 @@ export class CodexRunner implements AgentRuntimeRunner {
         cwd: input.cwd,
         allowWrites: input.allowWrites !== false,
         developerInstructions: input.developerInstructions,
+        cleanContext: input.cleanContext,
+        maxPromptTokens: input.contextTokenBudget,
         onTurnVisible: refreshActivity,
         onTextDelta: refreshActivity,
         onProviderEvent: refreshActivity,
@@ -116,6 +120,19 @@ export class CodexRunner implements AgentRuntimeRunner {
         threadId = await adapter.startThread(turnOptions);
         lease.threadId = threadId;
         turn = adapter.runTurnOnThread(threadId, turnOptions);
+        if (input.structuredOutputRequired) {
+          turn = turn.then(async (result) => {
+            if (hasStructuredJsonResult(result)) return result;
+            refreshActivity();
+            return adapter.runTurnOnThread!(threadId!, {
+              ...turnOptions,
+              prompt: [
+                'Your previous response did not end with a valid JSON object.',
+                'Return only the required JSON object now. Do not repeat analysis, rerun commands, or load more context.',
+              ].join('\n'),
+            });
+          });
+        }
       } else {
         turn = adapter.runTurn(turnOptions);
       }
@@ -240,6 +257,27 @@ export class CodexRunner implements AgentRuntimeRunner {
       await shared.adapter.stop().catch(() => undefined);
     }
   }
+}
+
+function hasStructuredJsonResult(result: unknown): boolean {
+  if (!result || typeof result !== 'object') return false;
+  const content = 'content' in result && typeof result.content === 'string' ? result.content.trim() : '';
+  if (!content) return false;
+  try {
+    const direct = JSON.parse(content);
+    if (direct && typeof direct === 'object' && !Array.isArray(direct)) return true;
+  } catch {
+    // Fall through to trailing-object extraction.
+  }
+  for (let index = content.lastIndexOf('{'); index >= 0; index = content.lastIndexOf('{', index - 1)) {
+    try {
+      const candidate = JSON.parse(content.slice(index));
+      if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) return true;
+    } catch {
+      // Continue scanning earlier opening braces.
+    }
+  }
+  return false;
 }
 
 function normalizeCodexMode(mode: AgentRuntimeMode): Extract<AgentRuntimeMode, 'codex_exec' | 'codex_app_server'> {

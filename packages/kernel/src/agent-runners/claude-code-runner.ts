@@ -66,6 +66,8 @@ export class ClaudeCodeRunner implements AgentRuntimeRunner {
       }),
       promptFile,
       prompt: input.renderedPrompt,
+      cleanContext: input.cleanContext,
+      contextTokenBudget: input.contextTokenBudget,
       timeoutMs: input.timeoutMs,
     };
   }

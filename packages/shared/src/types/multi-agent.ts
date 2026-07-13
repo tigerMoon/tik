@@ -316,6 +316,10 @@ export interface AgentInvocationRecord {
   };
   /** True only when Tik owns launching and recovering the native runtime process. */
   nativeRuntimeOwned?: boolean;
+  contextBundleHash?: string;
+  estimatedContextTokens?: number;
+  contextTokenBudget?: number;
+  cleanContext?: boolean;
   attestationToken?: string;
   hookAttested?: boolean;
   attestationStartedAt?: string;
@@ -705,9 +709,89 @@ export interface EvaluationRun {
     workspaceFingerprintAfter?: string;
   };
   result?: CodexEvaluationResult;
+  semanticResult?: SemanticEvaluationResult;
+  semanticCacheKey?: string;
+  retryOfEvaluationRunId?: string;
+  resumeFromStage?: EvaluationStage;
+  failureClass?: EvaluationFailureClass;
+  checkpoints?: EvaluationCheckpoint[];
   artifactRefs: string[];
   startedAt: string;
   completedAt?: string;
+}
+
+export type EvaluationStage =
+  | 'semantic_review'
+  | 'validation_commands'
+  | 'artifact_verification'
+  | 'verdict_merge'
+  | 'questioner';
+
+export type EvaluationFailureClass =
+  | 'infra_failure'
+  | 'command_failure'
+  | 'artifact_failure'
+  | 'invalid_output'
+  | 'semantic_failure'
+  | 'readonly_violation'
+  | 'head_changed';
+
+export interface EvaluationCheckpoint {
+  stage: EvaluationStage;
+  status: 'pending' | 'running' | 'passed' | 'failed' | 'reused';
+  inputHash: string;
+  outputHash?: string;
+  sourceEvaluationRunId?: string;
+  failureClass?: EvaluationFailureClass;
+  artifactRefs?: string[];
+  startedAt: string;
+  completedAt?: string;
+}
+
+export interface SemanticEvaluationResult {
+  verdict: CodexEvaluationResult['verdict'];
+  criteriaResults: CodexEvaluationResult['criteriaResults'];
+  runtimeFindings: CodexEvaluationResult['runtimeFindings'];
+  coverageGaps: CodexEvaluationResult['coverageGaps'];
+  confidence: number;
+}
+
+export interface NativeAgentContextBundle {
+  schemaVersion: 'native-agent-context.v1';
+  workflowId: string;
+  role: MultiAgentInvocationRole;
+  subtaskId?: string;
+  headSha: string;
+  goal: string;
+  contract?: {
+    id: string;
+    goal: string;
+    mustCriteria: Array<{ id: string; statement: string }>;
+    allowedPaths: string[];
+    blockedPaths: string[];
+  };
+  implementation?: {
+    evidenceId: string;
+    summary: string;
+    changedFiles: string[];
+  };
+  evaluation?: {
+    runId: string;
+    verdict?: CodexEvaluationResult['verdict'];
+    failedCommands: string[];
+    coverageGaps: string[];
+  };
+  taskInput?: Record<string, unknown>;
+  allowedPaths: string[];
+  validationCommands: string[];
+  artifactIndex: string[];
+  instructions: string[];
+  budget: {
+    estimatedTokens: number;
+    maxTokens: number;
+    truncated: boolean;
+  };
+  contextHash: string;
 }
 
 export interface QuestionerContextV1 {
@@ -874,6 +958,7 @@ export interface CodexEvaluationResult {
       artifactSha256: string;
       artifactBytes: number;
     }>;
+    reusedFromEvaluationRunId?: string;
     summary: string;
   }>;
   runtimeFindings: Array<{

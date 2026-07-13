@@ -40,6 +40,7 @@ import {
   synthesizeReview as synthesizeReviewAction,
   tikFetch,
   transitionTask,
+  updateEvaluationRun,
   updateSubtask,
   validateEvaluationReadonly,
 } from '../lib/tik-client.mjs';
@@ -822,6 +823,20 @@ async function startEvaluator(options) {
   const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
   const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
   const evaluatorAllowedPaths = mergeEvidenceRefs(defaultEvaluatorAllowedPaths(), splitList(options.evaluatorArtifactPath));
+  const semanticCacheKey = evaluationSemanticCacheKey(state, subtaskId, headSha, projectPath, options);
+  const reusableSemantic = findReusableSemanticEvaluation(state, subtaskId, semanticCacheKey);
+  if (reusableSemantic) {
+    printJson({
+      action: 'evaluator-semantic-reused',
+      workflowId,
+      subtaskId,
+      semanticCacheKey,
+      sourceEvaluationRunId: reusableSemantic.id,
+      runtime: { status: 'completed', reused: true },
+      instruction: 'Semantic inputs are unchanged; run evaluate to resume at validation_commands without launching another LLM.',
+    });
+    return;
+  }
   const reviewEvidence = state.workflow.mode === 'review' ? latestEvidence(state, subtaskId, ['review']) : undefined;
   if (state.workflow.mode === 'review' && !reviewEvidence) {
     throw new Error(`Review evaluator requires recorded review evidence for ${subtaskId}.`);
@@ -1140,6 +1155,9 @@ async function evaluate(options) {
     throw new Error('--contract is required when no accepted contract is stored');
   }
   const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
+  const semanticCacheKey = evaluationSemanticCacheKey(state, subtaskId, headSha, projectPath, options);
+  const reusableSemantic = findReusableSemanticEvaluation(state, subtaskId, semanticCacheKey);
+  const retryOf = latestEvaluationForSubtask(state, subtaskId, (run) => run.status !== 'passed');
   const gitStatusBefore = git(projectPath, ['status', '--porcelain=v1'], { optional: true }) || '';
   const sandbox = await prepareEvaluatorSandbox(projectPath, headSha, options);
   const evaluationCwd = sandbox.path || projectPath;
@@ -1152,6 +1170,10 @@ async function evaluate(options) {
       sessionId: stringOption(options.thread) || stringOption(options.session),
       runnerId: stringOption(options.invocation),
     },
+    semanticCacheKey,
+    retryOfEvaluationRunId: retryOf?.id,
+    resumeFromStage: reusableSemantic ? 'validation_commands' : 'semantic_review',
+    checkpoints: [],
   });
   if (subtaskId !== '__final__') {
     await updateSubtask(options, workflowId, subtaskId, { status: 'evaluating' });
@@ -1167,10 +1189,13 @@ async function evaluate(options) {
     ? JSON.parse(String(options.resultJson))
     : options.result
       ? await readJsonFile(options.result)
-      : nativeStructuredResult;
+      : nativeStructuredResult || reusableSemantic?.semanticResult;
+  const semanticReused = !options.resultJson && !options.result && !nativeStructuredResult && Boolean(reusableSemantic);
   const commands = evaluationCommandsFromOptions(options, state, subtaskId);
   const setupCommands = splitList(options.evaluatorSetupCommand) || splitList(options.setupCommand) || [];
   const commandResults = [];
+  const commandIds = splitList(options.commandId) || [];
+  const reusableCommands = reusablePassedEvaluationCommands(state, subtaskId, semanticCacheKey);
   let commandResult = null;
   let setupFailure = null;
   try {
@@ -1193,8 +1218,29 @@ async function evaluate(options) {
       }
     }
     if (commands.length > 0 && !setupFailure) {
-      const commandIds = splitList(options.commandId) || [];
       for (const [index, command] of commands.entries()) {
+        const commandId = commandIds[index]
+          || (commands.length === 1 ? 'cmd-evaluate' : `cmd-evaluate-${index + 1}`);
+        const reusable = reusableCommands.find((candidate) =>
+          candidate.result.command === command
+          && candidate.result.status === 'passed'
+        );
+        const reusedResult = reusable
+          && await evaluationCommandArtifactsValid(projectPath, workflowId, reusable)
+          && await materializeReusedCommandArtifacts({
+            projectPath,
+            workflowId,
+            evaluationRunId: evaluationRun.evaluationRun.id,
+            commandId,
+            command,
+            commandIndex: index,
+            reusable,
+          }).catch(() => null);
+        if (reusedResult) {
+          commandResults.push(reusedResult);
+          commandResult = reusedResult;
+          continue;
+        }
         const artifactSuffix = commands.length === 1 ? '' : `-${index + 1}`;
         const currentResult = await runCommandWithArtifacts({
           command,
@@ -1206,8 +1252,7 @@ async function evaluate(options) {
           stdoutArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'evaluations', evaluationRun.evaluationRun.id, `stdout${artifactSuffix}.log`),
           stderrArtifactPath: path.join(projectPath, '.tik', 'multi-agent', 'workflows', workflowId, 'evaluations', evaluationRun.evaluationRun.id, `stderr${artifactSuffix}.log`),
         });
-        currentResult.commandId = commandIds[index]
-          || (commands.length === 1 ? 'cmd-evaluate' : `cmd-evaluate-${index + 1}`);
+        currentResult.commandId = commandId;
         const surefire = await collectSurefireEvidence({
           command,
           cwd: evaluationCwd,
@@ -1310,6 +1355,70 @@ async function evaluate(options) {
       reason: 'No evaluator command, criteria result, or artifact evidence was provided.',
     });
   }
+  const semanticResult = {
+    verdict: semanticVerdict || 'inconclusive',
+    criteriaResults: Array.isArray(structuredResult?.criteriaResults) ? structuredResult.criteriaResults : [],
+    runtimeFindings: Array.isArray(structuredResult?.runtimeFindings) ? structuredResult.runtimeFindings : [],
+    coverageGaps: Array.isArray(structuredResult?.coverageGaps) ? structuredResult.coverageGaps : [],
+    confidence: Number.isFinite(structuredResult?.confidence) ? structuredResult.confidence : 0.5,
+  };
+  const evaluationFailureClass = classifyEvaluationFailure({
+    semanticVerdict,
+    readonlyAccepted: readonly.guard?.accepted !== false,
+    commandResults: evaluationCommandResults(commandResults),
+  });
+  const checkpointTime = new Date().toISOString();
+  const commandArtifactRefs = evaluationCommandResults(commandResults).flatMap((command) => [
+    command.stdoutArtifactId,
+    command.stderrArtifactId,
+    ...(command.testReports || []).map((report) => report.artifactId),
+  ]).filter(Boolean);
+  await updateEvaluationRun(options, workflowId, subtaskId, evaluationRun.evaluationRun.id, {
+    semanticCacheKey,
+    semanticResult,
+    failureClass: evaluationFailureClass,
+    resumeFromStage: evaluationFailureClass === 'command_failure'
+      ? 'validation_commands'
+      : evaluationFailureClass === 'artifact_failure'
+        ? 'artifact_verification'
+        : evaluationFailureClass
+          ? 'semantic_review'
+          : 'verdict_merge',
+    checkpoints: [
+      {
+        stage: 'semantic_review',
+        status: semanticReused ? 'reused' : semanticVerdict ? 'passed' : 'failed',
+        inputHash: semanticCacheKey,
+        outputHash: hashJson(semanticResult),
+        sourceEvaluationRunId: semanticReused ? reusableSemantic?.id : undefined,
+        failureClass: semanticVerdict ? undefined : 'invalid_output',
+        startedAt: evaluationRun.evaluationRun.startedAt,
+        completedAt: checkpointTime,
+      },
+      {
+        stage: 'validation_commands',
+        status: commands.length === 0
+          ? 'pending'
+          : evaluationCommandResults(commandResults).every((command) => command.status === 'passed') ? 'passed' : 'failed',
+        inputHash: hashJson(commands),
+        outputHash: hashJson(evaluationCommandResults(commandResults)),
+        failureClass: evaluationFailureClass === 'command_failure' ? 'command_failure' : undefined,
+        artifactRefs: commandArtifactRefs,
+        startedAt: evaluationRun.evaluationRun.startedAt,
+        completedAt: checkpointTime,
+      },
+      {
+        stage: 'artifact_verification',
+        status: evaluationFailureClass === 'artifact_failure' ? 'failed' : 'passed',
+        inputHash: hashJson(commandArtifactRefs),
+        outputHash: hashJson(commandResults.map((command) => command.gateFailureCodes || [])),
+        failureClass: evaluationFailureClass === 'artifact_failure' ? 'artifact_failure' : undefined,
+        artifactRefs: commandArtifactRefs,
+        startedAt: checkpointTime,
+        completedAt: checkpointTime,
+      },
+    ],
+  });
   const result = {
     workflowId,
     subtaskId,
@@ -1332,6 +1441,7 @@ async function evaluate(options) {
         stderrArtifactBytes: result.stderrArtifactBytes,
         gateFailureCodes: result.gateFailureCodes,
         testReports: result.testReports,
+        reusedFromEvaluationRunId: result.reusedFromEvaluationRunId,
         summary: result.summary,
       }))
       : [],
@@ -1985,6 +2095,128 @@ function evaluationCommandResults(commandResults) {
 
 function normalizeEvaluationVerdict(value) {
   return ['pass', 'fail', 'inconclusive', 'human_review_required'].includes(value) ? value : undefined;
+}
+
+function evaluationSemanticCacheKey(state, subtaskId, headSha, projectPath, options) {
+  const baseRef = state.workflow.baseRef || `${headSha}^`;
+  const diff = git(projectPath, ['diff', '--binary', `${baseRef}...${headSha}`], { optional: true }) || '';
+  const contract = latestAcceptedContract(state, subtaskId);
+  return hashJson({
+    headSha,
+    subtaskId,
+    contract: contract ? {
+      id: contract.id,
+      version: contract.version,
+      goal: contract.goal,
+      acceptanceCriteria: contract.acceptanceCriteria,
+      scope: contract.scope,
+      verificationPlan: contract.verificationPlan,
+    } : { id: latestContractId(state, subtaskId) || subtaskId },
+    diffHash: hashJson(diff),
+    promptVersion: stringOption(options.promptContract) || 'codex-evaluator.v1',
+    additionalPromptHash: hashJson(stringOption(options.prompt) || ''),
+    model: stringOption(options.model) || 'default',
+  });
+}
+
+function findReusableSemanticEvaluation(state, subtaskId, semanticCacheKey) {
+  return (state.evaluationRuns || [])
+    .filter((run) => run.subtaskId === subtaskId && run.semanticCacheKey === semanticCacheKey && run.semanticResult)
+    .filter((run) => (run.checkpoints || []).some((checkpoint) =>
+      checkpoint.stage === 'semantic_review'
+      && (checkpoint.status === 'passed' || checkpoint.status === 'reused')
+    ))
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
+}
+
+function latestEvaluationForSubtask(state, subtaskId, predicate = () => true) {
+  return (state.evaluationRuns || [])
+    .filter((run) => run.subtaskId === subtaskId && predicate(run))
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
+}
+
+function reusablePassedEvaluationCommands(state, subtaskId, semanticCacheKey) {
+  return (state.evaluationRuns || [])
+    .filter((run) => run.subtaskId === subtaskId && run.semanticCacheKey === semanticCacheKey)
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt))
+    .flatMap((run) => (run.result?.commandResults || [])
+      .filter((result) => result.status === 'passed')
+      .map((result) => ({ evaluationRunId: run.id, result })));
+}
+
+async function evaluationCommandArtifactsValid(projectPath, workflowId, reusable) {
+  const { evaluationRunId, result } = reusable;
+  const sourcePrefix = `.tik/multi-agent/workflows/${workflowId}/evaluations/${evaluationRunId}/`;
+  const artifacts = [
+    [result.stdoutArtifactId, result.stdoutArtifactSha256, result.stdoutArtifactBytes],
+    [result.stderrArtifactId, result.stderrArtifactSha256, result.stderrArtifactBytes],
+    ...(result.testReports || []).map((report) => [
+      report.artifactId,
+      report.artifactSha256,
+      report.artifactBytes,
+    ]),
+  ];
+  for (const [artifactRef, expectedHash, expectedBytes] of artifacts) {
+    if (!artifactRef) return false;
+    const normalizedRef = normalizeEvidencePath(artifactRef);
+    if (!normalizedRef.startsWith(sourcePrefix)) return false;
+    const buffer = await readFile(path.resolve(projectPath, normalizedRef)).catch(() => null);
+    if (!buffer || buffer.byteLength === 0) return false;
+    if (Number.isFinite(expectedBytes) && buffer.byteLength !== expectedBytes) return false;
+    if (expectedHash && `sha256:${createHash('sha256').update(buffer).digest('hex')}` !== expectedHash) return false;
+  }
+  return true;
+}
+
+async function materializeReusedCommandArtifacts(input) {
+  const source = input.reusable.result;
+  const targetPrefix = `.tik/multi-agent/workflows/${input.workflowId}/evaluations/${input.evaluationRunId}`;
+  const suffix = input.commandIndex === 0 ? '' : `-${input.commandIndex + 1}`;
+  const copyArtifact = async (sourceRef, targetRef) => {
+    const sourcePath = path.resolve(input.projectPath, normalizeEvidencePath(sourceRef));
+    const targetPath = path.resolve(input.projectPath, targetRef);
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    await cp(sourcePath, targetPath, { force: true });
+    return targetRef;
+  };
+  const stdoutArtifactId = await copyArtifact(source.stdoutArtifactId, `${targetPrefix}/stdout${suffix}.log`);
+  const stderrArtifactId = await copyArtifact(source.stderrArtifactId, `${targetPrefix}/stderr${suffix}.log`);
+  const testReports = [];
+  for (const [reportIndex, report] of (source.testReports || []).entries()) {
+    const filename = path.basename(normalizeEvidencePath(report.artifactId));
+    const artifactId = await copyArtifact(
+      report.artifactId,
+      `${targetPrefix}/surefire/reused-${input.commandIndex + 1}-${reportIndex + 1}-${filename}`,
+    );
+    testReports.push({ ...report, artifactId });
+  }
+  return {
+    ...source,
+    commandId: input.commandId,
+    command: input.command,
+    stdoutArtifactId,
+    stderrArtifactId,
+    testReports,
+    reusedFromEvaluationRunId: input.reusable.evaluationRunId,
+    summary: `Reused passed command evidence from ${input.reusable.evaluationRunId}.`,
+  };
+}
+
+function classifyEvaluationFailure(input) {
+  if (!input.readonlyAccepted) return 'readonly_violation';
+  if (!input.semanticVerdict) return 'invalid_output';
+  if (input.semanticVerdict === 'fail' || input.semanticVerdict === 'human_review_required') return 'semantic_failure';
+  if (input.commandResults.some((command) => command.status !== 'passed')) {
+    const artifactFailure = input.commandResults.some((command) =>
+      (command.gateFailureCodes || []).some((code) => /artifact|report_missing|stale_report|hash/i.test(code))
+    );
+    return artifactFailure ? 'artifact_failure' : 'command_failure';
+  }
+  return undefined;
+}
+
+function hashJson(value) {
+  return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`;
 }
 
 function composeEvaluationVerdict(input) {

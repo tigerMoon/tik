@@ -113,6 +113,7 @@ describe('CodexHarnessAdapter', () => {
       prompt: 'hello',
       cwd: '/tmp/project',
       allowWrites: true,
+      cleanContext: true,
       onProviderEvent: (event) => providerEvents.push(event),
       onTextDelta: (delta) => textChunks.push(delta),
     });
@@ -121,7 +122,11 @@ describe('CodexHarnessAdapter', () => {
     expect(request).toHaveBeenCalledWith('initialize', expect.anything(), undefined);
     expect(request).toHaveBeenCalledWith(
       'thread/start',
-      expect.objectContaining({ cwd: '/tmp/project' }),
+      expect.objectContaining({
+        cwd: '/tmp/project',
+        ephemeral: true,
+        persistExtendedHistory: false,
+      }),
       expect.anything(),
     );
     expect(request).toHaveBeenCalledWith(
@@ -205,6 +210,53 @@ describe('CodexHarnessAdapter', () => {
 
     await adapter.stop();
     vi.useRealTimers();
+    start.mockRestore();
+    stop.mockRestore();
+    onNotification.mockRestore();
+    request.mockRestore();
+  });
+
+  it('interrupts a clean thread when observed prompt usage exceeds its hard budget', async () => {
+    const start = vi.spyOn(CodexAppServerClient.prototype, 'start').mockResolvedValue(undefined);
+    const stop = vi.spyOn(CodexAppServerClient.prototype, 'stop').mockResolvedValue(undefined);
+    const listeners = new Map<string, Array<(params: any) => void>>();
+    const onNotification = vi.spyOn(CodexAppServerClient.prototype, 'onNotification').mockImplementation((method: string, listener: (params: any) => void) => {
+      listeners.set(method, [...(listeners.get(method) || []), listener]);
+      return () => undefined;
+    });
+    const request = vi.spyOn(CodexAppServerClient.prototype, 'request').mockImplementation(async (method: string) => {
+      if (method === 'initialize') return { userAgent: 'codex-test' } as any;
+      if (method === 'thread/start') return { thread: { id: 'thread-budget' } } as any;
+      if (method === 'turn/start') {
+        setTimeout(() => {
+          for (const listener of listeners.get('thread/tokenUsage/updated') || []) {
+            listener({
+              threadId: 'thread-budget',
+              turnId: 'turn-budget',
+              tokenUsage: { last: { inputTokens: 15_000, cachedInputTokens: 2_000, outputTokens: 1 } },
+            });
+          }
+        }, 0);
+        return { turn: { id: 'turn-budget' } } as any;
+      }
+      if (method === 'turn/interrupt') return {} as any;
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const adapter = new CodexHarnessAdapter('/tmp/project');
+
+    await expect(adapter.runTurn({
+      prompt: 'bounded',
+      cwd: '/tmp/project',
+      cleanContext: true,
+      maxPromptTokens: 16_000,
+    })).rejects.toThrow(/context_budget_exceeded: observed 17000 prompt tokens, budget 16000/);
+    expect(request).toHaveBeenCalledWith(
+      'turn/interrupt',
+      { threadId: 'thread-budget', turnId: 'turn-budget' },
+      { timeoutMs: 10_000 },
+    );
+
+    await adapter.stop();
     start.mockRestore();
     stop.mockRestore();
     onNotification.mockRestore();

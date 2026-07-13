@@ -20,6 +20,9 @@ export interface AgentRunInput {
   worktreePath?: string;
   labels: string[];
   artifactOutputDir: string;
+  cleanContext?: boolean;
+  contextTokenBudget?: number;
+  structuredOutputRequired?: boolean;
   timeoutMs?: number;
 }
 
@@ -36,6 +39,9 @@ export interface PreparedRun {
   allowWrites?: boolean;
   requireThreadId?: boolean;
   developerInstructions?: string;
+  cleanContext?: boolean;
+  contextTokenBudget?: number;
+  structuredOutputRequired?: boolean;
   timeoutMs?: number;
 }
 

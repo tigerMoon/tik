@@ -13,6 +13,8 @@ export interface CodexHarnessTurnOptions {
   onProviderEvent?: (event: ProviderRuntimeEvent) => void;
   onTextDelta?: (text: string) => void;
   onTurnVisible?: (source: 'turn.started' | 'item.started' | 'item.completed' | 'message.delta') => void;
+  cleanContext?: boolean;
+  maxPromptTokens?: number;
 }
 
 export interface CodexHarnessThreadOptions {
@@ -22,6 +24,7 @@ export interface CodexHarnessThreadOptions {
   developerInstructions?: string;
   allowWrites?: boolean;
   signal?: AbortSignal;
+  cleanContext?: boolean;
 }
 
 export interface CodexHarnessTurnResult {
@@ -103,9 +106,9 @@ export class CodexHarnessAdapter {
       sandbox: options.allowWrites ? 'workspace-write' : 'read-only',
       baseInstructions: options.baseInstructions ?? null,
       developerInstructions: options.developerInstructions ?? null,
-      ephemeral: false,
+      ephemeral: options.cleanContext === true,
       experimentalRawEvents: false,
-      persistExtendedHistory: true,
+      persistExtendedHistory: options.cleanContext !== true,
     }, {
       timeoutMs: 90_000,
       signal: options.signal,
@@ -125,6 +128,7 @@ export class CodexHarnessAdapter {
     let content = '';
     let usage: CodexHarnessTurnResult['usage'];
     let threadSystemError = false;
+    let contextBudgetExceeded = false;
     const observedItems = new Map<string, HarnessObservedItemState>();
     let turnVisible = false;
     let resolveTurnCompleted: ((status: 'completed' | 'failed' | 'interrupted') => void) | undefined;
@@ -230,6 +234,20 @@ export class CodexHarnessAdapter {
           completionTokens: Number(params.tokenUsage?.last?.outputTokens || 0),
           totalTokens: Number(params.tokenUsage?.last?.totalTokens || 0),
         };
+        if (
+          !contextBudgetExceeded
+          && options.maxPromptTokens
+          && usage.promptTokens > options.maxPromptTokens
+        ) {
+          contextBudgetExceeded = true;
+          if (turnId) {
+            void this.client.request('turn/interrupt', { threadId, turnId }, { timeoutMs: 10_000 })
+              .catch(() => undefined);
+          }
+          rejectTurnCompleted?.(new Error(
+            `context_budget_exceeded: observed ${usage.promptTokens} prompt tokens, budget ${options.maxPromptTokens}.`,
+          ));
+        }
       }),
       this.client.onNotification<any>('thread/status/changed', (params) => {
         if (params.threadId !== threadId) return;

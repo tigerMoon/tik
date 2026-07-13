@@ -156,6 +156,13 @@ export async function createEvaluationRun(options, workflowId, subtaskId, evalua
   });
 }
 
+export async function updateEvaluationRun(options, workflowId, subtaskId, evaluationRunId, patch) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(subtaskId)}/evaluations/${encodeURIComponent(evaluationRunId)}`, {
+    method: 'PATCH',
+    body: patch,
+  });
+}
+
 export async function createInvocation(options, workflowId, invocation) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations`, {
     method: 'POST',
