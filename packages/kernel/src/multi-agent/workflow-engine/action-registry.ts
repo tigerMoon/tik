@@ -5,11 +5,13 @@ export type WorkflowActionPhase =
   | 'contract'
   | 'contract_questioning'
   | 'building'
+  | 'review'
   | 'evaluation'
   | 'evaluation_questioning'
   | 'completion'
   | 'final_evaluation'
   | 'final_questioning'
+  | 'synthesis'
   | 'workflow_completion'
   | 'human_review'
   | 'abort';
@@ -26,7 +28,7 @@ export interface WorkflowActionDefinition {
   kind: WorkflowActionKind;
   title: string;
   runner?: 'codex' | 'codex-evaluator' | 'claude-code';
-  role?: 'planner' | 'executor' | 'evaluator' | 'questioner';
+  role?: 'planner' | 'executor' | 'reviewer' | 'evaluator' | 'questioner';
   intent?: QuestionerIntent;
   produces?: string[];
   handler: string;
@@ -91,6 +93,25 @@ export const tikV1Actions: Partial<Record<WorkflowDecisionAction, WorkflowAction
     title: 'Record Implementation',
     produces: ['ImplementationEvidence'],
     handler: 'implementation.record',
+  },
+  run_readonly_reviewer: {
+    id: 'run_readonly_reviewer',
+    phase: 'review',
+    kind: 'agent_invocation',
+    title: 'Run Readonly Codex Reviewer',
+    runner: 'codex-evaluator',
+    role: 'reviewer',
+    produces: ['ReviewEvidence'],
+    handler: 'reviewer.start',
+    runtimePolicy: 'readonly',
+  },
+  record_review: {
+    id: 'record_review',
+    phase: 'review',
+    kind: 'state_transition',
+    title: 'Record Review Candidates',
+    produces: ['ReviewEvidence'],
+    handler: 'review.record',
   },
   run_codex_evaluator: {
     id: 'run_codex_evaluator',
@@ -167,6 +188,14 @@ export const tikV1Actions: Partial<Record<WorkflowDecisionAction, WorkflowAction
     handler: 'questioner.start',
     strictOutput: 'QuestionerOutputV2',
     runtimePolicy: 'readonly_tik_api_only',
+  },
+  synthesize_review: {
+    id: 'synthesize_review',
+    phase: 'synthesis',
+    kind: 'human_or_agent_action',
+    title: 'Synthesize Review Findings',
+    produces: ['ReviewSynthesis'],
+    handler: 'review.synthesize',
   },
   complete_workflow: {
     id: 'complete_workflow',

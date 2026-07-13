@@ -96,6 +96,9 @@ function validateActionTransition(
       return accept();
 
     case 'execute_subtask':
+      if (bundle.workflow.mode === 'review') {
+        return reject('invalid_transition', 'Review workflows cannot execute Builder subtasks.');
+      }
       return guardCanExecuteSubtask(bundle, decision, [
         'pending',
         'ready',
@@ -112,6 +115,9 @@ function validateActionTransition(
       return accept();
 
     case 'draft_contract': {
+      if (bundle.workflow.mode === 'review') {
+        return reject('invalid_transition', 'Review workflows do not use SprintContracts.');
+      }
       const statusGuard = requireSubtaskStatus(bundle, decision, ['pending', 'ready', 'contract_drafting', 'contract_questioning']);
       if (!statusGuard.accepted) return statusGuard;
       return requireDependenciesDone(bundle, decision);
@@ -126,11 +132,21 @@ function validateActionTransition(
     }
 
     case 'accept_contract': {
+      if (bundle.workflow.mode === 'review') {
+        return reject('invalid_transition', 'Review workflows do not accept SprintContracts.');
+      }
       const statusGuard = requireSubtaskStatus(bundle, decision, ['contract_drafting', 'contract_questioning']);
       if (!statusGuard.accepted) return statusGuard;
       const contract = decision.subtaskId ? latestContract(bundle, decision.subtaskId) : undefined;
       if (!contract) {
         return reject('missing_contract', 'Accepting a contract requires a drafted SprintContract.');
+      }
+      const requestedContractId = readStringInput(decision.inputs, 'contractId');
+      if (requestedContractId && requestedContractId !== contract.id) {
+        return reject('version_conflict', `Contract ${requestedContractId || 'unknown'} is not the latest draft ${contract.id}.`, {
+          requestedContractId,
+          latestContractId: contract.id,
+        });
       }
       if (bundle.workflow.policy?.requireQuestionerBeforeBuild) {
         const headSha = readStringInput(decision.inputs, 'currentHeadSha')
@@ -170,7 +186,30 @@ function validateActionTransition(
     }
 
     case 'record_implementation':
+      if (bundle.workflow.mode === 'review') {
+        return reject('invalid_transition', 'Review workflows cannot record implementation evidence.');
+      }
       return guardCanRecordImplementation(bundle, decision);
+
+    case 'run_readonly_reviewer': {
+      if (bundle.workflow.mode !== 'review') {
+        return reject('invalid_transition', 'Readonly reviewer actions require mode=review.');
+      }
+      const statusGuard = requireSubtaskStatus(bundle, decision, ['pending', 'ready', 'reviewing']);
+      return statusGuard.accepted ? requireDependenciesDone(bundle, decision) : statusGuard;
+    }
+
+    case 'record_review': {
+      if (bundle.workflow.mode !== 'review') {
+        return reject('invalid_transition', 'Review evidence requires mode=review.');
+      }
+      const statusGuard = requireSubtaskStatus(bundle, decision, ['ready', 'reviewing']);
+      if (!statusGuard.accepted) return statusGuard;
+      if (!decision.subtaskId || !latestEvidenceForSubtask(bundle, decision.subtaskId, 'review')) {
+        return reject('missing_evidence', 'Recording a review requires readonly review evidence.');
+      }
+      return requireDependenciesDone(bundle, decision);
+    }
 
     case 'run_codex_evaluator':
     case 're_evaluate':
@@ -215,6 +254,14 @@ function validateActionTransition(
     case 'complete_subtask': {
       return guardCompleteSubtaskV1(bundle, decision);
     }
+
+    case 'synthesize_review':
+      if (bundle.workflow.mode !== 'review') {
+        return reject('invalid_transition', 'Review synthesis requires mode=review.');
+      }
+      return allSubtasksDone(bundle)
+        ? accept()
+        : reject('invalid_transition', 'Review synthesis requires every review shard to be done.');
 
     case 'complete_workflow':
       if (!allSubtasksDone(bundle)) {
@@ -288,6 +335,9 @@ function guardCompleteSubtaskV1(
   bundle: MultiAgentWorkflowBundle,
   decision: WorkflowDecision,
 ): GuardResult {
+  if (bundle.workflow.mode === 'review') {
+    return guardCompleteReviewSubtask(bundle, decision);
+  }
   const statusGuard = requireSubtaskStatus(bundle, decision, [
     'evaluation_passed',
     'questioning_evidence',
@@ -380,6 +430,67 @@ function guardCompleteSubtaskV1(
     }
   }
 
+  return accept();
+}
+
+function guardCompleteReviewSubtask(
+  bundle: MultiAgentWorkflowBundle,
+  decision: WorkflowDecision,
+): GuardResult {
+  const statusGuard = requireSubtaskStatus(bundle, decision, ['evaluation_passed', 'questioning_evidence']);
+  if (!statusGuard.accepted) return statusGuard;
+  const subtaskId = decision.subtaskId;
+  if (!subtaskId) return reject('invalid_transition', 'complete_subtask requires subtaskId.');
+  const review = latestEvidenceForSubtask(bundle, subtaskId, 'review');
+  if (!review) return reject('missing_evidence', `Review subtask ${subtaskId} has no readonly review evidence.`);
+  const evaluation = latestEvaluationRun(bundle, subtaskId);
+  if (!evaluation?.result) return reject('missing_evaluation_result', `Review subtask ${subtaskId} has no evaluator result.`);
+  if (evaluation.status === 'invalidated' || !evaluation.readonlyPolicy.enforced || (evaluation.readonlyPolicy.violations?.length || 0) > 0) {
+    return reject('readonly_policy_violated', 'Review evaluator readonly policy was not satisfied.', {
+      evaluationRunId: evaluation.id,
+      violations: evaluation.readonlyPolicy.violations || [],
+    });
+  }
+  if (evaluation.status !== 'passed' || evaluation.result.verdict !== 'pass') {
+    return reject('evaluation_not_passed', 'Review completion requires a passing focused evaluator result.', {
+      evaluationRunId: evaluation.id,
+      status: evaluation.status,
+      verdict: evaluation.result.verdict,
+    });
+  }
+  const expectedHead = readStringInput(decision.inputs, 'currentHeadSha') || bundle.workflow.currentHeadSha;
+  if (bundle.workflow.policy?.requireSameHeadShaForEvidence !== false && expectedHead) {
+    if (review.headSha && review.headSha !== expectedHead) {
+      return reject('head_sha_mismatch', 'Review evidence head does not match workflow head.', {
+        expectedHeadSha: expectedHead,
+        reviewHeadSha: review.headSha,
+      });
+    }
+    if (evaluation.result.headSha !== expectedHead) {
+      return reject('head_sha_mismatch', 'Review evaluator head does not match workflow head.', {
+        expectedHeadSha: expectedHead,
+        evaluationHeadSha: evaluation.result.headSha,
+      });
+    }
+  }
+  const subagentGuard = requireIsolatedReviewSubagents(bundle, subtaskId, review, evaluation);
+  if (!subagentGuard.accepted) return subagentGuard;
+  if (bundle.workflow.policy?.requireQuestionerAfterEvaluation) {
+    const questioner = latestMatchingQuestionerOutput(bundle, {
+      subtaskId,
+      intent: 'question_evaluation',
+      evaluationRunId: evaluation.id,
+      headSha: evaluation.result.headSha || evaluation.headSha,
+    });
+    if (!questioner) return reject('blocking_question_unresolved', 'Claude Questioner must inspect review evaluation evidence before completion.');
+    const questionerGuard = requireQuestionerMatchesEvaluation(bundle, questioner, evaluation);
+    if (!questionerGuard.accepted) return questionerGuard;
+    if (hasBlockingQuestions(bundle, questioner)) {
+      return reject('blocking_question_unresolved', 'Claude Questioner has unresolved review questions.', {
+        questionerOutputId: questioner.id,
+      });
+    }
+  }
   return accept();
 }
 
@@ -483,10 +594,68 @@ function requireIsolatedCodexSubagents(
   return accept();
 }
 
+function requireIsolatedReviewSubagents(
+  bundle: MultiAgentWorkflowBundle,
+  subtaskId: string,
+  review: MultiAgentWorkflowEvidence,
+  evaluation: EvaluationRun,
+): GuardResult {
+  const reviewer = latestCompletedInvocation(bundle, subtaskId, (invocation) =>
+    invocation.role === 'reviewer'
+    && invocation.runner === 'codex-evaluator'
+    && (invocation.evidenceRefs || []).includes(review.id)
+  );
+  const evaluator = latestCompletedInvocation(bundle, subtaskId, (invocation) =>
+    invocation.role === 'evaluator'
+    && invocation.runner === 'codex-evaluator'
+    && invocation.evaluationRunId === evaluation.id
+  );
+  if (!reviewer || !evaluator) {
+    return reject('missing_subagent_invocation', 'Review completion requires attested Reviewer and Evaluator invocations.', {
+      reviewerInvocationId: reviewer?.id,
+      evaluatorInvocationId: evaluator?.id,
+    });
+  }
+  if (!isRuntimeAttestedInvocation(reviewer) || !isRuntimeAttestedInvocation(evaluator)) {
+    return reject('missing_subagent_invocation', 'Reviewer and Evaluator invocations must be attested by the Codex hook runtime.');
+  }
+  const reviewerThread = reviewer.actualSubagentThreadId || reviewer.runtimeAttestation?.actualSubagentThreadId;
+  const evaluatorThread = evaluator.actualSubagentThreadId || evaluator.runtimeAttestation?.actualSubagentThreadId;
+  if (!reviewerThread || !evaluatorThread || reviewerThread === evaluatorThread) {
+    return reject('subagent_thread_not_isolated', 'Reviewer and Evaluator must use distinct native subagent threads.', {
+      reviewerThread,
+      evaluatorThread,
+    });
+  }
+  if (!reviewer.readonlyPolicy?.enforced || (reviewer.readonlyPolicy.violations || []).length > 0) {
+    return reject('readonly_policy_violated', 'Readonly Reviewer violated its write policy.', {
+      reviewerInvocationId: reviewer.id,
+      violations: reviewer.readonlyPolicy?.violations || [],
+    });
+  }
+  return accept();
+}
+
 function guardCompleteWorkflowV1(
   bundle: MultiAgentWorkflowBundle,
   decision: WorkflowDecision,
 ): GuardResult {
+  if (bundle.workflow.mode === 'review') {
+    const synthesis = bundle.evidence
+      .filter((item) => item.kind === 'synthesis')
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+    if (!synthesis) return reject('missing_evidence', 'Completing a review workflow requires synthesis evidence.');
+    const expectedHead = readStringInput(decision.inputs, 'currentHeadSha')
+      || readStringInput(decision.inputs, 'headSha')
+      || bundle.workflow.currentHeadSha;
+    if (expectedHead && synthesis.headSha && expectedHead !== synthesis.headSha) {
+      return reject('head_sha_mismatch', 'Review synthesis head does not match workflow completion head.', {
+        expectedHeadSha: expectedHead,
+        synthesisHeadSha: synthesis.headSha,
+      });
+    }
+    return accept();
+  }
   const evaluation = latestEvaluationRun(bundle, '__final__');
   if (!evaluation?.result) {
     return reject('missing_evaluation_result', 'Completing a v1 workflow requires a final Codex evaluation result.');
@@ -693,6 +862,13 @@ function guardCanRunCodexEvaluator(
   if (!decision.subtaskId) {
     return reject('invalid_transition', `${decision.action} requires subtaskId.`);
   }
+  if (bundle.workflow.mode === 'review') {
+    const review = latestEvidenceForSubtask(bundle, decision.subtaskId, 'review');
+    if (!review) return reject('missing_evidence', 'Review evaluator requires readonly review candidate evidence.');
+    const statusGuard = requireSubtaskStatus(bundle, decision, ['reviewed', 'evaluation_failed', 'evaluating']);
+    if (!statusGuard.accepted) return statusGuard;
+    return requireEvidenceHeadMatchesDecision(bundle, decision, review, 'review');
+  }
   const contractGuard = requireAcceptedContractIfPolicyRequires(bundle, decision.subtaskId);
   if (!contractGuard.accepted) return contractGuard;
   const implementation = latestImplementationEvidence(bundle, decision.subtaskId);
@@ -835,10 +1011,10 @@ function requireQuestionerMatchesEvaluation(
   bundle: MultiAgentWorkflowBundle,
   output: QuestionerOutput,
   evaluation: EvaluationRun,
-  contract: SprintContract,
+  contract?: SprintContract,
 ): GuardResult {
   const strictGuard = requireStrictQuestionerOutput(bundle, output, {
-    contractId: contract.id,
+    contractId: contract?.id,
     evaluationRunId: evaluation.id,
     headSha: evaluation.headSha,
   });
@@ -862,7 +1038,7 @@ function requireQuestionerMatchesEvaluation(
       actualEvaluationRunId: output.evaluationRunId,
     });
   }
-  if (output.contractId !== contract.id) {
+  if (contract && output.contractId !== contract.id) {
     return reject('blocking_question_unresolved', 'Questioner output does not match the accepted SprintContract.', {
       questionerOutputId: output.id,
       expectedContractId: contract.id,
@@ -1134,15 +1310,25 @@ function isRuntimeAttestedInvocation(
 ): boolean {
   const attestation = invocation.runtimeAttestation;
   const actualThreadId = invocation.actualSubagentThreadId || attestation?.actualSubagentThreadId;
-  return Boolean(
+  const commonFacts = Boolean(
     invocation.hookAttested === true
       && attestation
-      && attestation.source === 'codex-plugin-hook'
       && attestation.role === invocation.role
       && attestation.nonce
       && attestation.parentThreadId
       && actualThreadId
       && actualThreadId === attestation.actualSubagentThreadId,
+  );
+  if (!commonFacts || !attestation) return false;
+  if (attestation.source === 'codex-plugin-hook') return true;
+  return Boolean(
+    attestation.source === 'codex-subagent-runtime'
+      && attestation.startedAt
+      && attestation.stoppedAt
+      && invocation.completedAt
+      && invocation.status === 'completed'
+      && attestation.headSha
+      && invocation.headSha === attestation.headSha,
   );
 }
 

@@ -15,6 +15,7 @@ import {
   attachProcessLogs,
   buildRuntimeProcessEnv,
   childCompletion,
+  terminateRuntimeChild,
   type RuntimeChildProcess,
 } from './runtime-process.js';
 import { collectGitDiffSummary, collectTranscriptFromRunLogs } from './runtime-collection.js';
@@ -109,7 +110,7 @@ export class ClaudeCodeRunner implements AgentRuntimeRunner {
     this.statuses.set(runId, 'cancelled');
     const child = this.children.get(runId);
     this.children.delete(runId);
-    child?.kill('SIGTERM');
+    if (child) await terminateRuntimeChild(child);
   }
 
   async getStatus(runId: string): Promise<AgentRunStatusSnapshot> {
@@ -131,7 +132,11 @@ export class ClaudeCodeRunner implements AgentRuntimeRunner {
   }
 
   async cleanup(runId: string): Promise<void> {
-    await this.stop(runId, 'cleanup');
+    if (this.children.has(runId)) {
+      await this.stop(runId, 'cleanup');
+    }
+    this.preparedRuns.delete(runId);
+    this.statuses.delete(runId);
   }
 }
 

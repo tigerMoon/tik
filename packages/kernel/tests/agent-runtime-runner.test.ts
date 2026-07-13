@@ -108,6 +108,71 @@ describe('AgentRuntimeRunner implementations', () => {
     expect(stop).toHaveBeenCalled();
   });
 
+  it('returns the native Codex thread id and preserves the completed turn result', async () => {
+    const input = await makeInput();
+    const startThread = vi.fn(async () => 'thread-native-1');
+    const runTurnOnThread = vi.fn(async () => ({
+      content: 'reviewed',
+      turnId: 'turn-native-1',
+      threadId: 'thread-native-1',
+    }));
+    const stop = vi.fn(async () => undefined);
+    const runner = new CodexRunner({
+      mode: 'codex_app_server',
+      adapterFactory: () => ({
+        runTurn: vi.fn(),
+        startThread,
+        runTurnOnThread,
+        stop,
+      }),
+    });
+    const prepared = { ...(await runner.prepare(input)), allowWrites: false, requireThreadId: true };
+
+    const handle = await runner.start(prepared);
+    const completion = await handle.completion;
+
+    expect(handle.threadId).toBe('thread-native-1');
+    expect(startThread).toHaveBeenCalledWith(expect.objectContaining({ allowWrites: false }));
+    expect(runTurnOnThread).toHaveBeenCalledWith('thread-native-1', expect.objectContaining({ allowWrites: false }));
+    expect(completion).toEqual({
+      status: 'completed',
+      result: {
+        content: 'reviewed',
+        turnId: 'turn-native-1',
+        threadId: 'thread-native-1',
+      },
+    });
+    expect(stop).toHaveBeenCalled();
+  });
+
+  it('shares one Codex App Server adapter across parallel native threads', async () => {
+    const first = await makeInput();
+    const second = { ...first, runId: 'run-2', renderedPrompt: 'Review TIK-1.' };
+    const resolvers = new Map<string, (value: { threadId: string }) => void>();
+    const stop = vi.fn(async () => undefined);
+    const adapterFactory = vi.fn(() => ({
+      runTurn: vi.fn(),
+      startThread: vi.fn(async (options: { prompt: string }) => `thread-${options.prompt}`),
+      runTurnOnThread: vi.fn((threadId: string) => new Promise<{ threadId: string }>((resolve) => {
+        resolvers.set(threadId, resolve);
+      })),
+      interruptThread: vi.fn(async () => undefined),
+      stop,
+    }));
+    const runner = new CodexRunner({ mode: 'codex_app_server', adapterFactory });
+
+    const firstHandle = await runner.start({ ...(await runner.prepare(first)), requireThreadId: true });
+    const secondHandle = await runner.start({ ...(await runner.prepare(second)), requireThreadId: true });
+
+    expect(adapterFactory).toHaveBeenCalledTimes(1);
+    expect(firstHandle.threadId).toBe('thread-Implement TIK-1.');
+    resolvers.get(firstHandle.threadId!)?.({ threadId: firstHandle.threadId! });
+    resolvers.get(secondHandle.threadId!)?.({ threadId: secondHandle.threadId! });
+    await Promise.all([firstHandle.completion, secondHandle.completion]);
+    await waitFor(() => stop.mock.calls.length === 1);
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
   it('stops codex app-server adapters when a run fails', async () => {
     const input = await makeInput();
     const runTurn = vi.fn(async () => {
@@ -125,6 +190,26 @@ describe('AgentRuntimeRunner implementations', () => {
     await expect(handle.completion).resolves.toEqual({
       status: 'failed',
       error: 'Codex App Server request timed out: initialize',
+    });
+    expect(stop).toHaveBeenCalledTimes(1);
+    await expect(runner.getStatus(input.runId)).resolves.toBe('failed');
+  });
+
+  it('enforces timeoutMs for Codex App Server turns and stops the adapter', async () => {
+    const input = { ...(await makeInput()), timeoutMs: 10 };
+    const runTurn = vi.fn(() => new Promise(() => undefined));
+    const stop = vi.fn(async () => undefined);
+    const runner = new CodexRunner({
+      mode: 'codex_app_server',
+      adapterFactory: () => ({ runTurn, stop }),
+    });
+    const prepared = await runner.prepare(input);
+
+    const handle = await runner.start(prepared);
+
+    await expect(handle.completion).resolves.toEqual({
+      status: 'failed',
+      error: 'codex app-server timed out after 10ms.',
     });
     expect(stop).toHaveBeenCalledTimes(1);
     await expect(runner.getStatus(input.runId)).resolves.toBe('failed');
@@ -309,7 +394,10 @@ describe('AgentRuntimeRunner implementations', () => {
     child.pid = 4323;
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
-    child.kill = vi.fn();
+    child.kill = vi.fn((signal?: NodeJS.Signals) => {
+      if (signal === 'SIGTERM') queueMicrotask(() => child.emit('exit', null));
+      return true;
+    });
     const runner = new ClaudeCodeRunner({ mode: 'claude_print', spawnProcess: vi.fn(() => child) });
     const prepared = {
       ...(await runner.prepare(input)),

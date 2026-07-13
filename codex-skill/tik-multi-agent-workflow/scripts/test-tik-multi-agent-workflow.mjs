@@ -31,12 +31,30 @@ let contextSnapshots = {};
 let decisionIfMatchLog = [];
 let workflowInitBodies = [];
 let forceConcurrentDecisionChange = false;
+let environmentPreflightAccepted = true;
 
 try {
   await initRepo(repo);
   const server = http.createServer(async (req, res) => {
     try {
       const route = req.url || '/';
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/preflight') {
+        const body = await readRequestJson(req);
+        const report = {
+          accepted: environmentPreflightAccepted,
+          mode: body.mode || 'implementation',
+          workspaceRoot: body.workspaceBinding?.workspaceRoot,
+          checks: [{
+            id: 'codex_hook_attestation',
+            passed: environmentPreflightAccepted,
+            message: environmentPreflightAccepted ? 'Codex hook attestation is available.' : 'Codex hook attestation is unavailable.',
+          }],
+        };
+        sendJson(res, environmentPreflightAccepted
+          ? { report }
+          : { error: { code: 'preflight_failed', message: report.checks[0].message }, report }, environmentPreflightAccepted ? 200 : 409);
+        return;
+      }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows') {
         const body = await readRequestJson(req);
         workflowInitBodies.push(body);
@@ -44,6 +62,7 @@ try {
           id: body.id || 'wf-cli',
           driver: 'codex-workflow',
           status: 'active',
+          mode: body.mode || 'implementation',
           goal: body.goal,
           rootTaskId: body.rootTaskId || body.id || 'wf-cli',
           repo: body.repo,
@@ -178,21 +197,67 @@ try {
         sendJson(res, { snapshot, guard: { accepted: true, code: 'ok' } });
         return;
       }
-      if (req.method === 'PUT' && route === '/api/v1/multi-agent/workflows/wf-cli/task-graph') {
+      if (req.method === 'PUT' && /^\/api\/v1\/multi-agent\/workflows\/[^/]+\/task-graph$/.test(route)) {
         const body = await readRequestJson(req);
         graph = body.graph;
-        subtasks = {
-          'st-api': {
-            subtaskId: 'st-api',
-            status: 'ready',
+        subtasks = Object.fromEntries(graph.subtasks.map((subtask) => [
+          subtask.id,
+          {
+            subtaskId: subtask.id,
+            status: subtask.dependsOn.length === 0 ? 'ready' : 'pending',
             validationRunIds: [],
             evidenceRefs: [],
             blockerFindingIds: [],
             fixRound: 0,
           },
-        };
+        ]));
         events.push({ type: 'task_graph.created', payload: { version: graph.version } });
         sendJson(res, { graph, subtasks });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/actions/execute-subtask') {
+        const body = await readRequestJson(req);
+        const invocation = invocations.find((item) => item.id === body.invocation.id);
+        const nativeCompleted = invocation?.status === 'completed'
+          && invocation.runtimeAttestation?.source === 'codex-subagent-runtime';
+        if (!invocation || (!nativeCompleted && (invocation.attestationToken !== body.invocation.attestationToken || !invocation.hookAttested))) {
+          sendJson(res, { error: { code: 'missing_subagent_invocation', message: 'Invalid hook attestation.' } }, 409);
+          return;
+        }
+        const item = {
+          id: body.evidence.id,
+          workflowId: 'wf-cli',
+          ...body.evidence,
+        };
+        evidence.push(item);
+        invocations = invocations.map((candidate) => candidate.id === invocation.id
+          ? {
+            ...candidate,
+            ...body.invocation,
+            status: 'completed',
+            evidenceRefs: [item.id],
+            attestationToken: undefined,
+            completedAt: new Date().toISOString(),
+          }
+          : candidate);
+        subtasks['st-api'] = {
+          ...subtasks['st-api'],
+          status: 'implemented',
+          implementationHeadSha: item.headSha,
+          evidenceRefs: Array.from(new Set([...(subtasks['st-api'].evidenceRefs || []), item.id])),
+        };
+        decisions.push(body.decision);
+        workflow = { ...workflow, lastDecisionId: body.decision.id };
+        events.push({ type: 'evidence.recorded', payload: { evidenceId: item.id, kind: item.kind, subtaskId: item.subtaskId } });
+        events.push({ type: 'subtask.updated', payload: { subtaskId: 'st-api', status: 'implemented' } });
+        sendJson(res, {
+          evidence: item,
+          invocation: invocations.find((candidate) => candidate.id === invocation.id),
+          subtask: subtasks['st-api'],
+          decision: body.decision,
+          workflow,
+          guard: { accepted: true, code: 'ok' },
+        });
         return;
       }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/evidence') {
@@ -249,6 +314,44 @@ try {
         contracts = contracts.filter((item) => item.id !== contract.id).concat(contract);
         events.push({ type: 'contract.accepted', payload: { contractId: contract.id, subtaskId: 'st-api' } });
         sendJson(res, { contract });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/actions/accept-contracts') {
+        const body = await readRequestJson(req);
+        const acceptedContracts = body.contracts.map((item) => {
+          const contract = {
+            ...contracts.find((candidate) => candidate.id === item.contractId),
+            status: 'accepted',
+            acceptedBy: item.acceptedBy,
+            acceptedAt: new Date().toISOString(),
+            headShaAtAcceptance: item.headShaAtAcceptance,
+          };
+          contracts = contracts.filter((candidate) => candidate.id !== contract.id).concat(contract);
+          return contract;
+        });
+        const acceptedDecisions = body.contracts.map((item, index) => ({
+          id: `dec-accept-batch-${index + 1}`,
+          workflowId: 'wf-cli',
+          rootTaskId: workflow.rootTaskId,
+          subtaskId: item.subtaskId,
+          decidedBy: 'codex-workflow',
+          decidedAt: new Date().toISOString(),
+          action: 'accept_contract',
+          reason: 'Atomic batch acceptance.',
+          evidenceRefs: [],
+          inputs: { contractId: item.contractId },
+        }));
+        decisions.push(...acceptedDecisions);
+        workflow = { ...workflow, lastDecisionId: acceptedDecisions.at(-1).id };
+        for (const item of body.contracts) {
+          subtasks[item.subtaskId] = { ...subtasks[item.subtaskId], status: 'contract_accepted' };
+        }
+        sendJson(res, {
+          contracts: acceptedContracts,
+          decisions: acceptedDecisions,
+          subtasks: body.contracts.map((item) => subtasks[item.subtaskId]),
+          workflow,
+        });
         return;
       }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/subtasks/st-api/evaluations') {
@@ -353,6 +456,16 @@ try {
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/questioner-runs') {
         const body = await readRequestJson(req);
         sendJson(res, createMockQuestionerRun(body));
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/questioner-runs/native-launch') {
+        const body = await readRequestJson(req);
+        const created = createMockQuestionerRun({ ...body, start: true });
+        const { token: _token, submitUrl: _submitUrl, contextUrl: _contextUrl, ...publicRun } = created;
+        sendJson(res, {
+          ...publicRun,
+          runtime: { runId: created.questionerRunId, runtimeRef: `pid:${questionerRuns.length}`, status: 'running' },
+        });
         return;
       }
       if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/actions\/[^/]+\/run$/)) {
@@ -600,6 +713,42 @@ try {
         sendJson(res, { invocation });
         return;
       }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-cli/agent-invocations/native-launch') {
+        const body = await readRequestJson(req);
+        const now = new Date().toISOString();
+        const threadId = `native-${body.id || invocations.length + 1}`;
+        const runtimeAttestation = {
+          source: 'codex-subagent-runtime',
+          parentThreadId: body.parentThreadId || workflow.metadata?.parentCodexThreadId || 'workflow-thread-cli',
+          actualSubagentThreadId: threadId,
+          role: body.role,
+          nonce: `nonce-${body.id}`,
+          startedAt: now,
+          stoppedAt: now,
+          headSha: body.headSha,
+        };
+        const stored = {
+          ...body,
+          id: body.id || `inv-${invocations.length + 1}`,
+          workflowId: 'wf-cli',
+          status: 'completed',
+          hookAttested: true,
+          threadId,
+          actualSubagentThreadId: threadId,
+          parentThreadId: runtimeAttestation.parentThreadId,
+          runtimeAttestation,
+          createdAt: now,
+          updatedAt: now,
+          startedAt: now,
+          completedAt: now,
+        };
+        invocations.push(stored);
+        sendJson(res, {
+          invocation: { ...stored, status: 'started', completedAt: undefined },
+          runtime: { runId: stored.id, runtimeRef: threadId, status: 'running' },
+        });
+        return;
+      }
       if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/hook-start$/)) {
         const invocationId = route.split('/').at(-2);
         const body = await readRequestJson(req);
@@ -611,6 +760,7 @@ try {
             ...item,
             status: 'started',
             hookAttested: true,
+            attestationToken: body.attestationToken,
             threadId: body.actualSubagentThreadId,
             actualSubagentThreadId: body.actualSubagentThreadId,
             parentThreadId: body.parentThreadId,
@@ -683,6 +833,21 @@ try {
             evaluationRunId: body.evaluationRunId,
             completedAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
+          }
+          : item);
+        sendJson(res, { invocation: invocations.find((item) => item.id === invocationId) });
+        return;
+      }
+      if (req.method === 'POST' && route.match(/^\/api\/v1\/multi-agent\/workflows\/wf-cli\/agent-invocations\/[^/]+\/native-result$/)) {
+        const invocationId = route.split('/').at(-2);
+        const body = await readRequestJson(req);
+        invocations = invocations.map((item) => item.id === invocationId
+          ? {
+            ...item,
+            ...body,
+            result: { ...(item.result || {}), ...(body.result || {}) },
+            evaluationRunId: body.evaluationRunId || item.evaluationRunId,
+            readonlyPolicy: body.readonlyPolicy || item.readonlyPolicy,
           }
           : item);
         sendJson(res, { invocation: invocations.find((item) => item.id === invocationId) });
@@ -788,6 +953,18 @@ try {
   assert.equal(transitionedTask.action, 'task-transitioned');
   assert.equal(rootTask.status, 'in_progress');
 
+  environmentPreflightAccepted = false;
+  const initFailure = await runExpectFailure([
+    'init',
+    '--api-base-url', apiBaseUrl,
+    '--path', repo,
+    '--goal', 'Must fail before durable creation',
+    '--workflow', 'wf-preflight-rejected',
+  ]);
+  assert.match(initFailure, /Codex hook attestation is unavailable/);
+  assert.equal(workflowInitBodies.some((body) => body.id === 'wf-preflight-rejected'), false);
+  environmentPreflightAccepted = true;
+
   const init = await run([
     'init',
     '--api-base-url', apiBaseUrl,
@@ -833,6 +1010,23 @@ try {
   assert.equal(workspaceBoundBody.workspaceBinding.effectiveProjectPath, worktreePath);
   assert.equal(workspaceBoundBody.workspaceBinding.laneId, 'feature-lane');
   assert.equal(workspaceBoundBody.workspaceBinding.worktreeKind, 'git-worktree');
+
+  const reviewInit = await run([
+    'init',
+    '--api-base-url', apiBaseUrl,
+    '--path', repo,
+    '--goal', 'Review the pinned changes',
+    '--workflow', 'wf-cli-review',
+    '--mode', 'review',
+    '--base', 'HEAD~1',
+  ]);
+  assert.equal(reviewInit.workflowMode, 'review');
+  assert.equal(reviewInit.reviewTaskGraph.createdBy, 'codex-workflow');
+  assert.ok(reviewInit.reviewTaskGraph.subtasks.length >= 1);
+  assert.ok(reviewInit.reviewTaskGraph.subtasks.every((subtask) => subtask.kind === 'review'));
+  assert.ok(reviewInit.reviewTaskGraph.subtasks.every((subtask) => subtask.assignedReviewer === 'codex'));
+  assert.ok(reviewInit.reviewTaskGraph.subtasks.every((subtask) => subtask.expectedChangedFiles === undefined));
+  assert.equal(workflowInitBodies.find((body) => body.id === 'wf-cli-review').mode, 'review');
 
   const putGraph = await run([
     'accept-plan',
@@ -913,12 +1107,12 @@ try {
     '--nonce', 'nonce-builder-cli',
     '--path', repo,
   ]);
-  assert.equal(builderStarted.action, 'builder-pending');
-  assert.equal(builderStarted.invocation.status, 'created');
-  assert.equal(builderStarted.invocation.threadId, 'builder-thread-cli');
+  assert.equal(builderStarted.action, 'builder-started');
+  assert.equal(builderStarted.invocation.status, 'started');
+  assert.equal(builderStarted.invocation.threadId, 'native-inv-builder-cli');
   assert.equal(builderStarted.invocation.attestationToken, undefined);
   assert.equal(builderStarted.attestationToken, undefined);
-  assert.match(builderStarted.instruction, /Codex hook will attest runtime start/);
+  assert.match(builderStarted.instruction, /Tik launched the Codex Builder native thread/);
 
   const builderHookStarted = await run([
     'complete-invocation',
@@ -953,9 +1147,9 @@ try {
   ]);
   assert.equal(execute.action, 'execution-recorded');
   assert.equal(subtasks['st-api'].status, 'implemented');
-  assert.deepEqual(subtasks['st-api'].evidenceRefs, ['ev-preflight-questioner', 'ev-cli']);
+  assert.deepEqual(subtasks['st-api'].evidenceRefs, ['ev-preflight-questioner', execute.evidence.id]);
   assert.equal(execute.invocation.status, 'completed');
-  assert.deepEqual(execute.invocation.evidenceRefs, ['ev-cli']);
+  assert.deepEqual(execute.invocation.evidenceRefs, [execute.evidence.id]);
   assert.deepEqual(evidence[0].payload.changedFiles, [
     { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
     { path: 'packages/kernel/src/server.ts', changeType: 'modified' },
@@ -969,7 +1163,7 @@ try {
     { path: 'packages/kernel/src/server.ts', changeType: 'modified' },
   ]);
 
-  const aliasExecution = await run([
+  const aliasFailure = await runExpectFailure([
     'record-implementation',
     '--api-base-url', apiBaseUrl,
     '--workflow', 'wf-cli',
@@ -977,7 +1171,7 @@ try {
     '--summary', 'Alias implementation evidence',
     '--observed-changed-files', 'packages/kernel/src/server.ts',
   ]);
-  assert.equal(aliasExecution.action, 'execution-recorded');
+  assert.match(aliasFailure, /--invocation is required/);
 
   const validate = await run([
     'validate',
@@ -992,7 +1186,7 @@ try {
   assert.equal(validate.evidence.artifactRef, '.tik/multi-agent/workflows/wf-cli/validation/st-api/ev-validation-cli.stdout.log');
   assert.match(await readFile(path.join(repo, validate.evidence.artifactRef), 'utf-8'), /validation ok/);
   assert.equal(subtasks['st-api'].status, 'validated');
-  assert.deepEqual(subtasks['st-api'].evidenceRefs, ['ev-preflight-questioner', 'ev-cli', 'ev-validation-cli']);
+  assert.deepEqual(subtasks['st-api'].evidenceRefs, ['ev-preflight-questioner', execute.evidence.id, 'ev-validation-cli']);
 
   const nextAfterValidation = await run(['next', '--api-base-url', apiBaseUrl, '--workflow', 'wf-cli']);
   assert.equal(nextAfterValidation.decision.action, 'run_codex_evaluator');
@@ -1115,7 +1309,7 @@ try {
   assert.equal(v1QuestionEvaluationNext.subtaskId, 'st-api');
   assert.match(
     instructionForDecision(v1QuestionEvaluationNext),
-    /async Claude Questioner subagent/,
+    /Tik to launch an async Claude Questioner/,
   );
 
   const v1ReadonlyViolationNext = decideNextAction({
@@ -1263,7 +1457,7 @@ try {
   assert.equal(v1FinalQuestionerNext.action, 'ask_claude_question_final_evidence');
   assert.match(
     instructionForDecision(v1FinalQuestionerNext),
-    /async Claude Questioner subagent/,
+    /Tik to launch an async Claude Questioner/,
   );
 
   const v1WorkflowCompleteNext = decideNextAction({
@@ -1368,12 +1562,12 @@ try {
     '--evaluator-artifact-path', 'reports/evaluator/',
     '--evaluator-artifact-path', 'custom-artifacts/result.json',
   ]);
-  assert.equal(evaluatorStarted.action, 'evaluator-pending');
-  assert.equal(evaluatorStarted.invocation.status, 'created');
-  assert.equal(evaluatorStarted.invocation.threadId, 'evaluator-thread-cli');
+  assert.equal(evaluatorStarted.action, 'evaluator-started');
+  assert.equal(evaluatorStarted.invocation.status, 'started');
+  assert.equal(evaluatorStarted.invocation.threadId, 'native-inv-evaluator-cli');
   assert.equal(evaluatorStarted.invocation.attestationToken, undefined);
   assert.equal(evaluatorStarted.attestationToken, undefined);
-  assert.match(evaluatorStarted.instruction, /Codex hook will attest runtime start/);
+  assert.match(evaluatorStarted.instruction, /Tik launched the readonly Codex Evaluator native thread/);
   assert.ok(evaluatorStarted.invocation.allowedPaths.includes('.tik/multi-agent/'));
   assert.ok(evaluatorStarted.invocation.allowedPaths.includes('reports/evaluator/'));
   assert.ok(evaluatorStarted.invocation.allowedPaths.includes('custom-artifacts/result.json'));
@@ -1771,7 +1965,7 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
       suffix: 'execute',
       expectedAction: 'execute_subtask',
       expectedOutputAction: 'continue-instruction',
-      expectedPendingAction: 'builder-pending',
+      expectedPendingAction: 'builder-started',
       expectedInstruction: /After the Builder produces code changes/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
@@ -1793,7 +1987,7 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
       suffix: 'draft-contract',
       expectedAction: 'draft_contract',
       expectedOutputAction: 'continue-instruction',
-      expectedPendingAction: 'builder-pending',
+      expectedPendingAction: 'builder-started',
       expectedInstruction: /After the Builder produces code changes/,
       expectedDecisionsPosted: 2,
       build: (workflowId) => ({
@@ -1816,7 +2010,7 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
       suffix: 'question-contract',
       expectedAction: 'accept_contract',
       expectedOutputAction: 'continue-instruction',
-      expectedPendingAction: 'builder-pending',
+      expectedPendingAction: 'builder-started',
       expectedInstruction: /After the Builder produces code changes/,
       expectedDecisionsPosted: 1,
       build: (workflowId) => ({
@@ -1842,7 +2036,7 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
       suffix: 'run-evaluator',
       expectedAction: 'run_codex_evaluator',
       expectedOutputAction: 'continue-instruction',
-      expectedPendingAction: 'evaluator-pending',
+      expectedPendingAction: 'evaluator-started',
       expectedInstruction: /After the Evaluator finishes/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
@@ -1935,7 +2129,7 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
       suffix: 'run-final-evaluation',
       expectedAction: 'run_final_evaluation',
       expectedOutputAction: 'continue-instruction',
-      expectedPendingAction: 'evaluator-pending',
+      expectedPendingAction: 'evaluator-started',
       expectedInstruction: /After the final Evaluator finishes/,
       build: (workflowId) => ({
         workflow: buildContinueWorkflow(workflowId, headSha, manualActionPolicy),
@@ -2056,6 +2250,33 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           sendJson(res, { contract });
           return;
         }
+        if (req.method === 'POST' && route === `/api/v1/multi-agent/workflows/${workflowId}/actions/accept-contracts`) {
+          const body = await readRequestJson(req);
+          const acceptedContracts = body.contracts.map((item) => ({
+            ...(localState.contracts || []).find((candidate) => candidate.id === item.contractId),
+            status: 'accepted',
+            acceptedBy: item.acceptedBy,
+            acceptedAt: new Date().toISOString(),
+            headShaAtAcceptance: item.headShaAtAcceptance,
+          }));
+          localState.contracts = (localState.contracts || [])
+            .filter((candidate) => !acceptedContracts.some((contract) => contract.id === candidate.id))
+            .concat(acceptedContracts);
+          localState.subtasks['st-api'] = { ...localState.subtasks['st-api'], status: 'contract_accepted' };
+          const batchDecisions = body.contracts.map((item, index) => ({
+            id: `dec-batch-${index + 1}`,
+            action: 'accept_contract',
+            subtaskId: item.subtaskId,
+          }));
+          decisionsPosted += batchDecisions.length;
+          sendJson(res, {
+            contracts: acceptedContracts,
+            decisions: batchDecisions,
+            subtasks: [localState.subtasks['st-api']],
+            workflow: localState.workflow,
+          });
+          return;
+        }
         if (req.method === 'PATCH' && route === `/api/v1/multi-agent/workflows/${workflowId}/subtasks/st-api`) {
           const body = await readRequestJson(req);
           localState.subtasks['st-api'] = {
@@ -2078,6 +2299,36 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
           };
           localState.invocations.push(invocation);
           sendJson(res, { invocation });
+          return;
+        }
+        if (req.method === 'POST' && route === `/api/v1/multi-agent/workflows/${workflowId}/agent-invocations/native-launch`) {
+          const body = await readRequestJson(req);
+          const threadId = `native-${body.id || localState.invocations.length + 1}`;
+          const invocation = {
+            ...body,
+            id: body.id || `inv-${localState.invocations.length + 1}`,
+            workflowId,
+            status: 'started',
+            hookAttested: true,
+            threadId,
+            actualSubagentThreadId: threadId,
+            parentThreadId: body.parentThreadId || 'parent-thread',
+            runtimeAttestation: {
+              source: 'codex-subagent-runtime',
+              parentThreadId: body.parentThreadId || 'parent-thread',
+              actualSubagentThreadId: threadId,
+              role: body.role,
+              nonce: `nonce-${threadId}`,
+              startedAt: new Date().toISOString(),
+            },
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          };
+          localState.invocations.push(invocation);
+          sendJson(res, {
+            invocation,
+            runtime: { runId: invocation.id, runtimeRef: threadId, status: 'running' },
+          });
           return;
         }
         if (req.method === 'POST' && route === `/api/v1/multi-agent/workflows/${workflowId}/questioner-runs`) {
@@ -2124,6 +2375,51 @@ async function assertContinueStopsForCurrentSessionActions(repoPath) {
             tokenExpiresAt: run.tokenExpiresAt,
             questionerRun: run,
             invocation,
+          });
+          return;
+        }
+        if (req.method === 'POST' && route === `/api/v1/multi-agent/workflows/${workflowId}/questioner-runs/native-launch`) {
+          const body = await readRequestJson(req);
+          const runId = body.id || `qr-${localState.questionerRuns?.length || 0}`;
+          const invocationId = body.invocationId || `inv-${runId}`;
+          const run = {
+            id: runId,
+            workflowId,
+            subtaskId: body.subtaskId,
+            intent: body.intent,
+            status: 'started',
+            invocationId,
+            contractId: body.contractId,
+            evaluationRunId: body.evaluationRunId,
+            finalEvaluationRunId: body.finalEvaluationRunId,
+            headSha: body.headSha,
+            contextArtifactRef: `.tik/multi-agent/workflows/${workflowId}/questioner-runs/${runId}/context.json`,
+            contextHash: `sha256:${runId}`,
+            expectedOutputArtifactRef: `.tik/multi-agent/workflows/${workflowId}/questioner-runs/${runId}/output.json`,
+            tokenExpiresAt: new Date(Date.now() + 3600000).toISOString(),
+          };
+          const invocation = {
+            id: invocationId,
+            workflowId,
+            subtaskId: body.subtaskId,
+            role: 'questioner',
+            runner: 'claude-code',
+            status: 'started',
+            input: body,
+            headSha: body.headSha,
+          };
+          localState.questionerRuns = [...(localState.questionerRuns || []), run];
+          localState.invocations.push(invocation);
+          sendJson(res, {
+            questionerRunId: run.id,
+            invocationId,
+            contextArtifactRef: run.contextArtifactRef,
+            contextHash: run.contextHash,
+            expectedOutputArtifactRef: run.expectedOutputArtifactRef,
+            tokenExpiresAt: run.tokenExpiresAt,
+            questionerRun: run,
+            invocation,
+            runtime: { runId, runtimeRef: `pid:${localState.invocations.length}`, status: 'running' },
           });
           return;
         }
@@ -2229,7 +2525,14 @@ async function assertPreexistingChangedFilesSubtracted(tempRoot) {
     }],
   };
   const subtasksState = {
-    'st-only': { subtaskId: 'st-only', status: 'ready', evidenceRefs: [], blockerFindingIds: [], fixRound: 0 },
+    'st-only': { subtaskId: 'st-only', status: 'contract_accepted', evidenceRefs: [], blockerFindingIds: [], fixRound: 0 },
+  };
+  const invocationState = {
+    id: 'inv-x',
+    subtaskId: 'st-only',
+    status: 'started',
+    hookAttested: true,
+    attestationToken: 'att-x',
   };
   const contract = {
     id: 'contract-st-only-v1',
@@ -2244,6 +2547,11 @@ async function assertPreexistingChangedFilesSubtracted(tempRoot) {
   const server = http.createServer(async (req, res) => {
     try {
       const route = req.url || '/';
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/preflight') {
+        const body = await readRequestJson(req);
+        sendJson(res, { report: { accepted: true, mode: body.mode, checks: [] } });
+        return;
+      }
       if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows') {
         capturedInitBody = await readRequestJson(req);
         workflowRecord.metadata = capturedInitBody.metadata || {};
@@ -2258,6 +2566,7 @@ async function assertPreexistingChangedFilesSubtracted(tempRoot) {
           contracts: [contract],
           decisions: [],
           evidence: [],
+          invocations: [invocationState],
         });
         return;
       }
@@ -2283,6 +2592,24 @@ async function assertPreexistingChangedFilesSubtracted(tempRoot) {
         const body = await readRequestJson(req);
         capturedEvidenceBodies.push(body);
         sendJson(res, { evidence: { id: body.id || `ev-${capturedEvidenceBodies.length}`, ...body } });
+        return;
+      }
+      if (req.method === 'POST' && route === '/api/v1/multi-agent/workflows/wf-preexisting/actions/execute-subtask') {
+        const body = await readRequestJson(req);
+        capturedEvidenceBodies.push(body.evidence);
+        subtasksState['st-only'] = {
+          ...subtasksState['st-only'],
+          status: 'implemented',
+          evidenceRefs: [body.evidence.id],
+        };
+        sendJson(res, {
+          evidence: body.evidence,
+          invocation: { ...invocationState, status: 'completed', evidenceRefs: [body.evidence.id] },
+          subtask: subtasksState['st-only'],
+          decision: body.decision,
+          workflow: workflowRecord,
+          guard: { accepted: true, code: 'ok' },
+        });
         return;
       }
       if (
@@ -2331,6 +2658,8 @@ async function assertPreexistingChangedFilesSubtracted(tempRoot) {
     '--workflow', 'wf-preexisting',
     '--subtask', 'st-only',
     '--summary', 'Applied scoped edit',
+    '--invocation', 'inv-x',
+    '--attestation-token', 'att-x',
     // No --changed-files, no --observed-changed-files: exercise the fallback.
   ]);
 
@@ -2352,6 +2681,7 @@ function runIn(cwd, args) {
     const child = spawn(process.execPath, [scriptPath, ...args], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, TIK_CODEX_HOOK_ATTESTATION: '1' },
     });
     let stdout = '';
     let stderr = '';
@@ -2411,6 +2741,7 @@ function run(args) {
     const child = spawn(process.execPath, [scriptPath, ...args], {
       cwd: repo,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, TIK_CODEX_HOOK_ATTESTATION: '1' },
     });
     let stdout = '';
     let stderr = '';
@@ -2433,6 +2764,29 @@ function run(args) {
       } catch (error) {
         reject(error);
       }
+    });
+  });
+}
+
+function runExpectFailure(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [scriptPath, ...args], {
+      cwd: repo,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, TIK_CODEX_HOOK_ATTESTATION: '1' },
+    });
+    let output = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { output += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) {
+        reject(new Error(`Expected command to fail: ${args.join(' ')}`));
+        return;
+      }
+      resolve(output);
     });
   });
 }

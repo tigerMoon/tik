@@ -16,11 +16,114 @@ export function decideNextAction(state) {
     };
   }
 
-  return decideNextV1Action(state, graph, subtasks);
+  return workflow?.mode === 'review'
+    ? decideNextReviewAction(state, graph, subtasks)
+    : decideNextV1Action(state, graph, subtasks);
 }
 
 function collectEvidenceRefs(subtasks) {
   return Array.from(new Set(Object.values(subtasks).flatMap((subtask) => subtask.evidenceRefs || [])));
+}
+
+function decideNextReviewAction(state, graph, subtasks) {
+  if (allSubtasksDone(graph, subtasks)) {
+    const synthesis = (state.evidence || [])
+      .filter((item) => item.kind === 'synthesis')
+      .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))[0];
+    return synthesis
+      ? {
+        action: 'complete_workflow',
+        reason: 'Readonly review evidence has been evaluated, questioned, and synthesized.',
+        evidenceRefs: mergeRefs(collectEvidenceRefs(subtasks), [synthesis.id]),
+        inputs: { taskGraphVersion: graph.version, synthesisEvidenceId: synthesis.id },
+      }
+      : {
+        action: 'synthesize_review',
+        reason: 'Readonly reviewers, focused evaluators, and Questioner checks are complete; synthesize the findings.',
+        evidenceRefs: collectEvidenceRefs(subtasks),
+        inputs: { taskGraphVersion: graph.version },
+      };
+  }
+  const active = chooseNextV1Subtask(graph, subtasks);
+  if (!active) {
+    return {
+      action: 'request_human_review',
+      reason: 'No schedulable readonly review subtask is available.',
+      evidenceRefs: collectEvidenceRefs(subtasks),
+      inputs: { workflowStatus: state.workflow?.status },
+    };
+  }
+  const subtaskId = active.id;
+  const subtaskState = subtasks[subtaskId] || { subtaskId, status: 'pending', evidenceRefs: [] };
+  const review = latestEvidence(state.evidence, subtaskId, ['review']);
+  if (!review) {
+    return {
+      action: 'run_readonly_reviewer',
+      subtaskId,
+      reason: `Review shard ${subtaskId} is ready for a pinned-HEAD readonly Codex reviewer.`,
+      evidenceRefs: subtaskState.evidenceRefs || [],
+      inputs: { title: active.title },
+    };
+  }
+  const evaluation = latestEvaluation(state.evaluationRuns, subtaskId);
+  if (!evaluation) {
+    return {
+      action: 'run_codex_evaluator',
+      subtaskId,
+      reason: `Review shard ${subtaskId} has candidates; run a focused evaluator over those candidates only.`,
+      evidenceRefs: mergeRefs(subtaskState.evidenceRefs, [review.id]),
+      inputs: { reviewEvidenceId: review.id },
+    };
+  }
+  if (evaluation.status === 'invalidated') {
+    return {
+      action: 'request_human_review',
+      subtaskId,
+      reason: `Review evaluator ${evaluation.id} violated readonly policy.`,
+      evidenceRefs: mergeRefs(subtaskState.evidenceRefs, [review.id]),
+      inputs: { evaluationRunId: evaluation.id },
+    };
+  }
+  if (!evaluation.result || evaluation.status !== 'passed' || evaluation.result.verdict !== 'pass') {
+    return {
+      action: 're_evaluate',
+      subtaskId,
+      reason: `Review evaluator ${evaluation.id} did not produce a passing candidate verification result.`,
+      evidenceRefs: mergeRefs(subtaskState.evidenceRefs, [review.id]),
+      inputs: { evaluationRunId: evaluation.id, reviewEvidenceId: review.id },
+    };
+  }
+  const questioned = latestMatchingQuestionerOutput(state, {
+    subtaskId,
+    intent: 'question_evaluation',
+    evaluationRunId: evaluation.id,
+    headSha: evaluation.result?.headSha || evaluation.headSha,
+  });
+  if (state.workflow?.policy?.requireQuestionerAfterEvaluation && !questioned) {
+    return {
+      action: 'ask_claude_question_evaluation',
+      subtaskId,
+      reason: `Focused evaluation ${evaluation.id} passed; Claude Questioner should challenge the remaining candidates.`,
+      evidenceRefs: mergeRefs(subtaskState.evidenceRefs, [review.id]),
+      inputs: { evaluationRunId: evaluation.id, reviewEvidenceId: review.id },
+    };
+  }
+  if (hasBlockingQuestionerFindings(questioned)) {
+    return {
+      action: 'request_human_review',
+      subtaskId,
+      reason: `Questioner output ${questioned.id} contains unresolved review questions.`,
+      evidenceRefs: mergeRefs(subtaskState.evidenceRefs, [review.id]),
+      inputs: { evaluationRunId: evaluation.id, questionerOutputId: questioned.id },
+    };
+  }
+  return {
+    action: 'complete_subtask',
+    subtaskId,
+    reason: `Review shard ${subtaskId} has readonly review evidence, focused evaluation, and no blocking Questioner output.`,
+    evidenceRefs: mergeRefs(subtaskState.evidenceRefs, [review.id]),
+    inputs: { evaluationRunId: evaluation.id, reviewEvidenceId: review.id, questionerOutputId: questioned?.id },
+  };
 }
 
 function decideNextV1Action(state, graph, subtasks) {

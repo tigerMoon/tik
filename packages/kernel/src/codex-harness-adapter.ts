@@ -51,6 +51,8 @@ export class CodexHarnessAdapter {
   private readonly process: CodexAppServerProcess;
   private readonly client: CodexAppServerClient;
   private started = false;
+  private startPromise?: Promise<void>;
+  private readonly activeTurns = new Map<string, string>();
 
   constructor(
     cwd: string,
@@ -62,20 +64,34 @@ export class CodexHarnessAdapter {
 
   async start(): Promise<void> {
     if (this.started) return;
-    await this.client.start();
-    await this.client.initialize({
-      clientInfo: {
-        name: 'tik',
-        version: this.appVersion,
-      },
-      capabilities: null,
-    });
-    this.started = true;
+    if (!this.startPromise) {
+      this.startPromise = (async () => {
+        await this.client.start();
+        await this.client.initialize({
+          clientInfo: {
+            name: 'tik',
+            version: this.appVersion,
+          },
+          capabilities: null,
+        });
+        this.started = true;
+      })().finally(() => {
+        this.startPromise = undefined;
+      });
+    }
+    await this.startPromise;
   }
 
   async stop(): Promise<void> {
     this.started = false;
+    this.activeTurns.clear();
     await this.client.stop();
+  }
+
+  async interruptThread(threadId: string): Promise<void> {
+    const turnId = this.activeTurns.get(threadId);
+    if (!turnId) return;
+    await this.client.request('turn/interrupt', { threadId, turnId }, { timeoutMs: 10_000 });
   }
 
   async startThread(options: CodexHarnessThreadOptions): Promise<string> {
@@ -240,6 +256,7 @@ export class CodexHarnessAdapter {
       });
 
       turnId = turnResponse.turn.id as string;
+      this.activeTurns.set(threadId, turnId);
       let turnTimeout: ReturnType<typeof setTimeout> | undefined;
       const status = await Promise.race([
         turnCompleted,
@@ -259,6 +276,7 @@ export class CodexHarnessAdapter {
         throw new Error('Codex App Server turn was interrupted.');
       }
     } finally {
+      this.activeTurns.delete(threadId);
       for (const unsubscribe of unsubscribers) unsubscribe();
     }
 

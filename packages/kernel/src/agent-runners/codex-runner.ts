@@ -2,7 +2,12 @@ import { spawn, type SpawnOptions } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { AgentRuntimeMode } from '@tik/shared';
-import { CodexHarnessAdapter, type CodexHarnessTurnOptions } from '../codex-harness-adapter.js';
+import {
+  CodexHarnessAdapter,
+  type CodexHarnessThreadOptions,
+  type CodexHarnessTurnOptions,
+  type CodexHarnessTurnResult,
+} from '../codex-harness-adapter.js';
 import type {
   AgentRunHandle,
   AgentRunInput,
@@ -17,13 +22,28 @@ import {
   buildRuntimeProcessEnv,
   childCompletion,
   promiseCompletion,
+  terminateRuntimeChild,
   type RuntimeChildProcess,
 } from './runtime-process.js';
 import { collectGitDiffSummary, collectTranscriptFromRunLogs } from './runtime-collection.js';
 
 export interface CodexHarnessLike {
   runTurn(options: CodexHarnessTurnOptions): Promise<unknown>;
+  startThread?(options: CodexHarnessThreadOptions): Promise<string>;
+  runTurnOnThread?(threadId: string, options: CodexHarnessTurnOptions): Promise<CodexHarnessTurnResult>;
+  interruptThread?(threadId: string): Promise<void>;
   stop(): Promise<void>;
+}
+
+interface CodexAdapterLease {
+  adapter: CodexHarnessLike;
+  cwd: string;
+  threadId?: string;
+}
+
+interface SharedCodexAdapter {
+  adapter: CodexHarnessLike;
+  activeRuns: Set<string>;
 }
 
 export interface CodexRunnerOptions {
@@ -38,7 +58,8 @@ export class CodexRunner implements AgentRuntimeRunner {
   private readonly mode?: Extract<AgentRuntimeMode, 'codex_exec' | 'codex_app_server'>;
   private readonly executable: string;
   private readonly adapterFactory: (cwd: string) => CodexHarnessLike;
-  private readonly adapters = new Map<string, CodexHarnessLike>();
+  private readonly adapters = new Map<string, CodexAdapterLease>();
+  private readonly sharedAdapters = new Map<string, SharedCodexAdapter>();
   private readonly children = new Map<string, RuntimeChildProcess>();
   private readonly preparedRuns = new Map<string, PreparedRun>();
   private readonly statuses = new Map<string, AgentRunStatusSnapshot>();
@@ -74,26 +95,38 @@ export class CodexRunner implements AgentRuntimeRunner {
     this.preparedRuns.set(input.runId, input);
     await assertRuntimeCwd(input.cwd);
     if (input.mode === 'codex_app_server') {
-      const adapter = this.adapterFactory(input.cwd);
-      this.adapters.set(input.runId, adapter);
+      const lease = this.acquireAdapter(input.cwd, input.runId);
+      const adapter = lease.adapter;
+      const turnOptions: CodexHarnessTurnOptions = {
+        prompt: input.prompt || (input.promptFile ? await fs.readFile(input.promptFile, 'utf-8') : ''),
+        cwd: input.cwd,
+        allowWrites: input.allowWrites !== false,
+        developerInstructions: input.developerInstructions,
+      };
+      let threadId: string | undefined;
+      let turn: Promise<unknown>;
+      if (input.requireThreadId && adapter.startThread && adapter.runTurnOnThread) {
+        threadId = await adapter.startThread(turnOptions);
+        lease.threadId = threadId;
+        turn = adapter.runTurnOnThread(threadId, turnOptions);
+      } else {
+        turn = adapter.runTurn(turnOptions);
+      }
       const completion = promiseCompletion(
-        adapter.runTurn({
-          prompt: input.prompt || (input.promptFile ? await fs.readFile(input.promptFile, 'utf-8') : ''),
-          cwd: input.cwd,
-          allowWrites: true,
-        }).finally(async () => {
-          if (this.adapters.get(input.runId) !== adapter) {
-            return;
-          }
-          this.adapters.delete(input.runId);
-          await adapter.stop().catch(() => undefined);
-        }),
+        turn,
         (status) => {
           this.statuses.set(input.runId, status);
         },
+        (result) => result && typeof result === 'object'
+          ? result as Record<string, unknown>
+          : { output: result },
+        input.timeoutMs,
+        () => this.interruptAdapterRun(input.runId),
       );
+      void completion.finally(() => this.releaseAdapter(input.runId));
       return {
         runId: input.runId,
+        threadId,
         startedAt: new Date().toISOString(),
         completion,
         stop: (reason) => this.stop(input.runId, reason),
@@ -131,11 +164,13 @@ export class CodexRunner implements AgentRuntimeRunner {
   async stop(runId: string, _reason: string): Promise<void> {
     this.statuses.set(runId, 'cancelled');
     const adapter = this.adapters.get(runId);
-    this.adapters.delete(runId);
     const child = this.children.get(runId);
     this.children.delete(runId);
-    child?.kill('SIGTERM');
-    await adapter?.stop();
+    await Promise.all([
+      child ? terminateRuntimeChild(child) : Promise.resolve(),
+      adapter ? this.interruptAdapterRun(runId) : Promise.resolve(),
+    ]);
+    if (adapter) await this.releaseAdapter(runId);
   }
 
   async getStatus(runId: string): Promise<AgentRunStatusSnapshot> {
@@ -157,7 +192,44 @@ export class CodexRunner implements AgentRuntimeRunner {
   }
 
   async cleanup(runId: string): Promise<void> {
-    await this.stop(runId, 'cleanup');
+    if (this.children.has(runId) || this.adapters.has(runId)) {
+      await this.stop(runId, 'cleanup');
+    }
+    this.preparedRuns.delete(runId);
+    this.statuses.delete(runId);
+  }
+
+  private acquireAdapter(cwd: string, runId: string): CodexAdapterLease {
+    let shared = this.sharedAdapters.get(cwd);
+    if (!shared) {
+      shared = { adapter: this.adapterFactory(cwd), activeRuns: new Set() };
+      this.sharedAdapters.set(cwd, shared);
+    }
+    shared.activeRuns.add(runId);
+    const lease = { adapter: shared.adapter, cwd };
+    this.adapters.set(runId, lease);
+    return lease;
+  }
+
+  private async interruptAdapterRun(runId: string): Promise<void> {
+    const lease = this.adapters.get(runId);
+    if (!lease) return;
+    if (lease.threadId && lease.adapter.interruptThread) {
+      await lease.adapter.interruptThread(lease.threadId).catch(() => undefined);
+    }
+  }
+
+  private async releaseAdapter(runId: string): Promise<void> {
+    const lease = this.adapters.get(runId);
+    if (!lease) return;
+    this.adapters.delete(runId);
+    const shared = this.sharedAdapters.get(lease.cwd);
+    if (!shared) return;
+    shared.activeRuns.delete(runId);
+    if (shared.activeRuns.size === 0) {
+      this.sharedAdapters.delete(lease.cwd);
+      await shared.adapter.stop().catch(() => undefined);
+    }
   }
 }
 

@@ -13,6 +13,8 @@ export type MultiAgentWorkflowStatus =
   | 'aborted'
   | 'failed';
 
+export type MultiAgentWorkflowMode = 'implementation' | 'review';
+
 export type WorkflowDecisionAction =
   | 'ask_claude_question_requirement'
   | 'ask_claude_question_task_graph'
@@ -22,6 +24,8 @@ export type WorkflowDecisionAction =
   | 'accept_contract'
   | 'execute_subtask'
   | 'record_implementation'
+  | 'run_readonly_reviewer'
+  | 'record_review'
   | 'run_codex_evaluator'
   | 'validate_subtask'
   | 'ask_claude_question_evaluation'
@@ -32,6 +36,7 @@ export type WorkflowDecisionAction =
   | 'complete_subtask'
   | 'run_final_evaluation'
   | 'ask_claude_question_final_evidence'
+  | 'synthesize_review'
   | 'complete_workflow'
   | 'abort_workflow';
 
@@ -77,6 +82,8 @@ export type GuardResultCode =
   | 'subagent_thread_not_isolated'
   | 'missing_evidence'
   | 'requires_human_approval'
+  | 'version_conflict'
+  | 'preflight_failed'
   | 'unknown_error';
 
 export interface GuardResult {
@@ -109,6 +116,7 @@ export interface WorkflowMetadata {
 export interface CreateMultiAgentWorkflowInput {
   id?: string;
   goal: string;
+  mode?: MultiAgentWorkflowMode;
   rootTaskId?: string;
   repo?: string;
   baseRef?: string;
@@ -123,7 +131,11 @@ export interface CreateMultiAgentWorkflowInput {
 export interface MultiAgentWorkflowRecord {
   id: string;
   driver: 'codex-workflow';
+  /** Monotonic durable-state revision; absent only on records created before revisioning. */
+  revision?: number;
   status: MultiAgentWorkflowStatus;
+  /** Defaults to implementation for records created before review mode existed. */
+  mode?: MultiAgentWorkflowMode;
   goal: string;
   rootTaskId: string;
   repo?: string;
@@ -163,6 +175,8 @@ export interface FinalWorkflowContract {
 
 export interface SubtaskSpec {
   id: string;
+  /** Defaults to implementation. Review workflows only accept review subtasks. */
+  kind?: 'implementation' | 'review';
   title: string;
   goal: string;
   dependsOn: string[];
@@ -173,8 +187,8 @@ export interface SubtaskSpec {
   validationCommands: string[];
   reviewFocus: string[];
   expectedChangedFiles?: string[];
-  assignedExecutor: 'codex';
-  assignedReviewer: 'claude-code';
+  assignedExecutor?: 'codex';
+  assignedReviewer: 'claude-code' | 'codex';
 }
 
 export type SubtaskRunStatus =
@@ -183,6 +197,8 @@ export type SubtaskRunStatus =
   | 'contract_drafting'
   | 'contract_questioning'
   | 'contract_accepted'
+  | 'reviewing'
+  | 'reviewed'
   | 'building'
   | 'executing'
   | 'implemented'
@@ -193,6 +209,8 @@ export type SubtaskRunStatus =
   | 'validated'
   | 'validation_failed'
   | 'questioning_evidence'
+  | 'synthesizing'
+  | 'synthesized'
   | 'needs_fix'
   | 'fixing'
   | 'done'
@@ -220,6 +238,8 @@ export interface ValidationSummary {
 
 export type MultiAgentEvidenceKind =
   | 'implementation'
+  | 'review'
+  | 'synthesis'
   | 'validation'
   | 'evaluation'
   | 'questioner'
@@ -262,7 +282,7 @@ export interface ImplementationEvidencePayload extends Record<string, unknown> {
   scopeCheck?: ImplementationScopeCheck;
 }
 
-export type MultiAgentInvocationRole = 'planner' | 'executor' | 'questioner' | 'evaluator';
+export type MultiAgentInvocationRole = 'planner' | 'executor' | 'reviewer' | 'questioner' | 'evaluator';
 export type MultiAgentInvocationRunner = 'claude-code' | 'codex' | 'codex-evaluator';
 export type MultiAgentInvocationStatus = 'created' | 'started' | 'completed' | 'failed' | 'cancelled';
 
@@ -433,6 +453,22 @@ export interface WorkflowPolicy {
   snapshotMaxChars?: Partial<Record<WorkflowContextSnapshotTarget, number>>;
 }
 
+export interface MultiAgentEnvironmentPreflightCheck {
+  id: string;
+  passed: boolean;
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+export interface MultiAgentEnvironmentPreflightReport {
+  accepted: boolean;
+  mode: MultiAgentWorkflowMode;
+  workspaceRoot?: string;
+  projectPath?: string;
+  headSha?: string;
+  checks: MultiAgentEnvironmentPreflightCheck[];
+}
+
 export type QuestionerIntent =
   | 'question_requirement'
   | 'question_task_graph'
@@ -477,6 +513,8 @@ export interface QuestionerRun {
     violations: string[];
     gitStatusBefore?: string;
     gitStatusAfter?: string;
+    workspaceFingerprintBefore?: string;
+    workspaceFingerprintAfter?: string;
   };
   createdAt: string;
   startedAt?: string;

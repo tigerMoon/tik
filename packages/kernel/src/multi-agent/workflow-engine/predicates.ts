@@ -124,6 +124,23 @@ export function hasImplementationEvidenceAtHead(ctx: WorkflowDecisionContext, su
   return pass([{ kind: 'evidence', id: implementation.id }]);
 }
 
+export function hasReviewEvidenceAtHead(ctx: WorkflowDecisionContext, subtaskId = requireSubtaskId(ctx)): PredicateResult {
+  const review = latestReviewEvidence(ctx.bundle, subtaskId);
+  if (!review) {
+    return fail('missing_evidence', `Review subtask ${subtaskId} has no readonly review evidence.`, {
+      refs: [{ kind: 'subtask', id: subtaskId }],
+    });
+  }
+  const expectedHead = ctx.headSha || ctx.workflow.currentHeadSha;
+  if (ctx.policy?.requireSameHeadShaForEvidence !== false && expectedHead && review.headSha && review.headSha !== expectedHead) {
+    return fail('head_sha_mismatch', 'Review evidence head does not match workflow head.', {
+      refs: [{ kind: 'evidence', id: review.id }],
+      currentState: { expectedHeadSha: expectedHead, reviewHeadSha: review.headSha },
+    });
+  }
+  return pass([{ kind: 'evidence', id: review.id }]);
+}
+
 export function hasPassingEvaluationAtHead(ctx: WorkflowDecisionContext, subtaskId = requireSubtaskId(ctx)): PredicateResult {
   const evaluation = latestEvaluationRun(ctx.bundle, subtaskId);
   if (!evaluation?.result) {
@@ -216,7 +233,7 @@ export function hasSufficientEvaluationQuestionerOutput(
   subtaskId = requireSubtaskId(ctx),
 ): PredicateResult {
   const contract = latestAcceptedContract(ctx.bundle, subtaskId);
-  if (!contract) {
+  if (ctx.workflow.mode !== 'review' && !contract) {
     return fail('missing_contract', `Subtask ${subtaskId} has no accepted SprintContract.`);
   }
   const evaluation = latestEvaluationRun(ctx.bundle, subtaskId);
@@ -226,7 +243,7 @@ export function hasSufficientEvaluationQuestionerOutput(
   return hasSufficientQuestionerOutput(ctx, {
     subtaskId,
     intent: 'question_evaluation',
-    contractId: contract.id,
+    contractId: contract?.id,
     evaluationRunId: evaluation.id,
     headSha: evaluation.result.headSha || evaluation.headSha,
   });
@@ -245,6 +262,17 @@ export function hasSufficientFinalQuestionerOutput(ctx: WorkflowDecisionContext)
 }
 
 export function allSubtaskGatesSatisfied(ctx: WorkflowDecisionContext, subtaskId = requireSubtaskId(ctx)): PredicateResult {
+  if (ctx.workflow.mode === 'review') {
+    const review = hasReviewEvidenceAtHead(ctx, subtaskId);
+    if (!review.ok) return review;
+    const evaluation = hasPassingEvaluationAtHead(ctx, subtaskId);
+    if (!evaluation.ok) return evaluation;
+    if (ctx.policy?.requireQuestionerAfterEvaluation) {
+      const questioner = hasSufficientEvaluationQuestionerOutput(ctx, subtaskId);
+      if (!questioner.ok) return questioner;
+    }
+    return pass([...(review.refs || []), ...(evaluation.refs || [])]);
+  }
   const contract = hasAcceptedContract(ctx, subtaskId);
   if (!contract.ok) return contract;
   const implementation = hasImplementationEvidenceAtHead(ctx, subtaskId);
@@ -286,6 +314,10 @@ export function latestAcceptedContract(bundle: MultiAgentWorkflowBundle, subtask
 export function latestImplementationEvidence(bundle: MultiAgentWorkflowBundle, subtaskId: string): MultiAgentWorkflowEvidence | undefined {
   return latestEvidenceForSubtask(bundle, subtaskId, 'implementation')
     || latestEvidenceForSubtask(bundle, subtaskId, 'fix');
+}
+
+export function latestReviewEvidence(bundle: MultiAgentWorkflowBundle, subtaskId: string): MultiAgentWorkflowEvidence | undefined {
+  return latestEvidenceForSubtask(bundle, subtaskId, 'review');
 }
 
 export function latestEvaluationRun(bundle: MultiAgentWorkflowBundle, subtaskId: string): EvaluationRun | undefined {
@@ -502,4 +534,3 @@ export function readDecisionHeadSha(decision: WorkflowDecision, workflowHeadSha?
       ? headSha
       : workflowHeadSha;
 }
-

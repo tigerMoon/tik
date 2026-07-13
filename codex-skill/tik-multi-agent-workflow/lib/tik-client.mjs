@@ -15,16 +15,38 @@ export async function tikFetch(options, route, input = {}) {
   if (input.ifMatch) {
     headers['if-match'] = input.ifMatch;
   }
-  const response = await fetch(`${baseUrl}${route}`, {
-    method: input.method || 'GET',
-    headers,
-    body: input.body === undefined ? undefined : JSON.stringify(input.body),
-  });
+  if (input.idempotencyKey) headers['idempotency-key'] = input.idempotencyKey;
+  const method = input.method || 'GET';
+  const retryable = input.retryable === true || method === 'GET';
+  const attempts = retryable ? 2 : 1;
+  const timeoutMs = input.timeoutMs ?? (method === 'GET' ? 15_000 : 30_000);
+  let response;
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error(`Tik API request timed out after ${timeoutMs}ms.`)), timeoutMs);
+    try {
+      response = await fetch(`${baseUrl}${route}`, {
+        method,
+        headers,
+        body: input.body === undefined ? undefined : JSON.stringify(input.body),
+        signal: controller.signal,
+      });
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt === attempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  if (!response) throw lastError || new Error(`Tik API ${method} ${route} failed without a response.`);
   const text = await response.text();
   const payload = text ? JSON.parse(text) : {};
   if (!response.ok) {
     const detail = payload.error?.message || payload.guard?.message || payload.error || text || response.statusText;
-    const error = new Error(`Tik API ${input.method || 'GET'} ${route} failed (${response.status}): ${detail}`);
+    const error = new Error(`Tik API ${method} ${route} failed (${response.status}): ${detail}`);
     error.status = response.status;
     error.payload = payload;
     throw error;
@@ -34,6 +56,13 @@ export async function tikFetch(options, route, input = {}) {
 
 export async function readWorkflow(options, workflowId) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}`);
+}
+
+export async function preflightEnvironment(options, input) {
+  return tikFetch(options, '/v1/multi-agent/preflight', {
+    method: 'POST',
+    body: input,
+  });
 }
 
 export async function readNextAction(options, workflowId, input = {}) {
@@ -67,6 +96,30 @@ export async function recordEvidence(options, workflowId, evidence) {
   });
 }
 
+export async function executeSubtask(options, workflowId, input, concurrency = {}) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/actions/execute-subtask`, {
+    method: 'POST',
+    body: input,
+    ifMatch: concurrency.ifMatch,
+  });
+}
+
+export async function recordReview(options, workflowId, input, concurrency = {}) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/actions/record-review`, {
+    method: 'POST',
+    body: input,
+    ifMatch: concurrency.ifMatch,
+  });
+}
+
+export async function synthesizeReview(options, workflowId, input, concurrency = {}) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/actions/synthesize-review`, {
+    method: 'POST',
+    body: input,
+    ifMatch: concurrency.ifMatch,
+  });
+}
+
 export async function updateSubtask(options, workflowId, subtaskId, patch) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(subtaskId)}`, {
     method: 'PATCH',
@@ -88,6 +141,14 @@ export async function acceptContract(options, workflowId, subtaskId, contractId,
   });
 }
 
+export async function acceptContracts(options, workflowId, contracts, concurrency = {}) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/actions/accept-contracts`, {
+    method: 'POST',
+    body: { contracts },
+    ifMatch: concurrency.ifMatch,
+  });
+}
+
 export async function createEvaluationRun(options, workflowId, subtaskId, evaluationRun) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/subtasks/${encodeURIComponent(subtaskId)}/evaluations`, {
     method: 'POST',
@@ -99,6 +160,23 @@ export async function createInvocation(options, workflowId, invocation) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations`, {
     method: 'POST',
     body: invocation,
+  });
+}
+
+export async function launchNativeInvocation(options, workflowId, invocation) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/native-launch`, {
+    method: 'POST',
+    body: invocation,
+    idempotencyKey: invocation.id,
+    retryable: Boolean(invocation.id),
+    timeoutMs: 100_000,
+  });
+}
+
+export async function linkNativeInvocationResult(options, workflowId, invocationId, result) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/agent-invocations/${encodeURIComponent(invocationId)}/native-result`, {
+    method: 'POST',
+    body: result,
   });
 }
 
@@ -155,6 +233,16 @@ export async function createQuestionerRun(options, workflowId, input) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/questioner-runs`, {
     method: 'POST',
     body: input,
+  });
+}
+
+export async function launchNativeQuestionerRun(options, workflowId, input) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}/questioner-runs/native-launch`, {
+    method: 'POST',
+    body: input,
+    idempotencyKey: input.id,
+    retryable: Boolean(input.id),
+    timeoutMs: 100_000,
   });
 }
 

@@ -59,6 +59,7 @@ export function childCompletion(
 ): Promise<AgentRunCompletion> {
   return new Promise((resolve) => {
     let settled = false;
+    let timedOut = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const settle = (completion: AgentRunCompletion) => {
       if (settled) return;
@@ -72,15 +73,21 @@ export function childCompletion(
 
     if (timeoutMs && timeoutMs > 0) {
       timeout = setTimeout(() => {
-        child.kill('SIGTERM');
-        settle({
-          status: 'failed',
-          error: `${runtimeName} timed out after ${timeoutMs}ms.`,
+        timedOut = true;
+        void terminateRuntimeChild(child).finally(() => {
+          settle({
+            status: 'failed',
+            error: `${runtimeName} timed out after ${timeoutMs}ms.`,
+          });
         });
       }, timeoutMs);
     }
 
     child.on('exit', (code) => {
+      if (timedOut) {
+        settle({ status: 'failed', error: `${runtimeName} timed out after ${timeoutMs}ms.` });
+        return;
+      }
       if (code === 0) {
         settle({ status: 'completed' });
       } else {
@@ -100,21 +107,55 @@ export function childCompletion(
   });
 }
 
-export function promiseCompletion(
-  promise: Promise<unknown>,
+export async function terminateRuntimeChild(child: RuntimeChildProcess, graceMs = 2_000): Promise<void> {
+  let exited = false;
+  const exit = new Promise<void>((resolve) => {
+    const markExited = () => {
+      exited = true;
+      resolve();
+    };
+    child.once('exit', markExited);
+    child.once('close', markExited);
+  });
+  child.kill('SIGTERM');
+  await Promise.race([exit, new Promise<void>((resolve) => setTimeout(resolve, graceMs))]);
+  if (!exited) {
+    child.kill('SIGKILL');
+  }
+}
+
+export function promiseCompletion<T>(
+  promise: Promise<T>,
   onSettled: (status: AgentRunCompletion['status']) => void,
+  resultMapper?: (value: T) => Record<string, unknown>,
+  timeoutMs?: number,
+  onTimeout?: () => Promise<void> | void,
 ): Promise<AgentRunCompletion> {
-  return promise.then(
-    () => {
-      onSettled('completed');
-      return { status: 'completed' as const };
-    },
-    (err) => {
-      const error = err instanceof Error ? err.message : String(err);
-      onSettled('failed');
-      return { status: 'failed' as const, error };
-    },
-  );
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const settle = (completion: AgentRunCompletion) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      onSettled(completion.status);
+      resolve(completion);
+    };
+    void promise.then(
+      (value) => settle({ status: 'completed', result: resultMapper?.(value) }),
+      (err) => settle({
+        status: 'failed',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    if (timeoutMs && timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        void Promise.resolve(onTimeout?.()).catch(() => undefined).finally(() => {
+          settle({ status: 'failed', error: `codex app-server timed out after ${timeoutMs}ms.` });
+        });
+      }, timeoutMs);
+    }
+  });
 }
 
 function redactChunk(chunk: string | Uint8Array, env: Record<string, string>): string | Uint8Array {

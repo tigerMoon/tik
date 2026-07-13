@@ -9,6 +9,7 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import type {
   AgentLoopPayload,
   ArtifactKind,
@@ -27,6 +28,8 @@ import type {
   EvaluationRun,
   HumanOverrideRecord,
   MultiAgentEvidenceKind,
+  MultiAgentEnvironmentPreflightReport,
+  MultiAgentWorkflowMode,
   MultiAgentWorkflowBundle,
   MultiAgentWorkflowRecord,
   QuestionerIntent,
@@ -74,7 +77,13 @@ import { WorkbenchTaskError } from './workbench/workbench-service.js';
 import type { ArtifactTemplateName } from './artifacts/artifact-templates.js';
 import { normalizeArtifactExtension } from './artifacts/artifact-security.js';
 import { FileArtifactRegistry } from './artifacts/artifact-registry.js';
-import { FileMultiAgentWorkflowStore, MultiAgentCoordinationError } from './multi-agent/workflow-store.js';
+import {
+  FileMultiAgentWorkflowStore,
+  MultiAgentCoordinationError,
+  type AcceptContractsBatchItem,
+  type NativeInvocationCompletionInput,
+} from './multi-agent/workflow-store.js';
+import { MultiAgentNativeRuntimeLauncher } from './multi-agent/native-runtime-launcher.js';
 import { evaluateWorkflowDecisionGuard } from './multi-agent/guard.js';
 import { planNextAction } from './multi-agent/workflow-engine/planner.js';
 
@@ -210,6 +219,16 @@ interface AcceptSprintContractBody {
   questionerOutputRefs?: string[];
 }
 
+interface AcceptSprintContractsBatchBody {
+  contracts: Array<{
+    subtaskId: string;
+    contractId: string;
+    acceptedBy?: SprintContract['acceptedBy'];
+    headShaAtAcceptance?: string;
+    questionerOutputRefs?: string[];
+  }>;
+}
+
 interface CreateEvaluationRunBody {
   id?: string;
   contractId: string;
@@ -280,9 +299,15 @@ interface CreateQuestionerRunBody {
   tokenTtlMs?: number;
   runtimeAudit?: {
     gitStatusBefore?: string;
+    workspaceFingerprintBefore?: string;
     allowedWritePaths?: string[];
     forbiddenWritePaths?: string[];
   };
+}
+
+interface NativeQuestionerRunBody extends CreateQuestionerRunBody {
+  prompt?: string;
+  timeoutMs?: number;
 }
 
 interface RunWorkflowActionBody {
@@ -301,6 +326,7 @@ interface SubmitQuestionerRunOutputBody {
   output: QuestionerOutputV2;
   runtimeAudit?: {
     gitStatusAfter?: string;
+    workspaceFingerprintAfter?: string;
     allowedWritePaths?: string[];
     forbiddenWritePaths?: string[];
   };
@@ -323,6 +349,27 @@ interface RecordImplementationActionBody {
   decision: WorkflowDecision;
   evidence: RecordEvidenceBody;
   subtaskPatch?: UpdateSubtaskBody;
+}
+
+interface RecordAttestedEvidenceActionBody {
+  decision: WorkflowDecision;
+  evidence: RecordEvidenceBody & { id?: string };
+  invocation: Omit<HookStopAgentInvocationBody, 'attestationToken'> & { id: string; attestationToken?: string };
+}
+
+interface MultiAgentEnvironmentPreflightBody {
+  mode?: MultiAgentWorkflowMode;
+  headSha?: string;
+  workspaceBinding?: TaskWorkspaceBinding;
+  clientCapabilities?: {
+    codexHookAttestation?: boolean;
+    codexCli?: boolean;
+    claudeCode?: boolean;
+    claudeQuestionerPlugin?: boolean;
+    nodeVersion?: string;
+    pnpmVersion?: string;
+    packageManagerSatisfied?: boolean;
+  };
 }
 
 interface RecordEvaluationResultActionBody {
@@ -382,6 +429,11 @@ interface CreateAgentInvocationBody {
   evidenceRefs?: string[];
   evaluationRunId?: string;
   readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
+}
+
+interface NativeAgentInvocationBody extends CreateAgentInvocationBody {
+  prompt?: string;
+  timeoutMs?: number;
 }
 
 interface UpdateAgentInvocationBody {
@@ -541,6 +593,19 @@ export async function createServer(
   const corsOrigin = options?.dashboardOrigin || process.env.TIK_DASHBOARD_ORIGIN || 'http://localhost:5173';
   const serverWorkspaceRoot = options?.workspaceRoot || kernel.projectPath || process.cwd();
   const multiAgentStore = new FileMultiAgentWorkflowStore(serverWorkspaceRoot);
+  const multiAgentRuntimeRunners = options?.runtimeRunners || createDefaultRuntimeRunners();
+  const multiAgentApiBaseUrl = options?.publicApiBaseUrl
+    || `http://${normalizeServerHost(config.host)}:${config.port}/api`;
+  const multiAgentNativeLauncher = new MultiAgentNativeRuntimeLauncher(
+    multiAgentStore,
+    serverWorkspaceRoot,
+    multiAgentApiBaseUrl,
+    multiAgentRuntimeRunners,
+  );
+  await reconcileOrphanedNativeRuntimeState(multiAgentStore);
+  fastify.addHook('onClose', async () => {
+    await multiAgentNativeLauncher.shutdown();
+  });
 
   function resolveWorkspaceRoot(rootPath?: string): string {
     const resolved = rootPath || options?.workspaceRoot;
@@ -870,7 +935,7 @@ export async function createServer(
   fastify.addHook('onRequest', async (req, reply) => {
     reply.header('Access-Control-Allow-Origin', corsOrigin);
     reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, If-Match');
+    reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, If-Match, Idempotency-Key');
     if (req.method === 'OPTIONS') { return reply.send(); }
     if (apiToken && !isPublicApiRoute(req.method, req.url)) {
       const authorization = req.headers.authorization;
@@ -1319,6 +1384,95 @@ export async function createServer(
     }
   });
 
+  fastify.post<{ Body: MultiAgentEnvironmentPreflightBody }>(
+    '/api/v1/multi-agent/preflight',
+    async (req, reply) => {
+      const mode = req.body.mode || 'implementation';
+      const checks: MultiAgentEnvironmentPreflightReport['checks'] = [];
+      let binding: TaskWorkspaceBinding | undefined;
+      try {
+        binding = await resolveMultiAgentWorkspaceBinding(req.body.workspaceBinding);
+        checks.push({
+          id: 'workspace_binding',
+          passed: true,
+          message: `Tik API is bound to ${serverWorkspaceRoot}.`,
+          details: { workspaceRoot: serverWorkspaceRoot },
+        });
+      } catch (error) {
+        checks.push({
+          id: 'workspace_binding',
+          passed: false,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      const capabilities = req.body.clientCapabilities || {};
+      const nativeRuntimeAvailable = multiAgentNativeLauncher.isAvailable();
+      checks.push(
+        {
+          id: 'native_subagent_runtime',
+          passed: nativeRuntimeAvailable || capabilities.codexHookAttestation === true,
+          message: nativeRuntimeAvailable
+            ? 'Tik-owned Codex and Claude native runtime launchers are available.'
+            : capabilities.codexHookAttestation === true
+              ? 'Tik-owned native runtime is unavailable; the verified Codex hook fallback is available.'
+              : 'Tik-owned native runtime launchers are unavailable.',
+        },
+        {
+          id: 'codex_hook_attestation',
+          passed: capabilities.codexHookAttestation === true || nativeRuntimeAvailable,
+          message: capabilities.codexHookAttestation === true
+            ? 'Codex native subagent hook attestation is available.'
+            : nativeRuntimeAvailable
+              ? 'Tik-owned native runtime provides server-attested Codex subagent facts.'
+              : 'Codex native subagent hook attestation is unavailable.',
+        },
+        {
+          id: 'codex_cli',
+          passed: capabilities.codexCli === true,
+          message: capabilities.codexCli === true ? 'Codex CLI is available.' : 'Codex CLI is unavailable.',
+        },
+        {
+          id: 'claude_questioner',
+          passed: capabilities.claudeCode === true && capabilities.claudeQuestionerPlugin === true,
+          message: capabilities.claudeCode === true && capabilities.claudeQuestionerPlugin === true
+            ? 'Claude Code and the Tik Questioner plugin are available.'
+            : 'Claude Code or the Tik Questioner plugin is unavailable.',
+        },
+        {
+          id: 'package_manager',
+          passed: capabilities.packageManagerSatisfied === true,
+          message: capabilities.packageManagerSatisfied === true
+            ? `Runtime versions are compatible (node ${capabilities.nodeVersion || 'unknown'}, pnpm ${capabilities.pnpmVersion || 'unknown'}).`
+            : `Runtime versions are incompatible (node ${capabilities.nodeVersion || 'unknown'}, pnpm ${capabilities.pnpmVersion || 'unknown'}).`,
+        },
+        {
+          id: 'head_sha',
+          passed: Boolean(req.body.headSha),
+          message: req.body.headSha ? `Pinned HEAD is ${req.body.headSha}.` : 'A pinned HEAD sha is required.',
+        },
+      );
+      const report: MultiAgentEnvironmentPreflightReport = {
+        accepted: checks.every((check) => check.passed),
+        mode,
+        workspaceRoot: serverWorkspaceRoot,
+        projectPath: binding?.effectiveProjectPath,
+        headSha: req.body.headSha,
+        checks,
+      };
+      if (!report.accepted) {
+        reply.code(409);
+        return {
+          error: {
+            code: 'preflight_failed',
+            message: checks.find((check) => !check.passed)?.message || 'Multi-agent environment preflight failed.',
+          },
+          report,
+        };
+      }
+      return { report };
+    },
+  );
+
   fastify.post<{ Body: CreateMultiAgentWorkflowInput }>(
     '/api/v1/multi-agent/workflows',
     async (req, reply) => {
@@ -1533,7 +1687,7 @@ export async function createServer(
           if (!lastDecisionMatchesForPreflight(bundle.workflow.lastDecisionId, expectedLastDecisionId)) {
             guard = {
               accepted: false,
-              code: 'invalid_transition',
+              code: 'version_conflict',
               message: `Decision history changed; expected ${expectedLastDecisionId || 'no last decision'}, current ${bundle.workflow.lastDecisionId || 'none'}.`,
               currentState: {
                 expectedLastDecisionId,
@@ -1672,13 +1826,24 @@ export async function createServer(
               ? readString(plannedAction.inputs.evaluationRunId)
               : undefined,
             headSha: questionerHeadSha,
-            start: req.body.options?.start,
+            start: false,
             tokenTtlMs: req.body.options?.tokenTtlMs,
             runtimeAudit: req.body.options?.runtimeAudit,
           });
+          const shouldLaunch = req.body.options?.start !== false;
+          const launched = shouldLaunch
+            ? await multiAgentNativeLauncher.launchQuestioner(req.params.workflowId, {
+              run: result.run,
+              invocation: result.invocation,
+              token: result.token,
+              gitStatusBefore: req.body.options?.runtimeAudit?.gitStatusBefore,
+            })
+            : null;
           const rootTask = await syncMultiAgentRootTaskFromWorkflow(bundle.workflow, {
             status: 'in_review',
-            reason: `Multi-agent workflow ${bundle.workflow.id} started questioner run ${result.run.id}.`,
+            reason: shouldLaunch
+              ? `Multi-agent workflow ${bundle.workflow.id} launched native questioner run ${result.run.id}.`
+              : `Multi-agent workflow ${bundle.workflow.id} created questioner run ${result.run.id}.`,
           });
           return {
             action: plannedAction.action,
@@ -1694,10 +1859,19 @@ export async function createServer(
             expectedOutputArtifactRef: result.run.expectedOutputArtifactRef,
             submitUrl: `/v1/multi-agent/workflows/${encodeURIComponent(result.run.workflowId)}/questioner-runs/${encodeURIComponent(result.run.id)}/output`,
             contextUrl: `/v1/multi-agent/workflows/${encodeURIComponent(result.run.workflowId)}/questioner-runs/${encodeURIComponent(result.run.id)}/context`,
-            token: result.token,
+            token: shouldLaunch ? undefined : result.token,
             tokenExpiresAt: result.run.tokenExpiresAt,
-            questionerRun: redactSensitiveObject(result.run),
-            invocation: sanitizeAgentInvocation(result.invocation),
+            questionerRun: redactSensitiveObject(
+              shouldLaunch
+                ? await multiAgentStore.readQuestionerRun(req.params.workflowId, result.run.id)
+                : result.run,
+            ),
+            invocation: sanitizeAgentInvocation(launched?.invocation || result.invocation),
+            runtime: launched ? {
+              runId: launched.runId,
+              runtimeRef: launched.runtimeRef,
+              status: launched.status,
+            } : undefined,
             rootTask,
           };
         }
@@ -1839,6 +2013,167 @@ export async function createServer(
         const syncedWorkflow = workflow || bundle.workflow;
         const rootTask = await syncMultiAgentRootTaskForDecision(syncedWorkflow, decision);
         return { decision, evidence, guard, workflow: syncedWorkflow, subtask, rootTask };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: RecordAttestedEvidenceActionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/actions/execute-subtask',
+    async (req, reply) => {
+      try {
+        if (req.body.decision.action !== 'record_implementation' || !req.body.decision.subtaskId) {
+          throw new MultiAgentCoordinationError(
+            'invalid_transition',
+            'execute-subtask action requires a record_implementation decision with subtaskId.',
+          );
+        }
+        const subtaskId = req.body.decision.subtaskId;
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        }
+        const evidenceId = req.body.evidence.id || `ev_${generateId()}`;
+        const plannedEvidence = {
+          id: evidenceId,
+          workflowId: req.params.workflowId,
+          createdAt: new Date().toISOString(),
+          ...req.body.evidence,
+        };
+        const implementationInvocation = await multiAgentStore.readInvocation(req.params.workflowId, req.body.invocation.id);
+        const nativeImplementationCompleted = implementationInvocation?.status === 'completed'
+          && implementationInvocation.runtimeAttestation?.source === 'codex-subagent-runtime';
+        if (!nativeImplementationCompleted) {
+          await multiAgentStore.prepareInvocationStop(
+            req.params.workflowId,
+            req.body.invocation.id,
+            req.body.invocation as HookStopAgentInvocationBody,
+          );
+        }
+        const decision = {
+          ...req.body.decision,
+          evidenceRefs: Array.from(new Set([...req.body.decision.evidenceRefs, evidenceId])),
+        };
+        const guard = evaluateWorkflowDecisionGuard({
+          ...bundle,
+          evidence: bundle.evidence.concat(plannedEvidence),
+        }, decision);
+        if (!guard.accepted) {
+          reply.code(409);
+          return { decision, evidence: plannedEvidence, guard, workflow: bundle.workflow, subtask: bundle.subtasks[subtaskId] };
+        }
+        const result = await multiAgentStore.recordAttestedEvidenceAtomically(req.params.workflowId, {
+          subtaskId,
+          evidence: {
+            ...req.body.evidence,
+            id: evidenceId,
+            kind: 'implementation',
+          },
+          decision,
+          invocationId: req.body.invocation.id,
+          invocationStop: req.body.invocation,
+          finalStatus: 'implemented',
+          expectedLastDecisionId: readIfMatch(req.headers['if-match']),
+        });
+        const rootTask = await syncMultiAgentRootTaskForDecision(result.workflow, result.decision);
+        return { ...result, guard, rootTask };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: RecordAttestedEvidenceActionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/actions/record-review',
+    async (req, reply) => {
+      try {
+        if (req.body.decision.action !== 'record_review' || !req.body.decision.subtaskId) {
+          throw new MultiAgentCoordinationError(
+            'invalid_transition',
+            'record-review action requires a record_review decision with subtaskId.',
+          );
+        }
+        const subtaskId = req.body.decision.subtaskId;
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        const evidenceId = req.body.evidence.id || `ev_${generateId()}`;
+        const plannedEvidence = {
+          id: evidenceId,
+          workflowId: req.params.workflowId,
+          createdAt: new Date().toISOString(),
+          ...req.body.evidence,
+          kind: 'review' as const,
+        };
+        const reviewerInvocation = await multiAgentStore.readInvocation(req.params.workflowId, req.body.invocation.id);
+        const nativeReviewerCompleted = reviewerInvocation?.status === 'completed'
+          && reviewerInvocation.runtimeAttestation?.source === 'codex-subagent-runtime';
+        if (!nativeReviewerCompleted) {
+          await multiAgentStore.prepareInvocationStop(
+            req.params.workflowId,
+            req.body.invocation.id,
+            req.body.invocation as HookStopAgentInvocationBody,
+          );
+        }
+        const decision = {
+          ...req.body.decision,
+          evidenceRefs: Array.from(new Set([...req.body.decision.evidenceRefs, evidenceId])),
+        };
+        const guard = evaluateWorkflowDecisionGuard({ ...bundle, evidence: bundle.evidence.concat(plannedEvidence) }, decision);
+        if (!guard.accepted) {
+          reply.code(409);
+          return { decision, evidence: plannedEvidence, guard, workflow: bundle.workflow, subtask: bundle.subtasks[subtaskId] };
+        }
+        const result = await multiAgentStore.recordAttestedEvidenceAtomically(req.params.workflowId, {
+          subtaskId,
+          evidence: { ...req.body.evidence, id: evidenceId, kind: 'review' },
+          decision,
+          invocationId: req.body.invocation.id,
+          invocationStop: req.body.invocation,
+          finalStatus: 'reviewed',
+          expectedLastDecisionId: readIfMatch(req.headers['if-match']),
+        });
+        const rootTask = await syncMultiAgentRootTaskForDecision(result.workflow, result.decision);
+        return { ...result, guard, rootTask };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: RecordImplementationActionBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/actions/synthesize-review',
+    async (req, reply) => {
+      try {
+        if (req.body.decision.action !== 'synthesize_review') {
+          throw new MultiAgentCoordinationError('invalid_transition', 'synthesize-review requires a synthesize_review decision.');
+        }
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        const evidenceId = req.body.evidence.id || `ev_${generateId()}`;
+        const plannedEvidence = {
+          id: evidenceId,
+          workflowId: req.params.workflowId,
+          createdAt: new Date().toISOString(),
+          ...req.body.evidence,
+          kind: 'synthesis' as const,
+        };
+        const decision = {
+          ...req.body.decision,
+          evidenceRefs: Array.from(new Set([...req.body.decision.evidenceRefs, evidenceId])),
+        };
+        const guard = evaluateWorkflowDecisionGuard({ ...bundle, evidence: bundle.evidence.concat(plannedEvidence) }, decision);
+        if (!guard.accepted) {
+          reply.code(409);
+          return { decision, evidence: plannedEvidence, guard, workflow: bundle.workflow };
+        }
+        const result = await multiAgentStore.recordEvidenceAndDecisionAtomically(req.params.workflowId, {
+          evidence: { ...req.body.evidence, id: evidenceId, kind: 'synthesis' },
+          decision,
+          expectedLastDecisionId: readIfMatch(req.headers['if-match']),
+        });
+        const rootTask = await syncMultiAgentRootTaskForDecision(result.workflow, result.decision);
+        return { ...result, guard, rootTask };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -2078,6 +2413,101 @@ export async function createServer(
     },
   );
 
+  fastify.post<{ Params: { workflowId: string }; Body: AcceptSprintContractsBatchBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/actions/accept-contracts',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['contracts'],
+          properties: {
+            contracts: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 100,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['subtaskId', 'contractId'],
+                properties: {
+                  subtaskId: { type: 'string', minLength: 1 },
+                  contractId: { type: 'string', minLength: 1 },
+                  acceptedBy: { type: 'string', enum: ['codex-workflow', 'codex-workflow-plugin', 'human'] },
+                  headShaAtAcceptance: { type: 'string', minLength: 1 },
+                  questionerOutputRefs: {
+                    type: 'array',
+                    maxItems: 100,
+                    items: { type: 'string', minLength: 1 },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req, reply) => {
+      try {
+        const bundle = await multiAgentStore.readBundle(req.params.workflowId);
+        if (!bundle) return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        const expectedRevision = readIfMatch(req.headers['if-match']);
+        if (!Array.isArray(req.body.contracts) || req.body.contracts.length === 0) {
+          throw new MultiAgentCoordinationError('invalid_transition', 'accept-contracts requires at least one Contract.');
+        }
+        const items: AcceptContractsBatchItem[] = req.body.contracts.map((item) => {
+          const decision: WorkflowDecision = {
+            id: `dec_accept_contract_${generateId()}`,
+            workflowId: bundle.workflow.id,
+            rootTaskId: bundle.workflow.rootTaskId,
+            subtaskId: item.subtaskId,
+            decidedBy: 'codex-workflow',
+            decidedAt: new Date().toISOString(),
+            action: 'accept_contract',
+            reason: `Accept SprintContract ${item.contractId} in an atomic batch.`,
+            evidenceRefs: [],
+            inputs: {
+              contractId: item.contractId,
+              currentHeadSha: item.headShaAtAcceptance || bundle.workflow.currentHeadSha,
+            },
+          };
+          return {
+            subtaskId: item.subtaskId,
+            contractId: item.contractId,
+            decision,
+            acceptance: {
+              acceptedBy: item.acceptedBy,
+              headShaAtAcceptance: item.headShaAtAcceptance,
+              questionerOutputRefs: item.questionerOutputRefs,
+            },
+          };
+        });
+        const result = await multiAgentStore.acceptContractsAtomically(
+          req.params.workflowId,
+          items,
+          expectedRevision,
+        );
+        reply.header('ETag', String(result.workflow.revision ?? 0));
+        let rootTask = null;
+        let rootTaskProjection: { status: 'synced' | 'pending'; error?: string } = { status: 'synced' };
+        try {
+          rootTask = await syncMultiAgentRootTaskFromWorkflow(result.workflow, {
+            status: 'running',
+            reason: `Multi-agent workflow ${result.workflow.id} atomically accepted ${result.contracts.length} SprintContracts.`,
+          });
+        } catch (error) {
+          rootTaskProjection = {
+            status: 'pending',
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+        return { ...result, rootTask, rootTaskProjection };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
   fastify.post<{ Params: { workflowId: string; subtaskId: string; contractId: string } }>(
     '/api/v1/multi-agent/workflows/:workflowId/subtasks/:subtaskId/contracts/:contractId/stale',
     async (req, reply) => {
@@ -2195,6 +2625,97 @@ export async function createServer(
     },
   );
 
+  fastify.post<{ Params: { workflowId: string }; Body: NativeQuestionerRunBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/questioner-runs/native-launch',
+    async (req, reply) => {
+      try {
+        if (req.body.id) {
+          const existingRun = await multiAgentStore.readQuestionerRun(req.params.workflowId, req.body.id);
+          if (existingRun) {
+            if (
+              existingRun.intent !== req.body.intent
+              || existingRun.subtaskId !== req.body.subtaskId
+              || existingRun.headSha !== req.body.headSha
+              || existingRun.contractId !== req.body.contractId
+              || existingRun.evaluationRunId !== req.body.evaluationRunId
+              || existingRun.finalEvaluationRunId !== req.body.finalEvaluationRunId
+            ) {
+              throw new MultiAgentCoordinationError('version_conflict', `QuestionerRun ${req.body.id} already exists with different input.`);
+            }
+            const existingInvocation = await multiAgentStore.readInvocation(req.params.workflowId, existingRun.invocationId);
+            return {
+              questionerRunId: existingRun.id,
+              invocationId: existingRun.invocationId,
+              contextArtifactRef: existingRun.contextArtifactRef,
+              contextHash: existingRun.contextHash,
+              expectedOutputArtifactRef: existingRun.expectedOutputArtifactRef,
+              tokenExpiresAt: existingRun.tokenExpiresAt,
+              questionerRun: redactSensitiveObject(existingRun),
+              invocation: existingInvocation ? sanitizeAgentInvocation(existingInvocation) : null,
+              runtime: {
+                runId: existingRun.id,
+                runtimeRef: existingInvocation?.actualSubagentThreadId || existingInvocation?.threadId || `run:${existingRun.id}`,
+                status: existingRun.status === 'validated' ? 'completed' : 'running',
+              },
+              rootTask: null,
+              rootTaskProjection: { status: 'synced' },
+            };
+          }
+        }
+        const { prompt, timeoutMs, runtimeAudit: _runtimeAudit, ...runInput } = req.body;
+        const workflowBeforeLaunch = await multiAgentStore.readWorkflow(req.params.workflowId);
+        if (!workflowBeforeLaunch) return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
+        const projectPath = workflowBeforeLaunch.workspaceBinding?.effectiveProjectPath || serverWorkspaceRoot;
+        const serverAuditBefore = captureWorkspaceReadonlyAudit(projectPath);
+        const result = await multiAgentStore.createQuestionerRun(req.params.workflowId, {
+          ...runInput,
+          start: false,
+          runtimeAudit: serverAuditBefore,
+        });
+        const launched = await multiAgentNativeLauncher.launchQuestioner(req.params.workflowId, {
+          run: result.run,
+          invocation: result.invocation,
+          token: result.token,
+          prompt,
+          timeoutMs,
+          gitStatusBefore: serverAuditBefore.gitStatusBefore,
+        });
+        const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        let rootTask = null;
+        let rootTaskProjection: { status: 'synced' | 'pending'; error?: string } = { status: 'synced' };
+        if (workflow) {
+          try {
+            rootTask = await syncMultiAgentRootTaskFromWorkflow(workflow, {
+              status: 'in_review',
+              reason: `Tik launched native Questioner run ${result.run.id}.`,
+            });
+          } catch (error) {
+            rootTaskProjection = { status: 'pending', error: error instanceof Error ? error.message : String(error) };
+          }
+        }
+        return {
+          questionerRunId: result.run.id,
+          invocationId: result.invocation.id,
+          contextArtifactRef: result.run.contextArtifactRef,
+          contextHash: result.run.contextHash,
+          expectedOutputArtifactRef: result.run.expectedOutputArtifactRef,
+          tokenExpiresAt: result.run.tokenExpiresAt,
+          questionerRun: redactSensitiveObject(await multiAgentStore.readQuestionerRun(req.params.workflowId, result.run.id)),
+          invocation: sanitizeAgentInvocation(launched.invocation),
+          runtime: {
+            runId: launched.runId,
+            runtimeRef: launched.runtimeRef,
+            status: launched.status,
+          },
+          rootTask,
+          rootTaskProjection,
+        };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
   fastify.get<{ Params: { workflowId: string; runId: string } }>(
     '/api/v1/multi-agent/workflows/:workflowId/questioner-runs/:runId/context',
     async (req, reply) => {
@@ -2216,10 +2737,28 @@ export async function createServer(
     async (req, reply) => {
       try {
         const token = bearerToken(req.headers.authorization);
+        const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        const questionerRun = await multiAgentStore.readQuestionerRun(req.params.workflowId, req.params.runId);
+        if (!workflow || !questionerRun) {
+          return sendV1Error(reply, 404, 'workflow_not_found', 'Workflow or QuestionerRun not found');
+        }
+        const projectPath = workflow.workspaceBinding?.effectiveProjectPath || serverWorkspaceRoot;
+        const serverAuditAfter = questionerRun.readonlyAudit?.workspaceFingerprintBefore
+          ? captureWorkspaceReadonlyAudit(projectPath)
+          : null;
         const result = await multiAgentStore.submitQuestionerRunOutput(req.params.workflowId, req.params.runId, {
           token,
           output: req.body.output,
-          runtimeAudit: req.body.runtimeAudit,
+          runtimeAudit: {
+            gitStatusAfter: serverAuditAfter?.gitStatusBefore ?? req.body.runtimeAudit?.gitStatusAfter,
+            workspaceFingerprintAfter: serverAuditAfter?.workspaceFingerprintBefore,
+            allowedWritePaths: serverAuditAfter
+              ? questionerRun.readonlyAudit?.allowedWritePaths
+              : req.body.runtimeAudit?.allowedWritePaths,
+            forbiddenWritePaths: serverAuditAfter
+              ? questionerRun.readonlyAudit?.forbiddenWritePaths
+              : req.body.runtimeAudit?.forbiddenWritePaths,
+          },
         });
         return {
           questionerRun: redactSensitiveObject(result.run),
@@ -2295,6 +2834,46 @@ export async function createServer(
       try {
         const invocation = await multiAgentStore.createInvocation(req.params.workflowId, req.body);
         return { invocation };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{ Params: { workflowId: string }; Body: NativeAgentInvocationBody }>(
+    '/api/v1/multi-agent/workflows/:workflowId/agent-invocations/native-launch',
+    async (req, reply) => {
+      try {
+        const { prompt, timeoutMs, ...invocation } = req.body;
+        const launched = await multiAgentNativeLauncher.launchCodexInvocation(req.params.workflowId, {
+          invocation,
+          prompt,
+          parentThreadId: invocation.parentThreadId,
+          timeoutMs,
+        });
+        const workflow = await multiAgentStore.readWorkflow(req.params.workflowId);
+        let rootTask = null;
+        let rootTaskProjection: { status: 'synced' | 'pending'; error?: string } = { status: 'synced' };
+        if (workflow) {
+          try {
+            rootTask = await syncMultiAgentRootTaskFromWorkflow(workflow, {
+              status: 'running',
+              reason: `Tik launched native ${launched.invocation.role} invocation ${launched.invocation.id}.`,
+            });
+          } catch (error) {
+            rootTaskProjection = { status: 'pending', error: error instanceof Error ? error.message : String(error) };
+          }
+        }
+        return {
+          invocation: sanitizeAgentInvocation(launched.invocation),
+          runtime: {
+            runId: launched.runId,
+            runtimeRef: launched.runtimeRef,
+            status: launched.status,
+          },
+          rootTask,
+          rootTaskProjection,
+        };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -2387,6 +2966,25 @@ export async function createServer(
     async (req, reply) => {
       try {
         const invocation = await multiAgentStore.attestInvocationStop(
+          req.params.workflowId,
+          req.params.invocationId,
+          req.body,
+        );
+        return { invocation: sanitizeAgentInvocation(invocation) };
+      } catch (error) {
+        return sendV1CaughtError(reply, error);
+      }
+    },
+  );
+
+  fastify.post<{
+    Params: { workflowId: string; invocationId: string };
+    Body: Omit<NativeInvocationCompletionInput, 'status' | 'stoppedAt'>;
+  }>(
+    '/api/v1/multi-agent/workflows/:workflowId/agent-invocations/:invocationId/native-result',
+    async (req, reply) => {
+      try {
+        const invocation = await multiAgentStore.linkNativeInvocationResult(
           req.params.workflowId,
           req.params.invocationId,
           req.body,
@@ -3749,6 +4347,7 @@ async function assertWorkspaceBindingInsideRoot(
   binding: TaskWorkspaceBinding,
 ): Promise<void> {
   const rootRealPath = await fs.realpath(workspaceRoot);
+  const allowedRoots = await resolveWorkspaceBindingAllowedRoots(workspaceRoot, rootRealPath);
   const paths = [
     binding.effectiveProjectPath,
     binding.sourceProjectPath,
@@ -3756,19 +4355,46 @@ async function assertWorkspaceBindingInsideRoot(
   ].filter((item): item is string => Boolean(item));
   for (const candidate of paths) {
     const resolved = path.resolve(candidate);
-    if (!isPathInside(path.resolve(workspaceRoot), resolved)) {
-      throw new WorkbenchTaskError('invalid_workspace_binding', `Workspace binding path must stay within workspace root: ${candidate}`);
-    }
     const realCandidate = await fs.realpath(resolved).catch((error) => {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         throw new WorkbenchTaskError('invalid_workspace_binding', `Workspace binding path does not exist: ${candidate}`);
       }
       throw error;
     });
-    if (!isPathInside(rootRealPath, realCandidate)) {
-      throw new WorkbenchTaskError('invalid_workspace_binding', `Workspace binding path must not escape workspace root: ${candidate}`);
+    if (!allowedRoots.some((allowedRoot) => isPathInside(allowedRoot, realCandidate))) {
+      throw new WorkbenchTaskError(
+        'invalid_workspace_binding',
+        `Workspace binding path must stay within the workspace root or a project explicitly listed by .code-workspace: ${candidate}`,
+      );
     }
   }
+}
+
+async function resolveWorkspaceBindingAllowedRoots(workspaceRoot: string, rootRealPath: string): Promise<string[]> {
+  const entries = await fs.readdir(workspaceRoot, { withFileTypes: true }).catch(() => []);
+  const workspaceFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.code-workspace'))
+    .map((entry) => path.join(workspaceRoot, entry.name));
+  const projectRoots = await Promise.all(workspaceFiles.map(async (workspaceFile) => {
+    try {
+      const parsed = JSON.parse(await fs.readFile(workspaceFile, 'utf-8')) as {
+        folders?: Array<{ path?: unknown }>;
+      };
+      return await Promise.all((parsed.folders || []).map(async (folder) => {
+        if (typeof folder.path !== 'string' || folder.path.trim().length === 0) return null;
+        const projectPath = path.isAbsolute(folder.path)
+          ? folder.path
+          : path.resolve(path.dirname(workspaceFile), folder.path);
+        return fs.realpath(projectPath).catch(() => null);
+      }));
+    } catch {
+      return [];
+    }
+  }));
+  return Array.from(new Set([
+    rootRealPath,
+    ...projectRoots.flat().filter((item): item is string => Boolean(item)),
+  ]));
 }
 
 function workspaceRegistryPath(): string {
@@ -4829,11 +5455,103 @@ function readIfMatch(value: string | string[] | undefined): string | undefined {
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
+function captureWorkspaceReadonlyAudit(cwd: string): {
+  gitStatusBefore: string;
+  workspaceFingerprintBefore: string;
+} {
+  const status = spawnSync('git', ['status', '--porcelain=v1'], {
+    cwd,
+    encoding: 'utf-8',
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  if (status.status !== 0) {
+    return {
+      gitStatusBefore: '',
+      workspaceFingerprintBefore: createHash('sha256').update(`non-git:${path.resolve(cwd)}`).digest('hex'),
+    };
+  }
+  const files = spawnSync('git', ['ls-files', '-co', '--exclude-standard'], {
+    cwd,
+    encoding: 'utf-8',
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (files.status !== 0) {
+    throw new MultiAgentCoordinationError('missing_evidence', `Unable to enumerate files for readonly audit in ${cwd}.`);
+  }
+  const uniqueFiles = Array.from(new Set(files.stdout.split(/\r?\n/).filter(Boolean))).sort();
+  const hashes = spawnSync('git', ['hash-object', '--stdin-paths'], {
+    cwd,
+    input: uniqueFiles.join('\n') + (uniqueFiles.length > 0 ? '\n' : ''),
+    encoding: 'utf-8',
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  if (hashes.status !== 0) {
+    throw new MultiAgentCoordinationError('missing_evidence', `Unable to fingerprint files for readonly audit in ${cwd}.`);
+  }
+  return {
+    gitStatusBefore: status.stdout.trim(),
+    workspaceFingerprintBefore: createHash('sha256')
+      .update(status.stdout)
+      .update('\0')
+      .update(uniqueFiles.join('\n'))
+      .update('\0')
+      .update(hashes.stdout)
+      .digest('hex'),
+  };
+}
+
+async function reconcileOrphanedNativeRuntimeState(store: FileMultiAgentWorkflowStore): Promise<void> {
+  const workflows = await store.listWorkflowRecords();
+  for (const workflow of workflows) {
+    const bundle = await store.readBundle(workflow.id);
+    if (!bundle) continue;
+    for (const invocation of bundle.invocations) {
+      if (invocation.status !== 'started') continue;
+      if (invocation.runtimeAttestation?.source === 'codex-subagent-runtime') {
+        await store.completeNativeInvocation(workflow.id, invocation.id, {
+          status: 'failed',
+          error: 'Tik server restarted before the native runtime reported completion.',
+          headSha: invocation.headSha,
+        }).catch(() => undefined);
+        continue;
+      }
+      if (invocation.role !== 'questioner') continue;
+      const run = bundle.questionerRuns.find((candidate) => candidate.invocationId === invocation.id);
+      if (!run || run.status !== 'started') continue;
+      await terminateOrphanedRuntimeRef(invocation.actualSubagentThreadId || invocation.threadId);
+      await store.failQuestionerRunRuntime(
+        workflow.id,
+        run.id,
+        'Tik server restarted before the native Questioner submitted output.',
+      ).catch(() => undefined);
+    }
+  }
+}
+
+async function terminateOrphanedRuntimeRef(runtimeRef: string | undefined): Promise<void> {
+  const match = runtimeRef?.match(/^pid:(\d+)$/);
+  if (!match) return;
+  const pid = Number(match[1]);
+  if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) return;
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  try {
+    process.kill(pid, 0);
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    // Process exited after SIGTERM.
+  }
+}
+
 function lastDecisionMatchesForPreflight(current: string | undefined, expected: string | undefined): boolean {
   if (expected === undefined || expected === '*') {
     return true;
   }
-  return current === expected;
+  return current === (expected === 'none' ? undefined : expected);
 }
 
 const ALLOWED_SUBTASK_PATCH_KEYS = new Set([

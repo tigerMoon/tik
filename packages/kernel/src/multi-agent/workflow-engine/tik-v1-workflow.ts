@@ -36,3 +36,24 @@ export const tikV1Workflow = {
   ] satisfies TikV1WorkflowStage[],
 };
 
+export const tikReviewV1Workflow = {
+  id: 'tik.multi_agent.review.v1',
+  version: 1,
+  phases: [
+    'planning',
+    'review',
+    'evaluation',
+    'evaluation_questioning',
+    'completion',
+    'synthesis',
+    'workflow_completion',
+  ] satisfies WorkflowActionPhase[],
+  stages: [
+    { id: 'review_subtask', phase: 'review', action: 'run_readonly_reviewer', completePredicate: 'hasReviewEvidenceAtHead' },
+    { id: 'evaluate_candidates', phase: 'evaluation', action: 'run_codex_evaluator', completePredicate: 'hasPassingEvaluationAtHead' },
+    { id: 'question_evaluation', phase: 'evaluation_questioning', action: 'ask_claude_question_evaluation', completePredicate: 'hasSufficientEvaluationQuestionerOutput' },
+    { id: 'complete_subtask', phase: 'completion', action: 'complete_subtask', completePredicate: 'subtaskIsDone' },
+    { id: 'synthesize_review', phase: 'synthesis', action: 'synthesize_review', completePredicate: 'hasReviewSynthesisAtHead' },
+    { id: 'complete_workflow', phase: 'workflow_completion', action: 'complete_workflow', completePredicate: 'workflowIsCompleted' },
+  ] satisfies TikV1WorkflowStage[],
+};

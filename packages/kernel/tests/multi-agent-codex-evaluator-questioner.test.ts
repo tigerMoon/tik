@@ -2967,6 +2967,7 @@ describe('codex evaluator and Claude questioner workflow', () => {
         options: {
           id: 'qr-run-action',
           invocationId: 'inv-run-action-questioner',
+          start: false,
           runtimeAudit: {
             gitStatusBefore: '',
           },

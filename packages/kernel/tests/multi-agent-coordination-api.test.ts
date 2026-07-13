@@ -1,8 +1,10 @@
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { AgentRunCompletion, AgentRuntimeRunner, PreparedRun } from '../src/agent-runners/agent-runtime-runner.js';
 import { EventBus } from '../src/event-bus.js';
+import { FileMultiAgentWorkflowStore } from '../src/multi-agent/workflow-store.js';
 import { createServer } from '../src/server.js';
 import { WorkbenchService } from '../src/workbench/workbench-service.js';
 import { WorkbenchStore } from '../src/workbench/workbench-store.js';
@@ -16,6 +18,314 @@ afterEach(async () => {
 });
 
 describe('multi-agent coordination API', () => {
+  it('preflights environment capabilities without creating durable workflow state', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root, { runtimeRunners: {} });
+    servers.push(server);
+
+    const rejected = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/preflight',
+      payload: {
+        mode: 'review',
+        headSha: 'head-1',
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: 'tik',
+          projectName: 'tik',
+          effectiveProjectPath: root,
+          sourceProjectPath: root,
+          worktreeKind: 'root',
+        },
+        clientCapabilities: {
+          codexHookAttestation: false,
+          codexCli: true,
+          claudeCode: true,
+          claudeQuestionerPlugin: true,
+          packageManagerSatisfied: true,
+        },
+      },
+    });
+    expect(rejected.statusCode).toBe(409);
+    expect(rejected.json()).toMatchObject({
+      error: { code: 'preflight_failed' },
+      report: { accepted: false, mode: 'review' },
+    });
+
+    const workflows = await server.inject({ method: 'GET', url: '/api/v1/multi-agent/workflows' });
+    expect(workflows.json().workflows).toEqual([]);
+  });
+
+  it('launches Tik-owned Codex native threads with server attestation and role-specific sandboxes', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const started: PreparedRun[] = [];
+    const codex = fakeRuntimeRunner('codex', started, { threadPrefix: 'codex-thread' });
+    const claude = fakeRuntimeRunner('claude-code', []);
+    const server = await createTestServer(root, { runtimeRunners: { codex, 'claude-code': claude } });
+    servers.push(server);
+
+    const preflight = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/preflight',
+      payload: {
+        mode: 'implementation',
+        headSha: 'head-1',
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: 'tik',
+          effectiveProjectPath: root,
+          sourceProjectPath: root,
+          worktreeKind: 'root',
+        },
+        clientCapabilities: {
+          codexHookAttestation: false,
+          codexCli: true,
+          claudeCode: true,
+          claudeQuestionerPlugin: true,
+          packageManagerSatisfied: true,
+        },
+      },
+    });
+    expect(preflight.statusCode).toBe(200);
+    expect(preflight.json().report.checks).toContainEqual(expect.objectContaining({
+      id: 'native_subagent_runtime',
+      passed: true,
+    }));
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-native-launch',
+        goal: 'Launch native Codex roles',
+        headSha: 'head-1',
+        metadata: { parentCodexThreadId: 'parent-thread' },
+      },
+    });
+
+    for (const [role, runner] of [['executor', 'codex'], ['evaluator', 'codex-evaluator']] as const) {
+      const response = await server.inject({
+        method: 'POST',
+        url: '/api/v1/multi-agent/workflows/wf-native-launch/agent-invocations/native-launch',
+        payload: {
+          id: `inv-${role}`,
+          role,
+          runner,
+          promptContract: `${role}.v1`,
+          headSha: 'head-1',
+          readonlyPolicy: role === 'evaluator' ? { enforced: true, violations: [] } : undefined,
+        },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        invocation: {
+          id: `inv-${role}`,
+          status: 'started',
+          hookAttested: true,
+          parentThreadId: 'parent-thread',
+          runtimeAttestation: {
+            source: 'codex-subagent-runtime',
+            actualSubagentThreadId: `codex-thread-inv-${role}`,
+          },
+        },
+        runtime: { status: 'running', runtimeRef: `codex-thread-inv-${role}` },
+      });
+      expect(response.json().invocation).not.toHaveProperty('attestationToken');
+    }
+
+    expect(started).toHaveLength(2);
+    expect(started[0].allowWrites).toBe(true);
+    expect(started[1].allowWrites).toBe(false);
+  });
+
+  it('records implementation evidence from a completed Tik-owned invocation without exposing a token', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const codex = fakeRuntimeRunner('codex', [], {
+      threadPrefix: 'codex-thread',
+      completion: Promise.resolve({ status: 'completed', result: { content: 'implemented' } }),
+    });
+    const server = await createTestServer(root, {
+      runtimeRunners: { codex, 'claude-code': fakeRuntimeRunner('claude-code', []) },
+    });
+    servers.push(server);
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: { id: 'wf-native-evidence', goal: 'Record native evidence', headSha: 'head-1' },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-native-evidence/task-graph',
+      payload: { graph: buildTaskGraph('wf-native-evidence', 1, [{ id: 'st-api', dependsOn: [] }]) },
+    });
+    await acceptContractForSubtask(server, 'wf-native-evidence', 'st-api', 'head-1');
+
+    const launched = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-native-evidence/agent-invocations/native-launch',
+      payload: {
+        id: 'inv-native-builder',
+        subtaskId: 'st-api',
+        role: 'executor',
+        runner: 'codex',
+        promptContract: 'codex-builder.v1',
+        headSha: 'head-1',
+        allowedPaths: ['packages/kernel/src'],
+      },
+    });
+    expect(launched.statusCode).toBe(200);
+    await waitForCondition(async () => {
+      const response = await server.inject({
+        method: 'GET',
+        url: '/api/v1/multi-agent/workflows/wf-native-evidence/agent-invocations/inv-native-builder',
+      });
+      return response.json().invocation.status === 'completed';
+    });
+
+    const mismatchedLink = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-native-evidence/agent-invocations/inv-native-builder/native-result',
+      payload: { headSha: 'different-head' },
+    });
+    expect(mismatchedLink.statusCode).toBe(409);
+    expect(mismatchedLink.json().error).toMatchObject({ code: 'head_sha_mismatch' });
+
+    const recorded = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-native-evidence/actions/execute-subtask',
+      headers: { 'if-match': 'none' },
+      payload: {
+        decision: buildDecision('wf-native-evidence', {
+          id: 'dec-native-evidence',
+          action: 'record_implementation',
+          subtaskId: 'st-api',
+          reason: 'Record native Builder evidence.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+        invocation: {
+          id: 'inv-native-builder',
+          status: 'completed',
+          headSha: 'head-1',
+          evidenceRefs: ['ev-native-implementation'],
+        },
+        evidence: {
+          id: 'ev-native-implementation',
+          kind: 'implementation',
+          title: 'Native implementation',
+          subtaskId: 'st-api',
+          headSha: 'head-1',
+          payload: {
+            observedChangedFiles: [{ path: 'packages/kernel/src/server.ts', changeType: 'modified' }],
+          },
+        },
+      },
+    });
+    expect(recorded.statusCode).toBe(200);
+    expect(recorded.json()).toMatchObject({
+      invocation: {
+        id: 'inv-native-builder',
+        status: 'completed',
+        evidenceRefs: ['ev-native-implementation'],
+        runtimeAttestation: { source: 'codex-subagent-runtime' },
+      },
+      subtask: { status: 'implemented' },
+      guard: { accepted: true },
+    });
+  });
+
+  it('launches Questioner with a server-only token injected into the Claude runtime', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const claudeRuns: PreparedRun[] = [];
+    const server = await createTestServer(root, {
+      runtimeRunners: {
+        codex: fakeRuntimeRunner('codex', [], { threadPrefix: 'codex-thread' }),
+        'claude-code': fakeRuntimeRunner('claude-code', claudeRuns, { pid: 4242 }),
+      },
+    });
+    servers.push(server);
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: { id: 'wf-native-questioner', goal: 'Launch Questioner', headSha: 'head-1' },
+    });
+
+    const launched = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-native-questioner/questioner-runs/native-launch',
+      payload: {
+        id: 'qr-native',
+        invocationId: 'inv-questioner-native',
+        intent: 'question_requirement',
+        headSha: 'head-1',
+        runtimeAudit: { gitStatusBefore: 'forged-client-status' },
+      },
+    });
+    expect(launched.statusCode).toBe(200);
+    expect(launched.json()).toMatchObject({
+      questionerRunId: 'qr-native',
+      invocation: { id: 'inv-questioner-native', status: 'started' },
+      runtime: { status: 'running', runtimeRef: 'pid:4242' },
+    });
+    expect(launched.json()).not.toHaveProperty('token');
+    expect(claudeRuns).toHaveLength(1);
+    expect(claudeRuns[0].cwd).not.toBe(root);
+    expect(claudeRuns[0].env?.TIK_QUESTIONER_TOKEN).toMatch(/^tqr_/);
+    expect(claudeRuns[0].env?.TIK_QUESTIONER_CONTEXT_URL).toContain('/api/v1/multi-agent/workflows/wf-native-questioner/questioner-runs/qr-native/context');
+    expect(JSON.stringify(launched.json())).not.toContain(claudeRuns[0].env?.TIK_QUESTIONER_TOKEN);
+    expect(launched.json().questionerRun.readonlyAudit).toMatchObject({
+      gitStatusBefore: '',
+      workspaceFingerprintBefore: expect.any(String),
+    });
+  });
+
+  it('reserves native invocation ids atomically under concurrent launch requests', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const codexRuns: PreparedRun[] = [];
+    const server = await createTestServer(root, {
+      runtimeRunners: {
+        codex: fakeRuntimeRunner('codex', codexRuns, { threadPrefix: 'codex-thread' }),
+        'claude-code': fakeRuntimeRunner('claude-code', []),
+      },
+    });
+    servers.push(server);
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: { id: 'wf-native-concurrent', goal: 'Launch once', headSha: 'head-1' },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-native-concurrent/task-graph',
+      payload: { graph: buildTaskGraph('wf-native-concurrent', 1, [{ id: 'st-api', dependsOn: [] }]) },
+    });
+    const launch = () => server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-native-concurrent/agent-invocations/native-launch',
+      payload: {
+        id: 'inv-native-once',
+        subtaskId: 'st-api',
+        role: 'executor',
+        runner: 'codex',
+        promptContract: 'codex-builder.v1',
+        headSha: 'head-1',
+      },
+    });
+
+    const responses = await Promise.all([launch(), launch()]);
+
+    expect(responses.map((response) => response.statusCode).sort()).toEqual([200, 409]);
+    expect(codexRuns).toHaveLength(1);
+    const retry = await launch();
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json()).toMatchObject({ invocation: { id: 'inv-native-once' } });
+    expect(codexRuns).toHaveLength(1);
+  });
+
   it('serves a workflow bundle from root and review workbench task references', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
     await fs.mkdir(path.join(root, 'repo'), { recursive: true });
@@ -349,6 +659,7 @@ describe('multi-agent coordination API', () => {
     expect(created.json().workflow).toMatchObject({
       id: 'wf-auth',
       driver: 'codex-workflow',
+      revision: 1,
       status: 'active',
       goal: 'Implement auth flow',
       rootTaskId: 'root-auth',
@@ -359,6 +670,12 @@ describe('multi-agent coordination API', () => {
       id: 'root-auth',
       status: 'in_progress',
     });
+    const immediatelyReadWorkflow = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-auth',
+    });
+    expect(immediatelyReadWorkflow.statusCode).toBe(200);
+    expect(immediatelyReadWorkflow.json().workflow.revision).toBe(created.json().workflow.revision);
 
     const taskGraph = {
       workflowId: 'wf-auth',
@@ -670,6 +987,406 @@ describe('multi-agent coordination API', () => {
     expect(readWorkflow.json().workflow.lastDecisionId).toBeUndefined();
   });
 
+  it('serializes decision writes and reports stale If-Match values as version conflicts', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: { id: 'wf-decision-version', goal: 'Protect concurrent decisions', headSha: 'head-1' },
+    });
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-decision-version/decisions',
+      payload: {
+        decision: buildDecision('wf-decision-version', {
+          id: 'dec-version-base',
+          action: 'request_human_review',
+          reason: 'Establish the decision version.',
+        }),
+      },
+    });
+
+    const responses = await Promise.all(['dec-version-left', 'dec-version-right'].map((decisionId) => server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-decision-version/decisions',
+      headers: { 'if-match': 'dec-version-base' },
+      payload: {
+        decision: buildDecision('wf-decision-version', {
+          id: decisionId,
+          action: 'request_human_review',
+          reason: 'Only one concurrent decision may commit.',
+        }),
+      },
+    })));
+    expect(responses.map((response) => response.statusCode).sort()).toEqual([200, 409]);
+    const conflict = responses.find((response) => response.statusCode === 409);
+    expect(conflict?.json().guard).toMatchObject({ accepted: false, code: 'version_conflict' });
+
+    const stored = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-decision-version',
+    });
+    expect(stored.json().decisions).toHaveLength(2);
+  });
+
+  it('rejects invalid TaskGraph scope and review-mode change declarations', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-invalid-graph',
+        goal: 'Reject contradictory graph scope',
+        headSha: 'head-1',
+      },
+    });
+    const overlap = buildTaskGraph('wf-invalid-graph', 1, [{ id: 'st-api', dependsOn: [] }]);
+    overlap.subtasks[0].allowedPaths = ['packages/kernel/src/**'];
+    overlap.subtasks[0].blockedPaths = ['**/*'];
+    const overlapResponse = await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-invalid-graph/task-graph',
+      payload: { graph: overlap },
+    });
+    expect(overlapResponse.statusCode).toBe(400);
+    expect(overlapResponse.json().error).toMatchObject({ code: 'invalid_task_graph' });
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-review-invalid-graph',
+        mode: 'review',
+        goal: 'Reject implementation declarations in review mode',
+        headSha: 'head-1',
+      },
+    });
+    const reviewGraph = buildTaskGraph('wf-review-invalid-graph', 1, [{ id: 'st-api', dependsOn: [] }]);
+    reviewGraph.subtasks[0].kind = 'review';
+    reviewGraph.subtasks[0].expectedChangedFiles = ['packages/kernel/src/server.ts'];
+    reviewGraph.subtasks[0].assignedReviewer = 'codex';
+    const reviewResponse = await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-review-invalid-graph/task-graph',
+      payload: { graph: reviewGraph },
+    });
+    expect(reviewResponse.statusCode).toBe(400);
+    expect(reviewResponse.json().error).toMatchObject({ code: 'invalid_task_graph' });
+  });
+
+  it('rejects unattested atomic execution without changing subtask or evidence state', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: { id: 'wf-atomic-execute', goal: 'Record implementation atomically', headSha: 'head-1' },
+    });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute/task-graph',
+      payload: {
+        graph: buildTaskGraph('wf-atomic-execute', 1, [
+          { id: 'st-api', dependsOn: [] },
+          { id: 'st-other', dependsOn: [] },
+        ]),
+      },
+    });
+    await acceptContractForSubtask(server, 'wf-atomic-execute', 'st-api', 'head-1');
+    const createdInvocation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute/agent-invocations',
+      payload: {
+        id: 'inv-builder',
+        subtaskId: 'st-api',
+        role: 'executor',
+        runner: 'codex',
+        promptContract: 'codex-builder.v1',
+        headSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute/agent-invocations/inv-builder/hook-start',
+      payload: {
+        attestationToken: createdInvocation.json().invocation.attestationToken,
+        nonce: 'nonce-builder',
+        parentThreadId: 'parent-thread',
+        actualSubagentThreadId: 'builder-thread',
+        role: 'executor',
+      },
+    });
+
+    const rejected = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute/actions/execute-subtask',
+      payload: {
+        decision: buildDecision('wf-atomic-execute', {
+          id: 'dec-record-implementation',
+          action: 'record_implementation',
+          subtaskId: 'st-api',
+          reason: 'Record implementation evidence.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+        invocation: {
+          id: 'inv-builder',
+          attestationToken: 'invalid-token',
+          status: 'completed',
+          headSha: 'head-1',
+          evidenceRefs: ['ev-implementation'],
+        },
+        evidence: {
+          id: 'ev-implementation',
+          kind: 'implementation',
+          title: 'Implementation',
+          subtaskId: 'st-api',
+          headSha: 'head-1',
+          payload: {
+            observedChangedFiles: [{ path: 'packages/kernel/src/server.ts', changeType: 'modified' }],
+          },
+        },
+      },
+    });
+    expect(rejected.statusCode).toBe(409);
+
+    const stored = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute',
+    });
+    expect(stored.json().subtasks['st-api'].status).toBe('contract_accepted');
+    expect(stored.json().subtasks['st-api'].evidenceRefs).toEqual([]);
+    expect(stored.json().evidence).toEqual([]);
+    expect(stored.json().invocations[0].status).toBe('started');
+
+    const wrongSubtaskInvocation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute/agent-invocations',
+      payload: {
+        id: 'inv-wrong-subtask',
+        subtaskId: 'st-other',
+        role: 'executor',
+        runner: 'codex',
+        promptContract: 'codex-builder.v1',
+        headSha: 'head-1',
+      },
+    });
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute/agent-invocations/inv-wrong-subtask/hook-start',
+      payload: {
+        attestationToken: wrongSubtaskInvocation.json().invocation.attestationToken,
+        nonce: 'nonce-wrong-subtask',
+        parentThreadId: 'parent-thread',
+        actualSubagentThreadId: 'wrong-subtask-thread',
+        role: 'executor',
+      },
+    });
+    const mismatched = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute/actions/execute-subtask',
+      payload: {
+        decision: buildDecision('wf-atomic-execute', {
+          id: 'dec-mismatched-implementation',
+          action: 'record_implementation',
+          subtaskId: 'st-api',
+          reason: 'A different subtask invocation must not provide evidence.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+        invocation: {
+          id: 'inv-wrong-subtask',
+          attestationToken: wrongSubtaskInvocation.json().invocation.attestationToken,
+          status: 'completed',
+          headSha: 'head-1',
+          evidenceRefs: ['ev-mismatched'],
+        },
+        evidence: {
+          id: 'ev-mismatched',
+          kind: 'implementation',
+          title: 'Mismatched implementation',
+          subtaskId: 'st-api',
+          headSha: 'head-1',
+          payload: {
+            observedChangedFiles: [{ path: 'packages/kernel/src/server.ts', changeType: 'modified' }],
+          },
+        },
+      },
+    });
+    expect(mismatched.statusCode).toBe(409);
+    expect(mismatched.json().error).toMatchObject({ code: 'missing_subagent_invocation' });
+    const afterMismatch = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute',
+    });
+    expect(afterMismatch.json().evidence).toEqual([]);
+    expect(afterMismatch.json().subtasks['st-api'].status).toBe('contract_accepted');
+    expect(afterMismatch.json().invocations.find((item: { id: string }) => item.id === 'inv-wrong-subtask').status).toBe('started');
+
+    for (const decisionId of ['dec-version-1', 'dec-version-2']) {
+      const recorded = await server.inject({
+        method: 'POST',
+        url: '/api/v1/multi-agent/workflows/wf-atomic-execute/decisions',
+        payload: {
+          decision: buildDecision('wf-atomic-execute', {
+            id: decisionId,
+            action: 'execute_subtask',
+            subtaskId: 'st-api',
+            reason: 'Advance decision history for optimistic locking.',
+            inputs: { currentHeadSha: 'head-1' },
+          }),
+        },
+      });
+      expect(recorded.statusCode).toBe(200);
+    }
+    const stale = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute/actions/execute-subtask',
+      headers: { 'if-match': 'dec-version-1' },
+      payload: {
+        decision: buildDecision('wf-atomic-execute', {
+          id: 'dec-stale-implementation',
+          action: 'record_implementation',
+          subtaskId: 'st-api',
+          reason: 'Stale implementation must not commit.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+        invocation: {
+          id: 'inv-builder',
+          attestationToken: createdInvocation.json().invocation.attestationToken,
+          status: 'completed',
+          headSha: 'head-1',
+          evidenceRefs: ['ev-stale'],
+        },
+        evidence: {
+          id: 'ev-stale',
+          kind: 'implementation',
+          title: 'Stale implementation',
+          subtaskId: 'st-api',
+          headSha: 'head-1',
+          payload: {
+            observedChangedFiles: [{ path: 'packages/kernel/src/server.ts', changeType: 'modified' }],
+          },
+        },
+      },
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json().error).toMatchObject({ code: 'version_conflict' });
+    const afterStale = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-atomic-execute',
+    });
+    expect(afterStale.json().evidence).toEqual([]);
+    expect(afterStale.json().invocations[0].status).toBe('started');
+  });
+
+  it('records attested readonly review evidence and advances to focused evaluation', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: { id: 'wf-review-record', mode: 'review', goal: 'Review pinned API changes', headSha: 'head-1' },
+    });
+    const graph = buildTaskGraph('wf-review-record', 1, [{ id: 'st-api', dependsOn: [] }]);
+    graph.subtasks[0].kind = 'review';
+    graph.subtasks[0].assignedReviewer = 'codex';
+    graph.subtasks[0].expectedChangedFiles = undefined;
+    const storedGraph = await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-review-record/task-graph',
+      payload: { graph },
+    });
+    expect(storedGraph.statusCode).toBe(200);
+
+    const createdInvocation = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-review-record/agent-invocations',
+      payload: {
+        id: 'inv-reviewer',
+        subtaskId: 'st-api',
+        role: 'reviewer',
+        runner: 'codex-evaluator',
+        promptContract: 'codex-reviewer.v1',
+        headSha: 'head-1',
+        readonlyPolicy: { enforced: true, violations: [] },
+      },
+    });
+    const token = createdInvocation.json().invocation.attestationToken;
+    const started = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-review-record/agent-invocations/inv-reviewer/hook-start',
+      payload: {
+        attestationToken: token,
+        nonce: 'nonce-reviewer',
+        parentThreadId: 'parent-thread',
+        actualSubagentThreadId: 'reviewer-thread',
+        role: 'reviewer',
+      },
+    });
+    expect(started.statusCode).toBe(200);
+
+    const recorded = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-review-record/actions/record-review',
+      payload: {
+        decision: buildDecision('wf-review-record', {
+          id: 'dec-record-review',
+          action: 'record_review',
+          subtaskId: 'st-api',
+          reason: 'Record candidate findings.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+        invocation: {
+          id: 'inv-reviewer',
+          attestationToken: token,
+          status: 'completed',
+          headSha: 'head-1',
+          evidenceRefs: ['ev-review'],
+          readonlyPolicy: { enforced: true, violations: [] },
+        },
+        evidence: {
+          id: 'ev-review',
+          kind: 'review',
+          title: 'API review candidates',
+          subtaskId: 'st-api',
+          headSha: 'head-1',
+          payload: { findings: [{ id: 'finding-1', severity: 'high' }] },
+        },
+      },
+    });
+    expect(recorded.statusCode).toBe(200);
+    expect(recorded.json()).toMatchObject({
+      subtask: { status: 'reviewed', evidenceRefs: ['ev-review'] },
+      evidence: { id: 'ev-review', kind: 'review' },
+      invocation: { id: 'inv-reviewer', status: 'completed' },
+      guard: { accepted: true },
+    });
+
+    const next = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-review-record/next-action',
+    });
+    expect(next.statusCode).toBe(200);
+    expect(next.json()).toMatchObject({
+      action: 'run_codex_evaluator',
+      subtaskId: 'st-api',
+      inputs: { reviewEvidenceId: 'ev-review' },
+    });
+  });
+
   it('allocates a new SprintContract version instead of overwriting an accepted contract', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
     tempDirs.push(root);
@@ -757,13 +1474,168 @@ describe('multi-agent coordination API', () => {
       method: 'POST',
       url: '/api/v1/multi-agent/workflows/wf-contract-versioning/subtasks/st-api/contracts/contract-st-api-v1/accept',
     });
-    expect(firstAfterRedraft.statusCode).toBe(200);
-    expect(firstAfterRedraft.json().contract).toMatchObject({
-      id: 'contract-st-api-v1',
-      version: 1,
-      status: 'accepted',
-      goal: 'Initial scope',
+    expect(firstAfterRedraft.statusCode).toBe(409);
+    expect(firstAfterRedraft.json().error).toMatchObject({ code: 'version_conflict' });
+  });
+
+  it('accepts independent SprintContracts atomically and rolls back the entire batch on failure', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    tempDirs.push(root);
+    const server = await createTestServer(root);
+    servers.push(server);
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: { id: 'wf-contract-batch', goal: 'Accept contracts atomically', headSha: 'head-1' },
     });
+    await server.inject({
+      method: 'PUT',
+      url: '/api/v1/multi-agent/workflows/wf-contract-batch/task-graph',
+      payload: {
+        graph: buildTaskGraph('wf-contract-batch', 1, [
+          { id: 'st-a', dependsOn: [] },
+          { id: 'st-b', dependsOn: [] },
+        ]),
+      },
+    });
+    for (const subtaskId of ['st-a', 'st-b']) {
+      await server.inject({
+        method: 'POST',
+        url: `/api/v1/multi-agent/workflows/wf-contract-batch/subtasks/${subtaskId}/contracts`,
+        payload: buildSprintContractPayload({ id: `contract-${subtaskId}-v1`, goal: `Implement ${subtaskId}` }),
+      });
+      await server.inject({
+        method: 'PATCH',
+        url: `/api/v1/multi-agent/workflows/wf-contract-batch/subtasks/${subtaskId}`,
+        payload: { status: 'contract_drafting' },
+      });
+    }
+    const beforeBatch = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-contract-batch',
+    });
+    const batchRevision = String(beforeBatch.json().workflow.revision);
+
+    const rejected = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-contract-batch/actions/accept-contracts',
+      headers: { 'if-match': batchRevision },
+      payload: {
+        contracts: [
+          { subtaskId: 'st-a', contractId: 'contract-st-a-v1', headShaAtAcceptance: 'head-1' },
+          { subtaskId: 'st-b', contractId: 'missing-contract', headShaAtAcceptance: 'head-1' },
+        ],
+      },
+    });
+    expect(rejected.statusCode).toBe(404);
+    const afterRejected = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-contract-batch',
+    });
+    expect(afterRejected.json().contracts.map((contract: { status: string }) => contract.status)).toEqual(['draft', 'draft']);
+    expect(afterRejected.json().subtasks['st-a'].status).toBe('contract_drafting');
+    expect(afterRejected.json().subtasks['st-b'].status).toBe('contract_drafting');
+    expect(afterRejected.json().decisions).toHaveLength(0);
+
+    const accepted = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-contract-batch/actions/accept-contracts',
+      headers: { 'if-match': batchRevision },
+      payload: {
+        contracts: [
+          { subtaskId: 'st-a', contractId: 'contract-st-a-v1', headShaAtAcceptance: 'head-1' },
+          { subtaskId: 'st-b', contractId: 'contract-st-b-v1', headShaAtAcceptance: 'head-1' },
+        ],
+      },
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(accepted.headers.etag).toBe(String(accepted.json().workflow.revision));
+    expect(accepted.json().contracts).toHaveLength(2);
+    expect(accepted.json().decisions).toHaveLength(2);
+    expect(accepted.json().subtasks).toMatchObject([
+      { subtaskId: 'st-a', status: 'contract_accepted' },
+      { subtaskId: 'st-b', status: 'contract_accepted' },
+    ]);
+
+    const stale = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-contract-batch/actions/accept-contracts',
+      headers: { 'if-match': batchRevision },
+      payload: { contracts: [{ subtaskId: 'st-a', contractId: 'contract-st-a-v1' }] },
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json().error).toMatchObject({ code: 'version_conflict' });
+
+    const missingRevision = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-contract-batch/actions/accept-contracts',
+      payload: { contracts: [{ subtaskId: 'st-a', contractId: 'contract-st-a-v1' }] },
+    });
+    expect(missingRevision.statusCode).toBe(409);
+    expect(missingRevision.json().error).toMatchObject({ code: 'version_conflict' });
+
+    const malformed = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-contract-batch/actions/accept-contracts',
+      payload: { contracts: [null] },
+    });
+    expect(malformed.statusCode).toBe(400);
+  });
+
+  it('restores every batch file when persistence fails after the first Contract write', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-store-'));
+    tempDirs.push(root);
+    const store = new FileMultiAgentWorkflowStore(root);
+    await store.createWorkflow({ id: 'wf-contract-rollback', goal: 'Rollback partial writes', headSha: 'head-1' });
+    await store.putTaskGraph('wf-contract-rollback', buildTaskGraph('wf-contract-rollback', 1, [
+      { id: 'st-a', dependsOn: [] },
+      { id: 'st-b', dependsOn: [] },
+    ]));
+    for (const subtaskId of ['st-a', 'st-b']) {
+      await store.createContract('wf-contract-rollback', subtaskId, buildSprintContractPayload({
+        id: `contract-${subtaskId}-v1`,
+        goal: `Implement ${subtaskId}`,
+      }));
+      await store.updateSubtask('wf-contract-rollback', subtaskId, { status: 'contract_drafting' });
+    }
+    const before = await store.readBundle('wf-contract-rollback');
+    expect(before).not.toBeNull();
+
+    const mutableStore = store as unknown as {
+      writeJsonFileAtomic: (filePath: string, value: unknown) => Promise<void>;
+    };
+    const originalWrite = mutableStore.writeJsonFileAtomic.bind(store);
+    mutableStore.writeJsonFileAtomic = async (filePath, value) => {
+      if (filePath.endsWith('contract-st-b-v1.json') && (value as { status?: string }).status === 'accepted') {
+        throw new Error('injected second Contract write failure');
+      }
+      await originalWrite(filePath, value);
+    };
+
+    await expect(store.acceptContractsAtomically('wf-contract-rollback', ['st-a', 'st-b'].map((subtaskId, index) => ({
+      subtaskId,
+      contractId: `contract-${subtaskId}-v1`,
+      decision: {
+        id: `dec-${index + 1}`,
+        workflowId: 'wf-contract-rollback',
+        rootTaskId: 'wf-contract-rollback',
+        subtaskId,
+        decidedBy: 'codex-workflow' as const,
+        decidedAt: new Date().toISOString(),
+        action: 'accept_contract' as const,
+        reason: 'Accept in rollback test',
+        evidenceRefs: [],
+        inputs: { contractId: `contract-${subtaskId}-v1`, currentHeadSha: 'head-1' },
+      },
+    })), String(before?.workflow.revision))).rejects.toThrow('injected second Contract write failure');
+    mutableStore.writeJsonFileAtomic = originalWrite;
+
+    const after = await store.readBundle('wf-contract-rollback');
+    expect(after?.contracts.map((contract) => contract.status)).toEqual(['draft', 'draft']);
+    expect(after?.subtasks['st-a'].status).toBe('contract_drafting');
+    expect(after?.subtasks['st-b'].status).toBe('contract_drafting');
+    expect(after?.decisions).toEqual([]);
+    expect(after?.workflow.revision).toBe(before?.workflow.revision);
   });
 
   it('stores a planner TaskGraph automatically when a planner invocation completes', async () => {
@@ -1075,6 +1947,42 @@ describe('multi-agent coordination API', () => {
     });
   });
 
+  it('accepts an external source project explicitly listed by the code workspace', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
+    const externalProject = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-external-project-'));
+    tempDirs.push(root, externalProject);
+    await fs.writeFile(path.join(root, 'merchant.code-workspace'), JSON.stringify({
+      folders: [{ name: 'merchant', path: externalProject }],
+    }), 'utf-8');
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-external-allowlisted',
+        goal: 'Review an allowlisted sibling repository',
+        headSha: 'head-1',
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: 'merchant',
+          projectName: 'merchant',
+          effectiveProjectPath: externalProject,
+          sourceProjectPath: externalProject,
+          worktreeKind: 'root',
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().workflow.workspaceBinding).toMatchObject({
+      workspaceRoot: root,
+      sourceProjectPath: externalProject,
+      effectiveProjectPath: externalProject,
+    });
+  });
+
   it('derives workflow workspace root from the server instead of trusting caller input', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tik-multi-agent-api-'));
     const repo = path.join(root, 'repo');
@@ -1361,11 +2269,17 @@ describe('multi-agent coordination API', () => {
   });
 });
 
-async function createTestServer(root: string) {
-  return (await createTestServerWithWorkbench(root)).server;
+async function createTestServer(
+  root: string,
+  options: { runtimeRunners?: Record<string, AgentRuntimeRunner> } = {},
+) {
+  return (await createTestServerWithWorkbench(root, options)).server;
 }
 
-async function createTestServerWithWorkbench(root: string) {
+async function createTestServerWithWorkbench(
+  root: string,
+  options: { runtimeRunners?: Record<string, AgentRuntimeRunner> } = {},
+) {
   const workbench = new WorkbenchService({
     rootPath: root,
     eventBus: new EventBus(),
@@ -1387,7 +2301,7 @@ async function createTestServerWithWorkbench(root: string) {
   const server = await createServer(
     mockKernel as any,
     { port: 0, host: '127.0.0.1' },
-    { workspaceRoot: root },
+    { workspaceRoot: root, runtimeRunners: options.runtimeRunners },
   );
   return { server, workbench };
 }
@@ -1473,6 +2387,49 @@ function buildSprintContractPayload(patch: {
       }],
     },
   };
+}
+
+function fakeRuntimeRunner(
+  name: 'codex' | 'claude-code',
+  started: PreparedRun[],
+  options: { threadPrefix?: string; pid?: number; completion?: Promise<AgentRunCompletion> } = {},
+): AgentRuntimeRunner {
+  return {
+    name,
+    prepare: vi.fn(async (input) => ({
+      runId: input.runId,
+      runner: name,
+      mode: input.runnerMode,
+      cwd: input.projectPath,
+      prompt: input.renderedPrompt,
+    })),
+    start: vi.fn(async (prepared) => {
+      started.push(prepared);
+      return {
+        runId: prepared.runId,
+        threadId: options.threadPrefix ? `${options.threadPrefix}-${prepared.runId}` : undefined,
+        pid: options.pid,
+        startedAt: '2026-07-11T00:00:00.000Z',
+        completion: options.completion || new Promise(() => undefined),
+        stop: async () => undefined,
+      };
+    }),
+    stop: vi.fn(async () => undefined),
+    getStatus: vi.fn(async () => 'running'),
+    collectTranscript: vi.fn(async () => []),
+    collectDiff: vi.fn(async () => ({ changedFiles: [] })),
+    collectArtifacts: vi.fn(async () => []),
+    cleanup: vi.fn(async () => undefined),
+  };
+}
+
+async function waitForCondition(predicate: () => Promise<boolean>, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Condition was not met within ${timeoutMs}ms.`);
 }
 
 async function moveSubtaskToDone(

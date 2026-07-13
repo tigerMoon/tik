@@ -262,6 +262,156 @@ describe('multi-agent workflow engine', () => {
     });
   });
 
+  it('plans readonly review workflows without contracts or builder execution', () => {
+    const reviewBundle = buildBundle({
+      workflow: {
+        ...buildBundle().workflow,
+        mode: 'review',
+        goal: 'Review the pinned merge request',
+        policy: {
+          ...buildBundle().workflow.policy!,
+          requireAcceptedContract: false,
+        },
+      } as MultiAgentWorkflowBundle['workflow'],
+      taskGraph: {
+        ...buildBundle().taskGraph!,
+        subtasks: [{
+          ...buildBundle().taskGraph!.subtasks[0],
+          kind: 'review',
+          goal: 'Review API changes',
+          expectedChangedFiles: undefined,
+          assignedReviewer: 'codex',
+        }],
+      },
+      subtasks: {
+        'st-api': {
+          subtaskId: 'st-api',
+          status: 'ready',
+          validationRunIds: [],
+          evidenceRefs: [],
+          blockerFindingIds: [],
+          fixRound: 0,
+        },
+      },
+      contracts: [],
+      evidence: [],
+      evaluationRuns: [],
+      questionerOutputs: [],
+    });
+
+    const first = planNextAction({ bundle: reviewBundle });
+    expect(first).toMatchObject({
+      action: 'run_readonly_reviewer',
+      phase: 'review',
+      subtaskId: 'st-api',
+    });
+    expect(first.action).not.toBe('draft_contract');
+    expect(first.action).not.toBe('execute_subtask');
+
+    const reviewed = buildBundle({
+      ...reviewBundle,
+      subtasks: {
+        'st-api': {
+          ...reviewBundle.subtasks['st-api'],
+          status: 'reviewed',
+          evidenceRefs: ['ev-review'],
+        },
+      },
+      evidence: [{
+        id: 'ev-review',
+        workflowId: 'wf-engine',
+        subtaskId: 'st-api',
+        kind: 'review',
+        title: 'Readonly review candidates',
+        headSha: 'head-1',
+        payload: { findings: [] },
+        createdAt: '2026-07-03T00:01:00.000Z',
+      }],
+    });
+    expect(planNextAction({ bundle: reviewed })).toMatchObject({
+      action: 'run_codex_evaluator',
+      phase: 'evaluation',
+      subtaskId: 'st-api',
+      inputs: { reviewEvidenceId: 'ev-review' },
+    });
+
+    const completed = buildBundle({
+      ...reviewBundle,
+      subtasks: {
+        'st-api': {
+          ...reviewBundle.subtasks['st-api'],
+          status: 'done',
+          evidenceRefs: ['ev-review'],
+        },
+      },
+      evidence: reviewed.evidence,
+    });
+    expect(planNextAction({ bundle: completed })).toMatchObject({
+      action: 'synthesize_review',
+      phase: 'synthesis',
+    });
+    const synthesized = buildBundle({
+      ...completed,
+      evidence: [
+        ...completed.evidence,
+        {
+          id: 'ev-synthesis',
+          workflowId: 'wf-engine',
+          kind: 'synthesis',
+          title: 'Review synthesis',
+          headSha: 'head-1',
+          createdAt: '2026-07-03T00:05:00.000Z',
+        },
+      ],
+    });
+    expect(planNextAction({ bundle: synthesized })).toMatchObject({
+      action: 'complete_workflow',
+      phase: 'workflow_completion',
+      inputs: { synthesisEvidenceId: 'ev-synthesis' },
+    });
+  });
+
+  it('waits for an in-flight native Builder instead of planning a duplicate launch', () => {
+    const bundle = buildBundle({
+      contracts: [{
+        id: 'contract-st-api-v1',
+        workflowId: 'wf-engine',
+        subtaskId: 'st-api',
+        version: 1,
+        status: 'accepted',
+        goal: 'Implement API',
+        scope: { allowedPaths: ['packages/kernel/src'], blockedPaths: [] },
+        deliverables: [],
+        acceptanceCriteria: [],
+        verificationPlan: { commands: [] },
+        questionerOutputRefs: [],
+        acceptedBy: 'codex-workflow-plugin',
+        acceptedAt: '2026-07-03T00:00:00.000Z',
+        headShaAtAcceptance: 'head-1',
+      }],
+      invocations: [{
+        id: 'inv-builder-running',
+        workflowId: 'wf-engine',
+        subtaskId: 'st-api',
+        role: 'executor',
+        runner: 'codex',
+        promptContract: 'codex-builder.v1',
+        status: 'started',
+        evidenceRefs: [],
+        createdAt: '2026-07-03T00:01:00.000Z',
+        updatedAt: '2026-07-03T00:01:00.000Z',
+      }],
+      evidence: [],
+      evaluationRuns: [],
+    });
+
+    expect(planNextAction({ bundle })).toMatchObject({
+      action: 'execute_subtask',
+      reasonCode: 'awaiting_native_runtime',
+      inputs: { invocationId: 'inv-builder-running' },
+    });
+  });
+
   it('keeps the Codex skill offline fallback aligned with canonical Kernel planning fixtures', () => {
     const draftContract = buildBundle({
       contracts: [],

@@ -99,7 +99,7 @@ describe('multi-agent v1 core runtime API', () => {
     expect(stale.json()).toMatchObject({
       guard: {
         accepted: false,
-        code: 'invalid_transition',
+        code: 'version_conflict',
       },
       workflow: {
         id: 'wf-if-match',
@@ -204,7 +204,7 @@ describe('multi-agent v1 core runtime API', () => {
     expect(preflight.json()).toMatchObject({
       guard: {
         accepted: false,
-        code: 'invalid_transition',
+        code: 'version_conflict',
       },
       workflow: {
         id: 'wf-if-match-preflight',

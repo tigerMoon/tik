@@ -33,6 +33,9 @@ export interface PreparedRun {
   env?: Record<string, string>;
   promptFile?: string;
   prompt?: string;
+  allowWrites?: boolean;
+  requireThreadId?: boolean;
+  developerInstructions?: string;
   timeoutMs?: number;
 }
 
@@ -40,11 +43,13 @@ export interface AgentRunCompletion {
   status: 'completed' | 'failed' | 'cancelled';
   error?: string;
   artifactIds?: string[];
+  result?: Record<string, unknown>;
 }
 
 export interface AgentRunHandle {
   runId: string;
   pid?: number;
+  threadId?: string;
   startedAt: string;
   completion?: Promise<AgentRunCompletion>;
   stop(reason: string): Promise<void>;

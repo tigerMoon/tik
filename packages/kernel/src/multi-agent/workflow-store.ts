@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   generateId,
   type AgentInvocationRecord,
@@ -31,6 +32,7 @@ import {
   type WorkflowPolicy,
 } from '@tik/shared';
 import { buildQuestionerContext } from './questioner-context.js';
+import { evaluateWorkflowDecisionGuard } from './guard.js';
 import {
   hashQuestionerToken,
   normalizeQuestionerOutputV2,
@@ -40,20 +42,24 @@ import {
 
 const SUBTASK_TRANSITIONS: Record<SubtaskRunStatus, SubtaskRunStatus[]> = {
   pending: ['ready', 'blocked', 'human_review_required'],
-  ready: ['contract_drafting', 'executing', 'blocked', 'human_review_required'],
+  ready: ['contract_drafting', 'executing', 'reviewing', 'reviewed', 'blocked', 'human_review_required'],
   contract_drafting: ['contract_questioning', 'contract_accepted', 'blocked', 'human_review_required'],
   contract_questioning: ['contract_drafting', 'contract_accepted', 'blocked', 'human_review_required'],
-  contract_accepted: ['building', 'executing', 'blocked', 'human_review_required'],
+  contract_accepted: ['building', 'executing', 'implemented', 'blocked', 'human_review_required'],
+  reviewing: ['reviewed', 'blocked', 'human_review_required'],
+  reviewed: ['reviewing', 'evaluating', 'blocked', 'human_review_required'],
   building: ['implemented', 'validation_failed', 'blocked', 'human_review_required'],
   executing: ['implemented', 'validation_failed', 'blocked', 'human_review_required'],
   implemented: ['evaluating', 'validating', 'validated', 'validation_failed', 'blocked', 'human_review_required'],
   evaluating: ['evaluation_failed', 'evaluation_passed', 'validation_failed', 'validated', 'blocked', 'human_review_required'],
-  evaluation_failed: ['needs_fix', 'fixing', 'building', 'executing', 'implemented', 'evaluating', 'blocked', 'human_review_required'],
+  evaluation_failed: ['needs_fix', 'fixing', 'building', 'executing', 'implemented', 'reviewing', 'reviewed', 'evaluating', 'blocked', 'human_review_required'],
   evaluation_passed: ['questioning_evidence', 'done', 'blocked', 'human_review_required'],
   validating: ['validated', 'validation_failed', 'blocked', 'human_review_required'],
   validated: ['evaluating', 'questioning_evidence', 'done', 'blocked', 'human_review_required'],
   validation_failed: ['executing', 'implemented', 'blocked', 'human_review_required'],
   questioning_evidence: ['needs_fix', 'evaluating', 'evaluation_failed', 'done', 'blocked', 'human_review_required'],
+  synthesizing: ['synthesized', 'blocked', 'human_review_required'],
+  synthesized: ['done', 'blocked', 'human_review_required'],
   needs_fix: ['fixing', 'executing', 'implemented', 'blocked', 'human_review_required'],
   fixing: ['implemented', 'blocked', 'human_review_required'],
   done: ['human_review_required'],
@@ -97,7 +103,7 @@ export class MultiAgentCoordinationError extends Error {
   }
 }
 
-interface CreateAgentInvocationInput {
+export interface CreateAgentInvocationInput {
   id?: string;
   workflowId?: string;
   subtaskId?: string;
@@ -129,6 +135,7 @@ interface CreateQuestionerRunInput {
   tokenTtlMs?: number;
   runtimeAudit?: {
     gitStatusBefore?: string;
+    workspaceFingerprintBefore?: string;
     allowedWritePaths?: string[];
     forbiddenWritePaths?: string[];
   };
@@ -140,6 +147,7 @@ interface SubmitQuestionerRunOutputInput {
   now?: string;
   runtimeAudit?: {
     gitStatusAfter?: string;
+    workspaceFingerprintAfter?: string;
     allowedWritePaths?: string[];
     forbiddenWritePaths?: string[];
   };
@@ -166,7 +174,44 @@ interface HookStopInvocationInput {
   error?: string;
 }
 
+type AttestedEvidenceInvocationInput = Omit<HookStopInvocationInput, 'attestationToken'> & {
+  attestationToken?: string;
+};
+
+export interface NativeInvocationStartInput {
+  parentThreadId: string;
+  actualSubagentThreadId: string;
+  role: AgentInvocationRecord['role'];
+  nonce: string;
+  startedAt?: string;
+}
+
+export interface NativeInvocationCompletionInput {
+  status: Extract<MultiAgentInvocationStatus, 'completed' | 'failed' | 'cancelled'>;
+  stoppedAt?: string;
+  headSha?: string;
+  evidenceRefs?: string[];
+  evaluationRunId?: string;
+  readonlyPolicy?: AgentInvocationRecord['readonlyPolicy'];
+  result?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface AcceptContractsBatchItem {
+  subtaskId: string;
+  contractId: string;
+  decision: WorkflowDecision;
+  acceptance?: {
+    acceptedBy?: SprintContract['acceptedBy'];
+    headShaAtAcceptance?: string;
+    questionerOutputRefs?: string[];
+  };
+}
+
 export class FileMultiAgentWorkflowStore {
+  private readonly mutationQueues = new Map<string, Promise<unknown>>();
+  private readonly mutationContext = new AsyncLocalStorage<Set<string>>();
+
   constructor(private readonly rootPath: string) {}
 
   async createWorkflow(input: CreateMultiAgentWorkflowInput): Promise<MultiAgentWorkflowRecord> {
@@ -184,7 +229,9 @@ export class FileMultiAgentWorkflowStore {
     const workflow: MultiAgentWorkflowRecord = {
       id,
       driver: 'codex-workflow',
+      revision: 0,
       status: 'active',
+      mode: input.mode || 'implementation',
       goal: input.goal,
       rootTaskId: input.rootTaskId || id,
       repo: input.repo,
@@ -196,6 +243,9 @@ export class FileMultiAgentWorkflowStore {
         ...DEFAULT_WORKFLOW_POLICY,
         maxFixRoundsPerSubtask: input.maxRounds ?? DEFAULT_WORKFLOW_POLICY.maxFixRoundsPerSubtask,
         ...input.policy,
+        requireAcceptedContract: input.mode === 'review'
+          ? false
+          : input.policy?.requireAcceptedContract ?? DEFAULT_WORKFLOW_POLICY.requireAcceptedContract,
       },
       workspaceBinding: input.workspaceBinding,
       metadata: input.metadata,
@@ -203,10 +253,10 @@ export class FileMultiAgentWorkflowStore {
       updatedAt: now,
     };
 
-    assertWorkspaceBindingInsideRoot(workflow.workspaceBinding);
+    await assertWorkspaceBindingInsideRoot(workflow.workspaceBinding);
     await this.writeWorkflow(workflow);
     await this.appendEvent(workflow.id, 'workflow.created', 'tik', { workflowId: workflow.id });
-    return workflow;
+    return this.requireWorkflow(workflow.id);
   }
 
   async readWorkflow(workflowId: string): Promise<MultiAgentWorkflowRecord | null> {
@@ -243,6 +293,9 @@ export class FileMultiAgentWorkflowStore {
     },
   ): Promise<MultiAgentWorkflowRecord> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.updateWorkflow(id, patch));
+    }
     const existing = await this.requireWorkflow(id);
     if (
       patch.status
@@ -281,7 +334,7 @@ export class FileMultiAgentWorkflowStore {
       completedAt: patch.status === 'completed' ? now : existing.completedAt,
       abortedAt: patch.status === 'aborted' ? now : existing.abortedAt,
     };
-    assertWorkspaceBindingInsideRoot(workflow.workspaceBinding);
+    await assertWorkspaceBindingInsideRoot(workflow.workspaceBinding);
     await this.writeWorkflow(workflow);
     if (patch.status === 'completed') {
       await this.appendEvent(id, 'workflow.completed', 'tik', { workflowId: id });
@@ -299,29 +352,54 @@ export class FileMultiAgentWorkflowStore {
 
   async readBundle(workflowId: string): Promise<MultiAgentWorkflowBundle | null> {
     const id = this.normalizeId(workflowId);
-    const workflow = await this.readWorkflow(id);
-    if (!workflow) {
-      return null;
+    const lockBefore = await pathExists(this.workflowMutationLockDir(id));
+    const transactionBefore = await pathExists(this.workflowTransactionFile(id));
+    if (!lockBefore && !transactionBefore) {
+      const snapshot = await this.readBundleSnapshot(id);
+      const [lockAfter, transactionAfter, workflowAfter] = await Promise.all([
+        pathExists(this.workflowMutationLockDir(id)),
+        pathExists(this.workflowTransactionFile(id)),
+        this.readWorkflow(id),
+      ]);
+      if (
+        !lockAfter
+        && !transactionAfter
+        && (!snapshot || (workflowAfter?.revision ?? snapshot.events.length) === snapshot.workflow.revision)
+      ) {
+        return snapshot;
+      }
     }
+    return this.withWorkflowMutation(id, async () => {
+      await this.recoverWorkflowTransaction(id);
+      return this.readBundleSnapshot(id);
+    });
+  }
 
+  private async readBundleSnapshot(workflowId: string): Promise<MultiAgentWorkflowBundle | null> {
+    const workflow = await this.readWorkflow(workflowId);
+    if (!workflow) return null;
+    const events = await this.readJsonLines<MultiAgentWorkflowEvent>(this.eventsFile(workflowId));
     return {
-      workflow,
+      workflow: { ...workflow, revision: workflow.revision ?? events.length },
       taskGraph: await this.readTaskGraphForWorkflow(workflow),
-      subtasks: await this.readSubtasks(id),
-      contracts: await this.readContracts(id),
-      evaluationRuns: await this.readEvaluationRuns(id),
-      questionerRuns: await this.readQuestionerRuns(id),
-      questionerOutputs: await this.readQuestionerOutputs(id),
-      questionResolutions: await this.readQuestionResolutions(id),
-      decisions: await this.readJsonLines<WorkflowDecision>(this.decisionsFile(id)),
-      evidence: await this.readEvidence(id),
-      invocations: await this.readJsonLines<AgentInvocationRecord>(this.invocationsFile(id)),
-      events: await this.readJsonLines<MultiAgentWorkflowEvent>(this.eventsFile(id)),
+      subtasks: await this.readSubtasks(workflowId),
+      contracts: await this.readContracts(workflowId),
+      evaluationRuns: await this.readEvaluationRuns(workflowId),
+      questionerRuns: await this.readQuestionerRuns(workflowId),
+      questionerOutputs: await this.readQuestionerOutputs(workflowId),
+      questionResolutions: await this.readQuestionResolutions(workflowId),
+      decisions: await this.readJsonLines<WorkflowDecision>(this.decisionsFile(workflowId)),
+      evidence: await this.readEvidence(workflowId),
+      invocations: await this.readJsonLines<AgentInvocationRecord>(this.invocationsFile(workflowId)),
+      events,
     };
   }
 
   async putTaskGraph(workflowId: string, graph: TaskGraph): Promise<{ graph: TaskGraph; subtasks: Record<string, SubtaskRunState> }> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.putTaskGraph(id, graph));
+    }
     const workflow = await this.requireWorkflow(id);
     if (graph.workflowId !== id) {
       throw new MultiAgentCoordinationError('invalid_task_graph', `TaskGraph workflowId ${graph.workflowId} does not match workflow ${id}.`);
@@ -337,6 +415,8 @@ export class FileMultiAgentWorkflowStore {
     if (duplicate) {
       throw new MultiAgentCoordinationError('invalid_task_graph', `Duplicate subtask id: ${duplicate}.`);
     }
+
+    validateTaskGraph(workflow, graph);
 
     const existingSubtasks = await this.readSubtasks(id);
     const subtasks = buildSubtaskStatesForGraph(graph, existingSubtasks);
@@ -361,6 +441,9 @@ export class FileMultiAgentWorkflowStore {
     patch: Partial<SubtaskRunState>,
   ): Promise<SubtaskRunState> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.updateSubtask(id, subtaskId, patch));
+    }
     const workflow = await this.requireWorkflow(id);
     const subtasks = await this.readSubtasks(id);
     const existing = subtasks[subtaskId];
@@ -395,6 +478,9 @@ export class FileMultiAgentWorkflowStore {
 
   async recordDecision(workflowId: string, decision: WorkflowDecision): Promise<WorkflowDecision> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.recordDecision(id, decision));
+    }
     const workflow = await this.requireWorkflow(id);
     await fs.mkdir(this.workflowDir(id), { recursive: true });
     await fs.appendFile(this.decisionsFile(id), `${JSON.stringify(decision)}\n`, 'utf-8');
@@ -436,27 +522,29 @@ export class FileMultiAgentWorkflowStore {
     expectedLastDecisionId?: string,
   ): Promise<{ decision?: WorkflowDecision; workflow: MultiAgentWorkflowRecord; guard: GuardResult }> {
     const id = this.normalizeId(workflowId);
-    const workflow = await this.requireWorkflow(id);
-    if (!lastDecisionMatches(workflow.lastDecisionId, expectedLastDecisionId)) {
-      return {
-        workflow,
-        guard: {
-          accepted: false,
-          code: 'invalid_transition',
-          message: `Decision history changed; expected ${expectedLastDecisionId || 'no last decision'}, current ${workflow.lastDecisionId || 'none'}.`,
-          currentState: {
-            expectedLastDecisionId,
-            lastDecisionId: workflow.lastDecisionId,
+    return this.withWorkflowMutation(id, async () => {
+      const workflow = await this.requireWorkflow(id);
+      if (!lastDecisionMatches(workflow.lastDecisionId, expectedLastDecisionId)) {
+        return {
+          workflow,
+          guard: {
+            accepted: false,
+            code: 'version_conflict',
+            message: `Decision history changed; expected ${expectedLastDecisionId || 'no last decision'}, current ${workflow.lastDecisionId || 'none'}.`,
+            currentState: {
+              expectedLastDecisionId,
+              lastDecisionId: workflow.lastDecisionId,
+            },
           },
-        },
+        };
+      }
+      const recorded = await this.recordDecision(id, decision);
+      return {
+        decision: recorded,
+        workflow: await this.requireWorkflow(id),
+        guard: { accepted: true, code: 'ok' },
       };
-    }
-    const recorded = await this.recordDecision(id, decision);
-    return {
-      decision: recorded,
-      workflow: await this.requireWorkflow(id),
-      guard: { accepted: true, code: 'ok' },
-    };
+    });
   }
 
   async recordEvidence(
@@ -502,6 +590,148 @@ export class FileMultiAgentWorkflowStore {
     return evidence;
   }
 
+  async recordAttestedEvidenceAtomically(
+    workflowId: string,
+    input: {
+      subtaskId: string;
+      evidence: Omit<Partial<MultiAgentWorkflowEvidence>, 'workflowId' | 'createdAt'> & {
+        id: string;
+        kind: 'implementation' | 'review';
+        title: string;
+      };
+      decision: WorkflowDecision;
+      invocationId: string;
+      invocationStop: AttestedEvidenceInvocationInput;
+      finalStatus: 'implemented' | 'reviewed';
+      expectedLastDecisionId?: string;
+    },
+  ): Promise<{
+    evidence: MultiAgentWorkflowEvidence;
+    decision: WorkflowDecision;
+    invocation: AgentInvocationRecord;
+    subtask: SubtaskRunState;
+    workflow: MultiAgentWorkflowRecord;
+  }> {
+    const id = this.normalizeId(workflowId);
+    return this.withWorkflowMutation(id, async () => {
+      await this.assertWorkflowVersion(id, input.expectedLastDecisionId);
+      const currentInvocation = await this.readInvocation(id, input.invocationId);
+      if (!currentInvocation) {
+        throw new MultiAgentCoordinationError('invocation_not_found', `Agent invocation not found: ${input.invocationId}.`);
+      }
+      const expectedRole = input.evidence.kind === 'implementation' ? 'executor' : 'reviewer';
+      if (currentInvocation.subtaskId !== input.subtaskId || currentInvocation.role !== expectedRole) {
+        throw new MultiAgentCoordinationError(
+          'missing_subagent_invocation',
+          `Invocation ${currentInvocation.id} must be the ${expectedRole} invocation for subtask ${input.subtaskId}.`,
+        );
+      }
+      const nativeCompleted = currentInvocation.status === 'completed'
+        && currentInvocation.runtimeAttestation?.source === 'codex-subagent-runtime';
+      if (!nativeCompleted) {
+        await this.prepareInvocationStop(id, input.invocationId, input.invocationStop as HookStopInvocationInput);
+      }
+      const existingSubtask = await this.requireSubtask(id, input.subtaskId);
+      assertSubtaskTransition(existingSubtask.status, input.finalStatus);
+      const evidenceId = this.normalizeId(input.evidence.id);
+      const snapshotPaths = [
+        this.workflowFile(id),
+        this.subtasksFile(id),
+        this.decisionsFile(id),
+        this.invocationsFile(id),
+        this.eventsFile(id),
+        this.evidenceFile(id, evidenceId),
+      ];
+      const snapshots = await this.snapshotFiles(snapshotPaths);
+      try {
+        const evidence = await this.recordEvidence(id, { ...input.evidence, id: evidenceId });
+        let invocation: AgentInvocationRecord;
+        if (nativeCompleted) {
+          const evidenceRefs = mergeUnique(currentInvocation.evidenceRefs, [evidence.id]);
+          invocation = {
+            ...currentInvocation,
+            evidenceRefs,
+            runtimeAttestation: {
+              ...currentInvocation.runtimeAttestation!,
+              evidenceRefs,
+            },
+            result: {
+              ...(currentInvocation.result || {}),
+              ...(input.invocationStop.result || {}),
+              evidenceRefs,
+            },
+            updatedAt: new Date().toISOString(),
+          };
+          await this.upsertInvocation(invocation);
+        } else {
+          invocation = await this.attestInvocationStop(id, input.invocationId, {
+            ...(input.invocationStop as HookStopInvocationInput),
+            evidenceRefs: mergeUnique(input.invocationStop.evidenceRefs, [evidence.id]),
+          });
+        }
+        const decision = await this.recordDecision(id, {
+          ...input.decision,
+          evidenceRefs: mergeUnique(input.decision.evidenceRefs, [evidence.id]),
+        });
+        const subtask = await this.updateSubtask(id, input.subtaskId, {
+          status: input.finalStatus,
+          implementationHeadSha: input.finalStatus === 'implemented' ? evidence.headSha : existingSubtask.implementationHeadSha,
+          evidenceRefs: [evidence.id],
+        });
+        return {
+          evidence,
+          decision,
+          invocation,
+          subtask,
+          workflow: await this.requireWorkflow(id),
+        };
+      } catch (error) {
+        await this.restoreFiles(snapshots);
+        throw error;
+      }
+    });
+  }
+
+  async recordEvidenceAndDecisionAtomically(
+    workflowId: string,
+    input: {
+      evidence: Omit<Partial<MultiAgentWorkflowEvidence>, 'workflowId' | 'createdAt'> & {
+        id: string;
+        kind: MultiAgentWorkflowEvidence['kind'];
+        title: string;
+      };
+      decision: WorkflowDecision;
+      expectedLastDecisionId?: string;
+    },
+  ): Promise<{
+    evidence: MultiAgentWorkflowEvidence;
+    decision: WorkflowDecision;
+    workflow: MultiAgentWorkflowRecord;
+  }> {
+    const id = this.normalizeId(workflowId);
+    return this.withWorkflowMutation(id, async () => {
+      await this.assertWorkflowVersion(id, input.expectedLastDecisionId);
+      const evidenceId = this.normalizeId(input.evidence.id);
+      const snapshots = await this.snapshotFiles([
+        this.workflowFile(id),
+        this.decisionsFile(id),
+        this.eventsFile(id),
+        this.evidenceFile(id, evidenceId),
+      ]);
+      try {
+        const evidence = await this.recordEvidence(id, { ...input.evidence, id: evidenceId });
+        const decision = await this.recordDecision(id, {
+          ...input.decision,
+          evidenceRefs: mergeUnique(input.decision.evidenceRefs, [evidence.id]),
+        });
+        return { evidence, decision, workflow: await this.requireWorkflow(id) };
+      } catch (error) {
+        await this.restoreFiles(snapshots);
+        throw error;
+      }
+    });
+  }
+
   async createContract(
     workflowId: string,
     subtaskId: string,
@@ -515,7 +745,13 @@ export class FileMultiAgentWorkflowStore {
     },
   ): Promise<SprintContract> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.createContract(id, subtaskId, input));
+    }
     const workflow = await this.requireWorkflow(id);
+    if (workflow.mode === 'review') {
+      throw new MultiAgentCoordinationError('invalid_transition', 'Review workflows do not create SprintContracts.');
+    }
     await this.requireSubtask(id, subtaskId);
     const contracts = await this.readContracts(id, subtaskId);
     const requestedVersion = input.version ?? (await this.nextContractVersion(id, subtaskId));
@@ -578,39 +814,10 @@ export class FileMultiAgentWorkflowStore {
     } = {},
   ): Promise<SprintContract> {
     const id = this.normalizeId(workflowId);
-    const workflow = await this.requireWorkflow(id);
-    const contract = await this.requireContract(id, subtaskId, contractId);
-    if (workflow.policy?.requireQuestionerBeforeBuild) {
-      const bundle = await this.requireBundle(id);
-      const headShaAtAcceptance = input.headShaAtAcceptance || contract.headShaAtAcceptance || workflow.currentHeadSha || '';
-      const questioner = latestMatchingStrictQuestionerOutput(bundle, {
-        subtaskId,
-        intent: 'question_contract',
-        contractId: contract.id,
-        headSha: headShaAtAcceptance,
-      });
-      if (!questioner) {
-        throw new MultiAgentCoordinationError(
-          'missing_evidence',
-          'Contract requires a validated Claude Questioner challenge before acceptance.',
-        );
-      }
-      if (hasBlockingQuestionerQuestions(bundle, questioner)) {
-        throw new MultiAgentCoordinationError(
-          'blocking_question_unresolved',
-          'Contract Questioner still has unresolved blocking or evidence-needed questions.',
-        );
-      }
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.acceptContract(id, subtaskId, contractId, input));
     }
-    const now = new Date().toISOString();
-    const accepted: SprintContract = {
-      ...contract,
-      status: 'accepted',
-      acceptedBy: input.acceptedBy || 'codex-workflow-plugin',
-      acceptedAt: now,
-      headShaAtAcceptance: input.headShaAtAcceptance || contract.headShaAtAcceptance,
-      questionerOutputRefs: mergeUnique(contract.questionerOutputRefs, input.questionerOutputRefs),
-    };
+    const accepted = await this.prepareAcceptedContract(id, subtaskId, contractId, input);
     await this.writeJsonFileAtomic(this.contractFile(id, subtaskId, accepted.id), accepted);
     await this.appendEvent(id, 'contract.accepted', 'codex-workflow', {
       contractId: accepted.id,
@@ -620,8 +827,162 @@ export class FileMultiAgentWorkflowStore {
     return accepted;
   }
 
+  async acceptContractsAtomically(
+    workflowId: string,
+    items: AcceptContractsBatchItem[],
+    expectedRevision?: string,
+  ): Promise<{
+    contracts: SprintContract[];
+    decisions: WorkflowDecision[];
+    subtasks: SubtaskRunState[];
+    workflow: MultiAgentWorkflowRecord;
+  }> {
+    const id = this.normalizeId(workflowId);
+    return this.withWorkflowMutation(id, async () => {
+      const bundle = await this.requireBundle(id);
+      this.assertWorkflowRevision(bundle.workflow, expectedRevision);
+      if (!Array.isArray(items) || items.length === 0) {
+        throw new MultiAgentCoordinationError('invalid_transition', 'Batch Contract acceptance requires at least one item.');
+      }
+      const workflow = bundle.workflow;
+      if (workflow.mode === 'review') {
+        throw new MultiAgentCoordinationError('invalid_transition', 'Review workflows do not accept SprintContracts.');
+      }
+      const duplicateSubtask = findDuplicate(items.map((item) => item.subtaskId));
+      if (duplicateSubtask) {
+        throw new MultiAgentCoordinationError('invalid_transition', `Batch Contract acceptance contains duplicate subtask ${duplicateSubtask}.`);
+      }
+      const planned = await Promise.all(items.map(async (item) => {
+        if (
+          item.decision.workflowId !== id
+          || item.decision.subtaskId !== item.subtaskId
+          || item.decision.action !== 'accept_contract'
+        ) {
+          throw new MultiAgentCoordinationError(
+            'invalid_transition',
+            `Batch decision for ${item.subtaskId} must be accept_contract for workflow ${id}.`,
+          );
+        }
+        const subtask = bundle.subtasks[item.subtaskId];
+        if (!subtask) {
+          throw new MultiAgentCoordinationError('subtask_not_found', `Subtask not found: ${item.subtaskId}.`);
+        }
+        assertSubtaskTransition(subtask.status, 'contract_accepted');
+        const requested = bundle.contracts.find((contract) =>
+          contract.subtaskId === item.subtaskId && contract.id === item.contractId
+        );
+        if (!requested) {
+          throw new MultiAgentCoordinationError('contract_not_found', `SprintContract not found: ${item.contractId}.`);
+        }
+        const latest = latestContractForSubtask(bundle.contracts, item.subtaskId);
+        if (!latest) {
+          throw new MultiAgentCoordinationError('contract_not_found', `SprintContract not found: ${item.contractId}.`);
+        }
+        if (latest.id !== item.contractId) {
+          throw new MultiAgentCoordinationError(
+            'version_conflict',
+            `Contract ${item.contractId} is stale; latest Contract for ${item.subtaskId} is ${latest.id}.`,
+          );
+        }
+        const guard = evaluateWorkflowDecisionGuard(bundle, item.decision);
+        if (!guard.accepted) {
+          throw new MultiAgentCoordinationError(
+            guard.code || 'invalid_transition',
+            guard.message || `Contract ${item.contractId} failed its acceptance guard.`,
+          );
+        }
+        const contract = await this.prepareAcceptedContract(id, item.subtaskId, item.contractId, item.acceptance || {});
+        return {
+          item,
+          contract,
+          subtask: {
+            ...subtask,
+            status: 'contract_accepted' as const,
+          },
+        };
+      }));
+      const snapshots = await this.snapshotFiles([
+        this.workflowFile(id),
+        this.subtasksFile(id),
+        this.decisionsFile(id),
+        this.eventsFile(id),
+        ...planned.map(({ item, contract }) => this.contractFile(id, item.subtaskId, contract.id)),
+      ]);
+      await this.beginWorkflowTransaction(id, snapshots);
+      try {
+        const contracts = planned.map(({ contract }) => contract);
+        const decisions = planned.map(({ item }) => item.decision);
+        const subtasks = planned.map(({ subtask }) => subtask);
+        const nextSubtasks = {
+          ...bundle.subtasks,
+          ...Object.fromEntries(planned.map(({ item, subtask }) => [item.subtaskId, subtask])),
+        };
+        for (const { item, contract } of planned) {
+          await this.writeJsonFileAtomic(this.contractFile(id, item.subtaskId, contract.id), contract);
+        }
+        await this.writeJsonFileAtomic(this.subtasksFile(id), nextSubtasks);
+        await fs.appendFile(
+          this.decisionsFile(id),
+          `${decisions.map((decision) => JSON.stringify(decision)).join('\n')}\n`,
+          'utf-8',
+        );
+        const now = new Date().toISOString();
+        await this.writeWorkflow({
+          ...workflow,
+          lastDecisionId: decisions[decisions.length - 1].id,
+          updatedAt: now,
+        });
+        await this.appendEvents(id, planned.flatMap(({ item, contract }) => ([
+          {
+            type: 'contract.accepted' as const,
+            actor: 'codex-workflow' as const,
+            payload: {
+              contractId: contract.id,
+              subtaskId: item.subtaskId,
+              version: contract.version,
+              batch: true,
+            },
+          },
+          {
+            type: 'decision.recorded' as const,
+            actor: 'codex-workflow' as const,
+            payload: {
+              decisionId: item.decision.id,
+              action: item.decision.action,
+              subtaskId: item.subtaskId,
+              batch: true,
+            },
+          },
+          {
+            type: 'subtask.updated' as const,
+            actor: 'codex-workflow' as const,
+            payload: {
+              subtaskId: item.subtaskId,
+              status: 'contract_accepted',
+              batch: true,
+            },
+          },
+        ])));
+        await this.commitWorkflowTransaction(id);
+        return {
+          contracts,
+          decisions,
+          subtasks,
+          workflow: await this.requireWorkflow(id),
+        };
+      } catch (error) {
+        await this.restoreFiles(snapshots);
+        await fs.rm(this.workflowTransactionFile(id), { force: true });
+        throw error;
+      }
+    });
+  }
+
   async staleContract(workflowId: string, subtaskId: string, contractId: string): Promise<SprintContract> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.staleContract(id, subtaskId, contractId));
+    }
     const contract = await this.requireContract(id, subtaskId, contractId);
     const stale: SprintContract = {
       ...contract,
@@ -651,10 +1012,12 @@ export class FileMultiAgentWorkflowStore {
     },
   ): Promise<EvaluationRun> {
     const id = this.normalizeId(workflowId);
-    await this.requireWorkflow(id);
+    const workflow = await this.requireWorkflow(id);
     if (!isFinalEvaluationSubtask(subtaskId)) {
       await this.requireSubtask(id, subtaskId);
-      await this.requireContract(id, subtaskId, input.contractId);
+      if (workflow.mode !== 'review') {
+        await this.requireContract(id, subtaskId, input.contractId);
+      }
     }
     const runId = this.normalizeId(input.id || `eval-${subtaskId}-${generateId().slice(0, 8)}`);
     const run: EvaluationRun = {
@@ -874,12 +1237,21 @@ export class FileMultiAgentWorkflowStore {
     input: CreateQuestionerRunInput,
   ): Promise<{ run: QuestionerRun; invocation: AgentInvocationRecord; context: QuestionerContextV1; token: string }> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.createQuestionerRun(id, input));
+    }
     const workflow = await this.requireWorkflow(id);
     if (input.subtaskId) {
       await this.requireSubtask(id, input.subtaskId);
     }
     const runId = this.normalizeId(input.id || `qr_${generateId().slice(0, 10)}`);
     const invocationId = this.normalizeId(input.invocationId || `inv_questioner_${generateId().slice(0, 10)}`);
+    if (await this.readQuestionerRun(id, runId)) {
+      throw new MultiAgentCoordinationError('version_conflict', `QuestionerRun already exists: ${runId}.`);
+    }
+    if (await this.readInvocation(id, invocationId)) {
+      throw new MultiAgentCoordinationError('version_conflict', `Agent invocation already exists: ${invocationId}.`);
+    }
     const token = `tqr_${randomBytes(24).toString('base64url')}`;
     const now = new Date().toISOString();
     const tokenExpiresAt = new Date(Date.parse(now) + (input.tokenTtlMs ?? 60 * 60 * 1000)).toISOString();
@@ -963,6 +1335,7 @@ export class FileMultiAgentWorkflowStore {
         forbiddenWritePaths: input.runtimeAudit?.forbiddenWritePaths || defaultQuestionerReadonlyPolicy().forbiddenWritePaths,
         violations: [],
         gitStatusBefore: input.runtimeAudit?.gitStatusBefore,
+        workspaceFingerprintBefore: input.runtimeAudit?.workspaceFingerprintBefore,
       },
       createdAt: now,
       startedAt: input.start === false ? undefined : now,
@@ -993,6 +1366,38 @@ export class FileMultiAgentWorkflowStore {
     return this.readJsonFile<QuestionerRun>(this.questionerRunFile(id, this.normalizeId(runId)));
   }
 
+  async startQuestionerRunRuntime(
+    workflowId: string,
+    runId: string,
+    runtimeRef: string,
+  ): Promise<{ run: QuestionerRun; invocation: AgentInvocationRecord }> {
+    const id = this.normalizeId(workflowId);
+    return this.withWorkflowMutation(id, async () => {
+      const run = await this.requireQuestionerRun(id, runId);
+      if (run.status !== 'created') {
+        throw new MultiAgentCoordinationError('invalid_transition', `QuestionerRun ${run.id} is ${run.status}, expected created.`);
+      }
+      const invocation = await this.updateInvocation(id, run.invocationId, {
+        status: 'started',
+        threadId: runtimeRef,
+        actualSubagentThreadId: runtimeRef,
+      });
+      const now = new Date().toISOString();
+      const started: QuestionerRun = {
+        ...run,
+        status: 'started',
+        startedAt: now,
+      };
+      await this.writeJsonFileAtomic(this.questionerRunFile(id, run.id), started);
+      await this.appendEvent(id, 'questioner.run.started', 'tik', {
+        questionerRunId: run.id,
+        invocationId: invocation.id,
+        runtimeRef,
+      });
+      return { run: started, invocation };
+    });
+  }
+
   async readQuestionerRunContext(
     workflowId: string,
     runId: string,
@@ -1017,6 +1422,9 @@ export class FileMultiAgentWorkflowStore {
     input: SubmitQuestionerRunOutputInput,
   ): Promise<{ run: QuestionerRun; questionerOutput: QuestionerOutput; invocation: AgentInvocationRecord }> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.submitQuestionerRunOutput(id, runId, input));
+    }
     const run = await this.requireQuestionerRun(id, runId);
     const tokenGuard = validateQuestionerRunToken(run, input.token, input.now);
     if (!tokenGuard.accepted) {
@@ -1133,6 +1541,9 @@ export class FileMultiAgentWorkflowStore {
     },
   ): Promise<QuestionerOutput> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.recordQuestionerOutput(id, input));
+    }
     await this.requireWorkflow(id);
     if (input.subtaskId) {
       await this.requireSubtask(id, input.subtaskId);
@@ -1302,6 +1713,9 @@ export class FileMultiAgentWorkflowStore {
     },
   ): Promise<QuestionResolution> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.recordQuestionResolution(id, input));
+    }
     await this.requireWorkflow(id);
     const output = (await this.readQuestionerOutputs(id)).find((candidate) => candidate.id === input.questionerOutputId);
     if (!output) {
@@ -1348,10 +1762,17 @@ export class FileMultiAgentWorkflowStore {
 
   async createInvocation(workflowId: string, input: CreateAgentInvocationInput): Promise<AgentInvocationRecord> {
     const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.createInvocation(id, input));
+    }
     await this.requireWorkflow(id);
+    const invocationId = this.normalizeId(input.id || `inv_${generateId()}`);
+    if (await this.readInvocation(id, invocationId)) {
+      throw new MultiAgentCoordinationError('version_conflict', `Agent invocation already exists: ${invocationId}.`);
+    }
     const now = new Date().toISOString();
     const invocation: AgentInvocationRecord = {
-      id: this.normalizeId(input.id || `inv_${generateId()}`),
+      id: invocationId,
       workflowId: id,
       subtaskId: input.subtaskId,
       role: input.role,
@@ -1380,6 +1801,167 @@ export class FileMultiAgentWorkflowStore {
       runner: invocation.runner,
     });
     return invocation;
+  }
+
+  async attestNativeInvocationStart(
+    workflowId: string,
+    invocationId: string,
+    input: NativeInvocationStartInput,
+  ): Promise<AgentInvocationRecord> {
+    const id = this.normalizeId(workflowId);
+    return this.withWorkflowMutation(id, async () => {
+      const existing = await this.readInvocation(id, invocationId);
+      if (!existing) {
+        throw new MultiAgentCoordinationError('invocation_not_found', `Agent invocation not found: ${invocationId}.`);
+      }
+      if (!requiresRuntimeAttestation(existing)) {
+        throw new MultiAgentCoordinationError('invalid_invocation_status', `Invocation ${invocationId} is not a Codex runtime invocation.`);
+      }
+      assertInvocationTransition(existing.status, 'started');
+      if (input.role !== existing.role || !input.parentThreadId || !input.actualSubagentThreadId || !input.nonce) {
+        throw new MultiAgentCoordinationError(
+          'missing_subagent_invocation',
+          `Tik-owned invocation ${existing.id} requires matching role, parent thread, native thread, and nonce.`,
+        );
+      }
+      const now = new Date().toISOString();
+      const startedAt = input.startedAt || now;
+      const updated: AgentInvocationRecord = {
+        ...existing,
+        status: 'started',
+        threadId: input.actualSubagentThreadId,
+        actualSubagentThreadId: input.actualSubagentThreadId,
+        parentThreadId: input.parentThreadId,
+        hookAttested: true,
+        attestationStartedAt: startedAt,
+        runtimeAttestation: {
+          source: 'codex-subagent-runtime',
+          parentThreadId: input.parentThreadId,
+          actualSubagentThreadId: input.actualSubagentThreadId,
+          role: existing.role,
+          nonce: input.nonce,
+          startedAt,
+        },
+        startedAt,
+        updatedAt: now,
+      };
+      await this.upsertInvocation(updated);
+      await this.appendEvent(id, 'agent_invocation.started', 'tik', {
+        invocationId: updated.id,
+        status: updated.status,
+        attestationSource: 'codex-subagent-runtime',
+        actualSubagentThreadId: updated.actualSubagentThreadId,
+      });
+      return updated;
+    });
+  }
+
+  async completeNativeInvocation(
+    workflowId: string,
+    invocationId: string,
+    input: NativeInvocationCompletionInput,
+  ): Promise<AgentInvocationRecord> {
+    const id = this.normalizeId(workflowId);
+    return this.withWorkflowMutation(id, async () => {
+      const existing = await this.requireNativeInvocation(id, invocationId, 'started');
+      assertInvocationTransition(existing.status, input.status);
+      const now = new Date().toISOString();
+      const stoppedAt = input.stoppedAt || now;
+      const evidenceRefs = mergeUnique(existing.evidenceRefs, input.evidenceRefs);
+      const readonlyPolicy = input.readonlyPolicy ?? readReadonlyPolicyFromRecord(input.result) ?? existing.readonlyPolicy;
+      const updated: AgentInvocationRecord = {
+        ...existing,
+        status: input.status,
+        result: input.result ?? existing.result,
+        error: input.error ?? existing.error,
+        headSha: input.headSha ?? readStringFromRecord(input.result, 'headSha') ?? existing.headSha,
+        evidenceRefs,
+        evaluationRunId: input.evaluationRunId ?? readStringFromRecord(input.result, 'evaluationRunId') ?? existing.evaluationRunId,
+        readonlyPolicy,
+        runtimeAttestation: {
+          ...existing.runtimeAttestation!,
+          stoppedAt,
+          headSha: input.headSha ?? readStringFromRecord(input.result, 'headSha') ?? existing.headSha,
+          evidenceRefs,
+          readonlyPolicy,
+        },
+        hookAttested: true,
+        attestationStoppedAt: stoppedAt,
+        attestationToken: undefined,
+        updatedAt: now,
+        completedAt: now,
+      };
+      await this.upsertInvocation(updated);
+      await this.appendEvent(id, 'agent_invocation.completed', 'tik', {
+        invocationId: updated.id,
+        status: updated.status,
+        attestationSource: 'codex-subagent-runtime',
+      });
+      return updated;
+    });
+  }
+
+  async linkNativeInvocationResult(
+    workflowId: string,
+    invocationId: string,
+    input: Omit<NativeInvocationCompletionInput, 'status' | 'stoppedAt'>,
+  ): Promise<AgentInvocationRecord> {
+    const id = this.normalizeId(workflowId);
+    return this.withWorkflowMutation(id, async () => {
+      const existing = await this.requireNativeInvocation(id, invocationId, 'completed');
+      const requestedHeadSha = input.headSha ?? readStringFromRecord(input.result, 'headSha');
+      if (requestedHeadSha && existing.headSha && requestedHeadSha !== existing.headSha) {
+        throw new MultiAgentCoordinationError(
+          'head_sha_mismatch',
+          `Native invocation ${existing.id} completed at ${existing.headSha}, not ${requestedHeadSha}.`,
+        );
+      }
+      const evidenceRefs = mergeUnique(existing.evidenceRefs, input.evidenceRefs);
+      const readonlyPolicy = mergeReadonlyPolicies(
+        existing.readonlyPolicy,
+        input.readonlyPolicy ?? readReadonlyPolicyFromRecord(input.result),
+      );
+      const headSha = existing.headSha || requestedHeadSha;
+      const updated: AgentInvocationRecord = {
+        ...existing,
+        result: { ...(existing.result || {}), ...(input.result || {}) },
+        error: input.error ?? existing.error,
+        headSha,
+        evidenceRefs,
+        evaluationRunId: input.evaluationRunId ?? readStringFromRecord(input.result, 'evaluationRunId') ?? existing.evaluationRunId,
+        readonlyPolicy,
+        runtimeAttestation: {
+          ...existing.runtimeAttestation!,
+          headSha,
+          evidenceRefs,
+          readonlyPolicy,
+        },
+        updatedAt: new Date().toISOString(),
+      };
+      await this.upsertInvocation(updated);
+      await this.appendEvent(id, 'agent_invocation.completed', 'tik', {
+        invocationId: updated.id,
+        status: updated.status,
+        attestationSource: 'codex-subagent-runtime',
+        resultLinked: true,
+      });
+      return updated;
+    });
+  }
+
+  async failQuestionerRunRuntime(workflowId: string, runId: string, message: string): Promise<QuestionerRun> {
+    const id = this.normalizeId(workflowId);
+    if (!this.isWorkflowMutationActive(id)) {
+      return this.withWorkflowMutation(id, () => this.failQuestionerRunRuntime(id, runId, message));
+    }
+    const run = await this.requireQuestionerRun(id, runId);
+    if (run.status === 'validated' || run.status === 'rejected' || run.status === 'expired') return run;
+    const rejected = await this.rejectQuestionerRun(id, run, message);
+    const invocation = await this.readInvocation(id, run.invocationId);
+    if (invocation?.status === 'created' || invocation?.status === 'started') {
+      await this.updateInvocation(id, invocation.id, { status: 'failed', error: message });
+    }
+    return rejected;
   }
 
   async saveContextSnapshot(
@@ -1788,6 +2370,22 @@ export class FileMultiAgentWorkflowStore {
     input: HookStopInvocationInput,
   ): Promise<AgentInvocationRecord> {
     const id = this.normalizeId(workflowId);
+    const updated = await this.prepareInvocationStop(id, invocationId, input);
+    await this.upsertInvocation(updated);
+    await this.appendEvent(id, 'agent_invocation.completed', 'tik', {
+      invocationId: updated.id,
+      status: updated.status,
+      hookAttested: true,
+    });
+    return updated;
+  }
+
+  async prepareInvocationStop(
+    workflowId: string,
+    invocationId: string,
+    input: HookStopInvocationInput,
+  ): Promise<AgentInvocationRecord> {
+    const id = this.normalizeId(workflowId);
     const existing = await this.readInvocation(id, invocationId);
     if (!existing) {
       throw new MultiAgentCoordinationError('invocation_not_found', `Agent invocation not found: ${invocationId}.`);
@@ -1819,7 +2417,7 @@ export class FileMultiAgentWorkflowStore {
       evidenceRefs,
       readonlyPolicy,
     };
-    const updated: AgentInvocationRecord = {
+    return {
       ...existing,
       status,
       result: input.result ?? existing.result,
@@ -1835,13 +2433,6 @@ export class FileMultiAgentWorkflowStore {
       updatedAt: now,
       completedAt: now,
     };
-    await this.upsertInvocation(updated);
-    await this.appendEvent(id, 'agent_invocation.completed', 'tik', {
-      invocationId: updated.id,
-      status: updated.status,
-      hookAttested: true,
-    });
-    return updated;
   }
 
   async readTimeline(workflowId: string): Promise<MultiAgentWorkflowEvent[]> {
@@ -1856,6 +2447,78 @@ export class FileMultiAgentWorkflowStore {
       throw new MultiAgentCoordinationError('workflow_not_found', `Multi-agent workflow not found: ${workflowId}.`);
     }
     return workflow;
+  }
+
+  private async requireNativeInvocation(
+    workflowId: string,
+    invocationId: string,
+    expectedStatus: 'started' | 'completed',
+  ): Promise<AgentInvocationRecord> {
+    const invocation = await this.readInvocation(workflowId, invocationId);
+    if (!invocation) {
+      throw new MultiAgentCoordinationError('invocation_not_found', `Agent invocation not found: ${invocationId}.`);
+    }
+    if (invocation.status !== expectedStatus || invocation.runtimeAttestation?.source !== 'codex-subagent-runtime') {
+      throw new MultiAgentCoordinationError(
+        'missing_subagent_invocation',
+        `Invocation ${invocation.id} is not a ${expectedStatus} Tik-owned native Codex invocation.`,
+      );
+    }
+    return invocation;
+  }
+
+  private async prepareAcceptedContract(
+    workflowId: string,
+    subtaskId: string,
+    contractId: string,
+    input: {
+      acceptedBy?: SprintContract['acceptedBy'];
+      headShaAtAcceptance?: string;
+      questionerOutputRefs?: string[];
+    },
+  ): Promise<SprintContract> {
+    const workflow = await this.requireWorkflow(workflowId);
+    if (workflow.mode === 'review') {
+      throw new MultiAgentCoordinationError('invalid_transition', 'Review workflows do not accept SprintContracts.');
+    }
+    const contract = await this.requireContract(workflowId, subtaskId, contractId);
+    const latest = await this.readLatestContract(workflowId, subtaskId);
+    if (!latest || latest.id !== contract.id) {
+      throw new MultiAgentCoordinationError(
+        'version_conflict',
+        `Contract ${contractId} is stale; latest Contract for ${subtaskId} is ${latest?.id || 'missing'}.`,
+      );
+    }
+    if (workflow.policy?.requireQuestionerBeforeBuild) {
+      const bundle = await this.requireBundle(workflowId);
+      const headShaAtAcceptance = input.headShaAtAcceptance || contract.headShaAtAcceptance || workflow.currentHeadSha || '';
+      const questioner = latestMatchingStrictQuestionerOutput(bundle, {
+        subtaskId,
+        intent: 'question_contract',
+        contractId: contract.id,
+        headSha: headShaAtAcceptance,
+      });
+      if (!questioner) {
+        throw new MultiAgentCoordinationError(
+          'missing_evidence',
+          'Contract requires a validated Claude Questioner challenge before acceptance.',
+        );
+      }
+      if (hasBlockingQuestionerQuestions(bundle, questioner)) {
+        throw new MultiAgentCoordinationError(
+          'blocking_question_unresolved',
+          'Contract Questioner still has unresolved blocking or evidence-needed questions.',
+        );
+      }
+    }
+    return {
+      ...contract,
+      status: 'accepted',
+      acceptedBy: input.acceptedBy || 'codex-workflow-plugin',
+      acceptedAt: new Date().toISOString(),
+      headShaAtAcceptance: input.headShaAtAcceptance || contract.headShaAtAcceptance,
+      questionerOutputRefs: mergeUnique(contract.questionerOutputRefs, input.questionerOutputRefs),
+    };
   }
 
   private async requireBundle(workflowId: string): Promise<MultiAgentWorkflowBundle> {
@@ -2092,16 +2755,39 @@ export class FileMultiAgentWorkflowStore {
     actor: MultiAgentWorkflowEvent['actor'],
     payload: Record<string, unknown>,
   ): Promise<void> {
-    const event: MultiAgentWorkflowEvent = {
-      id: generateId(),
-      workflowId,
-      type,
-      actor,
-      timestamp: new Date().toISOString(),
-      payload,
-    };
-    await fs.mkdir(this.workflowDir(workflowId), { recursive: true });
-    await fs.appendFile(this.eventsFile(workflowId), `${JSON.stringify(event)}\n`, 'utf-8');
+    await this.appendEvents(workflowId, [{ type, actor, payload }]);
+  }
+
+  private async appendEvents(
+    workflowId: string,
+    inputs: Array<Pick<MultiAgentWorkflowEvent, 'type' | 'actor' | 'payload'>>,
+  ): Promise<void> {
+    if (inputs.length === 0) return;
+    await this.withWorkflowMutation(workflowId, async () => {
+      const events = inputs.map((input): MultiAgentWorkflowEvent => ({
+        id: generateId(),
+        workflowId,
+        type: input.type,
+        actor: input.actor,
+        timestamp: new Date().toISOString(),
+        payload: input.payload,
+      }));
+      await fs.mkdir(this.workflowDir(workflowId), { recursive: true });
+      await fs.appendFile(
+        this.eventsFile(workflowId),
+        `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
+        'utf-8',
+      );
+      const workflow = await this.readWorkflow(workflowId);
+      if (workflow) {
+        const durableEventCount = (await this.readJsonLines<MultiAgentWorkflowEvent>(this.eventsFile(workflowId))).length;
+        await this.writeWorkflow({
+          ...workflow,
+          revision: durableEventCount,
+          updatedAt: events[events.length - 1].timestamp,
+        });
+      }
+    });
   }
 
   private normalizeId(id: string): string {
@@ -2118,6 +2804,14 @@ export class FileMultiAgentWorkflowStore {
 
   private workflowDir(workflowId: string): string {
     return path.join(this.rootDir(), workflowId);
+  }
+
+  private workflowMutationLockDir(workflowId: string): string {
+    return path.join(this.workflowDir(workflowId), '.mutation.lock');
+  }
+
+  private workflowTransactionFile(workflowId: string): string {
+    return path.join(this.workflowDir(workflowId), '.transaction.json');
   }
 
   private workflowFile(workflowId: string): string {
@@ -2273,6 +2967,167 @@ export class FileMultiAgentWorkflowStore {
     const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     await fs.writeFile(tempPath, JSON.stringify(value, null, 2), 'utf-8');
     await fs.rename(tempPath, filePath);
+  }
+
+  private async withWorkflowMutation<T>(workflowId: string, mutation: () => Promise<T>): Promise<T> {
+    const activeWorkflows = this.mutationContext.getStore();
+    if (activeWorkflows?.has(workflowId)) {
+      return mutation();
+    }
+    const previous = this.mutationQueues.get(workflowId) || Promise.resolve();
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const queued = previous.catch(() => undefined).then(() => gate);
+    this.mutationQueues.set(workflowId, queued);
+    await previous.catch(() => undefined);
+    let releaseFileLock: (() => Promise<void>) | undefined;
+    try {
+      releaseFileLock = await this.acquireWorkflowFileLock(workflowId);
+      const nextContext = new Set(activeWorkflows || []);
+      nextContext.add(workflowId);
+      return await this.mutationContext.run(nextContext, async () => {
+        await this.recoverWorkflowTransaction(workflowId);
+        return mutation();
+      });
+    } finally {
+      try {
+        await releaseFileLock?.();
+      } finally {
+        release?.();
+        if (this.mutationQueues.get(workflowId) === queued) this.mutationQueues.delete(workflowId);
+      }
+    }
+  }
+
+  private isWorkflowMutationActive(workflowId: string): boolean {
+    return Boolean(this.mutationContext.getStore()?.has(workflowId));
+  }
+
+  private async acquireWorkflowFileLock(workflowId: string): Promise<() => Promise<void>> {
+    const lockPath = this.workflowMutationLockDir(workflowId);
+    await fs.mkdir(this.workflowDir(workflowId), { recursive: true });
+    const deadline = Date.now() + 30_000;
+    while (true) {
+      try {
+        await fs.mkdir(lockPath);
+        await fs.writeFile(
+          path.join(lockPath, 'owner.json'),
+          JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }),
+          'utf-8',
+        );
+        return async () => fs.rm(lockPath, { recursive: true, force: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        const stat = await fs.stat(lockPath).catch(() => null);
+        const owner = await this.readJsonFile<{ pid?: number }>(path.join(lockPath, 'owner.json'));
+        if ((owner?.pid && !isProcessAlive(owner.pid)) || (stat && Date.now() - stat.mtimeMs > 60_000)) {
+          await fs.rm(lockPath, { recursive: true, force: true });
+          continue;
+        }
+        if (Date.now() >= deadline) {
+          throw new MultiAgentCoordinationError(
+            'version_conflict',
+            `Workflow ${workflowId} is locked by another durable mutation.`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+  }
+
+  private assertWorkflowRevision(workflow: MultiAgentWorkflowRecord, expectedRevision: string | undefined): void {
+    if (!expectedRevision || expectedRevision === '*') {
+      throw new MultiAgentCoordinationError(
+        'version_conflict',
+        'Batch Contract acceptance requires an exact If-Match workflow revision.',
+      );
+    }
+    const expected = Number(expectedRevision);
+    const current = workflow.revision ?? 0;
+    if (!Number.isSafeInteger(expected) || expected < 0 || current !== expected) {
+      throw new MultiAgentCoordinationError(
+        'version_conflict',
+        `Workflow state changed; expected revision ${expectedRevision}, current ${current}.`,
+      );
+    }
+  }
+
+  private async assertWorkflowVersion(workflowId: string, expectedLastDecisionId: string | undefined): Promise<void> {
+    if (!expectedLastDecisionId || expectedLastDecisionId === '*') return;
+    const workflow = await this.requireWorkflow(workflowId);
+    const expected = expectedLastDecisionId === 'none' ? undefined : expectedLastDecisionId;
+    if (workflow.lastDecisionId !== expected) {
+      throw new MultiAgentCoordinationError(
+        'version_conflict',
+        `Workflow decision history changed; expected ${expectedLastDecisionId}, current ${workflow.lastDecisionId || 'none'}.`,
+      );
+    }
+  }
+
+  private async snapshotFiles(filePaths: string[]): Promise<Array<{ filePath: string; contents: Buffer | null }>> {
+    return Promise.all(filePaths.map(async (filePath) => ({
+      filePath,
+      contents: await fs.readFile(filePath).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }),
+    })));
+  }
+
+  private async restoreFiles(snapshots: Array<{ filePath: string; contents: Buffer | null }>): Promise<void> {
+    await Promise.all(snapshots.map(async ({ filePath, contents }) => {
+      if (contents === null) {
+        await fs.rm(filePath, { force: true });
+        return;
+      }
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, contents);
+    }));
+  }
+
+  private async beginWorkflowTransaction(
+    workflowId: string,
+    snapshots: Array<{ filePath: string; contents: Buffer | null }>,
+  ): Promise<void> {
+    const workflowDir = this.workflowDir(workflowId);
+    await this.writeJsonFileAtomic(this.workflowTransactionFile(workflowId), {
+      phase: 'prepared',
+      snapshots: snapshots.map(({ filePath, contents }) => ({
+        path: path.relative(workflowDir, filePath),
+        contents: contents?.toString('base64') ?? null,
+      })),
+    });
+  }
+
+  private async commitWorkflowTransaction(workflowId: string): Promise<void> {
+    await this.writeJsonFileAtomic(this.workflowTransactionFile(workflowId), { phase: 'committed' });
+    await fs.rm(this.workflowTransactionFile(workflowId), { force: true });
+  }
+
+  private async recoverWorkflowTransaction(workflowId: string): Promise<void> {
+    const transaction = await this.readJsonFile<{
+      phase?: string;
+      snapshots?: Array<{ path?: string; contents?: string | null }>;
+    }>(this.workflowTransactionFile(workflowId));
+    if (!transaction) return;
+    if (transaction.phase === 'prepared') {
+      const workflowDir = this.workflowDir(workflowId);
+      const snapshots = (transaction.snapshots || []).map((snapshot) => {
+        const filePath = path.resolve(workflowDir, snapshot.path || '');
+        const relative = path.relative(workflowDir, filePath);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+          throw new MultiAgentCoordinationError('invalid_workflow', 'Workflow transaction contains an invalid snapshot path.');
+        }
+        return {
+          filePath,
+          contents: snapshot.contents === null || snapshot.contents === undefined
+            ? null
+            : Buffer.from(snapshot.contents, 'base64'),
+        };
+      });
+      await this.restoreFiles(snapshots);
+    }
+    await fs.rm(this.workflowTransactionFile(workflowId), { force: true });
   }
 }
 
@@ -2455,7 +3310,26 @@ function lastDecisionMatches(current: string | undefined, expected: string | und
   if (expected === '*') {
     return true;
   }
-  return current === expected;
+  return current === (expected === 'none' ? undefined : expected);
+}
+
+function latestContractForSubtask(contracts: SprintContract[], subtaskId: string): SprintContract | undefined {
+  return contracts
+    .filter((contract) => contract.subtaskId === subtaskId)
+    .sort((left, right) => right.version - left.version || right.id.localeCompare(left.id))[0];
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  return fs.stat(filePath).then(() => true, () => false);
 }
 
 function normalizeLoopContract(workflowId: string, value: WorkflowPolicy['loopContract']): WorkflowPolicy['loopContract'] {
@@ -2598,17 +3472,50 @@ function readReadonlyPolicyFromRecord(
   };
 }
 
-function assertWorkspaceBindingInsideRoot(binding: MultiAgentWorkflowRecord['workspaceBinding']): void {
+function mergeReadonlyPolicies(
+  stored: AgentInvocationRecord['readonlyPolicy'] | undefined,
+  requested: AgentInvocationRecord['readonlyPolicy'] | undefined,
+): AgentInvocationRecord['readonlyPolicy'] | undefined {
+  if (!stored) return requested;
+  if (!requested) return stored;
+  const violations = mergeUnique(stored.violations, requested.violations);
+  return {
+    enforced: stored.enforced && requested.enforced && violations.length === 0,
+    allowedWritePaths: stored.allowedWritePaths || requested.allowedWritePaths,
+    forbiddenWritePaths: stored.forbiddenWritePaths || requested.forbiddenWritePaths,
+    violations,
+    gitStatusBefore: stored.gitStatusBefore || requested.gitStatusBefore,
+    gitStatusAfter: stored.gitStatusAfter || requested.gitStatusAfter,
+  };
+}
+
+async function assertWorkspaceBindingInsideRoot(binding: MultiAgentWorkflowRecord['workspaceBinding']): Promise<void> {
   if (!binding?.workspaceRoot || !binding.effectiveProjectPath) {
     return;
   }
 
-  const root = path.resolve(binding.workspaceRoot);
-  const target = path.resolve(binding.effectiveProjectPath);
-  const relative = path.relative(root, target);
-  if (relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))) {
-    return;
-  }
+  const root = await fs.realpath(path.resolve(binding.workspaceRoot)).catch(() => path.resolve(binding.workspaceRoot));
+  const target = await fs.realpath(path.resolve(binding.effectiveProjectPath)).catch(() => path.resolve(binding.effectiveProjectPath));
+  const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+  const workspaceFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.code-workspace'))
+    .map((entry) => path.join(root, entry.name));
+  const externalRoots = (await Promise.all(workspaceFiles.map(async (workspaceFile) => {
+    try {
+      const parsed = JSON.parse(await fs.readFile(workspaceFile, 'utf-8')) as { folders?: Array<{ path?: unknown }> };
+      return await Promise.all((parsed.folders || []).map(async (folder) => {
+        if (typeof folder.path !== 'string' || folder.path.trim().length === 0) return null;
+        const candidate = path.isAbsolute(folder.path) ? folder.path : path.resolve(path.dirname(workspaceFile), folder.path);
+        return fs.realpath(candidate).catch(() => null);
+      }));
+    } catch {
+      return [];
+    }
+  }))).flat().filter((item): item is string => Boolean(item));
+  if ([root, ...externalRoots].some((allowedRoot) => {
+    const relative = path.relative(allowedRoot, target);
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  })) return;
 
   throw new MultiAgentCoordinationError(
     'worktree_out_of_scope',
@@ -2740,6 +3647,8 @@ function validateQuestionerReadonlyAudit(
     violations: [],
     gitStatusBefore: base.gitStatusBefore,
     gitStatusAfter: input?.gitStatusAfter,
+    workspaceFingerprintBefore: base.workspaceFingerprintBefore,
+    workspaceFingerprintAfter: input?.workspaceFingerprintAfter,
   };
   if (audit.gitStatusBefore === undefined || audit.gitStatusAfter === undefined) {
     return {
@@ -2750,6 +3659,12 @@ function validateQuestionerReadonlyAudit(
     };
   }
   audit.violations = detectReadonlyViolations(audit.gitStatusBefore, audit.gitStatusAfter, allowedWritePaths, forbiddenWritePaths);
+  if (
+    audit.workspaceFingerprintBefore
+    && audit.workspaceFingerprintBefore !== audit.workspaceFingerprintAfter
+  ) {
+    audit.violations = mergeUnique(audit.violations, ['workspace_content_changed']);
+  }
   if (audit.violations.length > 0) {
     return {
       accepted: false,
@@ -2838,6 +3753,86 @@ function globPathToRegExp(pattern: string): RegExp {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+}
+
+function validateTaskGraph(workflow: MultiAgentWorkflowRecord, graph: TaskGraph): void {
+  const subtaskIds = new Set(graph.subtasks.map((subtask) => subtask.id));
+  for (const subtask of graph.subtasks) {
+    if (!Array.isArray(subtask.allowedPaths) || subtask.allowedPaths.length === 0) {
+      throw new MultiAgentCoordinationError('invalid_task_graph', `Subtask ${subtask.id} must declare at least one allowed path.`);
+    }
+    const blockedPaths = subtask.blockedPaths || [];
+    const overlap = subtask.allowedPaths.flatMap((allowed) =>
+      blockedPaths
+        .filter((blocked) => pathPatternsOverlap(allowed, blocked))
+        .map((blocked) => ({ allowed, blocked }))
+    );
+    if (overlap.length > 0) {
+      throw new MultiAgentCoordinationError(
+        'invalid_task_graph',
+        `Subtask ${subtask.id} has overlapping allowedPaths and blockedPaths: ${overlap.map((item) => `${item.allowed} <-> ${item.blocked}`).join(', ')}.`,
+      );
+    }
+    const missingDependencies = subtask.dependsOn.filter((dependency) => !subtaskIds.has(dependency));
+    if (missingDependencies.length > 0) {
+      throw new MultiAgentCoordinationError(
+        'invalid_task_graph',
+        `Subtask ${subtask.id} references missing dependencies: ${missingDependencies.join(', ')}.`,
+      );
+    }
+    if (subtask.dependsOn.includes(subtask.id)) {
+      throw new MultiAgentCoordinationError('invalid_task_graph', `Subtask ${subtask.id} cannot depend on itself.`);
+    }
+    if (workflow.mode === 'review') {
+      if (subtask.kind !== 'review') {
+        throw new MultiAgentCoordinationError('invalid_task_graph', `Review workflow subtask ${subtask.id} must use kind=review.`);
+      }
+      if ((subtask.expectedChangedFiles || []).length > 0) {
+        throw new MultiAgentCoordinationError('invalid_task_graph', `Review subtask ${subtask.id} cannot declare expectedChangedFiles.`);
+      }
+      if (subtask.assignedReviewer !== 'codex') {
+        throw new MultiAgentCoordinationError('invalid_task_graph', `Review subtask ${subtask.id} must use a readonly Codex reviewer.`);
+      }
+    } else if (subtask.kind === 'review') {
+      throw new MultiAgentCoordinationError('invalid_task_graph', `Implementation workflow subtask ${subtask.id} cannot use kind=review.`);
+    }
+  }
+  assertTaskGraphAcyclic(graph);
+}
+
+function pathPatternsOverlap(left: string, right: string): boolean {
+  const normalizedLeft = normalizeGitStatusPath(left);
+  const normalizedRight = normalizeGitStatusPath(right);
+  if (normalizedLeft === normalizedRight) return true;
+  const leftWitness = globWitness(normalizedLeft);
+  const rightWitness = globWitness(normalizedRight);
+  return matchesAnyPath(leftWitness, [normalizedRight])
+    || matchesAnyPath(rightWitness, [normalizedLeft]);
+}
+
+function globWitness(pattern: string): string {
+  return pattern
+    .replace(/\*\*\/\*/g, '__tik_scope_probe__/file')
+    .replace(/\*\*/g, '__tik_scope_probe__')
+    .replace(/\*/g, '__tik_scope_probe__')
+    .replace(/\/$/, '/__tik_scope_probe__');
+}
+
+function assertTaskGraphAcyclic(graph: TaskGraph): void {
+  const dependencies = new Map(graph.subtasks.map((subtask) => [subtask.id, subtask.dependsOn]));
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (subtaskId: string): void => {
+    if (visited.has(subtaskId)) return;
+    if (visiting.has(subtaskId)) {
+      throw new MultiAgentCoordinationError('invalid_task_graph', `TaskGraph contains a dependency cycle at ${subtaskId}.`);
+    }
+    visiting.add(subtaskId);
+    for (const dependency of dependencies.get(subtaskId) || []) visit(dependency);
+    visiting.delete(subtaskId);
+    visited.add(subtaskId);
+  };
+  for (const subtaskId of dependencies.keys()) visit(subtaskId);
 }
 
 function isFinalEvaluationSubtask(subtaskId: string): boolean {

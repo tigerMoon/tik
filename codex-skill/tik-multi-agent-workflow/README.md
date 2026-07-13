@@ -13,7 +13,7 @@ multi-agent workflows should use the contract/evaluator/questioner loop instead:
 
 | Removed command | v1.1 replacement |
 | --- | --- |
-| `review` | `start-questioner --intent question_evaluation`, then launch a background Questioner subagent; Tik records `QuestionerOutputV2` through the callback. |
+| `review` | `start-questioner --intent question_evaluation`; Tik launches Claude and records `QuestionerOutputV2` through the callback. |
 | `process-review` | `record-questioner --intent question_evaluation`, followed by `complete-subtask` when Tik guards pass. |
 | `fix` | Fix in the current Codex session, then `execute`, `validate`, `evaluate`, and async `start-questioner`. |
 | `final-review` | `evaluate --subtask __final__`, then async `start-questioner --intent question_final_evidence`. |
@@ -30,13 +30,13 @@ removal only applies to Tik multi-agent workflow commands.
 | `plan` | Request a Claude planner invocation through Tik. When the planner invocation completes with `taskGraph`, Tik may store that planner output as a draft. | `request_dynamic_plan` decision plus planner `AgentInvocationRecord` and draft TaskGraph writeback when available. |
 | `accept-plan` | Explicitly accept a reviewed or edited TaskGraph as the active workflow graph. | TaskGraph plus initialized subtask run states. |
 | `next` | Compute the next local Codex policy action from Tik state. | Guarded `WorkflowDecision`. |
-| Contract APIs | Store and accept per-subtask SprintContracts before build when v1 policy requires it. | `SprintContract` history and contract events. |
+| Contract APIs | Atomically accept one or many SprintContracts using the exact workflow revision as `If-Match`. | Crash-recoverable Contract, decision, subtask, revision, and event batch. |
 | `execute` | Record Codex implementation evidence for a subtask. | Implementation evidence, subtask state, validation decision. |
 | Evaluation APIs | Record isolated Codex Evaluator runs, results, artifacts, and readonly validation. | `EvaluationRun`, `CodexEvaluationResult`, readonly guard result. |
-| Questioner APIs | Create async Claude plugin Questioner runs and store callback outputs for contract, evaluation, and final evidence challenges. | `QuestionerRun` plus callback `QuestionerOutput` records with source, head SHA, artifact refs, and timeline events. |
+| Questioner APIs | Launch async Claude plugin Questioner runs with server-only token injection. | `QuestionerRun` plus callback `QuestionerOutput` records with source, head SHA, artifact refs, and timeline events. |
 | `validate` | Run a validation command and persist the result. | Validation evidence, pass/fail state, next evaluator/build decision. |
 | `start-evaluator` / `evaluate` | Record isolated Codex Evaluator runs, results, artifacts, and readonly validation. | `EvaluationRun`, `CodexEvaluationResult`, readonly guard result. |
-| `start-questioner` / `record-questioner` | Create async Claude plugin Questioner runs; use `record-questioner` only for explicit/manual imports. | `QuestionerRun` plus callback or imported `QuestionerOutput` records with source, head SHA, artifact refs, and timeline events. |
+| `start-questioner` / `record-questioner` | Launch async Claude Questioner runs; use `record-questioner` only for explicit/manual imports. | `QuestionerRun` plus callback or imported `QuestionerOutput` records. |
 | `complete-subtask` | Complete a subtask after v1 evidence gates pass. | Guarded `complete_subtask` decision and `done` state. |
 | `complete-workflow` | Complete the workflow after final evaluator/questioner gates pass. | Guarded `complete_workflow` decision. |
 | `continue` | Advance safe automated steps such as planning request, contract draft/accept, validation, and v1 runtime launch preparation. | The corresponding guarded decision and Tik mutation for the safe step. |
@@ -71,22 +71,27 @@ accepted SprintContract
   -> complete_workflow
 ```
 
-Builder and Evaluator invocations must be attested by Tik server-verified
-Codex hook facts. Tik issues a one-time `attestationToken` when an invocation is
-created; the token is not printed by the main workflow CLI. The Codex subagent
-hook must call `hook-start` and `hook-stop` with that token, a nonce, the parent
-thread id, the actual subagent thread id, and the role. Hand-filled thread ids or
-CLI-provided `runtimeAttestation` payloads are stored only as audit metadata and
-do not satisfy `complete_subtask`.
+Tik creates Codex App Server threads directly for Builder, Reviewer, and
+Evaluator roles. The real thread id is recorded with
+`source=codex-subagent-runtime`; the one-time token stays inside Tik and is
+removed on completion. Verified `hook-start` / `hook-stop` remains an explicit
+compatibility fallback. Hand-filled thread ids do not satisfy guards.
+Parallel roles in one workspace share an App Server process. Native launch ids
+are deterministic, so a lost HTTP response can be retried without starting a
+second agent. All native roles have server-side deadlines and shutdown cleanup.
 
 Questioner execution is intentionally asynchronous. `start-questioner`,
-`run-action`, and `continue` create a token-scoped `QuestionerRun` and print the
-`TIK_QUESTIONER_*` environment values. The workflow driver should spawn a Codex
-native subagent to run the Claude Questioner plugin/runtime with those values,
-then return to the main thread. Do not synchronously wait or poll for Claude in
-the main Codex workflow thread; the Questioner hook/callback submits
-`QuestionerOutputV2` to Tik, and a later `status`, `next`, or `continue` observes
-the recorded output.
+`run-action`, and `continue` launch Claude directly; `TIK_QUESTIONER_*` and the
+token exist only in the child environment. The main workflow returns
+immediately, and a later `status`, `next`, or `continue` observes the callback.
+Explicit `run-action --start=false` preserves the manual compatibility envelope.
+Questioner runs execute in disposable worktrees, and Tik computes before/after
+workspace fingerprints itself rather than trusting child-reported git status.
+
+For review workflows, `start-reviewers --max-concurrency 4` launches all ready
+shards together. Deterministic shards are capped at 25 changed files. Completed
+Reviewer and Evaluator JSON can be consumed directly with `record-review
+--invocation <id>` and `evaluate --invocation <id>`; no result file is required.
 
 Evaluator commands run in a throwaway git worktree by default. The readonly git
 status check remains as an audit layer, while the sandbox prevents source writes
@@ -123,33 +128,31 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs a
   --subtask <subtask-id> \
   --contract <contract-id>
 
+node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs accept-contracts \
+  --workflow <workflow-id> \
+  --items ./contracts-to-accept.json
+
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-builder \
   --workflow <workflow-id> \
   --subtask <subtask-id> \
-  --invocation inv-builder-<subtask-id> \
-  --parent-thread <workflow-thread-id> \
-  --thread <builder-codex-thread-id>
+  --invocation inv-builder-<subtask-id>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute \
   --workflow <workflow-id> \
   --subtask <subtask-id> \
   --summary "Implemented the scoped change." \
-  --invocation inv-builder-<subtask-id> \
-  --attestation-token <token-from-codex-hook-runtime>
+  --invocation inv-builder-<subtask-id>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-evaluator \
   --workflow <workflow-id> \
   --subtask <subtask-id> \
-  --invocation inv-evaluator-<subtask-id> \
-  --parent-thread <workflow-thread-id> \
-  --thread <evaluator-codex-thread-id>
+  --invocation inv-evaluator-<subtask-id>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs evaluate \
   --workflow <workflow-id> \
   --subtask <subtask-id> \
   --command "pnpm test" \
-  --invocation inv-evaluator-<subtask-id> \
-  --attestation-token <token-from-codex-hook-runtime>
+  --invocation inv-evaluator-<subtask-id>
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-questioner \
   --workflow <workflow-id> \
@@ -158,9 +161,8 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs s
   --contract <contract-id> \
   --evaluation <evaluation-run-id>
 
-# Spawn a Codex native subagent with the printed TIK_QUESTIONER_* env. The
-# Questioner callback posts output to Tik; do not block this thread waiting for
-# Claude. After callback ingestion, continue with complete-subtask.
+# Tik launches Claude and injects the callback environment. After callback
+# ingestion, continue with complete-subtask.
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs complete-subtask \
   --workflow <workflow-id> \
@@ -177,8 +179,7 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs s
   --intent question_final_evidence \
   --evaluation <final-evaluation-run-id>
 
-# Spawn a Codex native subagent with the printed TIK_QUESTIONER_* env. Continue
-# with complete-workflow only after Tik records the callback output.
+# Continue with complete-workflow only after Tik records the callback output.
 
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs complete-workflow \
   --workflow <workflow-id>
@@ -236,7 +237,7 @@ pnpm run test:multi-agent-skill
   executable only after dependencies are `done`.
 - Each subtask follows the v1 contract -> build -> evaluate -> question -> complete loop.
 - Each subtask requires an accepted `SprintContract`, same-head
-  implementation/evaluation evidence, hook-attested isolated Builder and
+  implementation/evaluation evidence, Tik-attested isolated Builder and
   Evaluator subagent invocations, readonly evaluator sandbox/audit validation,
   full must acceptance-criteria coverage, real command/artifact/reproduction
   evidence, and no blocking `question_evaluation` output from the Claude plugin.
@@ -264,8 +265,8 @@ Do:
 - keep all decisions recorded through Tik workflow APIs;
 - use Tik invocations/runs for Claude planner/questioner work;
 - inspect Claude output before applying fixes;
-- keep code edits in the current Codex session unless a future CodexRunner path
-  is explicitly added.
+- launch Builder, Reviewer, Evaluator, and Questioner work through Tik-owned
+  native runtime APIs;
 
 Do not:
 
