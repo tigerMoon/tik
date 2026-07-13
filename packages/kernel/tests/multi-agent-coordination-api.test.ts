@@ -147,7 +147,7 @@ describe('multi-agent coordination API', () => {
     expect(started[0].allowWrites).toBe(true);
     expect(started[1].allowWrites).toBe(true);
     expect(started[0]).toMatchObject({ cleanContext: true, contextTokenBudget: 24_000 });
-    expect(started[1]).toMatchObject({ cleanContext: true, contextTokenBudget: 16_000 });
+    expect(started[1]).toMatchObject({ cleanContext: true, contextTokenBudget: 24_000 });
 
     const oversized = await server.inject({
       method: 'POST',

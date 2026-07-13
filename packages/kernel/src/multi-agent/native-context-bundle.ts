@@ -10,7 +10,7 @@ const ROLE_TOKEN_BUDGETS: Record<AgentInvocationRecord['role'], number> = {
   planner: 12_000,
   executor: 24_000,
   reviewer: 16_000,
-  evaluator: 16_000,
+  evaluator: 24_000,
   questioner: 12_000,
 };
 

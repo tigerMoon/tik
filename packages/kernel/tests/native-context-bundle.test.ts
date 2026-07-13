@@ -58,7 +58,7 @@ describe('native agent context bundles', () => {
 
     expect(first).toEqual(second);
     expect(first.contextHash).toMatch(/^sha256:/);
-    expect(first.budget).toMatchObject({ maxTokens: 16_000, truncated: false });
+    expect(first.budget).toMatchObject({ maxTokens: 24_000, truncated: false });
     expect(first.budget.estimatedTokens).toBeLessThan(2_000);
     expect(first.implementation?.changedFiles).toEqual(['packages/kernel/src/checkpoint.ts']);
     expect(first.taskInput).toEqual({ targetModule: 'kernel' });
