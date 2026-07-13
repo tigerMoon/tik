@@ -127,7 +127,12 @@ describe('AgentRuntimeRunner implementations', () => {
       }),
     });
     const prepared = {
-      ...(await runner.prepare({ ...input, cleanContext: true, contextTokenBudget: 16_000 })),
+      ...(await runner.prepare({
+        ...input,
+        cleanContext: true,
+        contextTokenBudget: 16_000,
+        estimatedPromptTokens: 1_000,
+      })),
       allowWrites: false,
       requireThreadId: true,
     };
@@ -140,6 +145,7 @@ describe('AgentRuntimeRunner implementations', () => {
       allowWrites: false,
       cleanContext: true,
       maxPromptTokens: 16_000,
+      estimatedPromptTokens: 1_000,
     }));
     expect(runTurnOnThread).toHaveBeenCalledWith('thread-native-1', expect.objectContaining({ allowWrites: false }));
     expect(completion).toEqual({

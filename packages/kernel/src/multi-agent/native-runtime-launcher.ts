@@ -26,6 +26,7 @@ import {
 import {
   assertContextBudget,
   buildNativeAgentContextBundle,
+  estimateContextTokens,
   renderNativeContextPrompt,
 } from './native-context-bundle.js';
 
@@ -182,6 +183,7 @@ export class MultiAgentNativeRuntimeLauncher {
         timeoutMs: input.timeoutMs ?? (readonly ? DEFAULT_READONLY_TIMEOUT_MS : DEFAULT_BUILDER_TIMEOUT_MS),
         cleanContext: true,
         contextTokenBudget: contextBundle.budget.maxTokens,
+        estimatedPromptTokens: estimateContextTokens(prompt),
       }));
       const handle = await runner.start({
         ...prepared,
@@ -618,6 +620,7 @@ function buildAgentRunInput(input: {
   timeoutMs?: number;
   cleanContext?: boolean;
   contextTokenBudget?: number;
+  estimatedPromptTokens?: number;
 }): AgentRunInput {
   const task: TrackedTask = {
     id: input.invocation.id,
@@ -646,6 +649,7 @@ function buildAgentRunInput(input: {
     timeoutMs: input.timeoutMs,
     cleanContext: input.cleanContext ?? input.invocation.cleanContext,
     contextTokenBudget: input.contextTokenBudget ?? input.invocation.contextTokenBudget,
+    estimatedPromptTokens: input.estimatedPromptTokens,
   };
 }
 

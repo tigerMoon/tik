@@ -141,7 +141,7 @@ describe('CodexHarnessAdapter', () => {
     expect(result.threadId).toBe('thread-1');
     expect(result.turnId).toBe('turn-1');
     if (result.usage) {
-      expect(result.usage.promptTokens).toBe(12);
+      expect(result.usage.promptTokens).toBe(10);
       expect(result.usage.completionTokens).toBe(3);
       expect(result.usage.totalTokens).toBe(15);
     }
@@ -233,7 +233,12 @@ describe('CodexHarnessAdapter', () => {
             listener({
               threadId: 'thread-budget',
               turnId: 'turn-budget',
-              tokenUsage: { last: { inputTokens: 15_000, cachedInputTokens: 2_000, outputTokens: 1 } },
+              tokenUsage: { last: { inputTokens: 17_000, cachedInputTokens: 16_000, outputTokens: 1 } },
+            });
+            listener({
+              threadId: 'thread-budget',
+              turnId: 'turn-budget',
+              tokenUsage: { last: { inputTokens: 33_000, cachedInputTokens: 32_000, outputTokens: 1 } },
             });
           }
         }, 0);
@@ -249,7 +254,8 @@ describe('CodexHarnessAdapter', () => {
       cwd: '/tmp/project',
       cleanContext: true,
       maxPromptTokens: 16_000,
-    })).rejects.toThrow(/context_budget_exceeded: observed 17000 prompt tokens, budget 16000/);
+      estimatedPromptTokens: 1_000,
+    })).rejects.toThrow(/context_budget_exceeded: scoped 17000 prompt tokens \(observed 33000, baseline 16000\), budget 16000/);
     expect(request).toHaveBeenCalledWith(
       'turn/interrupt',
       { threadId: 'thread-budget', turnId: 'turn-budget' },

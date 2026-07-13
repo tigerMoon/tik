@@ -15,6 +15,7 @@ export interface CodexHarnessTurnOptions {
   onTurnVisible?: (source: 'turn.started' | 'item.started' | 'item.completed' | 'message.delta') => void;
   cleanContext?: boolean;
   maxPromptTokens?: number;
+  estimatedPromptTokens?: number;
 }
 
 export interface CodexHarnessThreadOptions {
@@ -56,6 +57,7 @@ export class CodexHarnessAdapter {
   private started = false;
   private startPromise?: Promise<void>;
   private readonly activeTurns = new Map<string, string>();
+  private readonly promptTokenBaselines = new Map<string, number>();
 
   constructor(
     cwd: string,
@@ -88,6 +90,7 @@ export class CodexHarnessAdapter {
   async stop(): Promise<void> {
     this.started = false;
     this.activeTurns.clear();
+    this.promptTokenBaselines.clear();
     await this.client.stop();
   }
 
@@ -114,7 +117,9 @@ export class CodexHarnessAdapter {
       signal: options.signal,
     });
 
-    return threadResponse.thread.id as string;
+    const threadId = threadResponse.thread.id as string;
+    this.promptTokenBaselines.delete(threadId);
+    return threadId;
   }
 
   async runTurn(options: CodexHarnessTurnOptions): Promise<CodexHarnessTurnResult> {
@@ -230,14 +235,21 @@ export class CodexHarnessAdapter {
         if (params.threadId !== threadId) return;
         if (turnId && params.turnId !== turnId) return;
         usage = {
-          promptTokens: Number(params.tokenUsage?.last?.inputTokens || 0) + Number(params.tokenUsage?.last?.cachedInputTokens || 0),
+          // App Server reports cachedInputTokens as a subset of inputTokens.
+          promptTokens: Number(params.tokenUsage?.last?.inputTokens || 0),
           completionTokens: Number(params.tokenUsage?.last?.outputTokens || 0),
           totalTokens: Number(params.tokenUsage?.last?.totalTokens || 0),
         };
+        let baseline = this.promptTokenBaselines.get(threadId);
+        if (baseline === undefined) {
+          baseline = Math.max(0, usage.promptTokens - Math.max(0, options.estimatedPromptTokens || 0));
+          this.promptTokenBaselines.set(threadId, baseline);
+        }
+        const scopedPromptTokens = Math.max(0, usage.promptTokens - baseline);
         if (
           !contextBudgetExceeded
           && options.maxPromptTokens
-          && usage.promptTokens > options.maxPromptTokens
+          && scopedPromptTokens > options.maxPromptTokens
         ) {
           contextBudgetExceeded = true;
           if (turnId) {
@@ -245,7 +257,7 @@ export class CodexHarnessAdapter {
               .catch(() => undefined);
           }
           rejectTurnCompleted?.(new Error(
-            `context_budget_exceeded: observed ${usage.promptTokens} prompt tokens, budget ${options.maxPromptTokens}.`,
+            `context_budget_exceeded: scoped ${scopedPromptTokens} prompt tokens (observed ${usage.promptTokens}, baseline ${baseline}), budget ${options.maxPromptTokens}.`,
           ));
         }
       }),

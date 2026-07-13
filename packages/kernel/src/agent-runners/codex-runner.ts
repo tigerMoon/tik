@@ -88,6 +88,7 @@ export class CodexRunner implements AgentRuntimeRunner {
       prompt: input.renderedPrompt,
       cleanContext: input.cleanContext,
       contextTokenBudget: input.contextTokenBudget,
+      estimatedPromptTokens: input.estimatedPromptTokens,
       timeoutMs: input.timeoutMs,
     };
   }
@@ -110,6 +111,7 @@ export class CodexRunner implements AgentRuntimeRunner {
         developerInstructions: input.developerInstructions,
         cleanContext: input.cleanContext,
         maxPromptTokens: input.contextTokenBudget,
+        estimatedPromptTokens: input.estimatedPromptTokens,
         onTurnVisible: refreshActivity,
         onTextDelta: refreshActivity,
         onProviderEvent: refreshActivity,

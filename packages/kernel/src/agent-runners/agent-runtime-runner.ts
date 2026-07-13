@@ -22,6 +22,7 @@ export interface AgentRunInput {
   artifactOutputDir: string;
   cleanContext?: boolean;
   contextTokenBudget?: number;
+  estimatedPromptTokens?: number;
   structuredOutputRequired?: boolean;
   timeoutMs?: number;
 }
@@ -41,6 +42,7 @@ export interface PreparedRun {
   developerInstructions?: string;
   cleanContext?: boolean;
   contextTokenBudget?: number;
+  estimatedPromptTokens?: number;
   structuredOutputRequired?: boolean;
   timeoutMs?: number;
 }
