@@ -56,6 +56,12 @@ export interface NativeRuntimeLaunchResult {
   runId: string;
   runtimeRef: string;
   status: 'running' | 'completed';
+  /**
+   * True when this launch returned an existing invocation (idempotency-key
+   * match) instead of starting a fresh native runtime. Callers should treat
+   * this as "no work started — poll for the existing invocation's result".
+   */
+  reused?: boolean;
 }
 
 export class MultiAgentNativeRuntimeLauncher {
@@ -117,6 +123,7 @@ export class MultiAgentNativeRuntimeLauncher {
             runId: existing.id,
             runtimeRef: existing.actualSubagentThreadId || existing.threadId || `run:${existing.id}`,
             status: existing.status === 'completed' ? 'completed' : 'running',
+            reused: true,
           };
         }
         throw new MultiAgentCoordinationError('version_conflict', `Agent invocation ${input.invocation.id} is ${existing.status}.`);

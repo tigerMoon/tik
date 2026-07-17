@@ -1,5 +1,99 @@
-export function printJson(value) {
-  console.log(JSON.stringify(value, null, 2));
+/**
+ * Fields to elide when terse mode is on. The values are usually long, echoed
+ * on every write, and rarely load-bearing for Codex' next-action decision.
+ * Terse mode keeps the compacted 5-minute prompt-cache TTL warm across calls;
+ * verbose mode restores the full body for humans debugging a workflow.
+ *
+ * Nested paths are dotted: `runtime.metadata` means `obj.runtime.metadata`.
+ */
+const TERSE_ELIDE_PATHS = [
+  'environmentPreflight',
+  'environmentPreflight.report',
+  'recentEvents',
+  'runtime.metadata',
+  'invocation.input.contextBundle',
+  'discoveredCandidates.details',
+  'contextBundle',
+];
+
+const TERSE_ELIDE_MARK = '[elided: pass --verbose to include]';
+
+/**
+ * Type-stable elide: an array becomes `[]`, an object becomes `{}`, a string
+ * becomes the marker. This preserves the shape downstream consumers expect
+ * (e.g. `.map` on an array field still works) while still trimming the
+ * context weight. The marker is also attached as a sibling `__elided`
+ * property on the parent so callers can detect elision without size
+ * heuristics.
+ */
+function elideAtPath(obj, dottedPath) {
+  const segments = dottedPath.split('.');
+  const last = segments.pop();
+  let cursor = obj;
+  for (const key of segments) {
+    if (!cursor || typeof cursor !== 'object') return;
+    cursor = cursor[key];
+    if (Array.isArray(cursor)) return;
+  }
+  if (!cursor || typeof cursor !== 'object' || !(last in cursor)) return;
+  const value = cursor[last];
+  if (value === null || value === undefined) return;
+  // Skip elision for cheap primitives; they're already small.
+  if (typeof value === 'number' || typeof value === 'boolean') return;
+  let size;
+  try {
+    size = typeof value === 'string' ? value.length : JSON.stringify(value).length;
+  } catch {
+    // Non-serializable (cyclic, BigInt, etc.). Treat as "large" and elide.
+    size = Number.POSITIVE_INFINITY;
+  }
+  if (size < 200) return; // don't elide short values — they're worth keeping
+  if (Array.isArray(value)) {
+    cursor[last] = [];
+  } else if (typeof value === 'object') {
+    cursor[last] = {};
+  } else {
+    cursor[last] = TERSE_ELIDE_MARK;
+  }
+  const elidedKeys = (cursor.__elided = cursor.__elided || []);
+  if (!elidedKeys.includes(last)) elidedKeys.push(last);
+}
+
+/**
+ * Print a JSON payload to stdout. `options.terse` (default: true when
+ * TIK_OUTPUT_TERSE=1 or the caller passes { terse: true }) trims long
+ * fields that inflate Codex context. Pass `terse: false` (or CLI
+ * `--verbose`) to keep the full body.
+ */
+export function printJson(value, options = {}) {
+  const envValue = process.env.TIK_OUTPUT_TERSE;
+  // Empty string is treated as "not set" so a `TIK_OUTPUT_TERSE=` shell
+  // preamble (a common way to "unset" a var) doesn't silently disable terse.
+  const terseByDefault = envValue === '1' || envValue === undefined || envValue === '';
+  const terseForcedOff = envValue === '0';
+  const terse = typeof options.terse === 'boolean'
+    ? options.terse
+    : terseForcedOff ? false : terseByDefault;
+  if (!terse || value === null || typeof value !== 'object') {
+    console.log(JSON.stringify(value, null, 2));
+    return;
+  }
+  // structuredClone throws on functions/symbols/Response/Headers/etc.; fall
+  // back to a JSON round-trip so we still print something usable rather than
+  // aborting the whole command with DataCloneError.
+  let cloned;
+  try {
+    cloned = structuredClone(value);
+  } catch {
+    try {
+      cloned = JSON.parse(JSON.stringify(value));
+    } catch {
+      console.log(JSON.stringify(value, null, 2));
+      return;
+    }
+  }
+  for (const p of TERSE_ELIDE_PATHS) elideAtPath(cloned, p);
+  console.log(JSON.stringify(cloned, null, 2));
 }
 
 export function instructionForDecision(decision, state) {

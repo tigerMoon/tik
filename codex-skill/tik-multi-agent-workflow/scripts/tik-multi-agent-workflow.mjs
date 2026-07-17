@@ -24,6 +24,8 @@ import {
   launchNativeQuestionerRun,
   linkNativeInvocationResult,
   executeSubtask,
+  listWorkflows,
+  patchWorkflow,
   readNextAction,
   readTask,
   readWorkflow,
@@ -45,10 +47,25 @@ import {
   validateEvaluationReadonly,
 } from '../lib/tik-client.mjs';
 import { instructionForDecision, printJson } from '../lib/output.mjs';
+import {
+  checkCooldown,
+  COOLDOWN_EXIT_CODE,
+  installCooldownFromResponse,
+} from '../lib/cooldown.mjs';
 
 async function main() {
   const [command = 'help', ...args] = process.argv.slice(2);
   const options = parseArgs(args);
+
+  // Default to terse output to keep Codex context small. `--verbose`
+  // explicitly restores full bodies. `TIK_OUTPUT_TERSE` env var can force
+  // the value (`0` or `1`); an empty-string or unset value defaults to terse.
+  const envTerse = process.env.TIK_OUTPUT_TERSE;
+  if (options.verbose === true) {
+    process.env.TIK_OUTPUT_TERSE = '0';
+  } else if (options.terse === true || envTerse === undefined || envTerse === '') {
+    process.env.TIK_OUTPUT_TERSE = '1';
+  }
 
   try {
     switch (command) {
@@ -136,6 +153,12 @@ async function main() {
       case 'complete-workflow':
         await completeWorkflow(options);
         break;
+      case 'abandon-workflow':
+        await abandonWorkflow(options);
+        break;
+      case 'pause-workflow':
+        await pauseWorkflow(options);
+        break;
       case 'synthesize-review':
         await synthesizeReadonlyReview(options);
         break;
@@ -182,11 +205,70 @@ async function initWorkflow(options) {
     workspaceBinding,
     headSha,
   });
+
+  // Discover open workflows already bound to this workspace/repo/headRef so we
+  // do not create yet another orphan. Callers can force-new via
+  // `--no-reuse-if-open` / `--force-new`, or bind explicitly with `--workflow`.
+  const forceNew = options.forceNew === true || options.noReuseIfOpen === true;
+  const explicitWorkflowId = stringOption(options.workflow);
+  const reusableWorkflow = !explicitWorkflowId && !forceNew
+    ? await discoverReusableOpenWorkflow(options, {
+        workspaceRoot: workspaceBinding?.workspaceRoot,
+        effectiveProjectPath: workspaceBinding?.effectiveProjectPath || projectPath,
+        repo,
+        mode: workflowMode,
+        headRef,
+        baseRef: options.base || 'HEAD~1',
+        goal: requireOption(options.goal, '--goal is required'),
+      })
+    : null;
+  // When callers pass --force-new while a live workflow already exists on the
+  // same binding, log a warning (to stderr) so the human sees the orphan-in-
+  // -waiting. The CLI still creates the new workflow — we do not overrule the
+  // explicit opt-out — but we surface the workflows that should probably be
+  // abandoned or paused first.
+  if (forceNew && !explicitWorkflowId) {
+    const conflicts = await discoverOpenWorkflowsForWarning(options, {
+      workspaceRoot: workspaceBinding?.workspaceRoot,
+      effectiveProjectPath: workspaceBinding?.effectiveProjectPath || projectPath,
+      repo,
+      mode: workflowMode,
+      headRef,
+      baseRef: options.base || 'HEAD~1',
+    });
+    if (conflicts && conflicts.length > 0) {
+      console.error(`[init] --force-new: leaving ${conflicts.length} open workflow(s) on this workspace:`);
+      for (const wf of conflicts.slice(0, 5)) {
+        console.error(`  - ${wf.id} (status=${wf.status}, updatedAt=${wf.updatedAt}, goal="${(wf.goal || '').slice(0, 60)}")`);
+      }
+      console.error('  Run `abandon-workflow --workflow <id>` or `pause-workflow --workflow <id>` to clean them up.');
+    }
+  }
+  if (reusableWorkflow?.workflow) {
+    printJson({
+      action: 'initialized',
+      workflowId: reusableWorkflow.workflow.id,
+      rootTaskId: reusableWorkflow.workflow.rootTaskId,
+      status: reusableWorkflow.workflow.status,
+      driver: reusableWorkflow.workflow.driver,
+      headSha: reusableWorkflow.workflow.currentHeadSha,
+      policy: reusableWorkflow.workflow.policy,
+      preexistingChangedFiles,
+      mode: 'v1',
+      workflowMode,
+      reusedWorkflow: true,
+      discoveredCandidates: reusableWorkflow.candidateCount,
+      hint: 'Reused an existing open workflow bound to this workspace. Pass --force-new to create a fresh workflow instead.',
+      nextCommand: `node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs next --workflow ${reusableWorkflow.workflow.id}`,
+    });
+    return;
+  }
+
   const body = {
-    id: stringOption(options.workflow),
+    id: explicitWorkflowId,
     goal: requireOption(options.goal, '--goal is required'),
     mode: workflowMode,
-    rootTaskId: stringOption(options.rootTask) || stringOption(options.workflow),
+    rootTaskId: stringOption(options.rootTask) || explicitWorkflowId,
     repo,
     baseRef: options.base || 'HEAD~1',
     headRef,
@@ -228,11 +310,125 @@ async function initWorkflow(options) {
     preexistingChangedFiles,
     mode: 'v1',
     workflowMode,
+    reusedWorkflow: false,
+    discoveredCandidates: 0,
     environmentPreflight: environment.report,
     reviewTaskGraph,
     breakingChange: 'v1.1 removed legacy multi-agent Claude review commands; use the contract/evaluator/questioner loop.',
     nextCommand: `node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs next --workflow ${response.workflow?.id}`,
   });
+}
+
+/**
+ * Fetch open workflows for the same workspace binding without any error paths
+ * — used by --force-new callers to surface a warning about the orphans they
+ * are about to leave behind. Never throws; failure returns an empty array.
+ */
+async function discoverOpenWorkflowsForWarning(options, filter) {
+  try {
+    const payload = await listWorkflows(options, {
+      status: 'open',
+      workspaceRoot: filter.workspaceRoot,
+      effectiveProjectPath: filter.effectiveProjectPath,
+      repo: filter.repo,
+      mode: filter.mode,
+      headRef: filter.headRef,
+      baseRef: filter.baseRef,
+    });
+    const all = Array.isArray(payload?.workflows) ? payload.workflows : [];
+    return all.filter((wf) => !wf?.metadata?.staleAt && !wf?.metadata?.pausedAt);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Look for an already-open workflow bound to the same workspace/repo/baseRef/
+ * headRef so `init` does not silently create another orphan. Rejects reuse
+ * when the candidate's `goal` differs from the caller's — otherwise a fresh
+ * `--goal` gets silently rebound to yesterday's workflow, and every later
+ * evaluator/questioner run is pinned to the wrong scope.
+ *
+ * Returns null when there are no candidates or when the sole candidate has a
+ * goal mismatch (caller should either pass `--workflow <id>` to reuse
+ * intentionally, or `--force-new` to explicitly create a fresh workflow).
+ * Throws `ambiguous_open_workflows` when multiple live non-stale candidates
+ * match.
+ */
+async function discoverReusableOpenWorkflow(options, filter) {
+  try {
+    const payload = await listWorkflows(options, {
+      status: 'open',
+      workspaceRoot: filter.workspaceRoot,
+      effectiveProjectPath: filter.effectiveProjectPath,
+      repo: filter.repo,
+      mode: filter.mode,
+      headRef: filter.headRef,
+      baseRef: filter.baseRef,
+    });
+    const all = Array.isArray(payload?.workflows) ? payload.workflows : [];
+    const live = all.filter((wf) => !wf?.metadata?.staleAt && !wf?.metadata?.pausedAt);
+    if (live.length === 1) {
+      const candidate = live[0];
+      // Guard rail: don't silently rebind a fresh --goal to an existing
+      // workflow with a different goal. The caller must either pass
+      // --workflow <id> to reuse intentionally, or --force-new to create.
+      if (filter.goal && candidate.goal && normalizeGoal(candidate.goal) !== normalizeGoal(filter.goal)) {
+        const err = new Error(
+          `Open workflow ${candidate.id} exists but its goal ("${candidate.goal}") differs from the requested --goal ("${filter.goal}"); pass --workflow ${candidate.id} to reuse or --force-new to create a fresh workflow.`,
+        );
+        err.payload = {
+          error: {
+            code: 'goal_mismatch',
+            message: err.message,
+            candidate: {
+              id: candidate.id,
+              goal: candidate.goal,
+              status: candidate.status,
+              updatedAt: candidate.updatedAt,
+              headRef: candidate.headRef,
+              baseRef: candidate.baseRef,
+            },
+            requestedGoal: filter.goal,
+          },
+        };
+        throw err;
+      }
+      return { workflow: candidate, candidateCount: all.length };
+    }
+    if (live.length > 1) {
+      const error = new Error(
+        `Multiple open workflows match this workspace; pass --workflow <id> to reuse a specific one, or --force-new to create a new workflow.`,
+      );
+      error.payload = {
+        error: {
+          code: 'ambiguous_open_workflows',
+          message: error.message,
+          candidates: live.map((wf) => ({
+            id: wf.id,
+            goal: wf.goal,
+            status: wf.status,
+            updatedAt: wf.updatedAt,
+            headRef: wf.headRef,
+            baseRef: wf.baseRef,
+          })),
+        },
+      };
+      throw error;
+    }
+    return null;
+  } catch (error) {
+    // If the server is running an older kernel that doesn't accept filters,
+    // treat discovery as best-effort and fall through to create-new. Locally
+    // thrown ambiguity / goal-mismatch errors do NOT have a numeric .status,
+    // so they propagate correctly.
+    if (error?.status === 400 || error?.status === 404) return null;
+    throw error;
+  }
+}
+
+function normalizeGoal(goal) {
+  return String(goal || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
 async function preflightWorkflowEnvironment(options) {
@@ -368,10 +564,18 @@ async function acceptPlan(options) {
 
 async function next(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
+  const cooldown = await checkCooldown(workflowId, options);
+  if (cooldown.blocked) {
+    printJson(cooldown.snapshot);
+    process.exit(COOLDOWN_EXIT_CODE);
+  }
   const state = await readWorkflow(options, workflowId);
   const nextAction = await resolveNextAction(options, workflowId, state);
   const decision = buildDecision(state.workflow, nextAction);
   const recorded = await safeRecordDecision(options, workflowId, decision, state);
+  if (nextAction.reasonCode === 'awaiting_native_runtime') {
+    await installCooldownFromResponse(workflowId, nextAction);
+  }
   printJson({
     action: 'next',
     workflowId,
@@ -380,6 +584,7 @@ async function next(options) {
     guard: recorded.guard,
     commandHint: nextAction.commandHint,
     instruction: instructionForDecision(decision, state),
+    retryAfterMs: nextAction.retryAfterMs,
   });
 }
 
@@ -502,6 +707,7 @@ async function acceptSprintContract(options) {
     contract: response.contracts?.[0],
     decision: response.decisions?.[0],
     subtask: response.subtasks?.[0],
+    nextRecommendedCommand: response.nextRecommendedCommand || [],
   });
 }
 
@@ -526,6 +732,7 @@ async function acceptSprintContracts(options) {
     decisions: response.decisions,
     subtasks: response.subtasks,
     workflow: response.workflow,
+    nextRecommendedCommand: response.nextRecommendedCommand || [],
   });
 }
 
@@ -625,6 +832,7 @@ async function execute(options) {
     subtask: response.subtask,
     decision: response.decision,
     guard: response.guard,
+    nextRecommendedCommand: response.nextRecommendedCommand || [],
   });
 }
 
@@ -657,12 +865,26 @@ async function startBuilder(options) {
     prompt: stringOption(options.prompt),
     timeoutMs: numberOption(options.timeoutMs, undefined),
   });
+  const reused = Boolean(launched.reused || launched.runtime?.reused);
+  if (reused) {
+    printJson({
+      action: 'builder-reused',
+      workflowId,
+      subtaskId,
+      invocation: launched.invocation,
+      runtime: launched.runtime,
+      reused: true,
+      hint: 'Builder for this subtask is already running or completed; do not launch again. Poll with `status` / `next` (subject to cooldown), or record evidence with `execute` when the run finishes.',
+    });
+    return;
+  }
   printJson({
     action: 'builder-started',
     workflowId,
     subtaskId,
     invocation: launched.invocation,
     runtime: launched.runtime,
+    reused: false,
     instruction: 'Tik launched the Codex Builder native thread and retained attestation credentials server-side.',
   });
 }
@@ -672,12 +894,26 @@ async function startReviewer(options) {
   const subtaskId = requireOption(options.subtask, '--subtask is required');
   const state = await readWorkflow(options, workflowId);
   const launched = await launchReviewerForState(options, state, subtaskId);
+  const reused = Boolean(launched.reused || launched.runtime?.reused);
+  if (reused) {
+    printJson({
+      action: 'reviewer-reused',
+      workflowId,
+      subtaskId,
+      invocation: launched.invocation,
+      runtime: launched.runtime,
+      reused: true,
+      hint: 'Reviewer for this shard is already running or completed; do not launch again. Wait for `record-review` evidence.',
+    });
+    return;
+  }
   printJson({
     action: 'reviewer-started',
     workflowId,
     subtaskId,
     invocation: launched.invocation,
     runtime: launched.runtime,
+    reused: false,
     instruction: 'Tik launched the readonly Codex Reviewer native thread and retained attestation credentials server-side.',
   });
 }
@@ -813,7 +1049,13 @@ async function recordReadonlyReview(options) {
       result: { headSha, evidenceRefs: [evidenceId], reviewResult: structuredResult },
     },
   }, { ifMatch: state.workflow.lastDecisionId || 'none' });
-  printJson({ action: 'review-recorded', workflowId, subtaskId, ...response });
+  printJson({
+    action: 'review-recorded',
+    workflowId,
+    subtaskId,
+    ...response,
+    nextRecommendedCommand: response.nextRecommendedCommand || [],
+  });
 }
 
 async function startEvaluator(options) {
@@ -873,12 +1115,26 @@ async function startEvaluator(options) {
     prompt: stringOption(options.prompt),
     timeoutMs: numberOption(options.timeoutMs, undefined),
   });
+  const reused = Boolean(launched.reused || launched.runtime?.reused);
+  if (reused) {
+    printJson({
+      action: 'evaluator-reused',
+      workflowId,
+      subtaskId,
+      invocation: launched.invocation,
+      runtime: launched.runtime,
+      reused: true,
+      hint: 'Evaluator for this subtask is already running or completed; do not launch again. Wait for the evaluator to complete and record its result with `evaluate`.',
+    });
+    return;
+  }
   printJson({
     action: 'evaluator-started',
     workflowId,
     subtaskId,
     invocation: launched.invocation,
     runtime: launched.runtime,
+    reused: false,
     instruction: 'Tik launched the readonly Codex Evaluator native thread and retained attestation credentials server-side.',
   });
 }
@@ -937,6 +1193,20 @@ async function startQuestioner(options) {
     prompt: stringOption(options.prompt),
     timeoutMs: numberOption(options.timeoutMs, undefined),
   });
+  const reused = Boolean(run.reused || run.runtime?.reused);
+  if (reused) {
+    printJson({
+      action: 'questioner-run-reused',
+      workflowId,
+      questionerRunId: run.questionerRunId,
+      invocationId: run.invocationId,
+      invocation: run.invocation,
+      runtime: run.runtime,
+      reused: true,
+      hint: 'Questioner run for these inputs is already running or completed; do not launch again. Wait for the QuestionerOutputV2 callback.',
+    });
+    return;
+  }
   printJson({
     action: 'questioner-run-started',
     workflowId,
@@ -948,6 +1218,7 @@ async function startQuestioner(options) {
     tokenExpiresAt: run.tokenExpiresAt,
     invocation: run.invocation,
     runtime: run.runtime,
+    reused: false,
     instruction: 'Tik launched Claude Questioner and injected the token-scoped runtime environment without exposing the token to the caller.',
   });
 }
@@ -1505,6 +1776,7 @@ async function evaluate(options) {
         .filter((result) => result.commandId?.startsWith('cmd-evaluate-setup-'))
         .map((result) => ({ command: result.command, status: result.status, exitCode: result.exitCode })),
     } : undefined,
+    nextRecommendedCommand: recorded.nextRecommendedCommand || [],
   });
   if (!evaluationPassed && options.failOnValidationError) {
     process.exitCode = (setupFailure || failedCommandResult || commandResult)?.exitCode || 1;
@@ -1572,6 +1844,9 @@ async function completeSubtask(options) {
     decision,
     guard: recorded.guard,
     subtask: subtask.subtask,
+    // The completion path uses POST /decisions + PATCH /subtasks, not
+    // /actions/complete-subtask, so nextRecommendedCommand is not returned by
+    // the server. Callers should use `next` to determine what runs next.
   });
 }
 
@@ -1606,7 +1881,12 @@ async function synthesizeReadonlyReview(options) {
   const response = await synthesizeReviewAction(options, workflowId, { decision, evidence }, {
     ifMatch: state.workflow.lastDecisionId,
   });
-  printJson({ action: 'review-synthesized', workflowId, ...response });
+  printJson({
+    action: 'review-synthesized',
+    workflowId,
+    ...response,
+    nextRecommendedCommand: response.nextRecommendedCommand || [],
+  });
 }
 
 async function completeWorkflow(options) {
@@ -1647,8 +1927,82 @@ async function completeWorkflow(options) {
   });
 }
 
+/**
+ * Abandon an open workflow. Records an `abort_workflow` decision so Kernel
+ * flips status to `aborted` and emits `workflow.aborted`; the workflow will
+ * no longer show up in `init` discovery. Use when the work is no longer
+ * needed and callers should not resume it. Prefer `pause-workflow` when the
+ * work might be resumed later.
+ */
+async function abandonWorkflow(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const state = await readWorkflow(options, workflowId);
+  if (state.workflow.status === 'completed' || state.workflow.status === 'aborted') {
+    printJson({
+      action: 'workflow-abandon-noop',
+      workflowId,
+      status: state.workflow.status,
+      hint: 'Workflow is already terminal; abandon is a no-op.',
+    });
+    return;
+  }
+  const reason = stringOption(options.reason) || 'Codex workflow abandoned by user request.';
+  const decision = buildDecision(state.workflow, {
+    action: 'abort_workflow',
+    reason,
+    evidenceRefs: collectSubtaskEvidenceRefs(state),
+    inputs: {
+      currentHeadSha: state.workflow.currentHeadSha,
+      taskGraphVersion: state.taskGraph?.version,
+    },
+  });
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
+  printJson({
+    action: 'workflow-abandoned',
+    workflowId,
+    reason,
+    decision,
+    guard: recorded.guard,
+    workflow: recorded.workflow,
+  });
+}
+
+/**
+ * Mark an open workflow as paused. Writes `metadata.pausedAt` + reason via a
+ * PATCH; discovery in `init` skips paused workflows so a new workflow can be
+ * started while the paused one stays resumable via `--workflow <id>`.
+ * Does NOT change `status` — the workflow remains active in Kernel, just
+ * intentionally shelved from discovery.
+ */
+async function pauseWorkflow(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const state = await readWorkflow(options, workflowId);
+  const reason = stringOption(options.reason) || 'Paused pending user follow-up.';
+  const now = new Date().toISOString();
+  const response = await patchWorkflow(options, workflowId, {
+    metadata: {
+      ...(state.workflow.metadata || {}),
+      pausedAt: now,
+      pausedReason: reason,
+    },
+  });
+  printJson({
+    action: 'workflow-paused',
+    workflowId,
+    reason,
+    pausedAt: now,
+    workflow: response.workflow,
+    hint: 'Discovery will skip this workflow until it is resumed. Use `--workflow <id>` to explicitly resume.',
+  });
+}
+
 async function continueWorkflow(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
+  const cooldown = await checkCooldown(workflowId, options);
+  if (cooldown.blocked) {
+    printJson(cooldown.snapshot);
+    process.exit(COOLDOWN_EXIT_CODE);
+  }
   const initialState = await readWorkflow(options, workflowId);
   const maxRounds = loopMaxRounds(initialState.workflow, options);
   const stopOn = new Set(initialState.workflow?.policy?.loopContract?.stop || ['guard_rejected', 'human_required']);
@@ -1756,6 +2110,17 @@ async function continueWorkflow(options) {
 async function executeContinueDecision(options, state, decision) {
   const workflowId = state.workflow.id;
   if (decision.reasonCode === 'awaiting_native_runtime') {
+    const retryAfterMs = typeof decision.retryAfterMs === 'number' ? decision.retryAfterMs : 2000;
+    // Persist a cooldown lock so subsequent continue/next/status calls in the
+    // same session bail out with exit 3 instead of hammering `/next-action`.
+    await installCooldownFromResponse(workflowId, {
+      plannedAction: {
+        reasonCode: 'awaiting_native_runtime',
+        retryAfterMs,
+        reason: decision.reason,
+        subtaskId: decision.subtaskId,
+      },
+    });
     return {
       directOutput: {
         action: 'continue-instruction',
@@ -1763,8 +2128,10 @@ async function executeContinueDecision(options, state, decision) {
         decision,
         guard: { accepted: true, code: 'ok' },
         pendingAction: 'await-runtime',
-        retryAfterMs: 2000,
+        retryAfterMs,
         instruction: decision.reason,
+        cooldownInstalled: true,
+        hint: 'CLI wrote a cooldown lock. Do not call continue/next/status again until the callback resumes the workflow.',
       },
       action: 'await-runtime',
       guard: { accepted: true, code: 'ok' },
@@ -1948,6 +2315,9 @@ async function resolveNextAction(options, workflowId, state) {
         headSha: stringOption(options.headSha),
       });
       const plannedAction = response.plannedAction || response;
+      const retryAfterMs = plannedAction.retryAfterMs
+        ?? response.retryAfterMs
+        ?? response.__http?.retryAfterMs;
       return {
         action: plannedAction.action,
         subtaskId: plannedAction.subtaskId,
@@ -1959,6 +2329,7 @@ async function resolveNextAction(options, workflowId, state) {
         refs: plannedAction.refs || [],
         commandHint: plannedAction.commandHint,
         actionDefinition: plannedAction.actionDefinition,
+        retryAfterMs,
       };
     } catch (error) {
       if (!options.allowOfflineNextFallback) {
@@ -2005,6 +2376,11 @@ function continueBlockedOutput(workflowId, decision, state, guard) {
 
 async function status(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
+  const cooldown = await checkCooldown(workflowId, options);
+  if (cooldown.blocked) {
+    printJson(cooldown.snapshot);
+    process.exit(COOLDOWN_EXIT_CODE);
+  }
   const state = await readWorkflow(options, workflowId);
   const timeline = await readWorkflowTimeline(options, workflowId);
   printJson({
@@ -3279,6 +3655,8 @@ Usage:
   node ${script} record-questioner --workflow <workflow-id> --intent <intent> [--subtask <id>]
   node ${script} complete-subtask --workflow <workflow-id> --subtask <id>
   node ${script} complete-workflow --workflow <workflow-id>
+  node ${script} abandon-workflow --workflow <workflow-id> [--reason <text>]
+  node ${script} pause-workflow --workflow <workflow-id> [--reason <text>]
   node ${script} synthesize-review --workflow <workflow-id> [--result <json-file>]
   node ${script} continue --workflow <workflow-id>
   node ${script} status --workflow <workflow-id>

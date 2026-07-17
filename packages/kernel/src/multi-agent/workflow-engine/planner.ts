@@ -6,6 +6,7 @@ import type {
   WorkflowDecision,
   WorkflowDecisionAction,
 } from '@tik/shared';
+import { mapWorkflowActionToCliCommand } from '@tik/shared';
 import { getWorkflowActionDefinition, type WorkflowActionDefinition, type WorkflowActionPhase } from './action-registry.js';
 import { guardTransition } from './transition-guard.js';
 import {
@@ -36,6 +37,34 @@ export interface PlannedAction {
   inputs: Record<string, unknown>;
   commandHint?: string;
   actionDefinition: WorkflowActionDefinition;
+  /**
+   * When `reasonCode === 'awaiting_native_runtime'`, suggested delay before the
+   * caller should re-poll `/next-action`. Emitted alongside HTTP 202 +
+   * `Retry-After` header so CLI clients can enforce a cooldown instead of
+   * hammering the endpoint. `undefined` when not applicable.
+   */
+  retryAfterMs?: number;
+}
+
+/**
+ * Suggested wait time before re-polling when a native runtime invocation is in
+ * flight. Grows with invocation age to reduce cache-invalidating polls on
+ * long-running Builder / Evaluator / Questioner runs.
+ */
+export function computeRetryAfterMs(
+  activeInvocationCreatedAt: string | undefined,
+  nowIso: string,
+): number {
+  const defaultMs = 15_000;
+  if (!activeInvocationCreatedAt) return defaultMs;
+  const started = Date.parse(activeInvocationCreatedAt);
+  const now = Date.parse(nowIso);
+  if (!Number.isFinite(started) || !Number.isFinite(now)) return defaultMs;
+  const ageMs = Math.max(0, now - started);
+  if (ageMs < 10_000) return 3_000;
+  if (ageMs < 60_000) return 5_000;
+  if (ageMs < 300_000) return 15_000;
+  return 30_000;
 }
 
 export function planNextAction(input: {
@@ -101,7 +130,7 @@ function planReviewSubtaskAction(ctx: WorkflowDecisionContext, subtaskId: string
   const review = latestReviewEvidence(ctx.bundle, subtaskId);
   if (!review) {
     const activeReviewer = findActiveInvocation(ctx.bundle, subtaskId, ['reviewer']);
-    return planned('run_readonly_reviewer', {
+    return withRetryAfter(planned('run_readonly_reviewer', {
       subtaskId,
       reason: activeReviewer
         ? `Readonly Reviewer ${activeReviewer.id} is still running for ${subtaskId}.`
@@ -110,13 +139,13 @@ function planReviewSubtaskAction(ctx: WorkflowDecisionContext, subtaskId: string
       evidenceRefs: subtaskState.evidenceRefs || [],
       refs: [{ kind: 'subtask', id: subtaskId }],
       inputs: { title, headSha: ctx.headSha, invocationId: activeReviewer?.id },
-    });
+    }), activeReviewer, ctx.now);
   }
 
   const evaluation = latestEvaluationRun(ctx.bundle, subtaskId);
   if (!evaluation) {
     const activeEvaluator = findActiveInvocation(ctx.bundle, subtaskId, ['evaluator']);
-    return planned('run_codex_evaluator', {
+    return withRetryAfter(planned('run_codex_evaluator', {
       subtaskId,
       reason: activeEvaluator
         ? `Readonly Evaluator ${activeEvaluator.id} is still running for ${subtaskId}.`
@@ -125,7 +154,7 @@ function planReviewSubtaskAction(ctx: WorkflowDecisionContext, subtaskId: string
       evidenceRefs: mergeRefs(subtaskState.evidenceRefs, [review.id]),
       refs: [{ kind: 'evidence', id: review.id }],
       inputs: { reviewEvidenceId: review.id, headSha: review.headSha || ctx.headSha, invocationId: activeEvaluator?.id },
-    });
+    }), activeEvaluator, ctx.now);
   }
   if (evaluation.status === 'invalidated') {
     return planned('request_human_review', {
@@ -319,7 +348,7 @@ function planSubtaskV1Action(ctx: WorkflowDecisionContext, subtaskId: string, ti
   const implementation = latestImplementationEvidence(ctx.bundle, subtaskId);
   if (!implementation) {
     const activeBuilder = findActiveInvocation(ctx.bundle, subtaskId, ['executor']);
-    return planned('execute_subtask', {
+    return withRetryAfter(planned('execute_subtask', {
       subtaskId,
       reason: activeBuilder
         ? `Codex Builder ${activeBuilder.id} is still running for ${subtaskId}.`
@@ -328,13 +357,13 @@ function planSubtaskV1Action(ctx: WorkflowDecisionContext, subtaskId: string, ti
       evidenceRefs: subtaskState.evidenceRefs || [],
       refs: [{ kind: 'contract', id: contract.id }],
       inputs: { title, contractId: contract.id, invocationId: activeBuilder?.id },
-    });
+    }), activeBuilder, ctx.now);
   }
 
   const evaluation = latestEvaluationRun(ctx.bundle, subtaskId);
   if (!evaluation) {
     const activeEvaluator = findActiveInvocation(ctx.bundle, subtaskId, ['evaluator']);
-    return planned('run_codex_evaluator', {
+    return withRetryAfter(planned('run_codex_evaluator', {
       subtaskId,
       reason: activeEvaluator
         ? `Codex Evaluator ${activeEvaluator.id} is still running for ${subtaskId}.`
@@ -343,7 +372,7 @@ function planSubtaskV1Action(ctx: WorkflowDecisionContext, subtaskId: string, ti
       evidenceRefs: mergeRefs(subtaskState.evidenceRefs, [implementation.id]),
       refs: [{ kind: 'contract', id: contract.id }, { kind: 'evidence', id: implementation.id }],
       inputs: { contractId: contract.id, implementationEvidenceId: implementation.id, invocationId: activeEvaluator?.id },
-    });
+    }), activeEvaluator, ctx.now);
   }
 
   if (evaluation.status === 'failed' || evaluation.result?.verdict === 'fail') {
@@ -417,7 +446,7 @@ function planSubtaskV1Action(ctx: WorkflowDecisionContext, subtaskId: string, ti
         evaluationRunId: evaluation.id,
         headSha: evaluationHead,
       });
-      return planned(existing ? 'fix_evaluation_findings' : 'ask_claude_question_evaluation', {
+      return withRetryAfter(planned(existing ? 'fix_evaluation_findings' : 'ask_claude_question_evaluation', {
         subtaskId,
         reason: activeQuestioner
           ? `Claude Questioner ${activeQuestioner.id} is still running for evaluation ${evaluation.id}.`
@@ -434,7 +463,7 @@ function planSubtaskV1Action(ctx: WorkflowDecisionContext, subtaskId: string, ti
           questionerOutputId: existing?.id,
           invocationId: activeQuestioner?.id,
         },
-      });
+      }), activeQuestioner, ctx.now);
     }
   }
 
@@ -500,7 +529,7 @@ function planFinalV1Action(ctx: WorkflowDecisionContext): PlannedAction {
   const finalEvaluation = latestEvaluationRun(ctx.bundle, '__final__');
   if (!finalEvaluation) {
     const activeEvaluator = findActiveInvocation(ctx.bundle, '__final__', ['evaluator']);
-    return planned('run_final_evaluation', {
+    return withRetryAfter(planned('run_final_evaluation', {
       reason: activeEvaluator
         ? `Final Codex Evaluator ${activeEvaluator.id} is still running.`
         : 'All subtasks are done; run final Codex evaluation before completing workflow.',
@@ -508,7 +537,7 @@ function planFinalV1Action(ctx: WorkflowDecisionContext): PlannedAction {
       evidenceRefs: collectEvidenceRefs(ctx.subtasks),
       refs: collectSubtaskRefs(ctx),
       inputs: { taskGraphVersion: ctx.taskGraph?.version, invocationId: activeEvaluator?.id },
-    });
+    }), activeEvaluator, ctx.now);
   }
   if (finalEvaluation.status === 'failed' || finalEvaluation.result?.verdict === 'fail') {
     return planned('request_human_review', {
@@ -570,7 +599,7 @@ function planFinalV1Action(ctx: WorkflowDecisionContext): PlannedAction {
         evaluationRunId: finalEvaluation.id,
         headSha: finalEvaluationHead,
       });
-      return planned(existing ? 'request_human_review' : 'ask_claude_question_final_evidence', {
+      return withRetryAfter(planned(existing ? 'request_human_review' : 'ask_claude_question_final_evidence', {
         reason: activeQuestioner
           ? `Final Claude Questioner ${activeQuestioner.id} is still running for evaluation ${finalEvaluation.id}.`
           : existing
@@ -586,7 +615,7 @@ function planFinalV1Action(ctx: WorkflowDecisionContext): PlannedAction {
           questionerOutputId: existing?.id,
           invocationId: activeQuestioner?.id,
         },
-      });
+      }), activeQuestioner, ctx.now);
     }
   }
   const completeGuard = preflightPlannedAction(ctx, 'complete_workflow', {
@@ -710,41 +739,39 @@ function planned(
   };
 }
 
+function withRetryAfter(
+  plannedResult: PlannedAction,
+  activeInvocation: { createdAt?: string; startedAt?: string } | undefined,
+  nowIso: string,
+): PlannedAction {
+  if (plannedResult.reasonCode !== 'awaiting_native_runtime') return plannedResult;
+  const ts = activeInvocation?.startedAt || activeInvocation?.createdAt;
+  return { ...plannedResult, retryAfterMs: computeRetryAfterMs(ts, nowIso) };
+}
+
+/**
+ * Delegates to the shared `mapWorkflowActionToCliCommand` so the human-readable
+ * `commandHint` string that /next-action returns stays in lock-step with the
+ * structured `nextRecommendedCommand` array on write-action responses. Any new
+ * action or CLI-command rename lives in one place (packages/shared).
+ */
 function commandHintForAction(
   action: WorkflowDecisionAction,
   subtaskId: string | undefined,
   inputs: Record<string, unknown>,
 ): string | undefined {
-  const workflowArg = '--workflow <workflow-id>';
-  const subtaskArg = subtaskId ? ` --subtask ${subtaskId}` : '';
-  switch (action) {
-    case 'request_dynamic_plan':
-      return `tik-multi-agent-workflow plan ${workflowArg}`;
-    case 'draft_contract':
-      return `tik-multi-agent-workflow draft-contract ${workflowArg}${subtaskArg}`;
-    case 'ask_claude_question_contract':
-    case 'ask_claude_question_evaluation':
-    case 'ask_claude_question_final_evidence':
-      return `tik-multi-agent-workflow start-questioner ${workflowArg}${subtaskArg} --intent ${getWorkflowActionDefinition(action).intent}`;
-    case 'accept_contract':
-      return `tik-multi-agent-workflow accept-contract ${workflowArg}${subtaskArg} --contract ${String(inputs.contractId || '<contract-id>')}`;
-    case 'execute_subtask':
-      return `tik-multi-agent-workflow start-builder ${workflowArg}${subtaskArg}`;
-    case 'run_readonly_reviewer':
-      return `tik-multi-agent-workflow start-reviewer ${workflowArg}${subtaskArg}`;
-    case 'run_codex_evaluator':
-    case 're_evaluate':
-    case 'run_final_evaluation':
-      return `tik-multi-agent-workflow start-evaluator ${workflowArg}${subtaskArg}`;
-    case 'complete_subtask':
-      return `tik-multi-agent-workflow complete-subtask ${workflowArg}${subtaskArg}`;
-    case 'complete_workflow':
-      return `tik-multi-agent-workflow complete-workflow ${workflowArg}`;
-    case 'synthesize_review':
-      return `tik-multi-agent-workflow synthesize-review ${workflowArg}`;
-    default:
-      return undefined;
-  }
+  const mapped = mapWorkflowActionToCliCommand(action, {
+    workflowId: '<workflow-id>',
+    subtaskId,
+    contractId: typeof inputs.contractId === 'string' ? inputs.contractId : undefined,
+    evaluationRunId: typeof inputs.evaluationRunId === 'string' ? inputs.evaluationRunId : undefined,
+    finalEvaluationRunId: typeof inputs.finalEvaluationRunId === 'string' ? inputs.finalEvaluationRunId : undefined,
+    reviewEvidenceId: typeof inputs.reviewEvidenceId === 'string' ? inputs.reviewEvidenceId : undefined,
+    invocationId: typeof inputs.invocationId === 'string' ? inputs.invocationId : undefined,
+  });
+  if (!mapped) return undefined;
+  const argParts = Object.entries(mapped.args).map(([flag, value]) => `${flag} ${value}`);
+  return `tik-multi-agent-workflow ${mapped.cmd}${argParts.length ? ' ' + argParts.join(' ') : ''}`;
 }
 
 function chooseNextV1Subtask(ctx: WorkflowDecisionContext): { id: string; title: string } | null {

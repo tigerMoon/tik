@@ -51,11 +51,51 @@ export async function tikFetch(options, route, input = {}) {
     error.payload = payload;
     throw error;
   }
+  // Surface 202 Accepted + Retry-After so callers can install cooldown locks
+  // when Tik reports awaiting_native_runtime. `retryAfterMs` is derived from
+  // the header (integer seconds) but falls back to the body field if missing.
+  if (response.status === 202) {
+    const headerVal = response.headers.get('retry-after');
+    const headerMs = headerVal ? Number.parseInt(headerVal, 10) * 1000 : NaN;
+    const bodyMs = typeof payload.retryAfterMs === 'number' ? payload.retryAfterMs : NaN;
+    payload.__http = {
+      status: 202,
+      retryAfterMs: Number.isFinite(headerMs) ? headerMs : Number.isFinite(bodyMs) ? bodyMs : undefined,
+    };
+  }
   return payload;
 }
 
 export async function readWorkflow(options, workflowId) {
   return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}`);
+}
+
+/**
+ * List workflows visible to this Tik API server. `filter` accepts the same
+ * querystring the server understands: `status` (`open` = any non-terminal),
+ * `workspaceRoot`, `effectiveProjectPath`, `repo`, `mode`, `headRef`, `stale`.
+ * All fields are optional; unset fields return every workflow.
+ */
+export async function listWorkflows(options, filter = {}) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filter)) {
+    if (value === undefined || value === null || value === '') continue;
+    params.set(key, String(value));
+  }
+  const query = params.toString() ? `?${params.toString()}` : '';
+  return tikFetch(options, `/v1/multi-agent/workflows${query}`);
+}
+
+/**
+ * Patch workflow metadata / head-sha / policy. Note the server rejects
+ * status transitions except through decisions; use dedicated action routes
+ * (e.g. `complete-workflow`) instead of PATCH for status changes.
+ */
+export async function patchWorkflow(options, workflowId, patch) {
+  return tikFetch(options, `/v1/multi-agent/workflows/${encodeURIComponent(workflowId)}`, {
+    method: 'PATCH',
+    body: patch,
+  });
 }
 
 export async function preflightEnvironment(options, input) {

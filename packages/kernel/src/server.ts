@@ -44,6 +44,7 @@ import type {
   WorkflowPolicy,
 } from '@tik/shared';
 import {
+  buildNextRecommendedCommands,
   canRetryWorkbenchTask,
   createEnvironmentPackSelection,
   generateId,
@@ -52,6 +53,8 @@ import {
   isWorkbenchTaskMaintenance,
   isWorkbenchTerminalStatus,
   toEnvironmentPackSnapshot,
+  type CliMappingContext,
+  type NextRecommendedCommand,
 } from '@tik/shared';
 import type { ExecutionKernel } from './execution-kernel.js';
 import type { CreateTaskInputV2 } from './execution-kernel.js';
@@ -84,6 +87,14 @@ import {
   type NativeInvocationCompletionInput,
 } from './multi-agent/workflow-store.js';
 import { MultiAgentNativeRuntimeLauncher } from './multi-agent/native-runtime-launcher.js';
+import { startStaleDetector } from './multi-agent/stale-detector.js';
+import {
+  NEXT_ACTION_THROTTLE,
+  READ_WORKFLOW_THROTTLE,
+  RequestThrottle,
+  throttleBypassed,
+  throttleClientKey,
+} from './multi-agent/request-throttle.js';
 import {
   committedEvidenceErrorMessage,
   validateCommittedEvidencePreflight,
@@ -200,6 +211,101 @@ interface MultiAgentWorkflowPatchBody {
 interface MultiAgentNextActionQuery {
   subtaskId?: string;
   headSha?: string;
+}
+
+interface MultiAgentWorkflowListQuery {
+  status?: string;
+  workspaceRoot?: string;
+  effectiveProjectPath?: string;
+  repo?: string;
+  mode?: MultiAgentWorkflowRecord['mode'];
+  headRef?: string;
+  baseRef?: string;
+  stale?: string;
+}
+
+const OPEN_WORKFLOW_STATUSES: ReadonlySet<MultiAgentWorkflowRecord['status']> = new Set([
+  'created',
+  'questioning_requirements',
+  'planning',
+  'task_graph_questioning',
+  'active',
+  'blocked',
+  'human_review_required',
+]);
+
+function normalizeWorkspacePath(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.replace(/\/+$/, '');
+}
+
+function matchesWorkflowListFilter(
+  workflow: MultiAgentWorkflowRecord,
+  filter: MultiAgentWorkflowListQuery,
+): boolean {
+  if (filter.status) {
+    if (filter.status === 'open') {
+      if (!OPEN_WORKFLOW_STATUSES.has(workflow.status)) return false;
+    } else if (workflow.status !== filter.status) {
+      return false;
+    }
+  }
+  const filterWorkspaceRoot = normalizeWorkspacePath(filter.workspaceRoot);
+  if (filterWorkspaceRoot) {
+    const wfRoot = normalizeWorkspacePath(workflow.workspaceBinding?.workspaceRoot);
+    if (wfRoot !== filterWorkspaceRoot) return false;
+  }
+  const filterProjectPath = normalizeWorkspacePath(filter.effectiveProjectPath);
+  if (filterProjectPath) {
+    const wfProject = normalizeWorkspacePath(workflow.workspaceBinding?.effectiveProjectPath);
+    if (wfProject !== filterProjectPath) return false;
+  }
+  if (filter.repo && workflow.repo !== filter.repo) return false;
+  if (filter.mode && workflow.mode !== filter.mode) return false;
+  if (filter.headRef && workflow.headRef !== filter.headRef) return false;
+  if (filter.baseRef && workflow.baseRef !== filter.baseRef) return false;
+  if (typeof filter.stale === 'string') {
+    const wantStale = filter.stale === 'true' || filter.stale === '1';
+    const isStale = Boolean((workflow.metadata as Record<string, unknown> | undefined)?.staleAt);
+    if (wantStale !== isStale) return false;
+  }
+  return true;
+}
+
+/**
+ * Compute the CLI commands a caller should run after a write action.
+ * Emitted on `execute-subtask`, `accept-contracts`, `record-review`, and the
+ * final completion routes so callers do not have to fall back to
+ * `next` / `status` / `continue` to figure out the next step.
+ *
+ * Returns `[]` when the planner cannot produce a deterministic next step or
+ * when the bundle read fails — the field is best-effort.
+ */
+async function nextRecommendedCommandsForWorkflow(
+  store: FileMultiAgentWorkflowStore,
+  workflowId: string,
+  ctx: Partial<CliMappingContext> = {},
+): Promise<NextRecommendedCommand[]> {
+  try {
+    const bundle = await store.readBundle(workflowId);
+    if (!bundle) return [];
+    const planned = planNextAction({ bundle });
+    const mappingCtx: CliMappingContext = {
+      workflowId,
+      subtaskId: ctx.subtaskId || planned.subtaskId,
+      contractId: (planned.inputs?.contractId as string | undefined) ?? ctx.contractId,
+      evaluationRunId: (planned.inputs?.evaluationRunId as string | undefined) ?? ctx.evaluationRunId,
+      finalEvaluationRunId: (planned.inputs?.finalEvaluationRunId as string | undefined) ?? ctx.finalEvaluationRunId,
+      reviewEvidenceId: (planned.inputs?.reviewEvidenceId as string | undefined) ?? ctx.reviewEvidenceId,
+      invocationId: (planned.inputs?.invocationId as string | undefined) ?? ctx.invocationId,
+      headSha: bundle.workflow.currentHeadSha,
+    };
+    return buildNextRecommendedCommands([planned.action], mappingCtx);
+  } catch {
+    return [];
+  }
 }
 
 interface CreateSprintContractBody {
@@ -619,8 +725,28 @@ export async function createServer(
     multiAgentRuntimeRunners,
   );
   await reconcileOrphanedNativeRuntimeState(multiAgentStore);
+  const stopStaleDetector = startStaleDetector(multiAgentStore);
+  const multiAgentThrottle = new RequestThrottle();
   fastify.addHook('onClose', async () => {
+    stopStaleDetector();
     await multiAgentNativeLauncher.shutdown();
+  });
+
+  // Invalidate throttle cache after any successful multi-agent workflow write.
+  // Doing this here (single hook) rather than sprinkled inside every handler
+  // guarantees mutation-followed-by-read never serves the pre-mutation body
+  // from within the same burst window. `bundle:` and `next-action:` prefixes
+  // are keyed by workflow id, so we invalidate both.
+  const MULTI_AGENT_WRITE_METHODS = new Set(['POST', 'PATCH', 'PUT', 'DELETE']);
+  const MULTI_AGENT_WORKFLOW_PATH = /^\/api\/v1\/multi-agent\/workflows\/([^/]+)/;
+  fastify.addHook('onResponse', async (req, reply) => {
+    if (!MULTI_AGENT_WRITE_METHODS.has(req.method)) return;
+    if (reply.statusCode < 200 || reply.statusCode >= 300) return;
+    const match = MULTI_AGENT_WORKFLOW_PATH.exec(req.url || '');
+    if (!match) return;
+    const workflowId = match[1];
+    multiAgentThrottle.invalidate(`bundle:${workflowId}:`);
+    multiAgentThrottle.invalidate(`next-action:${workflowId}:`);
   });
 
   function resolveWorkspaceRoot(rootPath?: string): string {
@@ -1511,12 +1637,25 @@ export async function createServer(
     },
   );
 
-  fastify.get(
+  fastify.get<{ Querystring: MultiAgentWorkflowListQuery }>(
     '/api/v1/multi-agent/workflows',
-    async (_req, reply) => {
+    async (req, reply) => {
       try {
-        const workflows = (await multiAgentStore.listWorkflowRecords())
+        const filter = req.query || {};
+        const hasFilter = Boolean(
+          filter.status
+          || filter.workspaceRoot
+          || filter.effectiveProjectPath
+          || filter.repo
+          || filter.mode
+          || filter.headRef
+          || filter.stale,
+        );
+        const all = (await multiAgentStore.listWorkflowRecords())
           .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+        const workflows = hasFilter
+          ? all.filter((workflow) => matchesWorkflowListFilter(workflow, filter))
+          : all;
         return {
           workflows: redactSensitiveObject(workflows) as MultiAgentWorkflowRecord[],
         };
@@ -1530,11 +1669,23 @@ export async function createServer(
     '/api/v1/multi-agent/workflows/:workflowId',
     async (req, reply) => {
       try {
+        const throttleKey = `bundle:${req.params.workflowId}:${throttleClientKey(req.headers, req.ip)}`;
+        const check = throttleBypassed(req.headers)
+          ? { throttled: false as const }
+          : multiAgentThrottle.check(throttleKey, READ_WORKFLOW_THROTTLE);
+        if (check.throttled) {
+          const retryAfterSec = String(Math.max(1, Math.ceil((check.retryAfterMs ?? 5_000) / 1000)));
+          reply.header('retry-after', retryAfterSec);
+          reply.header('x-tik-throttled', '1');
+          return { ...(check.cachedResult as object), throttled: true, retryAfterMs: check.retryAfterMs };
+        }
         const bundle = await multiAgentStore.readBundle(req.params.workflowId);
         if (!bundle) {
           return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
         }
-        return sanitizeMultiAgentWorkflowBundle(bundle);
+        const result = sanitizeMultiAgentWorkflowBundle(bundle);
+        multiAgentThrottle.record(throttleKey, READ_WORKFLOW_THROTTLE, result);
+        return result;
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1590,6 +1741,24 @@ export async function createServer(
     '/api/v1/multi-agent/workflows/:workflowId/next-action',
     async (req, reply) => {
       try {
+        const throttleKey = `next-action:${req.params.workflowId}:${req.query.subtaskId || '-'}:${req.query.headSha || '-'}:${throttleClientKey(req.headers, req.ip)}`;
+        const check = throttleBypassed(req.headers)
+          ? { throttled: false as const }
+          : multiAgentThrottle.check(throttleKey, NEXT_ACTION_THROTTLE);
+        if (check.throttled) {
+          const retryAfterMs = check.retryAfterMs ?? 5_000;
+          reply.header('retry-after', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+          reply.header('x-tik-throttled', '1');
+          // If the cached response was originally 202 awaiting_native_runtime,
+          // re-emit 202 so the CLI's `if (response.status === 202)` cooldown
+          // installer keeps firing on throttled hits — otherwise the client
+          // would poll again after 2 s instead of honoring retryAfterMs.
+          if (check.cachedAwaiting) {
+            reply.code(202);
+          }
+          const cached = (check.cachedResult as Record<string, unknown>) || {};
+          return { ...cached, throttled: true, retryAfterMs };
+        }
         const bundle = await multiAgentStore.readBundle(req.params.workflowId);
         if (!bundle) {
           return sendV1Error(reply, 404, 'workflow_not_found', 'Multi-agent workflow not found');
@@ -1599,7 +1768,12 @@ export async function createServer(
           subtaskId: req.query.subtaskId,
           headSha: req.query.headSha,
         });
-        return {
+        const isAwaiting = plannedAction.reasonCode === 'awaiting_native_runtime' && Boolean(plannedAction.retryAfterMs);
+        if (isAwaiting) {
+          reply.code(202);
+          reply.header('retry-after', String(Math.max(1, Math.ceil(plannedAction.retryAfterMs! / 1000))));
+        }
+        const result = {
           plannedAction,
           action: plannedAction.action,
           phase: plannedAction.phase,
@@ -1611,7 +1785,13 @@ export async function createServer(
           inputs: plannedAction.inputs,
           commandHint: plannedAction.commandHint,
           actionDefinition: plannedAction.actionDefinition,
+          retryAfterMs: plannedAction.retryAfterMs,
         };
+        multiAgentThrottle.record(throttleKey, NEXT_ACTION_THROTTLE, result, {
+          awaitingNativeRuntime: isAwaiting,
+          retryAfterMs: plannedAction.retryAfterMs,
+        });
+        return result;
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -1947,12 +2127,18 @@ export async function createServer(
           status: workbenchStatusForSubtaskStatus(subtask.status),
           reason: `Multi-agent workflow ${syncedWorkflow.id} completed subtask ${subtask.subtaskId}.`,
         });
+        const nextRecommendedCommand = await nextRecommendedCommandsForWorkflow(
+          multiAgentStore,
+          req.params.workflowId,
+          { subtaskId: subtask.subtaskId },
+        );
         return {
           decision,
           guard,
           workflow: syncedWorkflow,
           subtask,
           rootTask,
+          nextRecommendedCommand,
         };
       } catch (error) {
         return sendV1CaughtError(reply, error);
@@ -2093,7 +2279,12 @@ export async function createServer(
           expectedLastDecisionId: readIfMatch(req.headers['if-match']),
         });
         const rootTask = await syncMultiAgentRootTaskForDecision(result.workflow, result.decision);
-        return { ...result, guard, rootTask };
+        const nextRecommendedCommand = await nextRecommendedCommandsForWorkflow(
+          multiAgentStore,
+          req.params.workflowId,
+          { subtaskId },
+        );
+        return { ...result, guard, rootTask, nextRecommendedCommand };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -2150,7 +2341,12 @@ export async function createServer(
           expectedLastDecisionId: readIfMatch(req.headers['if-match']),
         });
         const rootTask = await syncMultiAgentRootTaskForDecision(result.workflow, result.decision);
-        return { ...result, guard, rootTask };
+        const nextRecommendedCommand = await nextRecommendedCommandsForWorkflow(
+          multiAgentStore,
+          req.params.workflowId,
+          { subtaskId },
+        );
+        return { ...result, guard, rootTask, nextRecommendedCommand };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -2189,7 +2385,11 @@ export async function createServer(
           expectedLastDecisionId: readIfMatch(req.headers['if-match']),
         });
         const rootTask = await syncMultiAgentRootTaskForDecision(result.workflow, result.decision);
-        return { ...result, guard, rootTask };
+        const nextRecommendedCommand = await nextRecommendedCommandsForWorkflow(
+          multiAgentStore,
+          req.params.workflowId,
+        );
+        return { ...result, guard, rootTask, nextRecommendedCommand };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -2237,7 +2437,12 @@ export async function createServer(
           status: workbenchStatusForEvaluationRunStatus(evaluationRun.status, evaluationRun.result?.verdict),
           reason: `Multi-agent workflow ${req.params.workflowId} recorded evaluation result ${evaluationRun.id}.`,
         });
-        return { decision, guard, evaluationRun, subtask, rootTask };
+        const nextRecommendedCommand = await nextRecommendedCommandsForWorkflow(
+          multiAgentStore,
+          req.params.workflowId,
+          { subtaskId: req.body.subtaskId, evaluationRunId: req.body.evaluationRunId },
+        );
+        return { decision, guard, evaluationRun, subtask, rootTask, nextRecommendedCommand };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -2284,7 +2489,12 @@ export async function createServer(
               : 'in_progress',
           reason: `Multi-agent workflow ${req.params.workflowId} recorded questioner output ${questionerOutput.id}.`,
         });
-        return { decision, guard, questionerOutput, subtask, rootTask };
+        const nextRecommendedCommand = await nextRecommendedCommandsForWorkflow(
+          multiAgentStore,
+          req.params.workflowId,
+          { subtaskId: req.body.output.subtaskId },
+        );
+        return { decision, guard, questionerOutput, subtask, rootTask, nextRecommendedCommand };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -2323,6 +2533,8 @@ export async function createServer(
           guard,
           workflow: syncedWorkflow,
           rootTask,
+          // Workflow is now completed; no further CLI commands are expected.
+          nextRecommendedCommand: [],
         };
       } catch (error) {
         return sendV1CaughtError(reply, error);
@@ -2517,7 +2729,11 @@ export async function createServer(
             error: error instanceof Error ? error.message : String(error),
           };
         }
-        return { ...result, rootTask, rootTaskProjection };
+        const nextRecommendedCommand = await nextRecommendedCommandsForWorkflow(
+          multiAgentStore,
+          req.params.workflowId,
+        );
+        return { ...result, rootTask, rootTaskProjection, nextRecommendedCommand };
       } catch (error) {
         return sendV1CaughtError(reply, error);
       }
@@ -2679,7 +2895,9 @@ export async function createServer(
                   : existingRun.status === 'rejected' || existingRun.status === 'expired'
                     ? 'failed'
                     : 'running',
+                reused: true,
               },
+              reused: true,
               rootTask: null,
               rootTaskProjection: { status: 'synced' },
             };
@@ -2910,7 +3128,9 @@ export async function createServer(
             runId: launched.runId,
             runtimeRef: launched.runtimeRef,
             status: launched.status,
+            reused: Boolean(launched.reused),
           },
+          reused: Boolean(launched.reused),
           rootTask,
           rootTaskProjection,
         };

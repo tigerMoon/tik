@@ -322,7 +322,14 @@ export class FileMultiAgentWorkflowStore {
       rootTaskId: patch.rootTaskId ?? existing.rootTaskId,
       currentHeadSha: patch.currentHeadSha ?? existing.currentHeadSha,
       pauseReason: patch.pauseReason ?? existing.pauseReason,
-      metadata: patch.metadata ?? existing.metadata,
+      // Shallow-merge metadata so concurrent writers (e.g. the CLI's
+      // pauseWorkflow and the in-process stale-detector) don't clobber each
+      // other's fields. Callers that need to remove a key should send it as
+      // `null` explicitly; the merge below preserves undefined values from
+      // `existing` rather than dropping them.
+      metadata: patch.metadata
+        ? mergeWorkflowMetadata(existing.metadata, patch.metadata)
+        : existing.metadata,
       policy: patch.policy
         ? {
           ...(existing.policy || DEFAULT_WORKFLOW_POLICY),
@@ -3330,6 +3337,27 @@ export class FileMultiAgentWorkflowStore {
     }
     await fs.rm(this.workflowTransactionFile(workflowId), { force: true });
   }
+}
+
+/**
+ * Shallow-merge two metadata objects. Any key set to explicit `null` in the
+ * patch removes that key from the merged output; `undefined` values in the
+ * patch are ignored so callers can partially update.
+ */
+function mergeWorkflowMetadata(
+  existing: Record<string, unknown> | undefined,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...(existing || {}) };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    if (value === null) {
+      delete merged[key];
+      continue;
+    }
+    merged[key] = value;
+  }
+  return merged;
 }
 
 function buildSubtaskStatesForGraph(

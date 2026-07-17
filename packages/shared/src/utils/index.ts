@@ -100,3 +100,9 @@ export {
   stableHash,
   stableStringify,
 } from './questioner-hash.js';
+export {
+  buildNextRecommendedCommands,
+  mapWorkflowActionToCliCommand,
+  type CliMappingContext,
+  type NextRecommendedCommand,
+} from './multi-agent-cli-mapping.js';
