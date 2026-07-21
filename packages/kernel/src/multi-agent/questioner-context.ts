@@ -21,6 +21,94 @@ const MAX_ARTIFACT_SUMMARY_CHARS = 1600;
 const MAX_LOG_EXCERPT_CHARS = 2400;
 const MAX_DIFF_EXCERPT_CHARS = 2600;
 
+// Slim-mode budgets: kick in only when the raw context exceeds the questioner
+// budget. Aggressive but not destructive — verdict, commandIds, criteriaIds,
+// and gaps still round-trip; only free-text excerpts get compressed.
+const SLIM_LOG_EXCERPT_CHARS = 600;
+const SLIM_DIFF_EXCERPT_CHARS = 400;
+const SLIM_FILE_EXCERPT_CHARS = 500;
+const SLIM_MAX_LOGS = 4;
+const SLIM_MAX_DIFF_EXCERPTS = 4;
+const SLIM_MAX_RELEVANT_FILES = 4;
+
+export function estimateContextTokens(value: unknown): number {
+  return Math.ceil(Buffer.byteLength(typeof value === 'string' ? value : JSON.stringify(value), 'utf-8') / 4);
+}
+
+/**
+ * Compress a QuestionerContextV1 in place-safe (returns a new object) when the
+ * raw estimate exceeds budget. Keeps identifiers, verdicts, criteria, gaps,
+ * and file paths intact so Claude can still cite evidenceRefs; only shrinks
+ * free-text excerpts. Recomputes contextHash so downstream attestation still
+ * matches. Idempotent: calling on an already-slim context is safe.
+ */
+export function slimQuestionerContext(context: QuestionerContextV1): QuestionerContextV1 {
+  const slim: QuestionerContextV1 = {
+    ...context,
+    evaluation: context.evaluation ? {
+      ...context.evaluation,
+      logs: (context.evaluation.logs || [])
+        .slice(0, SLIM_MAX_LOGS)
+        .map((log) => ({
+          ...log,
+          excerpt: slimTruncate(log.excerpt, SLIM_LOG_EXCERPT_CHARS),
+        })),
+    } : undefined,
+    diff: context.diff ? {
+      ...context.diff,
+      // buildDiffExcerpts always emits the two synthetic entries
+      // (__git_diff_stat__, __git_diff_name_status__) at indices 0/1, then
+      // per-file diffs. A naive slice(0, N) would keep the two headers and
+      // drop the file diffs — leaving Questioner with only summary metadata
+      // exactly when there are many files. Reserve slots for the synthetic
+      // entries and give the remaining slots to per-file diffs.
+      excerpts: budgetDiffExcerpts(context.diff.excerpts || [], SLIM_MAX_DIFF_EXCERPTS, SLIM_DIFF_EXCERPT_CHARS),
+    } : context.diff,
+    relevantFiles: (context.relevantFiles || [])
+      .slice(0, SLIM_MAX_RELEVANT_FILES)
+      .map((file) => ({
+        ...file,
+        excerpt: slimTruncate(file.excerpt, SLIM_FILE_EXCERPT_CHARS),
+      })),
+  };
+  // Recompute hash on the slimmed body so attestation matches what we persist.
+  const withoutHash: QuestionerContextV1 = {
+    ...slim,
+    run: { ...slim.run, contextHash: '' },
+  };
+  const contextHash = stableHash(withoutHash);
+  return { ...slim, run: { ...slim.run, contextHash } };
+}
+
+function slimTruncate(value: string, maxChars: number): string {
+  if (!value) return value;
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, Math.max(0, maxChars - 20))}\n[truncated]`;
+}
+
+const SYNTHETIC_DIFF_PATHS = new Set(['__git_diff_stat__', '__git_diff_name_status__']);
+
+/**
+ * Preserve the synthetic diff headers plus as many per-file diffs as the
+ * budget allows. Falls back to a plain slice-then-truncate for callers whose
+ * excerpts don't include the synthetic entries.
+ */
+function budgetDiffExcerpts(
+  excerpts: NonNullable<QuestionerContextV1['diff']>['excerpts'],
+  maxEntries: number,
+  maxCharsPerEntry: number,
+): NonNullable<QuestionerContextV1['diff']>['excerpts'] {
+  const synthetic = excerpts.filter((entry) => SYNTHETIC_DIFF_PATHS.has(entry.path));
+  const files = excerpts.filter((entry) => !SYNTHETIC_DIFF_PATHS.has(entry.path));
+  const syntheticKept = synthetic.slice(0, maxEntries);
+  const fileBudget = Math.max(0, maxEntries - syntheticKept.length);
+  const filesKept = files.slice(0, fileBudget);
+  return [...syntheticKept, ...filesKept].map((excerpt) => ({
+    ...excerpt,
+    excerpt: slimTruncate(excerpt.excerpt, maxCharsPerEntry),
+  }));
+}
+
 export interface BuildQuestionerContextInput {
   workflowId: string;
   questionerRunId: string;

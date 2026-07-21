@@ -15,6 +15,17 @@ export type MultiAgentWorkflowStatus =
 
 export type MultiAgentWorkflowMode = 'implementation' | 'review';
 
+/**
+ * Workflow kind orthogonal to mode. `standard` (default) requires the full
+ * Codex Evaluator + Claude Questioner audit loop. `lite` is a fast path for
+ * narrow, low-risk changes (single-file config, dependency version bumps,
+ * documentation): it keeps evidence and evaluator gates but skips the
+ * Claude Questioner requirement on complete_subtask and complete_workflow.
+ * Contract acceptance, implementation evidence, and evaluator pass remain
+ * mandatory — a lite workflow is auditable, just faster.
+ */
+export type MultiAgentWorkflowKind = 'standard' | 'lite';
+
 export type WorkflowDecisionAction =
   | 'ask_claude_question_requirement'
   | 'ask_claude_question_task_graph'
@@ -119,6 +130,7 @@ export interface CreateMultiAgentWorkflowInput {
   id?: string;
   goal: string;
   mode?: MultiAgentWorkflowMode;
+  kind?: MultiAgentWorkflowKind;
   rootTaskId?: string;
   repo?: string;
   baseRef?: string;
@@ -138,6 +150,8 @@ export interface MultiAgentWorkflowRecord {
   status: MultiAgentWorkflowStatus;
   /** Defaults to implementation for records created before review mode existed. */
   mode?: MultiAgentWorkflowMode;
+  /** Defaults to standard. Lite workflows skip the Claude Questioner gate. */
+  kind?: MultiAgentWorkflowKind;
   goal: string;
   rootTaskId: string;
   repo?: string;

@@ -33,7 +33,15 @@ import {
   type WorkflowDecision,
   type WorkflowPolicy,
 } from '@tik/shared';
-import { buildQuestionerContext } from './questioner-context.js';
+import { buildQuestionerContext, estimateContextTokens, slimQuestionerContext } from './questioner-context.js';
+
+/**
+ * Hard budget for a Questioner ContextBundle before the kernel rejects the
+ * launch with context_budget_exceeded. Keep this in sync with the tighter
+ * budgets in `native-context-bundle.ts:ROLE_TOKEN_BUDGETS.questioner`; the
+ * bundle path is separate but we don't want the two to drift apart.
+ */
+const QUESTIONER_CONTEXT_TOKEN_BUDGET = 12_000;
 import { evaluateWorkflowDecisionGuard } from './guard.js';
 import {
   hashQuestionerToken,
@@ -240,6 +248,7 @@ export class FileMultiAgentWorkflowStore {
       revision: 0,
       status: 'active',
       mode: input.mode || 'implementation',
+      kind: input.kind || 'standard',
       goal: input.goal,
       rootTaskId: input.rootTaskId || id,
       repo: input.repo,
@@ -251,6 +260,14 @@ export class FileMultiAgentWorkflowStore {
         ...DEFAULT_WORKFLOW_POLICY,
         maxFixRoundsPerSubtask: input.maxRounds ?? DEFAULT_WORKFLOW_POLICY.maxFixRoundsPerSubtask,
         ...input.policy,
+        // Lite workflows skip the Claude Questioner gate by default. Contract
+        // acceptance and evaluator pass still remain mandatory. Applied AFTER
+        // `...input.policy` so an explicit `undefined` in input.policy cannot
+        // clobber the computed default — the ?? here still lets a caller
+        // supply an explicit boolean to override lite behavior.
+        requireQuestionerAfterEvaluation: input.kind === 'lite'
+          ? input.policy?.requireQuestionerAfterEvaluation ?? false
+          : input.policy?.requireQuestionerAfterEvaluation ?? DEFAULT_WORKFLOW_POLICY.requireQuestionerAfterEvaluation,
         requireAcceptedContract: input.mode === 'review'
           ? false
           : input.policy?.requireAcceptedContract ?? DEFAULT_WORKFLOW_POLICY.requireAcceptedContract,
@@ -557,6 +574,86 @@ export class FileMultiAgentWorkflowStore {
       return {
         decision: recorded,
         workflow: await this.requireWorkflow(id),
+        guard: { accepted: true, code: 'ok' },
+      };
+    });
+  }
+
+  /**
+   * Record a decision AND patch a subtask under a single workflow mutation
+   * lock. Guarantees the pair is atomic: if the subtask transition throws
+   * (raced by a concurrent status change), the decision is not appended and
+   * lastDecisionId does not move. Prevents the dangling-decision failure
+   * mode that plain recordDecisionIfMatch + updateSubtask exhibits when
+   * the two are called from a route without a shared lock.
+   */
+  async recordDecisionAndUpdateSubtaskIfMatch(
+    workflowId: string,
+    decision: WorkflowDecision,
+    subtaskPatch: { subtaskId: string; patch: Partial<SubtaskRunState> },
+    expectedLastDecisionId?: string,
+  ): Promise<{
+    decision?: WorkflowDecision;
+    workflow: MultiAgentWorkflowRecord;
+    subtask?: SubtaskRunState;
+    guard: GuardResult;
+  }> {
+    const id = this.normalizeId(workflowId);
+    return this.withWorkflowMutation(id, async () => {
+      const workflow = await this.requireWorkflow(id);
+      if (!lastDecisionMatches(workflow.lastDecisionId, expectedLastDecisionId)) {
+        return {
+          workflow,
+          guard: {
+            accepted: false,
+            code: 'version_conflict',
+            message: `Decision history changed; expected ${expectedLastDecisionId || 'no last decision'}, current ${workflow.lastDecisionId || 'none'}.`,
+            currentState: {
+              expectedLastDecisionId,
+              lastDecisionId: workflow.lastDecisionId,
+            },
+          },
+        };
+      }
+      // Verify the subtask transition is legal BEFORE writing the decision.
+      // If we discover the transition is illegal after the decision landed,
+      // we cannot roll back the append-only decisions journal cleanly.
+      const subtasks = await this.readSubtasks(id);
+      const existing = subtasks[subtaskPatch.subtaskId];
+      if (!existing) {
+        return {
+          workflow,
+          guard: {
+            accepted: false,
+            code: 'invalid_transition',
+            message: `Subtask not found: ${subtaskPatch.subtaskId}.`,
+          },
+        };
+      }
+      const nextStatus = subtaskPatch.patch.status ?? existing.status;
+      try {
+        assertSubtaskTransition(existing.status, nextStatus);
+      } catch (error) {
+        return {
+          workflow,
+          guard: {
+            accepted: false,
+            code: 'invalid_transition',
+            message: (error as Error).message,
+            currentState: { subtaskId: subtaskPatch.subtaskId, status: existing.status },
+          },
+        };
+      }
+      const recorded = await this.recordDecision(id, decision);
+      const patchedSubtask = await this.updateSubtask(
+        id,
+        subtaskPatch.subtaskId,
+        subtaskPatch.patch,
+      );
+      return {
+        decision: recorded,
+        workflow: await this.requireWorkflow(id),
+        subtask: patchedSubtask,
         guard: { accepted: true, code: 'ok' },
       };
     });
@@ -1387,23 +1484,32 @@ export class FileMultiAgentWorkflowStore {
       headSha: input.headSha,
       submitUrl,
     });
-    const estimatedContextTokens = Math.ceil(Buffer.byteLength(JSON.stringify(context), 'utf-8') / 4);
-    const contextTokenBudget = 12_000;
-    if (estimatedContextTokens > contextTokenBudget) {
+    const rawEstimate = estimateContextTokens(context);
+    // Try slimming before rejecting on budget — verbose stdout/stderr and
+    // trailing coverage gaps blow past 12k on evaluations with a few
+    // multi-command runs, even when the actual signal is small. The slim
+    // pass truncates commandResults output but preserves verdict/counts.
+    let finalContext = context;
+    let finalEstimate = rawEstimate;
+    if (rawEstimate > QUESTIONER_CONTEXT_TOKEN_BUDGET) {
+      finalContext = slimQuestionerContext(context);
+      finalEstimate = estimateContextTokens(finalContext);
+    }
+    if (finalEstimate > QUESTIONER_CONTEXT_TOKEN_BUDGET) {
       await this.updateInvocation(id, invocation.id, {
         status: 'cancelled',
-        error: `context_budget_exceeded: estimated ${estimatedContextTokens} tokens, budget ${contextTokenBudget}.`,
+        error: `context_budget_exceeded: estimated ${finalEstimate} tokens (raw ${rawEstimate}, after slim ${finalEstimate}), budget ${QUESTIONER_CONTEXT_TOKEN_BUDGET}.`,
       });
       throw new MultiAgentCoordinationError(
         'context_budget_exceeded',
-        `Questioner context estimated ${estimatedContextTokens} tokens exceeds budget ${contextTokenBudget}.`,
+        `Questioner context estimated ${finalEstimate} tokens exceeds budget ${QUESTIONER_CONTEXT_TOKEN_BUDGET}.`,
       );
     }
     const boundedInvocation = await this.updateInvocation(id, invocation.id, {
       status: 'created',
-      contextBundleHash: context.run.contextHash,
-      estimatedContextTokens,
-      contextTokenBudget,
+      contextBundleHash: finalContext.run.contextHash,
+      estimatedContextTokens: finalEstimate,
+      contextTokenBudget: QUESTIONER_CONTEXT_TOKEN_BUDGET,
       cleanContext: true,
     });
     const run: QuestionerRun = {
@@ -1420,7 +1526,7 @@ export class FileMultiAgentWorkflowStore {
       finalEvaluationRunId: input.finalEvaluationRunId,
       headSha: input.headSha,
       contextArtifactRef,
-      contextHash: context.run.contextHash,
+      contextHash: finalContext.run.contextHash,
       expectedOutputArtifactRef,
       tokenId: `tok_${generateId().slice(0, 10)}`,
       tokenHash: hashQuestionerToken(token),
@@ -1438,7 +1544,7 @@ export class FileMultiAgentWorkflowStore {
       startedAt: input.start === false ? undefined : now,
     };
     await this.writeJsonFileAtomic(this.questionerRunFile(id, run.id), run);
-    await this.writeJsonFileAtomic(this.questionerRunContextFile(id, run.id), context);
+    await this.writeJsonFileAtomic(this.questionerRunContextFile(id, run.id), finalContext);
     await this.appendEvent(id, 'questioner.run.created', 'tik', {
       questionerRunId: run.id,
       invocationId: invocation.id,
@@ -1453,9 +1559,9 @@ export class FileMultiAgentWorkflowStore {
         invocationId: invocation.id,
       });
       const startedInvocation = await this.readInvocation(id, boundedInvocation.id);
-      return { run, invocation: startedInvocation || boundedInvocation, context, token };
+      return { run, invocation: startedInvocation || boundedInvocation, context: finalContext, token };
     }
-    return { run, invocation: boundedInvocation, context, token };
+    return { run, invocation: boundedInvocation, context: finalContext, token };
   }
 
   async readQuestionerRun(workflowId: string, runId: string): Promise<QuestionerRun | null> {

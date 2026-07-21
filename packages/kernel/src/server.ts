@@ -1841,11 +1841,25 @@ export async function createServer(
             workflow: bundle.workflow,
           };
         }
-        const recorded = await multiAgentStore.recordDecisionIfMatch(
-          req.params.workflowId,
-          req.body.decision,
-          readIfMatch(req.headers['if-match']),
-        );
+        // fix_evaluation_findings is guard-approved but historically lacked a
+        // real state transition — callers had to stitch the subtask patch
+        // manually. We handle that here atomically: the atomic helper
+        // pre-checks the subtask transition before writing the decision, so
+        // a race on the subtask row cannot produce a dangling decision.
+        const isFixEvaluationFindings =
+          req.body.decision.action === 'fix_evaluation_findings' && !!req.body.decision.subtaskId;
+        const recorded = isFixEvaluationFindings
+          ? await multiAgentStore.recordDecisionAndUpdateSubtaskIfMatch(
+              req.params.workflowId,
+              req.body.decision,
+              { subtaskId: req.body.decision.subtaskId!, patch: { status: 'needs_fix' } },
+              readIfMatch(req.headers['if-match']),
+            )
+          : await multiAgentStore.recordDecisionIfMatch(
+              req.params.workflowId,
+              req.body.decision,
+              readIfMatch(req.headers['if-match']),
+            );
         if (!recorded.guard.accepted) {
           reply.code(409);
           return {
@@ -1862,6 +1876,7 @@ export async function createServer(
           guard,
           workflow: recorded.workflow,
           rootTask,
+          subtask: 'subtask' in recorded ? recorded.subtask : undefined,
         };
       } catch (error) {
         return sendV1CaughtError(reply, error);

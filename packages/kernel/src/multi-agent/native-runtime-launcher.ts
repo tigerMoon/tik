@@ -588,7 +588,14 @@ function changedPathsFromStatus(status: string): string[] {
 function isAllowedEvaluatorGeneratedPath(value: string, allowedPaths: string[] = []): boolean {
   const filePath = value.replace(/\\/g, '/').replace(/^\.\/+/, '');
   return /(^|\/)target(?:\/|$)/.test(filePath)
-    || /(^|\/)\.risk\.env$/.test(filePath)
+    // Scoped env files written by common `local_verify.sh`-style scripts
+    // (.risk.env, .scope.env, .local_verify_*.env). These are per-run
+    // gate artifacts, never source, so evaluators can safely emit them.
+    || /(^|\/)\.(risk|scope)\.env$/.test(filePath)
+    // `[^/]*` (not `[^/]+`) matches the CLI's `.local_verify_*.env` glob,
+    // which allows zero-or-more chars in the star. Two encodings must agree
+    // on the edge case `.local_verify_.env`.
+    || /(^|\/)\.local_verify_[^/]*\.env$/.test(filePath)
     || /(^|\/)(?:test-results|playwright-report|coverage)(?:\/|$)/.test(filePath)
     || filePath.startsWith('.tmp/evaluation/')
     || filePath.startsWith('.tik/multi-agent/')

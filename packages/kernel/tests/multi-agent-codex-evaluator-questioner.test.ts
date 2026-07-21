@@ -2918,6 +2918,277 @@ describe('codex evaluator and Claude questioner workflow', () => {
     });
   });
 
+  it('atomically transitions evaluation_failed → executing when fix_evaluation_findings is recorded', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    await createV1Workflow(server, 'wf-fix-eval', root);
+    await putSingleSubtaskGraph(server, 'wf-fix-eval');
+    await createAcceptedContract(server, 'wf-fix-eval');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-eval/evidence',
+      payload: {
+        id: 'ev-fix-eval-impl',
+        kind: 'implementation',
+        title: 'Implementation evidence',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/guard.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    for (const status of ['executing', 'implemented', 'validated', 'evaluating', 'evaluation_failed']) {
+      const patch = await server.inject({
+        method: 'PATCH',
+        url: '/api/v1/multi-agent/workflows/wf-fix-eval/subtasks/st-api',
+        payload: {
+          status,
+          ...(status === 'implemented' || status === 'validated'
+            ? { implementationHeadSha: 'head-1', evidenceRefs: ['ev-fix-eval-impl'] }
+            : {}),
+          ...(status === 'validated' ? { lastValidatedHeadSha: 'head-1' } : {}),
+        },
+      });
+      expect(patch.statusCode).toBe(200);
+    }
+
+    // Record a failed evaluation so guardCanFixEvaluationFindings passes.
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-eval/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-fix-eval-failed',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-fix-eval-failed' },
+      },
+    });
+    const failedEval = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-eval/subtasks/st-api/evaluations/eval-fix-eval-failed/result',
+      payload: {
+        result: {
+          workflowId: 'wf-fix-eval',
+          subtaskId: 'st-api',
+          contractId: 'contract-st-api-v1',
+          evaluatorRunId: 'eval-fix-eval-failed',
+          headSha: 'head-1',
+          verdict: 'fail',
+          criteriaResults: [{ criterionId: 'ac-1', status: 'fail', evidence: 'Coverage gap.' }],
+          commandResults: [],
+          runtimeFindings: [],
+          coverageGaps: [{ criterionId: 'ac-1', description: 'Missing test.' }],
+          confidence: 0.9,
+        },
+      },
+    });
+    expect(failedEval.statusCode).toBe(200);
+
+    const recorded = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-eval/decisions',
+      payload: {
+        decision: buildDecision('wf-fix-eval', {
+          id: 'dec-fix-eval',
+          action: 'fix_evaluation_findings',
+          subtaskId: 'st-api',
+          reason: 'Codex will address the coverage gap before re-running.',
+          inputs: { currentHeadSha: 'head-1', evaluationRunId: 'eval-fix-eval-failed' },
+        }),
+      },
+    });
+    expect(recorded.statusCode).toBe(200);
+    const body = recorded.json();
+    expect(body.guard).toMatchObject({ accepted: true });
+    expect(body.subtask).toMatchObject({
+      subtaskId: 'st-api',
+      status: 'needs_fix',
+    });
+
+    // Sanity: preflight execute_subtask (guard allows needs_fix).
+    const nextExecutePreflight = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-eval/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-fix-eval', {
+          id: 'dec-post-fix-execute',
+          action: 'execute_subtask',
+          subtaskId: 'st-api',
+          reason: 'Retry after fix_evaluation_findings transition.',
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(nextExecutePreflight.statusCode).toBe(200);
+    expect(nextExecutePreflight.json().guard).toMatchObject({ accepted: true });
+
+    // Regression: record_implementation guard must also accept needs_fix, or
+    // the fix-evaluation → execute flow deadlocks one step later. Before the
+    // guard fix, this preflight returned 409 with invalid_transition even
+    // though execute_subtask above accepted the same state.
+    const recordImplementationPreflight = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-fix-eval/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-fix-eval', {
+          id: 'dec-post-fix-record-implementation',
+          action: 'record_implementation',
+          subtaskId: 'st-api',
+          reason: 'Codex Builder recorded corrective implementation.',
+          evidenceRefs: [],
+          inputs: { currentHeadSha: 'head-1' },
+        }),
+      },
+    });
+    expect(recordImplementationPreflight.statusCode).toBe(200);
+    expect(recordImplementationPreflight.json().guard).toMatchObject({ accepted: true });
+  });
+
+  it('kind=lite workflow completes without a Claude Questioner gate', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    // Create a lite workflow with kind at top-level; kernel defaults
+    // requireQuestionerAfterEvaluation to false for lite.
+    const created = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-lite',
+        goal: 'Bump one dependency version',
+        kind: 'lite',
+        rootTaskId: 'root-wf-lite',
+        headSha: 'head-1',
+        metadata: { parentCodexThreadId: 'workflow-parent-thread' },
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: path.basename(root),
+          projectName: 'repo',
+          effectiveProjectPath: path.join(root, 'repo'),
+          sourceProjectPath: path.join(root, 'repo'),
+          worktreeKind: 'root',
+        },
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    expect(created.json().workflow).toMatchObject({
+      kind: 'lite',
+      policy: expect.objectContaining({ requireQuestionerAfterEvaluation: false }),
+    });
+
+    await putSingleSubtaskGraph(server, 'wf-lite');
+    await createAcceptedContract(server, 'wf-lite');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-lite/evidence',
+      payload: {
+        id: 'ev-lite-impl',
+        kind: 'implementation',
+        title: 'Implementation evidence',
+        subtaskId: 'st-api',
+        headSha: 'head-1',
+        payload: {
+          changedFiles: [
+            { path: 'packages/kernel/src/multi-agent/workflow-store.ts', changeType: 'modified' },
+          ],
+        },
+      },
+    });
+    // Walk the subtask through the sanctioned statuses used by the existing
+    // complete-v1 test (which does have a questioner output). Ours will skip
+    // that step and rely on kind=lite defaulting requireQuestionerAfterEvaluation
+    // to false.
+    await moveSubtaskToQuestioningEvidence(server, 'wf-lite', 'st-api');
+
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-lite/subtasks/st-api/evaluations',
+      payload: {
+        id: 'eval-lite-pass',
+        contractId: 'contract-st-api-v1',
+        headSha: 'head-1',
+        evaluator: { kind: 'codex-evaluator', sessionId: 'eval-lite-pass' },
+      },
+    });
+    await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-lite/subtasks/st-api/evaluations/eval-lite-pass/result',
+      payload: {
+        result: {
+          workflowId: 'wf-lite',
+          subtaskId: 'st-api',
+          contractId: 'contract-st-api-v1',
+          evaluatorRunId: 'eval-lite-pass',
+          headSha: 'head-1',
+          verdict: 'pass',
+          criteriaResults: [{ criterionId: 'ac-1', status: 'pass', evidence: 'Targeted test passed.' }],
+          commandResults: [
+            {
+              commandId: 'cmd-test',
+              command: 'pnpm --filter @tik/kernel test',
+              status: 'passed',
+              exitCode: 0,
+              summary: 'Kernel tests passed.',
+            },
+          ],
+          runtimeFindings: [],
+          coverageGaps: [],
+          confidence: 0.9,
+        },
+      },
+    });
+    await createCompletedInvocation(server, 'wf-lite', {
+      id: 'inv-builder-wf-lite',
+      subtaskId: 'st-api',
+      role: 'executor',
+      runner: 'codex',
+      promptContract: 'codex-builder.v1',
+      threadId: 'builder-thread-wf-lite',
+      headSha: 'head-1',
+      evidenceRefs: ['ev-lite-impl'],
+    });
+    await createCompletedInvocation(server, 'wf-lite', {
+      id: 'inv-evaluator-wf-lite',
+      subtaskId: 'st-api',
+      role: 'evaluator',
+      runner: 'codex-evaluator',
+      promptContract: 'codex-evaluator.v1',
+      threadId: 'evaluator-thread-wf-lite',
+      headSha: 'head-1',
+      evaluationRunId: 'eval-lite-pass',
+      readonlyPolicy: { enforced: true, violations: [] },
+    });
+
+    const complete = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows/wf-lite/decisions/preflight',
+      payload: {
+        decision: buildDecision('wf-lite', {
+          id: 'dec-lite-complete-subtask',
+          action: 'complete_subtask',
+          subtaskId: 'st-api',
+          reason: 'Lite workflow completes the subtask without a Questioner audit.',
+          evidenceRefs: ['ev-lite-impl'],
+          inputs: {
+            currentHeadSha: 'head-1',
+            contractId: 'contract-st-api-v1',
+            evaluationRunId: 'eval-lite-pass',
+          },
+        }),
+      },
+    });
+    expect(complete.statusCode).toBe(200);
+    expect(complete.json().guard).toMatchObject({ accepted: true });
+  });
+
   it('serves v1 next-action from the kernel planner with action metadata and strict questioner gates', async () => {
     const root = await makeTempWorkspace();
     const server = await createTestServer(root);

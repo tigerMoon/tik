@@ -10,12 +10,88 @@ import { decideNextAction } from '../lib/loop-gate.mjs';
 import { instructionForDecision } from '../lib/output.mjs';
 import { parseLastJsonObject } from '../lib/structured-output.mjs';
 import { collectSurefireEvidence, parseSurefireReport } from '../lib/surefire-evidence.mjs';
+import { validateQuestionerOutputShape } from '../lib/tik-client.mjs';
 
 const scriptPath = new URL('./tik-multi-agent-workflow.mjs', import.meta.url).pathname;
 assert.deepEqual(
   parseLastJsonObject('progress before result.{\n  "verdict": "pass",\n  "findings": []\n}'),
   { verdict: 'pass', findings: [] },
 );
+
+// -- validateQuestionerOutputShape: legacy fields, bad verdicts, id mismatches --
+{
+  const legacyFields = validateQuestionerOutputShape({
+    schemaVersion: 'questioner-output.v2',
+    verdict: 'evidence_sufficient',
+    coverageMatrix: [{ id: 'global-1', label: 'x', evidence: [] }],
+  });
+  assert.equal(legacyFields.ok, false);
+  assert.ok(legacyFields.errors.some((err) => err.includes('legacy field(s) id, label, evidence')),
+    `expected legacy-field error, got ${JSON.stringify(legacyFields.errors)}`);
+
+  const badVerdict = validateQuestionerOutputShape({
+    schemaVersion: 'questioner-output.v2',
+    verdict: 'need_clarification',
+    coverageMatrix: [{
+      criterionId: 'global-ac-1', criterionText: 't', required: true,
+      status: 'covered', evidenceRefs: ['x'], comment: 'ok',
+    }],
+  });
+  assert.equal(badVerdict.ok, false);
+  assert.ok(badVerdict.errors.some((err) => err.startsWith('verdict must be one of')));
+
+  const idMismatch = validateQuestionerOutputShape({
+    schemaVersion: 'questioner-output.v2',
+    verdict: 'evidence_sufficient',
+    coverageMatrix: [{
+      criterionId: 'global-1', criterionText: 't', required: true,
+      status: 'covered', evidenceRefs: ['x'], comment: 'ok',
+    }],
+  }, ['global-ac-1']);
+  assert.equal(idMismatch.ok, false);
+  assert.ok(idMismatch.errors.some((err) => err.includes('missing required criterionId(s): global-ac-1')));
+
+  // Superset case: expected ac-1 is present alongside extras — kernel accepts
+  // this, so client lint must too.
+  const supersetCovered = validateQuestionerOutputShape({
+    schemaVersion: 'questioner-output.v2',
+    verdict: 'evidence_sufficient',
+    coverageMatrix: [
+      { criterionId: 'global-ac-1', criterionText: 't', required: true, status: 'covered', evidenceRefs: ['e1'], comment: 'ok' },
+      { criterionId: 'ac-extra', criterionText: 'x', required: false, status: 'covered', evidenceRefs: ['e2'], comment: 'ok' },
+    ],
+  }, ['global-ac-1']);
+  assert.deepEqual(supersetCovered, { ok: true });
+
+  const good = validateQuestionerOutputShape({
+    schemaVersion: 'questioner-output.v2',
+    verdict: 'evidence_sufficient',
+    coverageMatrix: [{
+      criterionId: 'global-ac-1', criterionText: 't', required: true,
+      status: 'covered', evidenceRefs: ['e1'], comment: 'ok',
+    }],
+  }, ['global-ac-1']);
+  assert.deepEqual(good, { ok: true });
+
+  const missingRequired = validateQuestionerOutputShape({
+    schemaVersion: 'questioner-output.v2',
+    verdict: 'evidence_sufficient',
+    coverageMatrix: [{ criterionId: 'ac-1' }],
+  });
+  assert.equal(missingRequired.ok, false);
+  assert.ok(missingRequired.errors.some((err) => err.includes('missing field(s)')));
+
+  const badStatus = validateQuestionerOutputShape({
+    schemaVersion: 'questioner-output.v2',
+    verdict: 'evidence_sufficient',
+    coverageMatrix: [{
+      criterionId: 'ac-1', criterionText: 't', required: true,
+      status: 'ok-i-guess', evidenceRefs: ['e'], comment: 'x',
+    }],
+  });
+  assert.equal(badStatus.ok, false);
+  assert.ok(badStatus.errors.some((err) => err.includes('status must be one of')));
+}
 assert.deepEqual(
   parseSurefireReport('<testsuite name="example.ExampleTest" tests="2" failures="0" errors="0" skipped="1"></testsuite>'),
   { name: 'example.ExampleTest', tests: 2, failures: 0, errors: 0, skipped: 1 },

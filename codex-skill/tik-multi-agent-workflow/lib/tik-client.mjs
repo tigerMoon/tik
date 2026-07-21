@@ -343,3 +343,80 @@ export async function transitionTask(options, taskId, transition) {
     body: transition,
   });
 }
+
+/**
+ * Fail-fast client-side lint for QuestionerOutputV2 payloads. Prevents the
+ * three protocol misses we've seen in the wild:
+ *   1. legacy field names (`id`/`label`/`evidence`) sneaking past into the
+ *      kernel POST body, which the kernel rejects as evaluation_evidence_insufficient
+ *   2. verdicts outside the enum
+ *   3. coverageMatrix criterionId sets that don't match the required set the
+ *      kernel derived from context (e.g. `global-1` vs `global-ac-1`).
+ *
+ * `expectedCriterionIds` is optional: pass it when the caller has already
+ * retrieved the QuestionerContext and knows exactly which IDs must appear.
+ * Returns { ok: true } on success or { ok: false, errors: [...] } with a
+ * plain-text list of what needs to change. Never throws.
+ */
+export function validateQuestionerOutputShape(output, expectedCriterionIds) {
+  const errors = [];
+  if (!output || typeof output !== 'object' || Array.isArray(output)) {
+    return { ok: false, errors: ['output must be a JSON object.'] };
+  }
+  if (output.schemaVersion !== 'questioner-output.v2') {
+    errors.push(`schemaVersion must be "questioner-output.v2" (got ${JSON.stringify(output.schemaVersion)}).`);
+  }
+  const allowedVerdicts = new Set([
+    'questions_blocking',
+    'evidence_needed',
+    'risk_found',
+    'no_blocking_questions',
+    'evidence_sufficient',
+  ]);
+  if (!allowedVerdicts.has(output.verdict)) {
+    errors.push(`verdict must be one of ${Array.from(allowedVerdicts).join(', ')} (got ${JSON.stringify(output.verdict)}).`);
+  }
+  if (!Array.isArray(output.coverageMatrix) || output.coverageMatrix.length === 0) {
+    errors.push('coverageMatrix must be a non-empty array.');
+  } else {
+    const legacyFields = ['id', 'label', 'evidence'];
+    const requiredFields = ['criterionId', 'criterionText', 'required', 'status', 'evidenceRefs', 'comment'];
+    const allowedStatus = new Set(['covered', 'partially_covered', 'missing', 'not_applicable']);
+    output.coverageMatrix.forEach((entry, index) => {
+      if (!entry || typeof entry !== 'object') {
+        errors.push(`coverageMatrix[${index}] must be an object.`);
+        return;
+      }
+      const usedLegacy = legacyFields.filter((field) => field in entry);
+      if (usedLegacy.length > 0) {
+        errors.push(`coverageMatrix[${index}] uses legacy field(s) ${usedLegacy.join(', ')}; QuestionerOutputV2 requires ${requiredFields.join(', ')}.`);
+      }
+      const missing = requiredFields.filter((field) => !(field in entry));
+      if (missing.length > 0) {
+        errors.push(`coverageMatrix[${index}] is missing field(s): ${missing.join(', ')}.`);
+      }
+      if ('status' in entry && !allowedStatus.has(entry.status)) {
+        errors.push(`coverageMatrix[${index}].status must be one of ${Array.from(allowedStatus).join(', ')} (got ${JSON.stringify(entry.status)}).`);
+      }
+      if ('evidenceRefs' in entry && !Array.isArray(entry.evidenceRefs)) {
+        errors.push(`coverageMatrix[${index}].evidenceRefs must be an array.`);
+      }
+      if ('required' in entry && typeof entry.required !== 'boolean') {
+        errors.push(`coverageMatrix[${index}].required must be a boolean.`);
+      }
+    });
+  }
+  if (Array.isArray(expectedCriterionIds) && expectedCriterionIds.length > 0
+      && Array.isArray(output.coverageMatrix)) {
+    // Kernel-side validateCoverageMatrix only requires the expected set to be
+    // COVERED — extra criteria are fine. We used to also reject "unexpected"
+    // criterionIds here, which blocked valid supersets that the kernel would
+    // have accepted. Only check the missing direction.
+    const actualIds = new Set(output.coverageMatrix.map((entry) => entry?.criterionId).filter(Boolean));
+    const missing = expectedCriterionIds.filter((id) => !actualIds.has(id));
+    if (missing.length > 0) {
+      errors.push(`coverageMatrix is missing required criterionId(s): ${missing.join(', ')}. Expected at minimum: ${expectedCriterionIds.join(', ')}.`);
+    }
+  }
+  return errors.length === 0 ? { ok: true } : { ok: false, errors };
+}

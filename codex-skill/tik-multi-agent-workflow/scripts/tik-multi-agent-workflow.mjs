@@ -45,6 +45,7 @@ import {
   updateEvaluationRun,
   updateSubtask,
   validateEvaluationReadonly,
+  validateQuestionerOutputShape,
 } from '../lib/tik-client.mjs';
 import { instructionForDecision, printJson } from '../lib/output.mjs';
 import {
@@ -111,6 +112,9 @@ async function main() {
       case 'execute':
       case 'record-implementation':
         await execute(options);
+        break;
+      case 'fix-evaluation':
+        await fixEvaluation(options);
         break;
       case 'start-builder':
         await startBuilder(options);
@@ -190,6 +194,7 @@ async function main() {
 async function initWorkflow(options) {
   const projectPath = resolveProjectPath(options.path);
   const workflowMode = normalizeWorkflowMode(options.mode);
+  const workflowKind = normalizeWorkflowKind(options.kind);
   const repo = options.repo || path.basename(projectPath);
   const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD']);
   const headRef = options.headRef || git(projectPath, ['branch', '--show-current'], { optional: true }) || 'HEAD';
@@ -268,6 +273,7 @@ async function initWorkflow(options) {
     id: explicitWorkflowId,
     goal: requireOption(options.goal, '--goal is required'),
     mode: workflowMode,
+    kind: workflowKind,
     rootTaskId: stringOption(options.rootTask) || explicitWorkflowId,
     repo,
     baseRef: options.base || 'HEAD~1',
@@ -279,7 +285,7 @@ async function initWorkflow(options) {
       parentCodexThreadId: stringOption(options.parentThread),
       preexistingChangedFiles: preexistingChangedFiles.length > 0 ? preexistingChangedFiles : undefined,
     }),
-    policy: codexEvaluatorQuestionerPolicy(workflowMode),
+    policy: codexEvaluatorQuestionerPolicy(workflowMode, workflowKind),
   };
   const response = await tikFetch(options, '/v1/multi-agent/workflows', {
     method: 'POST',
@@ -742,6 +748,22 @@ async function execute(options) {
   const state = await readWorkflow(options, workflowId);
   const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
   const headSha = git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
+  // Detect the common `evaluation_failed` block before we build the decision.
+  // The guard would reject on record_implementation anyway, but users then
+  // reach for `updateSubtask` and drift outside the audit trail. Point them
+  // at `fix-evaluation` instead — it's the sanctioned path.
+  const currentStatus = state.subtasks?.[subtaskId]?.status;
+  if (currentStatus === 'evaluation_failed' && !options.skipFixEvaluationHint) {
+    printJson({
+      action: 'execution-blocked-on-evaluation-failed',
+      workflowId,
+      subtaskId,
+      currentStatus,
+      hint: `Subtask is in evaluation_failed. Run \`fix-evaluation --workflow ${workflowId} --subtask ${subtaskId}\` first, then re-run execute.`,
+    });
+    process.exitCode = 3;
+    return;
+  }
   const decision = buildDecision(state.workflow, {
     action: 'execute_subtask',
     subtaskId,
@@ -833,6 +855,70 @@ async function execute(options) {
     decision: response.decision,
     guard: response.guard,
     nextRecommendedCommand: response.nextRecommendedCommand || [],
+  });
+}
+
+/**
+ * `fix-evaluation` records a fix_evaluation_findings decision and — thanks to
+ * the /decisions endpoint enhancement — atomically transitions the subtask
+ * from evaluation_failed / needs_fix / questioning_evidence back to executing,
+ * so the next `execute` call is legal. Before this existed, callers had to
+ * hand-roll the transition via updateSubtask, which bypassed guard evidence
+ * checks and drifted outside the audit trail.
+ */
+async function fixEvaluation(options) {
+  const workflowId = requireOption(options.workflow, '--workflow is required');
+  const subtaskId = requireOption(options.subtask, '--subtask is required');
+  const state = await readWorkflow(options, workflowId);
+  const decision = buildDecision(state.workflow, {
+    action: 'fix_evaluation_findings',
+    subtaskId,
+    reason: stringOption(options.reason) || 'Codex will address findings from the failed evaluation before re-running.',
+    evidenceRefs: state.subtasks?.[subtaskId]?.evidenceRefs || [],
+    inputs: {
+      currentHeadSha: state.workflow.currentHeadSha,
+      // Use the latest FAILED evaluation (fallback: latest overall). Passing
+      // the id of a later passing evaluation would leave a misleading audit
+      // trail — decision.inputs.evaluationRunId should always reference the
+      // failure being fixed.
+      evaluationRunId: stringOption(options.evaluation) || latestFailedEvaluationId(state, subtaskId),
+    },
+  });
+  const preflight = await safePreflightDecision(options, workflowId, decision, state);
+  if (!preflight.guard?.accepted) {
+    printJson({
+      action: 'fix-evaluation-rejected',
+      workflowId,
+      subtaskId,
+      decision,
+      guard: preflight.guard,
+    });
+    return;
+  }
+  const recorded = await safeRecordDecision(options, workflowId, decision, state);
+  // A 409 caught by safeRecordDecision comes back with guard.accepted=false
+  // and no subtask patch. Distinguish that from a real success so callers
+  // don't chase a phantom "transitioned to needs_fix" hint after a race.
+  if (!recorded.guard?.accepted) {
+    printJson({
+      action: 'fix-evaluation-rejected',
+      workflowId,
+      subtaskId,
+      decision: recorded.decision || decision,
+      guard: recorded.guard,
+      hint: 'Fix-evaluation was rejected after preflight (usually a race with concurrent state change). Re-read workflow state and retry.',
+    });
+    process.exitCode = 3;
+    return;
+  }
+  printJson({
+    action: 'fix-evaluation-recorded',
+    workflowId,
+    subtaskId,
+    decision: recorded.decision,
+    guard: recorded.guard,
+    subtask: recorded.subtask,
+    hint: 'Subtask transitioned to needs_fix. Re-run `execute` with the corrective changes.',
   });
 }
 
@@ -943,7 +1029,7 @@ async function launchReviewerForState(options, state, subtaskId) {
     headSha,
     readonlyPolicy: {
       enforced: true,
-      allowedWritePaths: defaultEvaluatorAllowedPaths(),
+      allowedWritePaths: mergeEvidenceRefs(defaultEvaluatorAllowedPaths(), splitList(options.evaluatorArtifactPath)),
       forbiddenWritePaths: ['**/*'],
       violations: [],
     },
@@ -1042,7 +1128,7 @@ async function recordReadonlyReview(options) {
       evidenceRefs: [evidenceId],
       readonlyPolicy: {
         enforced: true,
-        allowedWritePaths: defaultEvaluatorAllowedPaths(),
+        allowedWritePaths: mergeEvidenceRefs(defaultEvaluatorAllowedPaths(), splitList(options.evaluatorArtifactPath)),
         forbiddenWritePaths: ['**/*'],
         violations: splitList(options.readonlyViolation) || [],
       },
@@ -1729,7 +1815,11 @@ async function evaluate(options) {
     const readonlyPolicy = {
       enforced: readonly.guard?.accepted !== false,
       violations: recorded.evaluationRun?.readonlyPolicy?.violations || readonly.evaluationRun?.readonlyPolicy?.violations || [],
-      allowedWritePaths: defaultEvaluatorAllowedPaths(),
+      // Merge the caller-supplied --evaluator-artifact-path list so `evaluate`
+      // matches the policy `start-evaluator` already applies (see line 1067).
+      // Callers that generate their own scoped .env / temp files during a
+      // read-only validation command can now pre-declare them here.
+      allowedWritePaths: mergeEvidenceRefs(defaultEvaluatorAllowedPaths(), splitList(options.evaluatorArtifactPath)),
       forbiddenWritePaths: ['**/*'],
     };
     const invocationResult = {
@@ -1790,6 +1880,30 @@ async function recordQuestioner(options) {
     : options.output
       ? await readJsonFile(options.output)
       : buildDefaultQuestionerOutput(options);
+  // Fail-fast lint before we hit the API. This catches the three protocol
+  // regressions we've been hitting: legacy `id/label/evidence` fields, bad
+  // verdict values, and criterionId sets that don't match the required set.
+  //
+  // NOTE: this used to be gated on `fromFile || schemaVersion === 'v2'`,
+  // which let the CLI's own buildDefaultQuestionerOutput bypass the lint —
+  // the very case it's meant to catch. The gate is gone; the default
+  // builder is legacy shape and MUST be flagged here rather than reach the
+  // kernel and fail with a much more confusing error. Bypass with
+  // --skip-shape-lint if you know why.
+  if (!options.skipShapeLint) {
+    const expectedIds = splitList(options.expectedCriterionId);
+    const lint = validateQuestionerOutputShape(output, expectedIds);
+    if (!lint.ok) {
+      printJson({
+        action: 'questioner-output-shape-invalid',
+        workflowId,
+        errors: lint.errors,
+        hint: 'Fix the payload locally, then re-run. Bypass with --skip-shape-lint after you understand the mismatch.',
+      });
+      process.exitCode = 3;
+      return;
+    }
+  }
   const response = await recordQuestionerOutput(options, workflowId, output);
   if (output.subtaskId && output.intent === 'question_evaluation') {
     const blockingQuestions = blockingQuestionerQuestions(output);
@@ -2626,6 +2740,22 @@ function latestEvaluation(state, subtaskId) {
     .sort((left, right) => String(right.startedAt || '').localeCompare(String(left.startedAt || '')))[0];
 }
 
+/**
+ * Return the most recent FAILED evaluation id for a subtask. Used by
+ * fix-evaluation so the audit trail records the actual failure being
+ * addressed, not a later passing run that happened to land on the same
+ * subtask (out-of-band retries, tooling drift). Falls back to
+ * latestEvaluationId if no failed run exists, so behavior is a superset of
+ * the old helper.
+ */
+function latestFailedEvaluationId(state, subtaskId) {
+  const failed = (state.evaluationRuns || [])
+    .filter((run) => run.subtaskId === subtaskId
+      && (run.status === 'failed' || run.result?.verdict === 'fail'))
+    .sort((left, right) => String(right.startedAt || '').localeCompare(String(left.startedAt || '')))[0];
+  return failed?.id || latestEvaluationId(state, subtaskId);
+}
+
 function latestQuestionerOutputId(state, subtaskId, intent) {
   return (state.questionerOutputs || [])
     .filter((output) => output.subtaskId === subtaskId && output.intent === intent)
@@ -2798,11 +2928,15 @@ async function mirrorLocalSnapshot(options, workflowId, target, markdown) {
   await writeFile(filePath, markdown, 'utf-8');
 }
 
-function codexEvaluatorQuestionerPolicy(mode = 'implementation') {
+function codexEvaluatorQuestionerPolicy(mode = 'implementation', kind = 'standard') {
   return {
     requireAcceptedContract: mode !== 'review',
     requireEvaluationPassForComplete: true,
-    requireQuestionerAfterEvaluation: true,
+    // Lite workflows still record evidence and require the evaluator pass,
+    // but skip the Claude Questioner audit step to shave ~30 min off narrow
+    // low-risk changes (single-file config, dependency version bumps,
+    // documentation-only updates).
+    requireQuestionerAfterEvaluation: kind !== 'lite',
     requireSameHeadShaForEvidence: true,
     allowHumanOverride: false,
   };
@@ -2900,6 +3034,14 @@ function normalizeWorkflowMode(value) {
     throw new Error(`Unsupported workflow mode: ${mode}. Expected implementation or review.`);
   }
   return mode;
+}
+
+function normalizeWorkflowKind(value) {
+  const kind = stringOption(value) || 'standard';
+  if (kind !== 'standard' && kind !== 'lite') {
+    throw new Error(`Unsupported workflow kind: ${kind}. Expected standard or lite.`);
+  }
+  return kind;
 }
 
 function buildDeterministicReviewTaskGraph(input) {
@@ -3105,6 +3247,9 @@ function mergeEvidenceRefs(...groups) {
 }
 
 function defaultEvaluatorAllowedPaths() {
+  // Keep in sync with `isAllowedEvaluatorGeneratedPath` in
+  // packages/kernel/src/multi-agent/native-runtime-launcher.ts. Extras
+  // beyond the kernel default are ignored server-side.
   return [
     '.tik/multi-agent/',
     'test-results/',
@@ -3113,6 +3258,8 @@ function defaultEvaluatorAllowedPaths() {
     '.tmp/evaluation/',
     '**/target/**',
     '.risk.env',
+    '.scope.env',
+    '.local_verify_*.env',
   ];
 }
 
@@ -3633,7 +3780,7 @@ Usage:
   node ${script} comment-task --task <task-id> --body <text>
   node ${script} transition-task --task <task-id> --to <status>
   node ${script} preflight --mode implementation|review [--path <repo>]
-  node ${script} init --goal <goal> [--path <repo>]
+  node ${script} init --goal <goal> [--path <repo>] [--kind standard|lite]
   node ${script} plan --workflow <workflow-id>
   node ${script} accept-plan --workflow <workflow-id> --task-graph <file>
   node ${script} draft-contract --workflow <workflow-id> --subtask <id>
@@ -3648,6 +3795,7 @@ Usage:
   node ${script} start-evaluator --workflow <workflow-id> --subtask <id> --invocation <id>
   node ${script} validate --workflow <workflow-id> --subtask <id> --command <cmd>
   node ${script} evaluate --workflow <workflow-id> --subtask <id> --command <cmd>
+  node ${script} fix-evaluation --workflow <workflow-id> --subtask <id> [--reason <text>]
   node ${script} start-questioner --workflow <workflow-id> --intent <intent> [--subtask <id>]
   node ${script} complete-questioner --unsafe-legacy --workflow <workflow-id> --invocation <id> --output <file>
   node ${script} import-questioner-output --unsafe-legacy --workflow <workflow-id> --invocation <id> --output <file>
@@ -3666,6 +3814,9 @@ Options:
   --api-token <token>        Tik API bearer token. Defaults to TIK_API_TOKEN.
   --path <repo>              Repository/worktree path. Defaults to cwd.
   --mode <mode>              Workflow mode: implementation (default) or review.
+  --kind <kind>              Workflow kind: standard (default) or lite. Lite
+                             keeps contract + evaluator gates but skips the
+                             Claude Questioner audit. See SKILL.md right-sizing.
   --workspace-root <path>    Tik workspace root; must match the API server's tik serve --project root.
   --workspace-name <name>    Dashboard/workbench workspace name. Defaults to basename of workspace root.
   --source-path <path>       Source project path for a managed worktree binding.
@@ -3685,7 +3836,9 @@ Options:
   --v1                       Enable Codex Evaluator / Claude Questioner gates.
   --max-rounds <n>           Max loop rounds. Defaults to 3.
   --max-concurrency <n>      Maximum ready Reviewer shards launched together. Defaults to 4.
-  --evaluator-artifact-path <path>  Extra evaluator artifact path allowed by readonly policy. Repeat or comma-separate.
+  --evaluator-artifact-path <path>  Extra evaluator artifact path allowed by readonly policy.
+                                    Applies to start-evaluator, start-reviewer, record-review, and evaluate.
+                                    Repeat or comma-separate. Must be a build/log artifact — not source.
   --output <path>            (init only) Write full JSON response to a file.
 `);
 }

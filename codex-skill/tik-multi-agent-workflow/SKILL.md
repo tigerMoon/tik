@@ -12,8 +12,9 @@ Codex-side workflow driver. Codex owns policy decisions and implementation/fix w
 When invoked for task execution, this skill is not advisory. Drive the work through a Tik durable workflow unless the user explicitly asks for a local-only dry run.
 
 **Right-sizing (apply before `init`):**
-- The workflow adds roughly 30–60 min of overhead beyond the code work. Skip it for single-line/typo fixes, cosmetic refactors, purely local experiments, "what does this do" reads, or "just run tests" one-shots. Note that it was intentionally skipped.
+- The full workflow adds roughly 30–60 min of overhead beyond the code work. Skip it for single-line/typo fixes, cosmetic refactors, purely local experiments, "what does this do" reads, or "just run tests" one-shots. Note that it was intentionally skipped.
 - Fits: contract-breaking API/DTO changes, cross-service behavior changes, migrations, security/policy-sensitive fixes, review-fix passes with multiple findings.
+- **`init --kind lite`** picks a middle path: contract acceptance and evaluator pass still gate the change, but the Claude Questioner audit is skipped. Use it for single-file config changes (POM parent removal, version bumps, feature-flag flips), narrow dependency updates, or documentation-only edits. Standard (`--kind standard`, the default) applies whenever cross-service behavior, DTOs, migrations, security boundaries, or multi-file logic changes are in play — if in doubt, stay standard.
 - Pure read-only MR review that needs durable audit uses `init --mode review` (never routed through the implementation loop).
 
 **Startup:**

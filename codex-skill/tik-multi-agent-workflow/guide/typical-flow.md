@@ -60,6 +60,18 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs s
 # Tik launches Claude and injects TIK_QUESTIONER_* server-side. Do not wait here;
 # re-run `continue` after the callback records QuestionerOutputV2.
 
+# ---
+# If the evaluator returns `fail`, the subtask lands in `evaluation_failed`.
+# The sanctioned recovery is a single `fix-evaluation` call — it records the
+# fix_evaluation_findings decision AND atomically transitions the subtask to
+# `needs_fix` in one round-trip. `execute_subtask` accepts `needs_fix`, so the
+# next execute is legal.
+#
+#   node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs fix-evaluation \
+#     --workflow wf_123 --subtask st_001 --reason "address ac-3 gap"
+#   node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute \
+#     --workflow wf_123 --subtask st_001 --invocation inv-builder-st_001-v2 --summary "..."
+
 node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs complete-subtask \
   --workflow wf_123 \
   --subtask st_001

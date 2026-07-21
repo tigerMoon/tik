@@ -856,7 +856,17 @@ function guardCanRecordImplementation(
   bundle: MultiAgentWorkflowBundle,
   decision: WorkflowDecision,
 ): GuardResult {
-  const statusGuard = guardCanExecuteSubtask(bundle, decision, ['contract_accepted', 'building', 'executing']);
+  // needs_fix and fixing come from the fix_evaluation_findings recovery path
+  // (evaluation_failed → needs_fix). Without them here, the sanctioned
+  // fix-evaluation → execute flow deadlocks: preflight for execute_subtask
+  // accepts needs_fix but recording implementation evidence rejects it.
+  const statusGuard = guardCanExecuteSubtask(bundle, decision, [
+    'contract_accepted',
+    'building',
+    'executing',
+    'needs_fix',
+    'fixing',
+  ]);
   if (!statusGuard.accepted) return statusGuard;
   if (decision.evidenceRefs.length > 0) {
     const implementation = latestImplementationEvidence(bundle, decision.subtaskId || '');
