@@ -30,6 +30,10 @@ const SLIM_FILE_EXCERPT_CHARS = 500;
 const SLIM_MAX_LOGS = 4;
 const SLIM_MAX_DIFF_EXCERPTS = 4;
 const SLIM_MAX_RELEVANT_FILES = 4;
+const SLIM_CRITERIA_EVIDENCE_CHARS = 300;
+const SLIM_MAX_GLOBAL_ACCEPTANCE_CRITERIA = 20;
+const SLIM_GLOBAL_AC_CHARS = 250;
+const SLIM_IMPL_SUMMARY_CHARS = 800;
 
 export function estimateContextTokens(value: unknown): number {
   return Math.ceil(Buffer.byteLength(typeof value === 'string' ? value : JSON.stringify(value), 'utf-8') / 4);
@@ -45,6 +49,18 @@ export function estimateContextTokens(value: unknown): number {
 export function slimQuestionerContext(context: QuestionerContextV1): QuestionerContextV1 {
   const slim: QuestionerContextV1 = {
     ...context,
+    workflow: context.workflow ? {
+      ...context.workflow,
+      // Cap and truncate globalAcceptanceCriteria — on 30+ criteria workflows
+      // this alone can be 6-9k chars. Preserve the first N and truncate each.
+      globalAcceptanceCriteria: (context.workflow.globalAcceptanceCriteria || [])
+        .slice(0, SLIM_MAX_GLOBAL_ACCEPTANCE_CRITERIA)
+        .map((ac) => slimTruncate(ac, SLIM_GLOBAL_AC_CHARS)),
+    } : context.workflow,
+    implementationEvidence: context.implementationEvidence ? {
+      ...context.implementationEvidence,
+      summary: slimTruncate(context.implementationEvidence.summary || '', SLIM_IMPL_SUMMARY_CHARS),
+    } : context.implementationEvidence,
     evaluation: context.evaluation ? {
       ...context.evaluation,
       logs: (context.evaluation.logs || [])
@@ -53,7 +69,28 @@ export function slimQuestionerContext(context: QuestionerContextV1): QuestionerC
           ...log,
           excerpt: slimTruncate(log.excerpt, SLIM_LOG_EXCERPT_CHARS),
         })),
+      // Trim criteriaResults evidence strings — each can be 200-400 chars.
+      coverage: (context.evaluation.coverage || []).map((criterion) => ({
+        ...criterion,
+        evidence: slimTruncate(criterion.evidence, SLIM_CRITERIA_EVIDENCE_CHARS),
+      })),
+      // Trim coverageGaps descriptions.
+      coverageGaps: (context.evaluation.coverageGaps || []).map((gap) => ({
+        ...gap,
+        description: slimTruncate(gap.description || '', SLIM_CRITERIA_EVIDENCE_CHARS),
+      })),
     } : undefined,
+    finalEvaluation: context.finalEvaluation ? {
+      ...context.finalEvaluation,
+      globalCriteriaCoverage: (context.finalEvaluation.globalCriteriaCoverage || []).map((criterion) => ({
+        ...criterion,
+        evidence: slimTruncate(criterion.evidence, SLIM_CRITERIA_EVIDENCE_CHARS),
+      })),
+      coverageGaps: (context.finalEvaluation.coverageGaps || []).map((gap) => ({
+        ...gap,
+        description: slimTruncate(gap.description || '', SLIM_CRITERIA_EVIDENCE_CHARS),
+      })),
+    } : context.finalEvaluation,
     diff: context.diff ? {
       ...context.diff,
       // buildDiffExcerpts always emits the two synthetic entries

@@ -203,6 +203,24 @@ function decideNextV1Action(state, graph, subtasks) {
         inputs: { fixRound: needsFix.fixRound || 0, evaluationRunId: invalidatedEvaluation.id },
       };
     }
+    // Once fix_evaluation_findings has been recorded and the subtask is in
+    // needs_fix, the sanctioned next step is a fresh Codex Builder run.
+    // Recommend execute_subtask directly rather than looping back to another
+    // fix_evaluation_findings (or falling through to the per-subtask path
+    // that would also loop back on the pre-fix failed evaluation).
+    // See parallel fix in packages/kernel/src/multi-agent/workflow-engine/planner.ts.
+    const alreadyDecidedFix = needsFix.status === 'needs_fix'
+      && (state.decisions || []).some((dec) =>
+        dec.action === 'fix_evaluation_findings' && dec.subtaskId === needsFix.subtaskId);
+    if (alreadyDecidedFix) {
+      return {
+        action: 'execute_subtask',
+        subtaskId: needsFix.subtaskId,
+        reason: `Subtask ${needsFix.subtaskId} recorded fix_evaluation_findings; run Codex Builder to record corrective evidence.`,
+        evidenceRefs: needsFix.evidenceRefs || [],
+        inputs: { fixRound: needsFix.fixRound || 0 },
+      };
+    }
     return {
       action: 'fix_evaluation_findings',
       subtaskId: needsFix.subtaskId,

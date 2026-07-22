@@ -65,10 +65,14 @@ node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs s
 # The sanctioned recovery is a single `fix-evaluation` call — it records the
 # fix_evaluation_findings decision AND atomically transitions the subtask to
 # `needs_fix` in one round-trip. `execute_subtask` accepts `needs_fix`, so the
-# next execute is legal.
+# next execute is legal. Because Codex Builder invocations must be attested,
+# you also need a fresh start-builder for the fix cycle:
 #
 #   node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs fix-evaluation \
 #     --workflow wf_123 --subtask st_001 --reason "address ac-3 gap"
+#   node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs start-builder \
+#     --workflow wf_123 --subtask st_001 --invocation inv-builder-st_001-v2
+#   # Wait for the Builder callback (or read status). Then:
 #   node codex-skill/tik-multi-agent-workflow/scripts/tik-multi-agent-workflow.mjs execute \
 #     --workflow wf_123 --subtask st_001 --invocation inv-builder-st_001-v2 --summary "..."
 

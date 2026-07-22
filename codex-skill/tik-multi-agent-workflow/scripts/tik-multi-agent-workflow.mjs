@@ -195,6 +195,15 @@ async function initWorkflow(options) {
   const projectPath = resolveProjectPath(options.path);
   const workflowMode = normalizeWorkflowMode(options.mode);
   const workflowKind = normalizeWorkflowKind(options.kind);
+  // Lite is a shortcut for skipping the Claude Questioner audit on
+  // implementation-mode workflows. Review-mode workflows have their own
+  // audit rules (synthesize-review + focused evaluators + Questioner on
+  // each shard) that lite would silently disable — that would defeat
+  // review mode's whole purpose. Reject the combination at the CLI layer
+  // so misconfigured invocations fail fast.
+  if (workflowMode === 'review' && workflowKind === 'lite') {
+    throw new Error('--kind lite is incompatible with --mode review. Review workflows must keep the full Questioner audit. Use --kind standard (or omit --kind).');
+  }
   const repo = options.repo || path.basename(projectPath);
   const headSha = options.headSha || git(projectPath, ['rev-parse', 'HEAD']);
   const headRef = options.headRef || git(projectPath, ['branch', '--show-current'], { optional: true }) || 'HEAD';
@@ -748,18 +757,22 @@ async function execute(options) {
   const state = await readWorkflow(options, workflowId);
   const projectPath = resolveProjectPath(options.path || state.workflow.workspaceBinding?.effectiveProjectPath);
   const headSha = git(projectPath, ['rev-parse', 'HEAD'], { optional: true }) || state.workflow.currentHeadSha;
-  // Detect the common `evaluation_failed` block before we build the decision.
-  // The guard would reject on record_implementation anyway, but users then
-  // reach for `updateSubtask` and drift outside the audit trail. Point them
-  // at `fix-evaluation` instead — it's the sanctioned path.
+  // Detect states that require fix-evaluation before execute. guardCanFixEvaluationFindings
+  // accepts starting from [evaluation_failed, needs_fix, questioning_evidence]; hitting
+  // execute directly from any of those would fail guardCanRecordImplementation
+  // (which after R1 accepts [contract_accepted, building, executing, needs_fix, fixing]).
+  // evaluation_failed and questioning_evidence are the states that still require
+  // a fix-evaluation transition; needs_fix is already valid. Point users at
+  // fix-evaluation for the audit-trail-preserving recovery.
   const currentStatus = state.subtasks?.[subtaskId]?.status;
-  if (currentStatus === 'evaluation_failed' && !options.skipFixEvaluationHint) {
+  const requiresFixEvaluation = currentStatus === 'evaluation_failed' || currentStatus === 'questioning_evidence';
+  if (requiresFixEvaluation && !options.skipFixEvaluationHint) {
     printJson({
-      action: 'execution-blocked-on-evaluation-failed',
+      action: 'execution-blocked-on-fix-evaluation-required',
       workflowId,
       subtaskId,
       currentStatus,
-      hint: `Subtask is in evaluation_failed. Run \`fix-evaluation --workflow ${workflowId} --subtask ${subtaskId}\` first, then re-run execute.`,
+      hint: `Subtask is in ${currentStatus}. Run \`fix-evaluation --workflow ${workflowId} --subtask ${subtaskId}\` first (records fix_evaluation_findings and transitions to needs_fix), then re-run execute. Bypass with --skip-fix-evaluation-hint if you know why.`,
     });
     process.exitCode = 3;
     return;
@@ -1875,21 +1888,20 @@ async function evaluate(options) {
 
 async function recordQuestioner(options) {
   const workflowId = requireOption(options.workflow, '--workflow is required');
+  if (!options.outputJson && !options.output) {
+    // The legacy default builder produced a shape that the v2 shape lint
+    // (and the kernel) always rejects — a pure fail-fast tripwire with no
+    // way to actually succeed. Refuse the shortcut here with an actionable
+    // error rather than routing users through a lint failure.
+    throw new Error('record-questioner requires --output <path> or --output-json <json> pointing at a QuestionerOutputV2 payload. The legacy default builder was removed; the normal path is the async Questioner callback recorded via /questioner-runs/:id/output.');
+  }
   const output = options.outputJson
     ? JSON.parse(String(options.outputJson))
-    : options.output
-      ? await readJsonFile(options.output)
-      : buildDefaultQuestionerOutput(options);
+    : await readJsonFile(options.output);
   // Fail-fast lint before we hit the API. This catches the three protocol
   // regressions we've been hitting: legacy `id/label/evidence` fields, bad
   // verdict values, and criterionId sets that don't match the required set.
-  //
-  // NOTE: this used to be gated on `fromFile || schemaVersion === 'v2'`,
-  // which let the CLI's own buildDefaultQuestionerOutput bypass the lint —
-  // the very case it's meant to catch. The gate is gone; the default
-  // builder is legacy shape and MUST be flagged here rather than reach the
-  // kernel and fail with a much more confusing error. Bypass with
-  // --skip-shape-lint if you know why.
+  // Bypass with --skip-shape-lint if you know why.
   if (!options.skipShapeLint) {
     const expectedIds = splitList(options.expectedCriterionId);
     const lint = validateQuestionerOutputShape(output, expectedIds);
@@ -2744,16 +2756,17 @@ function latestEvaluation(state, subtaskId) {
  * Return the most recent FAILED evaluation id for a subtask. Used by
  * fix-evaluation so the audit trail records the actual failure being
  * addressed, not a later passing run that happened to land on the same
- * subtask (out-of-band retries, tooling drift). Falls back to
- * latestEvaluationId if no failed run exists, so behavior is a superset of
- * the old helper.
+ * subtask (out-of-band retries, tooling drift). Returns undefined when no
+ * failed evaluation exists — do NOT fall back to a passing run. The server
+ * guard admits fix_evaluation_findings via the blocking-questioner path
+ * even without a failed evaluation, so undefined is a valid input.
  */
 function latestFailedEvaluationId(state, subtaskId) {
   const failed = (state.evaluationRuns || [])
     .filter((run) => run.subtaskId === subtaskId
       && (run.status === 'failed' || run.result?.verdict === 'fail'))
     .sort((left, right) => String(right.startedAt || '').localeCompare(String(left.startedAt || '')))[0];
-  return failed?.id || latestEvaluationId(state, subtaskId);
+  return failed?.id;
 }
 
 function latestQuestionerOutputId(state, subtaskId, intent) {
@@ -3188,51 +3201,6 @@ function buildDefaultContract(state, subtask, headSha) {
     },
     questionerOutputRefs: [],
     headShaAtAcceptance: headSha,
-  };
-}
-
-function buildDefaultQuestionerOutput(options) {
-  const intent = requireOption(options.intent, '--intent is required');
-  const blockingQuestions = splitList(options.blockingQuestion) || [];
-  const invocationId = requireOption(options.invocation, '--invocation is required for Claude plugin Questioner output');
-  const headSha = requireOption(options.headSha, '--head-sha is required for Claude plugin Questioner output');
-  const artifactRef = requireOption(options.artifactRef, '--artifact-ref is required for Claude plugin Questioner output');
-  const evaluationRunId = (intent === 'question_evaluation' || intent === 'question_final_evidence')
-    ? requireOption(options.evaluation, '--evaluation is required for evaluation Questioner output')
-    : stringOption(options.evaluation);
-  const finalEvaluationRunId = intent === 'question_final_evidence'
-    ? evaluationRunId
-    : undefined;
-  const contractId = (intent === 'question_contract' || intent === 'question_evaluation')
-    ? requireOption(options.contract, '--contract is required for contract/evaluation Questioner output')
-    : stringOption(options.contract);
-  return {
-    id: stringOption(options.questionerOutput),
-    subtaskId: stringOption(options.subtask),
-    intent,
-    actor: {
-      kind: 'claude-code-questioner',
-      invocationId,
-    },
-    source: 'claude-plugin',
-    headSha,
-    evaluationRunId: finalEvaluationRunId ? undefined : evaluationRunId,
-    finalEvaluationRunId,
-    contractId,
-    artifactRef,
-    verdict: blockingQuestions.length > 0
-      ? 'need_clarification'
-      : stringOption(options.verdict) || 'evidence_sufficient',
-    questions: blockingQuestions.map((question, index) => ({
-      id: `q-${index + 1}`,
-      priority: 'blocking',
-      question,
-      whyItMatters: 'Questioner marked this as blocking evidence or contract risk.',
-      expectedAnswerType: 'evidence',
-    })),
-    risks: [],
-    missingTests: [],
-    suggestedContractChanges: [],
   };
 }
 
@@ -3837,8 +3805,17 @@ Options:
   --max-rounds <n>           Max loop rounds. Defaults to 3.
   --max-concurrency <n>      Maximum ready Reviewer shards launched together. Defaults to 4.
   --evaluator-artifact-path <path>  Extra evaluator artifact path allowed by readonly policy.
-                                    Applies to start-evaluator, start-reviewer, record-review, and evaluate.
+                                    Runtime enforcement is fixed at start-evaluator (allowedPaths
+                                    is snapshotted onto the invocation). On evaluate/record-review/
+                                    start-reviewer this flag only updates the recorded readonlyPolicy
+                                    metadata sidecar — the actual runtime violation check reads the
+                                    invocation's frozen allowedPaths. Pass it on start-evaluator to
+                                    actually let the flag reach the readonly enforcement path.
                                     Repeat or comma-separate. Must be a build/log artifact — not source.
+  --skip-shape-lint          (record-questioner) Bypass client-side QuestionerOutputV2 shape lint.
+  --expected-criterion-id <id>  (record-questioner) Assert coverageMatrix covers each id. Repeat or comma-separate.
+  --skip-fix-evaluation-hint (execute) Bypass the fix-evaluation hint printed when subtask is in
+                             evaluation_failed or questioning_evidence.
   --output <path>            (init only) Write full JSON response to a file.
 `);
 }

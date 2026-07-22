@@ -3048,6 +3048,51 @@ describe('codex evaluator and Claude questioner workflow', () => {
     });
     expect(recordImplementationPreflight.statusCode).toBe(200);
     expect(recordImplementationPreflight.json().guard).toMatchObject({ accepted: true });
+
+    // Regression: after fix_evaluation_findings is recorded and subtask is
+    // in needs_fix, /next-action must NOT keep recommending
+    // fix_evaluation_findings — otherwise the continue-loop is stuck. It
+    // should recommend execute_subtask so a Builder can record corrective
+    // evidence.
+    const nextAction = await server.inject({
+      method: 'GET',
+      url: '/api/v1/multi-agent/workflows/wf-fix-eval/next-action',
+    });
+    expect(nextAction.statusCode).toBe(200);
+    expect(nextAction.json()).toMatchObject({
+      action: 'execute_subtask',
+      subtaskId: 'st-api',
+    });
+    expect(nextAction.json().action).not.toBe('fix_evaluation_findings');
+  });
+
+  it('rejects mode=review + kind=lite combination', async () => {
+    const root = await makeTempWorkspace();
+    const server = await createTestServer(root);
+    servers.push(server);
+
+    const created = await server.inject({
+      method: 'POST',
+      url: '/api/v1/multi-agent/workflows',
+      payload: {
+        id: 'wf-review-lite',
+        goal: 'Should not be allowed',
+        mode: 'review',
+        kind: 'lite',
+        rootTaskId: 'root-wf-review-lite',
+        headSha: 'head-1',
+        workspaceBinding: {
+          workspaceRoot: root,
+          workspaceName: path.basename(root),
+          projectName: 'repo',
+          effectiveProjectPath: path.join(root, 'repo'),
+          sourceProjectPath: path.join(root, 'repo'),
+          worktreeKind: 'root',
+        },
+      },
+    });
+    expect([400, 409]).toContain(created.statusCode);
+    expect(created.json().error).toMatchObject({ code: 'invalid_workflow' });
   });
 
   it('kind=lite workflow completes without a Claude Questioner gate', async () => {

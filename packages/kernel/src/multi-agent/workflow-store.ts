@@ -234,6 +234,14 @@ export class FileMultiAgentWorkflowStore {
     if (!input.goal?.trim()) {
       throw new MultiAgentCoordinationError('invalid_workflow', 'Workflow goal is required.');
     }
+    // Lite is only meaningful for implementation-mode workflows. Review mode
+    // has its own audit rules that lite would silently disable.
+    if (input.mode === 'review' && input.kind === 'lite') {
+      throw new MultiAgentCoordinationError(
+        'invalid_workflow',
+        'kind=lite is incompatible with mode=review; review workflows must keep the full Questioner audit.',
+      );
+    }
 
     const id = this.normalizeId(input.id || `wf_${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}_${generateId().slice(0, 8)}`);
     const existing = await this.readWorkflow(id);
@@ -581,11 +589,21 @@ export class FileMultiAgentWorkflowStore {
 
   /**
    * Record a decision AND patch a subtask under a single workflow mutation
-   * lock. Guarantees the pair is atomic: if the subtask transition throws
-   * (raced by a concurrent status change), the decision is not appended and
-   * lastDecisionId does not move. Prevents the dangling-decision failure
-   * mode that plain recordDecisionIfMatch + updateSubtask exhibits when
-   * the two are called from a route without a shared lock.
+   * lock. Guarantees the pair is atomic w.r.t. concurrent mutations: the
+   * subtask transition is validated (via assertSubtaskTransition) BEFORE
+   * the decision is appended, so a raced status change causes both writes
+   * to abort. Prevents the dangling-decision failure mode that plain
+   * recordDecisionIfMatch + updateSubtask exhibits from a route without a
+   * shared lock.
+   *
+   * Limitation — NOT atomic w.r.t. disk faults. `recordDecision` appends
+   * to decisions.jsonl and bumps lastDecisionId before `updateSubtask`
+   * runs. If updateSubtask throws mid-flight (ENOSPC on the atomic rename,
+   * EIO on writeWorkflow, appendEvent failure), the decision is already
+   * on disk permanently and there is no rollback — the append-only
+   * journal has no undo. Callers who need disk-fault atomicity must go
+   * through recoverWorkflowTransaction's prepare/commit shape; this
+   * helper is scoped to protect against concurrency races only.
    */
   async recordDecisionAndUpdateSubtaskIfMatch(
     workflowId: string,
@@ -3334,7 +3352,23 @@ export class FileMultiAgentWorkflowStore {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         const stat = await fs.stat(lockPath).catch(() => null);
         const owner = await this.readJsonFile<{ pid?: number }>(path.join(lockPath, 'owner.json'));
-        if ((owner?.pid && !isProcessAlive(owner.pid)) || (stat && Date.now() - stat.mtimeMs > 60_000)) {
+        // Stale-lock recovery: steal only when the previous owner is dead.
+        // Cases:
+        //   1. owner.json has a pid AND that pid is not alive → dead owner,
+        //      steal after 60s or immediately.
+        //   2. owner.json is unreadable/missing pid → can't verify liveness,
+        //      fall back to age-only heuristic (>60s).
+        //   3. owner is alive → do NOT steal even after 60s. Legitimate long
+        //      mutations (large readJsonLines during appendEvents, slow fs)
+        //      would otherwise cause concurrent writers to corrupt
+        //      decisions.jsonl / subtasks.json. owner.json is written once at
+        //      acquire and never refreshed (no heartbeat), so this is the
+        //      only signal we have.
+        const ownerHasPid = typeof owner?.pid === 'number';
+        const ownerIsDead = ownerHasPid && !isProcessAlive(owner!.pid!);
+        const olderThan60s = stat != null && Date.now() - stat.mtimeMs > 60_000;
+        const canSteal = ownerIsDead || (!ownerHasPid && olderThan60s);
+        if (canSteal) {
           await fs.rm(lockPath, { recursive: true, force: true });
           continue;
         }

@@ -181,11 +181,15 @@ describe('multi-agent coordination API', () => {
               await fs.mkdir(path.join(prepared.cwd, 'module/target'), { recursive: true });
               await fs.writeFile(path.join(prepared.cwd, 'module/target/report.txt'), 'generated\n', 'utf-8');
               await fs.writeFile(path.join(prepared.cwd, '.risk.env'), 'RISK=checked\n', 'utf-8');
-              // .scope.env and .local_verify_*.env are common local_verify.sh
-              // artifacts. Confirm the kernel default whitelist accepts both
-              // without an explicit allowedPaths override.
+              // .scope.env, .local_verify_*.env, and the empty-middle
+              // .local_verify_.env are common local_verify.sh artifacts.
+              // Confirm the kernel default whitelist accepts all without an
+              // explicit allowedPaths override; empty-middle is the edge case
+              // where the regex `[^/]*` (not `[^/]+`) matters — CLI-vs-kernel
+              // parity requires zero-or-more.
               await fs.writeFile(path.join(prepared.cwd, '.scope.env'), 'SCOPE=one\n', 'utf-8');
               await fs.writeFile(path.join(prepared.cwd, '.local_verify_gate.env'), 'GATE=ok\n', 'utf-8');
+              await fs.writeFile(path.join(prepared.cwd, '.local_verify_.env'), 'EMPTY=middle\n', 'utf-8');
             }
             if (prepared.runId === 'inv-evaluator-custom-artifact') {
               await fs.mkdir(path.join(prepared.cwd, 'custom-artifacts'), { recursive: true });

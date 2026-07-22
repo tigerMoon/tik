@@ -244,6 +244,31 @@ function planNextV1Action(ctx: WorkflowDecisionContext): PlannedAction {
         inputs: { fixRound: needsFix.fixRound || 0, evaluationRunId: invalidatedEvaluation.id },
       });
     }
+    // Once fix_evaluation_findings has been recorded for this subtask (and
+    // the subtask is therefore in needs_fix), the sanctioned next step is a
+    // Codex Builder run that records corrective implementation evidence.
+    // If we kept recommending fix_evaluation_findings here — or fell through
+    // to planSubtaskV1Action which would also loop back to
+    // fix_evaluation_findings because the pre-fix failed evaluation is still
+    // the latest — the loop cannot self-advance. Recommend execute_subtask
+    // directly so continue/next-action can drive the fix cycle to a new
+    // Builder invocation.
+    const alreadyDecidedFix = needsFix.status === 'needs_fix'
+      && ctx.bundle.decisions.some((dec) =>
+        dec.action === 'fix_evaluation_findings' && dec.subtaskId === needsFix.subtaskId);
+    if (alreadyDecidedFix) {
+      const activeBuilder = findActiveInvocation(ctx.bundle, needsFix.subtaskId, ['executor']);
+      return withRetryAfter(planned('execute_subtask', {
+        subtaskId: needsFix.subtaskId,
+        reason: activeBuilder
+          ? `Codex Builder ${activeBuilder.id} is running the fix cycle for ${needsFix.subtaskId}.`
+          : `Subtask ${needsFix.subtaskId} recorded fix_evaluation_findings; run Codex Builder to record corrective evidence.`,
+        reasonCode: activeBuilder ? 'awaiting_native_runtime' : 'missing_implementation_evidence',
+        evidenceRefs: needsFix.evidenceRefs || [],
+        refs: [{ kind: 'subtask', id: needsFix.subtaskId }],
+        inputs: { fixRound: needsFix.fixRound || 0, invocationId: activeBuilder?.id },
+      }), activeBuilder, ctx.now);
+    }
     return planned('fix_evaluation_findings', {
       subtaskId: needsFix.subtaskId,
       reason: 'Subtask needs Codex Builder to fix evaluator or questioner findings.',
